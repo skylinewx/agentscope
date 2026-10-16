@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """Schemas for equipping a workspace with MCPs and skills."""
-from pydantic import BaseModel, Field
 
-from ....mcp import MCPClient
+from datetime import datetime
+
+from pydantic import BaseModel, Field, ConfigDict
 
 
 class AddSkillRequest(BaseModel):
@@ -109,8 +110,33 @@ class ToolInfo(BaseModel):
     description: str | None = None
 
 
-class MCPClientStatus(MCPClient):
-    """MCPClient enriched with live tool list and health status."""
+class ScopedResourceUpdate(BaseModel):
+    """Null resets an inherited switch; boolean is an explicit override."""
+
+    model_config = ConfigDict(extra="forbid")
+    enabled: bool | None
+
+
+class ResourceScopeView(BaseModel):
+    binding_sources: list[str]
+    binding_id: str
+    agent_enabled: bool | None
+    session_override: bool | None
+    effective_enabled: bool
+    available: bool
+
+
+class MCPClientStatus(ResourceScopeView):
+    """Redacted selection and cached health; listing opens no connection."""
+
+    name: str
+    is_stateful: bool
+    transport: str
+    resource_id: str
+    enabled: bool
+    source: str = "custom"
+    version: str | None = None
+    status: str = "not_loaded"
 
     is_healthy: bool = False
     tools: list[ToolInfo] = Field(default_factory=list)
@@ -122,3 +148,31 @@ class MCPClientStatus(MCPClient):
             "unreachable host and a missing command all look the same."
         ),
     )
+
+
+class WorkspaceSkillView(ResourceScopeView):
+    """An equipped Skill, including user switch and installed version."""
+
+    name: str
+    description: str
+    dir: str
+    markdown: str
+    updated_at: float | None = None
+    resource_id: str
+    enabled: bool
+    source: str = "custom"
+    version: str | None = None
+    version_updated_at: datetime | None = None
+    installed_version: str | None = None
+    installed_version_updated_at: datetime | None = None
+    status: str = "ready"
+    error: str | None = None
+
+
+class WorkspaceFileInfo(BaseModel):
+    """Verified metadata for a file card in a session's workspace."""
+
+    path: str
+    name: str
+    media_type: str
+    size_bytes: int | None = None

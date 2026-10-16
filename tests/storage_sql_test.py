@@ -9,6 +9,7 @@ backend implements, mirroring the shape (though not always the
 literal assertions) of the Redis backend's tests so both backends
 stay behavioural equivalents.
 """
+
 from contextlib import AsyncExitStack
 from datetime import datetime, timedelta, timezone
 from importlib import import_module
@@ -1358,11 +1359,13 @@ class AsyncSQLAlchemyStorageTest(IsolatedAsyncioTestCase):
     async def test_mcps_round_trip(self) -> None:
         """Upsert / get / get-by-name / list / delete + owner scoping."""
         record = _mcp_record("user-1")
+        record.card_snapshot = {"name": "deepwiki", "version": "1"}
         mcp_id = await self.storage.upsert_mcp("user-1", record)
 
         fetched = await self.storage.get_mcp("user-1", mcp_id)
         self.assertEqual(fetched.client.mcp_config.type, "http_mcp")
         self.assertEqual(fetched.name, "deepwiki")
+        self.assertEqual(fetched.card_snapshot, record.card_snapshot)
 
         by_name = await self.storage.get_mcp_by_name("user-1", "deepwiki")
         self.assertEqual(by_name.id, mcp_id)
@@ -1406,10 +1409,19 @@ class AsyncSQLAlchemyStorageTest(IsolatedAsyncioTestCase):
     async def test_skills_round_trip(self) -> None:
         """Upsert / get / get-by-name / list / delete + owner scoping."""
         record = SkillRecord(user_id="user-1", name="gifgrep")
+        record.update_version("b" * 64, "1")
         skill_id = await self.storage.upsert_skill("user-1", record)
 
         fetched = await self.storage.get_skill("user-1", skill_id)
         self.assertEqual(fetched.name, "gifgrep")
+        self.assertEqual(fetched.artifact_id, "b" * 64)
+        self.assertEqual(fetched.version_updated_at, record.version_updated_at)
+        self.assertIsNotNone(fetched.version_updated_at.tzinfo)
+
+        fetched.description = "updated description"
+        await self.storage.upsert_skill("user-1", fetched)
+        toggled = await self.storage.get_skill("user-1", skill_id)
+        self.assertEqual(toggled.version_updated_at, record.version_updated_at)
 
         by_name = await self.storage.get_skill_by_name("user-1", "gifgrep")
         self.assertEqual(by_name.id, skill_id)
@@ -1700,6 +1712,22 @@ class LegacyRecordShapeTest(IsolatedAsyncioTestCase):
     promotion refactor must still deserialise, so a database populated
     by an older build keeps round-tripping after an upgrade.
     """
+
+    async def test_skill_without_revision_date_remains_undated(self) -> None:
+        """Old record timestamps are not used as content revision dates."""
+        record = SkillRecord.model_validate(
+            {
+                "user_id": "u1",
+                "name": "old-skill",
+                "version": "1",
+                "artifact_id": "c" * 64,
+                "created_at": "2020-01-01T00:00:00",
+                "updated_at": "2025-01-01T00:00:00",
+            }
+        )
+        self.assertIsNone(record.version_updated_at)
+        record.update_version("c" * 64, "1")
+        self.assertIsNone(record.version_updated_at)
 
     async def test_knowledge_base_flat_payload_migrates(self) -> None:
         """Flat KB fields fold into :attr:`KnowledgeBaseRecord.data`."""

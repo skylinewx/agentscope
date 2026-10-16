@@ -34,14 +34,16 @@ class SummarySchema(BaseModel):
         description=(
             "Specific actions needed to complete the task.\n"
             "Any blockers or open questions to resolve.\n"
-            "Priority order if multiple steps remain"
+            "Priority order if multiple steps remain. Distinguish required actions from provisional "
+            "choices; do not invent or freeze an unconfirmed implementation or presentation plan."
         ),
     )
     context_to_preserve: str = Field(
         description=(
             "User preferences or style requirements.\n"
             "Domain-specific details that aren't obvious.\n"
-            "Any promises made to the user"
+            "Any promises made to the user. Active skill constraints and exact reference paths "
+            "needed for remaining work; unresolved acceptance checks and re-reading requirements."
         ),
     )
     """The important context to preserve across compression, e.g. user
@@ -105,6 +107,16 @@ class ContextConfig(BaseModel):
             "waiting on — give each one's id and a short note of what it is "
             "doing — and mark each item's owner (user request vs your own "
             "decision) and status (done / pending / blocked).\n"
+            "- Preserve active user requirements, applicable skill constraints, "
+            "and unfinished acceptance checks before verbose data or proposed tool arguments.\n"
+            "- Separate user-confirmed requirements, verified results, and your provisional "
+            "choices. Never turn a suggested implementation or display plan into a requirement; "
+            "keep undecided choices open to revision.\n"
+            "- Preserve the exact skill/reference paths and relevant sections needed for "
+            "remaining work. If their contents cannot fit, explicitly require re-reading "
+            "them before the relevant stage; saying 'already read' is insufficient.\n"
+            "- Preserve task IDs, completion criteria, actual outcomes, pending checks, "
+            "and data recovery pointers. Tool success alone does not prove delivery quality.\n"
             "</system-hint>"
         ),
         # ``format: textarea`` is a hint for schema-driven UI renderers

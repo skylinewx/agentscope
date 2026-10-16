@@ -261,6 +261,23 @@ class SandboxedWorkspaceBase(WorkspaceBase):
 
     # ── MCP management (gateway-routed) ───────────────────────────
 
+    def create_mcp_client(
+        self,
+        spec: MCPClient,
+        *,
+        agent_id: str,
+        session_id: str,
+        instance_id: str,
+    ) -> MCPClient:
+        """Keep retired generations separate while their calls drain."""
+        if self._gateway is None:
+            raise RuntimeError("Workspace has no MCP gateway attached.")
+        return self._gateway.make_client(
+            spec.model_dump(mode="json"),
+            agent_id=agent_id,
+            session_id=f"{session_id}:resource:{instance_id}",
+        )
+
     async def list_mcps(
         self,
         *,

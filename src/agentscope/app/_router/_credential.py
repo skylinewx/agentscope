@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Credential router — CRUD endpoints for API key credentials."""
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, HTTPException, status
+from pydantic import ValidationError
 
 from ..access import ResourceKind
 from ..deps import (
@@ -17,13 +18,28 @@ from ._schema import (
 )
 from .._service import CredentialView, ResourceAccessService
 from ..storage import StorageBase
-from ...credential import CredentialFactory
+from ...credential import CredentialBase, CredentialFactory
 
 credential_router = APIRouter(
     prefix="/credential",
     tags=["credential"],
     responses={404: {"description": "Not found"}},
 )
+
+
+def _validate_credential(data: dict) -> CredentialBase:
+    """Report invalid credentials without returning secret input values."""
+    try:
+        return CredentialFactory.from_dict(data)
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail=exc.errors(
+                include_input=False,
+                include_context=False,
+                include_url=False,
+            ),
+        ) from exc
 
 
 @credential_router.get(
@@ -100,7 +116,7 @@ async def create_credential(
     """
     credential_id = await storage.upsert_credential(
         user_id,
-        CredentialFactory.from_dict(body.data),
+        _validate_credential(body.data),
     )
     return CreateCredentialResponse(credential_id=credential_id)
 
@@ -141,7 +157,7 @@ async def update_credential(
         credential_id,
     )
 
-    credential = CredentialFactory.from_dict(body.data)
+    credential = _validate_credential(body.data)
     credential.id = credential_id
     await storage.upsert_credential(owner_id, credential)
     # ``resolve_for_edit`` proved the record existed under ``owner_id``

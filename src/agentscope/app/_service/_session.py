@@ -45,6 +45,7 @@ live in different databases in the future. The service is the **only**
 component that touches both in the same call. Storage code never
 imports the bus; bus code never imports storage.
 """
+
 import asyncio
 from enum import StrEnum
 
@@ -123,6 +124,7 @@ class SessionService:
         storage: StorageBase,
         message_bus: MessageBus,
         workspace_manager: WorkspaceManagerBase | None = None,
+        resource_service=None,
     ) -> None:
         """Bind dependencies.
 
@@ -137,6 +139,7 @@ class SessionService:
         self._storage = storage
         self._bus = message_bus
         self._workspace_manager = workspace_manager
+        self._resource_service = resource_service
         self._projection = SessionProjection(message_bus)
 
     # ------------------------------------------------------------------
@@ -409,6 +412,13 @@ class SessionService:
                     agent_id=agent_id,
                     session_id=session_id,
                 )
+                if self._resource_service is not None:
+                    await self._resource_service.purge_session(
+                        user_id,
+                        workspace,
+                        agent_id,
+                        session_id,
+                    )
             except Exception as e:
                 logger.warning(
                     "Failed to purge workspace %r for session %r: %s",

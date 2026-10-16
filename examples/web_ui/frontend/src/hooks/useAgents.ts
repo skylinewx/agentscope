@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback } from 'react';
 
 import { agentApi } from '../api';
 import type { AgentView, CreateAgentRequest, UpdateAgentRequest } from '../api';
+import { notifyResourceChanged } from '@/lib/resource-events';
 
 /**
  * Manages the full agent list with CRUD operations.
@@ -43,6 +44,7 @@ export function useAgents() {
 	const update = useCallback(
 		async (agentId: string, body: UpdateAgentRequest, options?: { silent?: boolean }) => {
 			const res = await agentApi.update(agentId, body, options);
+			notifyResourceChanged();
 			await refetch();
 			return res;
 		},

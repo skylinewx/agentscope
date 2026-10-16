@@ -1,21 +1,22 @@
 import { ReplyFinishedReason } from '@agentscope-ai/agentscope/event';
 import {
 	type ContentBlock,
-	getContentBlocks,
 	type Msg,
 	type TextBlock,
 	type ToolCallBlock,
 } from '@agentscope-ai/agentscope/message';
 import { GitBranch, TriangleAlert } from 'lucide-react';
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 
+import { AnalysisDraftContext } from './AnalysisDraftContext';
 import { Button } from '../ui/button';
 import { DiffStats } from './tool-renderers/_shared';
 import type { GitStatus } from '@/api';
+import { getBaseUrl, getUserId } from '@/api/client';
 import { ASMessageBubble } from '@/components/chat/ASMessageBubble.tsx';
 import { ConfirmCard } from '@/components/chat/ConfirmCard.tsx';
 import { FlipCard } from '@/components/chat/FlipCard.tsx';
-import { TextInput } from '@/components/chat/TextInput.tsx';
+import { TextInput, type TextInputRef } from '@/components/chat/TextInput.tsx';
 import { WorkingDirectoryDialog } from '@/components/dialog/WorkingDirectoryDialog';
 import { Alert, AlertAction, AlertDescription, AlertTitle } from '@/components/ui/alert.tsx';
 import { Marker, MarkerContent } from '@/components/ui/marker';
@@ -30,7 +31,9 @@ import {
 import { Spinner } from '@/components/ui/spinner';
 import type { ReplyPhase } from '@/hooks/useMessages';
 import { useTranslation } from '@/i18n/useI18n';
+import { draftScope } from '@/lib/analysis-draft';
 import type { RealtimeConnectionState } from '@/lib/browserWebRTCTransport';
+import { pendingCalls } from '@/lib/reply-presentation';
 import { cn } from '@/lib/utils';
 
 /** How long a load may run before it is worth showing a spinner. */
@@ -68,6 +71,9 @@ interface ChatContentProps {
 	 * *previous* session's messages until the fetch effect clears them.
 	 */
 	loading?: boolean;
+	/** A failed persisted-history read must not show the new-session greeting. */
+	historyError?: Error | null;
+	onReloadHistory?: () => void;
 	/**
 	 * Reply lifecycle phase from ``useMessages`` — forwarded to
 	 * ``TextInput`` so the shared voice / send / stop button can pick its
@@ -118,6 +124,8 @@ interface ChatContentProps {
 const ChatContentComponent: React.FC<ChatContentProps> = ({
 	msgs,
 	loading = false,
+	historyError = null,
+	onReloadHistory,
 	phase,
 	disabled,
 	onSend,
@@ -139,10 +147,12 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	onRefreshGit,
 }) => {
 	const { t, i18n } = useTranslation();
+	const inputRef = useRef<TextInputRef>(null);
+	const inputScope = draftScope(getBaseUrl(), getUserId(), agentId, sessionId);
 	// Only a session that finished loading with nothing in it is empty.
 	// Treating "no messages yet" as empty would flash the greeting over
 	// every session that does have history.
-	const isEmpty = !loading && msgs.length === 0;
+	const isEmpty = !loading && !historyError && msgs.length === 0;
 
 	// A spinner that appears and vanishes inside a couple of frames reads
 	// as a flicker, not as feedback — so hold it back until the load has
@@ -159,17 +169,17 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	}, [loading]);
 
 	const toConfirmedToolCalls = useMemo(() => {
-		if (msgs.length === 0) return [];
-
-		const lastMsg = msgs[msgs.length - 1];
-		return getContentBlocks(lastMsg, 'tool_call')
+		return msgs.flatMap((message) => pendingCalls(message)
 			.filter((tc) => tc.state === 'asking')
-			.map((tc) => ({ replyId: lastMsg.id, toolCall: tc }));
+			.map((tc) => ({ replyId: message.id, toolCall: tc })));
 	}, [msgs]);
 
 	// On an empty session the prompt and the input centre together, so every box
 	// down to the message list shrinks to its content instead of filling.
 	return (
+		<AnalysisDraftContext.Provider value={{ insert: (text, workspace) => {
+			if (!loading && !disabled && workspace.agentId === agentId && workspace.sessionId === sessionId) inputRef.current?.insertDraft(text, inputScope);
+		} }}>
 		<div
 			className={cn(
 				'flex flex-col h-full w-full items-center gap-4',
@@ -181,12 +191,27 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 				<div className="flex flex-1 w-full items-center justify-center">
 					{showSpinner ? <Spinner className="size-5 text-muted-foreground" /> : null}
 				</div>
+			) : historyError ? (
+				<div className="flex flex-1 w-full items-center justify-center p-4">
+					<Alert>
+						<TriangleAlert />
+						<AlertTitle>{t('chat.historyLoadFailed')}</AlertTitle>
+						<AlertDescription>{t('chat.historyLoadFailedDescription')}</AlertDescription>
+						{onReloadHistory && (
+							<AlertAction>
+								<Button variant="outline" size="sm" onClick={onReloadHistory}>
+									{t('chat.reloadHistory')}
+								</Button>
+							</AlertAction>
+						)}
+					</Alert>
+				</div>
 			) : isEmpty ? (
 				<span className="text-center text-4xl font-light tracking-[-0.035em] text-foreground mb-2">
 					{t('chat.greeting')}
 				</span>
 			) : (
-				<MessageScrollerProvider autoScroll={true} defaultScrollPosition={'end'}>
+				<MessageScrollerProvider key={inputScope} autoScroll={true} defaultScrollPosition={'end'}>
 					<MessageScroller>
 						<MessageScrollerViewport>
 							<MessageScrollerContent>
@@ -198,7 +223,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 										: at;
 									return (
 										<MessageScrollerItem
-											key={message.id}
+												key={`${inputScope}:${message.id}`}
 											messageId={message.id}
 										>
 											{at.getTime() - previousAt.getTime() >
@@ -213,6 +238,8 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 												</Marker>
 											)}
 											<ASMessageBubble
+												agentId={agentId}
+												sessionId={sessionId}
 												message={message}
 												onUserConfirm={onUserConfirm}
 											/>
@@ -294,6 +321,9 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 				    edges parallel — a plain rectangle here would show the
 				    pill's corners cutting into it. */}
 					<TextInput
+						key={inputScope}
+						ref={inputRef}
+						draftScope={inputScope}
 						className="min-w-full max-w-full w-full rounded-[32px] bg-muted p-1"
 						onSend={onSend}
 						disabled={disabled}
@@ -352,6 +382,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 				</div>
 			)}
 		</div>
+		</AnalysisDraftContext.Provider>
 	);
 };
 

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Test cases for installing a skill from an archive stream."""
+
 import io
 import os
 import shutil
@@ -81,7 +82,7 @@ class AddSkillArchiveLocalTest(IsolatedAsyncioTestCase):
         self.assertEqual(names, ["alpha", "beta"])
 
     async def test_duplicate_is_skipped(self) -> None:
-        """The same skill twice is deduped by SKILL.md hash."""
+        """The same skill twice is deduped by directory content hash."""
         payload = _zip({"pack/SKILL.md": _skill_md("alpha")})
         await self.workspace.add_skill_archive(
             _chunks(payload),
@@ -94,6 +95,23 @@ class AddSkillArchiveLocalTest(IsolatedAsyncioTestCase):
             "pack",
         )
         self.assertEqual(len(await self.workspace.list_skills()), 1)
+
+    async def test_script_only_archive_changes_are_installed(self) -> None:
+        """Archives with the same Markdown and different scripts both land."""
+        for script in ("print('old')", "print('new')"):
+            await self.workspace.add_skill_archive(
+                _chunks(
+                    _zip(
+                        {
+                            "pack/SKILL.md": _skill_md("alpha"),
+                            "pack/scripts/run.py": script,
+                        },
+                    ),
+                ),
+                "zip",
+                "pack",
+            )
+        self.assertEqual(len(await self.workspace.list_skills()), 2)
 
     async def test_traversing_archive_is_refused(self) -> None:
         """A member escaping the staging directory fails the install."""
@@ -177,6 +195,10 @@ class AddSkillArchiveSandboxedTest(IsolatedAsyncioTestCase):
         )
         self.assertEqual(os.listdir(self.skills_dir), ["flat-pack"])
 
+    @unittest.skipIf(
+        os.name == "nt",
+        "base archive importer requires a POSIX sandbox filesystem",
+    )
     async def test_oversized_expansion_is_refused(self) -> None:
         """An archive expanding past the cap fails inside the sandbox."""
         payload = _zip({"pack/SKILL.md": _skill_md("big") + "A" * 5000})

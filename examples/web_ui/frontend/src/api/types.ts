@@ -57,7 +57,34 @@ export interface ChatConfig {
 /** Partial text-mode settings accepted by create and update requests. */
 export type ChatConfigInput = Partial<ChatConfig>;
 
+export interface ResourceBinding {
+	enabled: boolean;
+	binding_id?: string;
+}
+export interface SkillResourceBinding extends ResourceBinding {
+	artifact_id?: string | null;
+	version?: string | null;
+	version_updated_at?: string | null;
+}
+export interface AgentResourceConfig {
+	mcps: Record<string, ResourceBinding>;
+	skills: Record<string, SkillResourceBinding>;
+}
+export interface SessionResourceConfig extends AgentResourceConfig {
+	mcp_overrides: Record<string, { enabled: boolean; binding_id: string }>;
+	skill_overrides: Record<string, { enabled: boolean; binding_id: string }>;
+}
+export interface ResourceScope {
+	binding_sources: ('agent' | 'session')[];
+	binding_id: string;
+	agent_enabled: boolean | null;
+	session_override: boolean | null;
+	effective_enabled: boolean;
+	available: boolean;
+}
+
 export interface AgentData {
+	resource_config: AgentResourceConfig;
 	id: string;
 	name: string;
 	system_prompt: string;
@@ -75,6 +102,7 @@ export interface AgentView extends RecordBase {
 }
 
 export interface CreateAgentRequest {
+	resource_config?: AgentResourceConfig;
 	name: string;
 	system_prompt?: string;
 	chat_config?: ChatConfigInput;
@@ -91,6 +119,7 @@ export interface CreateAgentResponse {
 }
 
 export interface UpdateAgentRequest {
+	resource_config?: AgentResourceConfig;
 	name?: string;
 	system_prompt?: string;
 	chat_config?: ChatConfigInput;
@@ -149,6 +178,7 @@ export type SessionOrigin =
 export type SessionSourceKind = SessionOrigin['type'];
 
 export interface SessionConfig {
+	resource_config: SessionResourceConfig;
 	name: string;
 	/** Who owns `name` — see the backend's `SessionNaming`. */
 	naming: { auto: boolean };
@@ -189,6 +219,7 @@ export interface SessionRecord extends RecordBase {
 }
 
 export interface CreateSessionRequest {
+	resource_config?: SessionResourceConfig;
 	agent_id: string;
 	workspace_id?: string;
 	chat_model_config?: ChatModelConfig | null;
@@ -211,6 +242,7 @@ export interface InterruptSessionResponse {
 }
 
 export interface UpdateSessionRequest {
+	resource_config?: SessionResourceConfig;
 	name?: string;
 	chat_model_config?: ChatModelConfig;
 	/**
@@ -514,6 +546,9 @@ export interface MCPClient {
 	name: string;
 	is_stateful: boolean;
 	mcp_config: StdioMCPConfig | HttpMCPConfig;
+	enable_tools?: string[] | null;
+	disable_tools?: string[] | null;
+	execution_timeout?: number | null;
 }
 
 export interface ToolInfo {
@@ -521,7 +556,15 @@ export interface ToolInfo {
 	description?: string | null;
 }
 
-export interface MCPClientStatus extends MCPClient {
+export interface MCPClientStatus extends ResourceScope {
+	name: string;
+	is_stateful: boolean;
+	transport: 'stdio_mcp' | 'http_mcp' | 'unknown';
+	resource_id: string;
+	enabled: boolean;
+	source: 'hub' | 'custom';
+	version: string | null;
+	status: 'not_loaded' | 'ready' | 'error' | 'disabled' | 'unavailable';
 	is_healthy: boolean;
 	tools: ToolInfo[];
 	/**
@@ -534,12 +577,21 @@ export interface MCPClientStatus extends MCPClient {
 
 // ─── Skill ────────────────────────────────────────────────────────────────────
 
-export interface Skill {
+export interface Skill extends ResourceScope {
 	name: string;
 	description: string;
 	dir: string;
 	markdown: string;
 	updated_at: number;
+	resource_id: string;
+	enabled: boolean;
+	source: 'hub' | 'custom';
+	version: string | null;
+	installed_version: string | null;
+	/** Library revision date and the date snapshotted when equipped. */
+	version_updated_at: string | null;
+	installed_version_updated_at: string | null;
+	status: 'ready' | 'disabled' | 'unavailable' | 'not_loaded';
 }
 
 /**
@@ -660,8 +712,7 @@ export interface SkillHubPage {
 
 /**
  * The outcome of putting library MCPs into a workspace, reported per MCP:
- * connecting happens one at a time, so a bad API key on the third pick must
- * not throw away the two that worked.
+ * selecting happens one at a time; MCP connections are opened by new runs.
  */
 export interface AddFromLibraryResponse {
 	/** Now in the workspace. Excludes ones already present. */
@@ -672,13 +723,16 @@ export interface AddFromLibraryResponse {
 
 /** A library edit. Omitted fields are left alone. */
 export interface UpdateMCPRequest {
+	description?: string;
+	version?: string;
 	name?: string;
+	/** Explicit write-only configuration replacement. Mutually exclusive with values. */
+	client?: MCPClient;
 	/**
 	 * New answers, merged over the stored ones — send only what changed, so
 	 * a write-only field the form never echoed back survives.
 	 */
 	values?: Record<string, unknown>;
-	enabled?: boolean;
 }
 
 export interface InstallMCPRequest {
@@ -705,7 +759,7 @@ export interface MCPView {
 	/** Unique per user — the handle a workspace refers to it by. */
 	name: string;
 	is_stateful: boolean;
-	enabled: boolean;
+	source: 'hub' | 'custom';
 	/**
 	 * Snapshotted from the card at install time, so they survive the hub
 	 * going away — and may lag behind it.
@@ -723,15 +777,15 @@ export interface MCPView {
 }
 
 /**
- * One skill in the user's own library. Unlike an MCP, the skill's files are
- * not stored — the record says where they came from, and the archive is
- * re-fetched from the hub when the skill reaches a workspace.
+ * One skill in the user's library. Complete packages are saved by content
+ * hash on the service; later workspace installs use that saved version.
  */
 export interface SkillView {
 	id: string;
-	/** Unique per user — the handle a workspace refers to it by. */
+	/** Unique per user; workspace bindings use id. */
 	name: string;
-	enabled: boolean;
+	source: 'hub' | 'custom';
+	package_saved: boolean;
 	display_name: string | null;
 	description: string;
 	tags: string[];
@@ -743,11 +797,28 @@ export interface SkillView {
 	hub_id: string | null;
 	card_id: string | null;
 	version: string | null;
+	/** ISO 8601 UTC revision time; old records may have no recorded date. */
+	version_updated_at: string | null;
 }
 
 /** A library skill with its `SKILL.md` body, from the detail endpoint. */
 export interface SkillRecord extends SkillView {
 	markdown: string;
+}
+
+export interface MCPDetail extends MCPView {
+	client: MCPClient;
+}
+
+export interface SkillFile {
+	path: string;
+	size: number;
+	editable: boolean;
+}
+
+export interface SaveSkillFilesRequest {
+	files: Record<string, string | null>;
+	version?: string;
 }
 
 // ─── Schedule ─────────────────────────────────────────────────────────────────

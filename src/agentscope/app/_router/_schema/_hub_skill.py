@@ -1,5 +1,8 @@
 # -*- coding: utf-8 -*-
 """Schemas for skills installed from a hub."""
+
+from datetime import datetime
+
 from pydantic import BaseModel, Field
 
 from ...storage import SkillRecord
@@ -10,7 +13,8 @@ class SkillView(BaseModel):
 
     id: str = Field(description="The installed-skill record id.")
     name: str = Field(description="The skill name, unique for this user.")
-    enabled: bool = Field(description="Whether the user has it turned on.")
+    source: str = "custom"
+    package_saved: bool = False
     display_name: str | None = Field(
         default=None,
         description="The card's user-facing name at install time.",
@@ -45,7 +49,13 @@ class SkillView(BaseModel):
     )
     version: str | None = Field(
         default=None,
-        description="The card version installed.",
+        description="The current library version label or short package hash.",
+    )
+    version_updated_at: datetime | None = Field(
+        default=None,
+        description=(
+            "UTC time this library revision was saved; null if unknown."
+        ),
     )
 
     @classmethod
@@ -66,7 +76,8 @@ class SkillView(BaseModel):
         return cls(
             id=record.id,
             name=record.name,
-            enabled=record.enabled,
+            source="hub" if record.hub_id else "custom",
+            package_saved=bool(record.artifact_id),
             display_name=record.display_name,
             description=record.description,
             tags=record.tags,
@@ -76,4 +87,26 @@ class SkillView(BaseModel):
             hub_id=record.hub_id,
             card_id=record.card_id,
             version=record.version,
+            version_updated_at=record.version_updated_at,
         )
+
+
+class SkillDetail(SkillView):
+    """Library metadata and instructions without server artifact paths."""
+
+    markdown: str = ""
+
+
+class SaveSkillFilesRequest(BaseModel):
+    """Create or revise a package using UTF-8 files; null deletes a file."""
+
+    files: dict[str, str | None] = Field(min_length=1, max_length=100)
+    version: str | None = Field(default=None, min_length=1)
+
+
+class SkillFileView(BaseModel):
+    """A relative package path, without exposing service filesystem paths."""
+
+    path: str
+    size: int
+    editable: bool

@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Session router — create, list, update, delete, stream, and get messages."""
+
 import asyncio
 import json
 from typing import AsyncGenerator
@@ -9,6 +10,7 @@ from fastapi.responses import StreamingResponse
 
 from ..._utils._common import _generate_id
 from ..access import ResourceKind
+from .._service._resource_config_service import ResourceConfigService
 from ..deps import (
     get_chat_service,
     get_current_user_id,
@@ -322,7 +324,15 @@ async def create_session(
             is not visible to the caller.
     """
     # Agent must be visible to the caller (own or shared).
-    await access.resolve_agent(user_id, body.agent_id)
+    agent = await access.resolve_agent(user_id, body.agent_id)
+    resource_config = await ResourceConfigService(
+        storage, access
+    ).validate_config(
+        user_id,
+        user_id,
+        body.resource_config,
+        agent_config=agent.data.resource_config,
+    )
 
     await _ensure_credential_exists(access, user_id, body.chat_model_config)
     await _ensure_credential_exists(
@@ -359,6 +369,7 @@ async def create_session(
         agent_id=body.agent_id,
         config=SessionConfig(
             workspace_id=resolved_workspace_id,
+            resource_config=resource_config,
             chat_model_config=body.chat_model_config,
             fallback_chat_model_config=body.fallback_chat_model_config,
             tts_model_config=body.tts_model_config,
@@ -505,7 +516,9 @@ async def update_session(
 
     # Checked after the 404 so a missing session reports as missing, and
     # before the validation round trips below so we fail fast.
-    if await message_bus.is_locked(MessageBusKeys.session_lock(session_id)):
+    if body.model_fields_set - {
+        "resource_config"
+    } and await message_bus.is_locked(MessageBusKeys.session_lock(session_id)):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -532,24 +545,6 @@ async def update_session(
         body.knowledge_config,
     )
 
-    # ``None`` leaves the stored state untouched (see
-    # ``StorageBase.upsert_session``). ``permission_mode`` is the only
-    # request field living inside ``state``; every other field is a
-    # pure config write, and rewriting ``state`` for those would put
-    # this handler's opening snapshot back over whatever the run has
-    # persisted since.
-    updated_state = None
-    if body.permission_mode is not None:
-        updated_ctx = existing.state.permission_context.model_copy(
-            update={"mode": body.permission_mode},
-        )
-
-        updated_state = existing.state.model_copy(
-            update={
-                "permission_context": updated_ctx,
-            },
-        )
-
     # PATCH semantics: only fields explicitly present in the request body are
     # applied. ``exclude_unset=True`` lets clients distinguish "leave
     # unchanged" (omit) from "clear" (send ``null``) — required for clearing
@@ -567,15 +562,38 @@ async def update_session(
             "auto": False,
         }
 
-    return await storage.upsert_session(
-        user_id=user_id,
-        agent_id=agent_id,
-        config=SessionConfig.model_validate(
-            {**existing.config.model_dump(mode="json"), **config_updates},
-        ),
-        state=updated_state,
-        session_id=session_id,
-    )
+    if "resource_config" in config_updates:
+        if body.resource_config is None:
+            raise HTTPException(422, "resource_config must be an object.")
+        agent = await access.resolve_agent(user_id, agent_id)
+        validated = await ResourceConfigService(
+            storage, access
+        ).validate_config(
+            user_id,
+            user_id,
+            body.resource_config,
+            existing.config.resource_config,
+            agent.data.resource_config,
+        )
+        config_updates["resource_config"] = validated.model_dump()
+
+    def mutate(latest):
+        if (
+            "resource_config" in config_updates
+            and latest.config.resource_config
+            != existing.config.resource_config
+        ):
+            raise HTTPException(
+                409,
+                "Resource bindings changed. Reload the session before saving.",
+            )
+        latest.config = SessionConfig.model_validate(
+            {**latest.config.model_dump(mode="json"), **config_updates},
+        )
+        if body.permission_mode is not None:
+            latest.state.permission_context.mode = body.permission_mode
+
+    return await storage.mutate_session(user_id, agent_id, session_id, mutate)
 
 
 # ----------------------------------------------------------------------
@@ -591,8 +609,7 @@ async def update_session(
 async def list_messages(
     session_id: str,
     agent_id: str = Query(description="Agent the session belongs to."),
-    before: str
-    | None = Query(
+    before: str | None = Query(
         None,
         description=(
             "A message ID used as the pagination cursor. Omit to get "
@@ -600,8 +617,7 @@ async def list_messages(
             "response to load older messages."
         ),
     ),
-    offset: int
-    | None = Query(
+    offset: int | None = Query(
         None,
         deprecated=True,
         description=(
@@ -815,8 +831,7 @@ async def _worker_still_asking(
 async def stream_session_events(
     session_id: str,
     agent_id: str = Query(description="Agent the session belongs to."),
-    after: str
-    | None = Query(
+    after: str | None = Query(
         None,
         description=("Replay only events after this checkpoint cursor."),
     ),

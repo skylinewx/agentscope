@@ -44,6 +44,7 @@ interface Props {
 	children: ReactNode;
 	/** Names already in this workspace, which cannot be picked again. */
 	present: Set<string>;
+	presentResourceIds: Set<string>;
 	onAdd: (mcps: MCPClient[]) => Promise<void>;
 	onAddFromLibrary: (mcpIds: string[]) => Promise<void>;
 }
@@ -60,18 +61,28 @@ interface Props {
  * The body is a fixed height and the footer sits outside the tabs, so
  * switching tabs moves nothing except the content between them.
  */
-export function AddMCPDialog({ children, present, onAdd, onAddFromLibrary }: Props) {
+export function AddMCPDialog({
+	children,
+	present,
+	presentResourceIds,
+	onAdd,
+	onAddFromLibrary,
+}: Props) {
 	const { t } = useTranslation();
 	const [open, setOpen] = useState(false);
 	const [tab, setTab] = useState('installed');
 	const [picked, setPicked] = useState<Set<string>>(new Set());
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
-	const { mcps, loading } = useMCPs();
+	const { mcps, loading, error: loadError, refetch } = useMCPs();
 
-	const selectable = mcps.filter((mcp) => !present.has(mcp.name));
+	const selectable = mcps.filter(
+		(mcp) => !present.has(mcp.name) && !presentResourceIds.has(mcp.id),
+	);
+	const selectedIds = [...picked].filter((id) => selectable.some((mcp) => mcp.id === id));
 
 	const toggle = (mcp: MCPView) => {
+		if (busy || !selectable.some((item) => item.id === mcp.id)) return;
 		setPicked((prev) => {
 			const next = new Set(prev);
 			if (next.has(mcp.id)) next.delete(mcp.id);
@@ -87,10 +98,11 @@ export function AddMCPDialog({ children, present, onAdd, onAddFromLibrary }: Pro
 	};
 
 	const handleAddPicked = async () => {
+		if (selectedIds.length === 0 || busy || loading || loadError) return;
 		setBusy(true);
 		setError(null);
 		try {
-			await onAddFromLibrary([...picked]);
+			await onAddFromLibrary(selectedIds);
 			close();
 		} catch (e) {
 			setError((e as Error).message);
@@ -126,6 +138,16 @@ export function AddMCPDialog({ children, present, onAdd, onAddFromLibrary }: Pro
 								<div className="flex justify-center py-10">
 									<Spinner />
 								</div>
+							) : loadError ? (
+								<Alert variant="destructive">
+									<CircleAlert />
+									<AlertDescription>
+										{loadError.message}
+										<Button variant="ghost" size="sm" onClick={refetch}>
+											{t('error.retry')}
+										</Button>
+									</AlertDescription>
+								</Alert>
 							) : mcps.length === 0 ? (
 								<Empty className="border-none py-10">
 									<EmptyHeader>
@@ -143,15 +165,20 @@ export function AddMCPDialog({ children, present, onAdd, onAddFromLibrary }: Pro
 							) : (
 								<ItemGroup className="gap-1">
 									{mcps.map((mcp) => {
-										const already = present.has(mcp.name);
+										const already =
+											present.has(mcp.name) || presentResourceIds.has(mcp.id);
+										const unavailable = already;
 										return (
-											<Item key={mcp.id} data-disabled={already || undefined}>
+											<Item
+												key={mcp.id}
+												data-disabled={unavailable || undefined}
+											>
 												{/* self-center overrides the base
 												    class, which top-aligns media
 												    once a description is present. */}
 												<Checkbox
 													checked={already || picked.has(mcp.id)}
-													disabled={already}
+													disabled={unavailable || busy}
 													onCheckedChange={() => toggle(mcp)}
 												/>
 
@@ -217,17 +244,22 @@ export function AddMCPDialog({ children, present, onAdd, onAddFromLibrary }: Pro
 					<span className="self-center text-xs text-muted-foreground">
 						{tab === 'installed' && selectable.length > 0
 							? t('common.selectedCount', {
-									selected: picked.size,
+									selected: selectedIds.length,
 									total: selectable.length,
 								})
 							: null}
 					</span>
 					<div className="flex items-center gap-x-2">
-						<Button variant="ghost" onClick={close}>
+						<Button variant="ghost" onClick={close} disabled={busy}>
 							{t('common.cancel')}
 						</Button>
 						{tab === 'installed' ? (
-							<Button onClick={handleAddPicked} disabled={picked.size === 0 || busy}>
+							<Button
+								onClick={handleAddPicked}
+								disabled={
+									selectedIds.length === 0 || busy || loading || !!loadError
+								}
+							>
 								{busy ? <Spinner /> : <PlusCircle />}
 								{t('common.add')}
 							</Button>

@@ -6,23 +6,80 @@ This is the user-level collection an install lands in, distinct from
 Installing from a hub only writes here; putting an MCP into a workspace
 stays a separate, explicit act.
 """
+
+import json
+import uuid
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import ValidationError
 
-from ..deps import get_current_user_id, get_mcp_hubs, get_storage
-from ..hub import MCPHubBase
-from .._service import MCPRenderError, render_mcp
-from ..storage import StorageBase
+from ..deps import (
+    get_current_user_id,
+    get_mcp_hubs,
+    get_storage,
+    get_resource_service,
+)
+from ..hub import MCPCard, MCPHubBase
+from .._service import MCPRenderError, render_mcp, ResourceService
+from ..storage import MCPRecord, StorageBase
+from .._service._mcp_edit import (
+    KEEP_SECRET,
+    editable_mcp,
+    restore_mcp_secrets,
+)
 from ...mcp import MCPClient
 from ._schema import MCPView, UpdateMCPRequest
+from ._schema._hub_mcp import CreateMCPRequest, MCPDetail
 
 mcp_router = APIRouter(prefix="/mcp", tags=["mcp"])
+
+
+@mcp_router.post("", status_code=status.HTTP_201_CREATED)
+async def create_mcp(
+    body: CreateMCPRequest,
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+) -> MCPView:
+    """Save a manually configured MCP without selecting any workspace."""
+    if KEEP_SECRET in json.dumps(body.client.model_dump()):
+        raise HTTPException(422, "A new MCP requires actual configuration.")
+    if await storage.get_mcp_by_name(user_id, body.client.name):
+        raise HTTPException(409, "An MCP with this name is already saved.")
+    record = MCPRecord(
+        user_id=user_id,
+        client=body.client,
+        description=body.description,
+        version=body.version or uuid.uuid4().hex[:12],
+    )
+    try:
+        await storage.upsert_mcp(user_id, record)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return MCPView.from_record(record)
+
+
+@mcp_router.get("/{mcp_id}")
+async def get_mcp(
+    mcp_id: str,
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+    resources: ResourceService = Depends(get_resource_service),
+) -> MCPDetail:
+    """Return the caller's editable configuration with masked credentials."""
+    record = await storage.get_mcp(user_id, mcp_id)
+    if record is None:
+        raise HTTPException(404, "MCP is not in your library.")
+    return MCPDetail(
+        **MCPView.from_record(record).model_dump(),
+        client=editable_mcp(record),
+    )
 
 
 @mcp_router.get("")
 async def list_mcps(
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> list[MCPView]:
     """Return every MCP the user has installed, ordered by name."""
     records = await storage.list_mcps(user_id)
@@ -38,7 +95,7 @@ async def update_mcp(
     body: UpdateMCPRequest,
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
-    hubs: dict[str, MCPHubBase] = Depends(get_mcp_hubs),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> MCPView:
     """Rename, enable/disable, or re-key an installed MCP.
 
@@ -60,26 +117,43 @@ async def update_mcp(
             detail=f"No installed MCP with id {mcp_id!r}.",
         )
 
-    if body.values is not None:
-        hub = hubs.get(record.hub_id or "")
-        if hub is None or record.card_id is None:
+    if body.client is not None and body.values is not None:
+        raise HTTPException(422, "Send either client or values, not both.")
+    if body.client is not None:
+        try:
+            record.client = MCPClient.model_validate(
+                {
+                    **restore_mcp_secrets(
+                        record, body.client.model_dump(mode="json")
+                    ),
+                    "name": (
+                        body.name
+                        if body.name is not None
+                        else body.client.name
+                    ),
+                }
+            )
+        except (ValueError, ValidationError) as exc:
+            raise HTTPException(
+                422, "Invalid MCP name or configuration."
+            ) from exc
+        # Explicit configuration edits become user-managed definitions.
+        record.hub_id = record.card_id = None
+        record.card_snapshot = None
+        record.values = {}
+        record.display_name = None
+        record.version = body.version or uuid.uuid4().hex[:12]
+    elif body.values is not None:
+        if record.card_snapshot is None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    "This MCP has no card to re-render from — its hub is "
-                    "not registered, or it was added by hand."
+                    "This MCP has no saved card template. "
+                    "Explicitly upgrade it, or edit the client "
+                    "configuration directly."
                 ),
             )
-        try:
-            card = await hub.get_mcp(user_id, record.card_id)
-        except KeyError as e:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=(
-                    f"Hub {record.hub_id!r} no longer has the card this "
-                    f"MCP was installed from."
-                ),
-            ) from e
+        card = MCPCard.model_validate(record.card_snapshot)
 
         # Merged, not replaced: the client sends only what changed, and
         # a write-only field the form did not echo back must survive.
@@ -96,7 +170,7 @@ async def update_mcp(
                 detail=str(e),
             ) from e
         record.values = merged
-        record.version = card.version
+        record.card_snapshot = card.model_dump(mode="json")
     elif body.name is not None:
         # ``MCPClient`` checks its name in ``model_post_init``, which a
         # plain attribute assignment skips; rebuild the client through
@@ -110,11 +184,16 @@ async def update_mcp(
         except ValidationError as exc:
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
-                detail=str(exc),
+                detail=(
+                    "Invalid MCP name. Use letters, numbers, "
+                    "underscores or hyphens."
+                ),
             ) from exc
 
-    if body.enabled is not None:
-        record.enabled = body.enabled
+    if body.description is not None:
+        record.description = body.description
+    if body.version is not None:
+        record.version = body.version
 
     try:
         await storage.upsert_mcp(user_id, record)
@@ -124,6 +203,43 @@ async def update_mcp(
             detail=str(e),
         ) from e
 
+    await resources.invalidate(user_id, record.id)
+    return MCPView.from_record(record)
+
+
+@mcp_router.post("/{mcp_id}/upgrade")
+async def upgrade_mcp(
+    mcp_id: str,
+    user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
+    hubs: dict[str, MCPHubBase] = Depends(get_mcp_hubs),
+    resources: ResourceService = Depends(get_resource_service),
+) -> MCPView:
+    """Explicitly choose the user's hub resource configuration version."""
+    record = await storage.get_mcp(user_id, mcp_id)
+    if record is None:
+        raise HTTPException(404, "MCP is not in your library.")
+    try:
+        hub = hubs.get(record.hub_id or "")
+        if hub is None or record.card_id is None:
+            raise ValueError("This MCP has no available upgrade source.")
+        card = await hub.get_mcp(user_id, record.card_id)
+        record.client = render_mcp(card, record.values, record.name)
+        record.version = card.version
+        record.card_snapshot = card.model_dump(mode="json")
+        for name in (
+            "display_name",
+            "description",
+            "tags",
+            "author",
+            "icon_url",
+            "url",
+        ):
+            setattr(record, name, getattr(card, name))
+        await storage.upsert_mcp(user_id, record)
+        await resources.invalidate(user_id, record.id)
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(409, str(exc)) from exc
     return MCPView.from_record(record)
 
 
@@ -132,16 +248,16 @@ async def delete_mcp(
     mcp_id: str,
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> None:
     """Remove an MCP from the user's library.
 
-    Workspaces that already hold this MCP keep it — the workspace
-    relation is derived by name, not a foreign key, and tearing down a
-    live stateful MCP session as a side effect of a library edit would
-    surprise the user.
+    Workspace declarations are retained, but new runs cannot load an
+    uninstalled resource. Every user-owned resource can be removed.
     """
     if not await storage.delete_mcp(user_id, mcp_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No installed MCP with id {mcp_id!r}.",
         )
+    await resources.invalidate(user_id, mcp_id)

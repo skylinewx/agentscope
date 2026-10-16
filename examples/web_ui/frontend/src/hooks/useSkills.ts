@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { skillApi } from '@/api';
 import type { SkillView } from '@/api';
+import { notifyResourceChanged, RESOURCE_CHANGED } from '@/lib/resource-events';
 
 /**
  * The user's library of installed skills.
@@ -31,15 +32,18 @@ export function useSkills() {
 
 	useEffect(() => {
 		refetch();
+		window.addEventListener(RESOURCE_CHANGED, refetch);
+		return () => window.removeEventListener(RESOURCE_CHANGED, refetch);
 	}, [refetch]);
 
-	const remove = useCallback(
-		async (skillId: string) => {
-			await skillApi.remove(skillId);
-			await refetch();
-		},
-		[refetch],
-	);
+	const remove = useCallback(async (skillId: string) => {
+		await skillApi.remove(skillId);
+		notifyResourceChanged();
+	}, []);
 
-	return { skills, loading, error, refetch, remove };
+	const upgrade = useCallback(async (skillId: string) => {
+		await skillApi.upgrade(skillId);
+		notifyResourceChanged();
+	}, []);
+	return { skills, loading, error, refetch, remove, upgrade };
 }

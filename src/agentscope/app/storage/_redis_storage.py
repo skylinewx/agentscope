@@ -3,6 +3,7 @@
 """The Redis storage implementation."""
 
 import warnings
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any, TYPE_CHECKING, Self
 
@@ -268,6 +269,70 @@ class RedisStorage(StorageBase):
     def get_client(self) -> Redis:
         """Get the underlying Redis client instance."""
         return self._client
+
+    async def _mutate_record(
+        self,
+        key: str,
+        record_cls: type,
+        mutate: Callable,
+        *,
+        user_id: str,
+        agent_id: str | None = None,
+    ) -> Any:
+        """Retry a transaction, preserving concurrent field edits."""
+        for _ in range(32):
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        raise KeyError(key)
+                    record = record_cls.model_validate_json(raw)
+                    if record.user_id != user_id or (
+                        agent_id is not None and record.agent_id != agent_id
+                    ):
+                        raise KeyError(key)
+                    mutate(record)
+                    record.updated_at = datetime.now()
+                    pipe.multi()
+                    pipe.set(key, record.model_dump_json(), keepttl=True)
+                    if self.key_ttl is not None:
+                        pipe.expire(key, self.key_ttl)
+                    await pipe.execute()
+                    return record
+                except _watch_error():
+                    continue
+        raise RuntimeError("Record changed too frequently; retry the update.")
+
+    async def mutate_agent(
+        self, user_id: str, agent_id: str, mutate: Callable
+    ) -> AgentRecord:
+        """Atomically update an agent's latest data."""
+        key = self._key(
+            self.key_config.agent, user_id=user_id, agent_id=agent_id
+        )
+        return await self._mutate_record(
+            key, AgentRecord, mutate, user_id=user_id
+        )
+
+    async def mutate_session(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        mutate: Callable,
+    ) -> SessionRecord:
+        """Atomically update a session's latest config or state."""
+        key = self._key(
+            self.key_config.session, user_id=user_id, session_id=session_id
+        )
+        return await self._mutate_record(
+            key,
+            SessionRecord,
+            mutate,
+            user_id=user_id,
+            agent_id=agent_id,
+        )
 
     async def _generate_credential_name(
         self,
@@ -978,18 +1043,12 @@ class RedisStorage(StorageBase):
         Raises:
             KeyError: If the session does not exist.
         """
-        key = self._key(
-            self.key_config.session,
-            user_id=user_id,
-            session_id=session_id,
+        await self.mutate_session(
+            user_id,
+            agent_id,
+            session_id,
+            lambda record: setattr(record, "state", state),
         )
-        raw = await self._client.get(key)
-        if not raw:
-            raise KeyError(f"Session {session_id!r} not found.")
-        record = SessionRecord.model_validate_json(raw)
-        record.state = state
-        record.updated_at = datetime.now()
-        await self._set_with_ttl(key, record.model_dump_json())
 
     async def list_sessions(
         self,

@@ -19,6 +19,7 @@ from agentscope.app._router._workspace import (
     create_download_token,
     list_workspace_directory,
     read_workspace_file,
+    workspace_file_info,
 )
 from agentscope.app._service import WorkspaceService
 from agentscope.app.storage import (
@@ -312,6 +313,52 @@ class WorkspaceFileEndpointTests(IsolatedAsyncioTestCase):
         self._wm = _FakeWorkspaceManager(self._workspace)
         self._storage = _FakeStorage([_make_session()])
         self._service = WorkspaceService(self._storage, self._wm, SECRET)
+
+
+    async def test_report_metadata_resolves_workspace_relative_path(self) -> None:
+        """Card metadata describes the real file without reading its body."""
+        content = "<html><body>预算报告</body></html>".encode("utf-8")
+        await self._backend.write_file("/workspace/report/预算.html", content)
+        info = await workspace_file_info(
+            agent_id="a", session_id="s", path="./report/预算.html",
+            user_id="u", workspace_service=self._service,
+        )
+        self.assertEqual(info.name, "预算.html")
+        self.assertEqual(info.path, "/workspace/report/预算.html")
+        self.assertEqual(info.media_type, "text/html")
+        self.assertEqual(info.size_bytes, len(content))
+        self.assertEqual(self._backend.read_paths, [])
+
+    async def test_report_metadata_refuses_missing_directory_and_other_user(self) -> None:
+        """A report reference cannot manufacture a file or bypass session access."""
+        for path, user, expected in [("missing.html", "u", 404), ("subdir", "u", 400), ("notes.txt", "another-user", 404)]:
+            with self.subTest(path=path, user=user):
+                with self.assertRaises(HTTPException) as ctx:
+                    await workspace_file_info(
+                        agent_id="a", session_id="s", path=path,
+                        user_id=user, workspace_service=self._service,
+                    )
+                self.assertEqual(ctx.exception.status_code, expected)
+
+    async def test_report_can_be_reopened_and_downloaded_with_fresh_token(self) -> None:
+        """Persisted relative references outlive a download token."""
+        path = "./report/预算.html"
+        content = "<!doctype html><h1>预算分析</h1>".encode("utf-8")
+        await self._backend.write_file("/workspace/report/预算.html", content)
+        expired, _ = self._service.sign_download_token("u", path, ttl=-1)
+        with self.assertRaises(HTTPException) as ctx:
+            await self._read(path=path, download=True, token=expired, x_user_id=None)
+        self.assertEqual(ctx.exception.status_code, 401)
+        preview = await self._read(path=path, download=False, token=None, x_user_id="u")
+        self.assertEqual(await _collect(preview), content)
+        self.assertEqual(preview.headers["cache-control"], "private, no-store")
+        fresh = await create_download_token(
+            agent_id="a", session_id="s", path=path,
+            user_id="u", workspace_service=self._service,
+        )
+        download = await self._read(path=path, download=True, token=fresh.token, x_user_id=None)
+        self.assertEqual(await _collect(download), content)
+        self.assertIn("attachment; filename*=UTF-8''", download.headers["content-disposition"])
 
     # ------------------------------------------------------------------
     # directories

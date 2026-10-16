@@ -200,7 +200,7 @@ class TestMiddleware(IsolatedAsyncioTestCase):
             {
                 "id": AnyString(),
                 "created_at": AnyString(),
-                "metadata": {},
+                "metadata": {"presentation": {"answer_block_ids": [AnyString()]}},
                 "type": "REPLY_END",
                 "session_id": agent.state.session_id,
                 "reply_id": agent.state.reply_id,
@@ -208,6 +208,10 @@ class TestMiddleware(IsolatedAsyncioTestCase):
                 "error": None,
             },
         )
+        # The swallowed candidate is process; only the accepted model output
+        # is selected, using the block IDs that were actually streamed.
+        starts = [event.block_id for event in events if event.type == "TEXT_BLOCK_START"]
+        self.assertEqual(events[-1].metadata["presentation"]["answer_block_ids"], [starts[-1]])
         self.assertDictEqual(
             final_msg.model_dump(),
             {

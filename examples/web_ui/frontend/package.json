@@ -4,11 +4,15 @@
 	"version": "0.0.0",
 	"type": "module",
 	"scripts": {
+		"test:reply-presentation": "node --experimental-strip-types --test tests/reply-presentation.test.mjs",
+		"test:reports": "node --experimental-strip-types --test tests/workspace-reports.test.mjs",
 		"dev": "vite",
 		"build": "tsc -b && vite build",
 		"lint": "eslint .",
 		"lint:fix": "eslint . --fix",
-		"preview": "vite preview"
+		"preview": "vite preview",
+		"test:analysis": "node --experimental-strip-types --test tests/workspace-analysis.test.mjs",
+		"test:actions": "node --experimental-strip-types --test tests/analysis-actions.test.mjs"
 	},
 	"dependencies": {
 		"@agentscope-ai/agentscope": "^0.0.15",

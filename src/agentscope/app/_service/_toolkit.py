@@ -6,6 +6,7 @@ workspace builtins, MCPs, skills, planning tools (Task*), background-task
 control (ToolStop), schedule control (Schedule*), team participation
 tools, and caller-supplied extras — into one :class:`Toolkit`.
 """
+
 from typing import Any, Literal
 
 from .._manager import BackgroundTaskManager, SchedulerManager
@@ -35,6 +36,7 @@ from ...tool import (
 from ...workspace import WorkspaceBase
 from ..access import ResourceKind
 from ._access import ResourceAccessService
+from ._resources import ResourceService, ResourceToolkit
 
 
 async def get_toolkit(
@@ -50,6 +52,7 @@ async def get_toolkit(
     agent_record: AgentRecord,
     session_record: SessionRecord,
     resource_access_service: ResourceAccessService,
+    resource_service: ResourceService | None = None,
     extra_factory: AgentToolFactory | None = None,
     sub_agent_templates: dict[str, SubAgentTemplate] | None = None,
     team_role: Literal["leader", "worker"] | None = None,
@@ -242,11 +245,13 @@ time or interval"
                 "step_index": index,
             }
             tools.append(
-                SubmitHandover(**submit_kwargs)
-                if run.state.steps[index].submission is None
-                else SubmitVerdict(
-                    **submit_kwargs,
-                    verifier=agent_record.data.name,
+                (
+                    SubmitHandover(**submit_kwargs)
+                    if run.state.steps[index].submission is None
+                    else SubmitVerdict(
+                        **submit_kwargs,
+                        verifier=agent_record.data.name,
+                    )
                 ),
             )
 
@@ -266,6 +271,25 @@ time or interval"
     # the channel section of the system prompt).
     if channel_tools:
         tools += channel_tools
+
+    if resource_service is not None:
+        resource_tools, skills, entries = await resource_service.snapshot(
+            user_id,
+            workspace,
+            agent_record.id,
+            session_record.id,
+        )
+        try:
+            return ResourceToolkit(
+                entries=entries,
+                tools=[*tools, *resource_tools],
+                skills_or_loaders=skills,
+                tool_groups=tool_groups,
+            )
+        except BaseException:
+            for entry in entries:
+                await entry.release()
+            raise
 
     return Toolkit(
         tools=tools,

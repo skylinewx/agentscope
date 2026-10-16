@@ -24,6 +24,7 @@ import jsonschema
 from pydantic import BaseModel
 
 from ._config import ContextConfig, ReActConfig, ModelConfig, InjectionConfig
+from ._reply_presentation import ReplyPresentationTracker
 from ..state import AgentState
 from ..state._state import ReplyContext
 from ._utils import _ToolCallBatch, Acting, Exit, Reasoning, _resolve_timezone
@@ -740,6 +741,14 @@ class Agent:
                 elif offload_reminder not in new_summary:
                     new_summary += f"\n{offload_reminder}"
 
+            from ._skill_recovery import preserve_references
+            available_skills = await self.toolkit._get_available_skills(
+                self.state.tool_context.activated_groups,
+            )
+            self.state.skill_read_refs = preserve_references(
+                self.state.skill_read_refs, self.state.context, available_skills,
+            )
+
             # Clear the read tool cache
             await self._clear_unreserved_read_cache(msgs_to_reserve)
 
@@ -960,7 +969,10 @@ class Agent:
             agen = execute_chain()
 
         self._receive_reply_end = False
+        presentation = ReplyPresentationTracker()
         async for item in agen:
+            if not isinstance(item, Msg):
+                presentation.apply(item)
             # Set before the yield: the suspended `_reply_impl` checks the
             # flag once resumed by the next pull
             if isinstance(item, ReplyEndEvent):
@@ -2494,7 +2506,8 @@ class Agent:
             # Validate the parsed input with the tool schema
             # TODO: Maybe some logic to mix the validation error in runtime
             try:
-                jsonschema.validate(parsed_input, tool.input_schema)
+                if tool.is_external_tool or not tool.validates_input_in_call:
+                    jsonschema.validate(parsed_input, tool.input_schema)
             except jsonschema.ValidationError as e:
                 raise AgentOrientedException(
                     f"Input validation failed for tool '{tool_call.name}': "
@@ -3257,6 +3270,15 @@ class Agent:
             )
         # The conversation context
         messages.extend(self.state.context)
+
+        if self.state.skill_read_refs:
+            from ._skill_recovery import recovery_hint
+            hint = recovery_hint(
+                self.state.skill_read_refs, self.state.context,
+                await self.toolkit._get_available_skills(self.state.tool_context.activated_groups),
+            )
+            if hint:
+                messages.append(UserMsg(name="user", content=hint))
 
         # Equip the compression tool, whose registration is kept across
         # replies so that its schema is stable for prompt caching

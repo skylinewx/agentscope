@@ -7,19 +7,156 @@ Tests cover both non-streaming and streaming modes, verifying that:
 - Stream mode yields n delta ChatResponses (is_last=False) followed by
   1 final ChatResponse (is_last=True) with the full accumulated content.
 """
+
 from typing import Any
+import hashlib
+import json
 import unittest
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, MagicMock
 
 from utils import AnyString
 
-from agentscope.message import TextBlock, ToolCallBlock, ThinkingBlock
-from agentscope.model import DeepSeekChatModel
+from agentscope.message import (
+    AssistantMsg,
+    DataBlock,
+    TextBlock,
+    ToolCallBlock,
+    ToolResultBlock,
+    ThinkingBlock,
+    UserMsg,
+    URLSource,
+)
+from agentscope.model import DeepSeekChatModel, StructuredResponse
+from agentscope.agent import Agent, ContextConfig
+from agentscope.state import AgentState
 from agentscope.credential import DeepSeekCredential
 from agentscope.tool import ToolChoice
 
 A = AnyString()
+
+
+class TestDeepSeekContextBudget(IsolatedAsyncioTestCase):
+    """Dense tool results must trigger compaction before provider rejection."""
+
+    async def test_json_tool_results_trigger_compression(self) -> None:
+        """Reproduce the long JSON path through the actual compression entry."""
+        model = _make_model()
+        self.addAsyncCleanup(model.client.close)
+        model.context_size = 10_000
+        payload = json.dumps(
+            {
+                "records": [
+                    {
+                        "id": hashlib.sha256(str(i).encode()).hexdigest(),
+                        "value": "12345.67",
+                    }
+                    for i in range(200)
+                ]
+            }
+        )
+        call = ToolCallBlock(
+            id="read-observations",
+            name="ReadObservations",
+            input="{}",
+            state="finished",
+        )
+        result = ToolResultBlock(
+            id=call.id,
+            name=call.name,
+            output=payload,
+            state="success",
+        )
+        state = AgentState(
+            context=[
+                UserMsg("user", "核对这些记录。"),
+                AssistantMsg("assistant", [call, result]),
+            ]
+        )
+        model.generate_structured_output = AsyncMock(
+            return_value=StructuredResponse(
+                content={
+                    "task_overview": "核对记录",
+                    "current_state": "数据已取得",
+                    "important_discoveries": "保留原始值",
+                    "next_steps": "核对来源",
+                    "context_to_preserve": "用户要求中文",
+                }
+            )
+        )
+        agent = Agent(
+            name="assistant",
+            system_prompt="使用中文。",
+            model=model,
+            state=state,
+            context_config=ContextConfig(trigger_ratio=0.7),
+        )
+        await agent.compress_context()
+        model.generate_structured_output.assert_awaited_once()
+        self.assertTrue(state.summary)
+        self.assertLess(
+            await model.count_tokens(**await agent._prepare_model_input()),
+            7000,
+        )
+
+    async def test_large_schemas_and_arguments_count_toward_budget(
+        self,
+    ) -> None:
+        """The budget includes tool schemas and outgoing arguments as well."""
+        model = _make_model()
+        self.addAsyncCleanup(model.client.close)
+        schema = {
+            "type": "function",
+            "function": {
+                "name": "Inspect",
+                "description": "schema " * 3000,
+                "parameters": {"type": "object"},
+            },
+        }
+        arguments = json.dumps(
+            {
+                "keys": [
+                    hashlib.sha256(str(i).encode()).hexdigest()
+                    for i in range(150)
+                ]
+            }
+        )
+        total = await model.count_tokens(
+            [
+                AssistantMsg(
+                    "assistant",
+                    [
+                        ToolCallBlock(
+                            id="inspect", name="Inspect", input=arguments
+                        ),
+                    ],
+                )
+            ],
+            [schema],
+        )
+        self.assertGreater(total, 14_000)
+
+    async def test_media_keeps_its_flat_budget(self) -> None:
+        """The text correction must not inflate the independent media budget."""
+        model = _make_model()
+        self.addAsyncCleanup(model.client.close)
+        count = await model.count_tokens(
+            [
+                UserMsg(
+                    "user",
+                    [
+                        DataBlock(
+                            source=URLSource(
+                                url="file:///not-read.png",
+                                media_type="image/png",
+                            )
+                        ),
+                    ],
+                )
+            ],
+            None,
+        )
+        self.assertEqual(count, 2000)
 
 
 # ---------------------------------------------------------------------------

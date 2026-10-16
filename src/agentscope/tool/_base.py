@@ -111,6 +111,10 @@ class ToolBase(ABC):
     is_read_only: bool
     """If this tool is read-only, which will be used in the permission
     checking."""
+    validates_input_in_call: bool = False
+    """Internal tools may validate the SAME input schema inside call to return
+    structured recovery details after permission checking. Such tools must
+    reject invalid input before executing their business operation."""
     is_external_tool: bool = False
     """If this tool is an external tool, which doesn't need to implement the
     __call__ method and the agent will yield the external tool call event."""

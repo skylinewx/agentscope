@@ -20,6 +20,7 @@ from .._bus_ops import publish_session_event
 from ..message_bus import MessageBus, MessageBusKeys
 from ..storage import StorageBase
 from ._webrtc_audio_transport import WebRTCAudioTransport
+from ._resources import close_resource_toolkit
 
 _CHECKPOINT_LOCK_TTL_SECS = (
     MessageBusKeys.SESSION_EVENT_CHECKPOINT_LOCK_TTL_SECS
@@ -225,11 +226,16 @@ class WebRTCSession:
             )
             self.transport.send_error(str(exc))
         finally:
-            async with self._close_lock:
-                self._closing = True
-            await self.transport.close()
-            await self.peer_connection.close()
-            self._on_closed(self)
+            try:
+                await close_resource_toolkit(
+                    getattr(self.agent, "toolkit", None)
+                )
+            finally:
+                async with self._close_lock:
+                    self._closing = True
+                await self.transport.close()
+                await self.peer_connection.close()
+                self._on_closed(self)
 
     async def _checkpoint_state(
         self,

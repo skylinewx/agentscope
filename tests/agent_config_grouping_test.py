@@ -7,6 +7,7 @@ beside them. Nothing migrates the stored rows and nothing rewrites the
 request bodies clients already send, so both the old and the new shape
 have to land in the same place — that is what these cases pin down.
 """
+
 import json
 from typing import Any
 from unittest import IsolatedAsyncioTestCase
@@ -148,6 +149,7 @@ class AgentConfigGroupingTest(IsolatedAsyncioTestCase):
                 "chat_config",
                 "id",
                 "name",
+                "resource_config",
                 "system_prompt",
             ],
         )
@@ -278,7 +280,11 @@ class AgentConfigGroupingTest(IsolatedAsyncioTestCase):
 
         self.assertListEqual(
             sorted(schema["properties"]),
-            ["chat_config", "name", "system_prompt"],
+            ["chat_config", "name", "resource_config", "system_prompt"],
+        )
+        self.assertEqual(
+            set(schema["properties"]["resource_config"]["properties"]),
+            {"mcps", "skills"},
         )
         chat_config = schema["properties"]["chat_config"]
         self.assertListEqual(

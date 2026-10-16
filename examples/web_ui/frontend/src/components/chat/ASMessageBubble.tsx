@@ -22,11 +22,16 @@ import {
 	TriangleAlert,
 } from 'lucide-react';
 import * as mime from 'mime-types';
-import { memo, useEffect, useRef, useState } from 'react';
+import { memo, useEffect, useMemo, useRef, useState } from 'react';
 
+import { DeliveredAnalysisPathsContext } from './AnalysisDeliveryContext';
+import { ModelFailureDetails } from './ModelFailureDetails';
+import { ReplyProcess } from './ReplyProcess';
 import { renderToolCall } from './tool-renderers';
 import { countDiffStats, DiffStats, getResultDiff } from './tool-renderers/_shared';
 import type { TFunction, ToolCallWithResult } from './tool-renderers/types';
+import { WorkspaceAnalysis } from './WorkspaceAnalysis';
+import { ReportMarkdown } from './WorkspaceReport';
 import { Markdown } from '@/components/markdown';
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import {
@@ -48,6 +53,9 @@ import {
 import { Message, MessageFooter, MessageContent } from '@/components/ui/message';
 import { useAudioBlock, useReplayController } from '@/context/AudioContext';
 import { useTranslation } from '@/i18n/useI18n';
+import { registeredAnalyses } from '@/lib/analysis-deliveries';
+import { replyErrorKey } from '@/lib/reply-diagnostics';
+import { presentReply } from '@/lib/reply-presentation';
 import { cn } from '@/lib/utils';
 import { copyToClipboard, formatNumber, formatTime } from '@/utils/common';
 import 'streamdown/styles.css';
@@ -389,6 +397,8 @@ function summarizeToolGroup(calls: ToolCallWithResult[], t: TFunction) {
 }
 
 interface MessageBubbleProps {
+	agentId?: string | null;
+	sessionId?: string | null;
 	message: Msg;
 	onUserConfirm: (
 		toolCallBlock: ToolCallBlock,
@@ -415,7 +425,7 @@ interface MessageBubbleProps {
  * When `content` is empty and the message is still running, the bubble
  * body is omitted entirely so only the bottom status row renders.
  */
-function ASMessageBubbleComponent({ message }: MessageBubbleProps) {
+function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubbleProps) {
 	const isUser = message.role === 'user';
 	const { t } = useTranslation();
 
@@ -440,11 +450,15 @@ function ASMessageBubbleComponent({ message }: MessageBubbleProps) {
 		(b): b is DataBlock => b.type === 'data' && b.source.media_type.split('/')[0] === 'audio',
 	);
 
-	const blocks = groupToolCalls(message.content);
+	const presentation = useMemo(() => presentReply(message), [message]);
+	const analyses = useMemo(() => agentId && sessionId ? registeredAnalyses(message) : [], [message, agentId, sessionId]);
+	const deliveredPaths = useMemo(() => analyses.map((item) => item.path), [analyses]);
+	const hasProcess = !isUser && presentation.process.length > 0;
+	const blocks = groupToolCalls(presentation.answer);
 
 	// What the copy button hands over — the prose of the message, without
 	// the tool calls and attachments around it.
-	const plainText = message.content
+	const plainText = presentation.answer
 		.filter((b): b is TextBlock => b.type === 'text')
 		.map((b) => b.text)
 		.join('\n\n');
@@ -455,17 +469,28 @@ function ASMessageBubbleComponent({ message }: MessageBubbleProps) {
 	const elapsedText = formatTime(elapsedSeconds);
 
 	return (
+		<DeliveredAnalysisPathsContext.Provider value={deliveredPaths}>
 		<Message align={isUser ? 'end' : 'start'} data-role={message.role}>
 			<MessageContent>
+				{hasProcess && <ReplyProcess
+					message={message}
+					presentation={presentation}
+					elapsed={elapsedText}
+					running={isRunning}
+					steps={presentation.steps.map((block) => <ASBlock key={block.id} agentId={agentId} sessionId={sessionId} block={block} />)}
+					details={groupToolCalls(presentation.process).map((block, index) => <ASBlock key={block.type === 'tool_call_group' ? `tools-${index}` : block.id} agentId={agentId} sessionId={sessionId} block={block} />)}
+				/>}
+				{presentation.pending && <p role="status" className="text-sm text-muted-foreground">{t(`replyProcess.${presentation.pending}Notice`)}</p>}
 				{blocks
 					.filter((block) => block.type !== 'data')
 					.map((block, index) => (
 						<Bubble key={index} variant={isUser ? 'muted' : 'ghost'}>
 							<BubbleContent>
-								<ASBlock block={block} />
+								<ASBlock agentId={agentId} sessionId={sessionId} block={block} />
 							</BubbleContent>
 						</Bubble>
 					))}
+				{agentId && sessionId && analyses.map((analysis) => <WorkspaceAnalysis key={analysis.path} path={analysis.path} workspace={{ agentId, sessionId }} />)}
 				{message.finished_reason === ReplyFinishedReason.ERROR && (
 					<Alert
 						variant="destructive"
@@ -474,18 +499,21 @@ function ASMessageBubbleComponent({ message }: MessageBubbleProps) {
 						<TriangleAlert />
 						<AlertTitle>{t('messageBubble.error.title')}</AlertTitle>
 						<AlertDescription>
-							{t(`messageBubble.error.${message.error?.type ?? 'unknown'}`, {
+							{t(`messageBubble.error.${replyErrorKey(message.error)}`, {
 								defaultValue:
 									message.error?.message ?? t('messageBubble.error.unknown'),
 							})}
+							<ModelFailureDetails error={message.error} />
 						</AlertDescription>
 					</Alert>
 				)}
+				{message.finished_reason === ReplyFinishedReason.INTERRUPTED && <p role="status" className="text-sm text-muted-foreground">{t('replyProcess.interruptedNotice')}</p>}
+				{!isUser && !isRunning && message.finished_reason === ReplyFinishedReason.COMPLETED && presentation.answer.length === 0 && analyses.length === 0 && <p className="text-sm text-muted-foreground">{t('replyProcess.noAnswer')}</p>}
 				<AttachmentGroup className="max-w-full">
 					{blocks
 						.filter((block) => block.type === 'data')
 						.map((block, index) => (
-							<ASBlock block={block} key={index} />
+							<ASBlock agentId={agentId} sessionId={sessionId} block={block} key={index} />
 						))}
 				</AttachmentGroup>
 				{message.role === 'user' ? (
@@ -496,16 +524,16 @@ function ASMessageBubbleComponent({ message }: MessageBubbleProps) {
 					)
 				) : (
 					<MessageFooter className="gap-1 font-mono">
-						<Badge
+						{(!hasProcess || hasUsage || audioBlocks.length > 0) && <Badge
 							variant="secondary"
 							aria-label={isRunning ? t('messageBubble.running') : undefined}
 						>
-							{isRunning ? (
+							{!hasProcess && (isRunning ? (
 								<Loader2 data-icon="inline-start" className="animate-spin" />
 							) : (
 								<CheckCircle data-icon="inline-start" />
-							)}
-							<span className="tabular-nums tracking-tighter">{elapsedText}</span>
+							))}
+							{!hasProcess && <span className="tabular-nums tracking-tighter">{elapsedText}</span>}
 							{hasUsage && (
 								<>
 									<ArrowUp data-icon="inline-start" className="ml-1" />
@@ -521,12 +549,13 @@ function ASMessageBubbleComponent({ message }: MessageBubbleProps) {
 							{audioBlocks.map((block) => (
 								<AudioInlineControl key={block.id} block={block} />
 							))}
-						</Badge>
+						</Badge>}
 						{plainText && <CopyButton text={plainText} />}
 					</MessageFooter>
 				)}
 			</MessageContent>
 		</Message>
+		</DeliveredAnalysisPathsContext.Provider>
 	);
 }
 
@@ -593,18 +622,20 @@ function ThinkingBlockView({ block }: { block: ThinkingBlock }) {
 }
 
 interface ASBlockProps {
+	agentId?: string | null;
+	sessionId?: string | null;
 	block: ExtendedContentBlock;
 }
 
-export function ASBlock({ block, ...props }: ASBlockProps) {
+export function ASBlock({ block, agentId, sessionId, ...props }: ASBlockProps) {
 	const { t } = useTranslation();
 
 	switch (block.type) {
 		case 'text':
 			return (
-				<Markdown animated isAnimating={!block.finished_at} {...props}>
+				<ReportMarkdown agentId={agentId} sessionId={sessionId} animated isAnimating={!block.finished_at} {...props}>
 					{block.text}
-				</Markdown>
+				</ReportMarkdown>
 			);
 		case 'data': {
 			const dataType = block.source.media_type.split('/')[0];

@@ -1,13 +1,16 @@
-import { Blocks, Check, Download, Plug, Trash2, TriangleAlert } from 'lucide-react';
+import { Blocks, Check, Download, Pencil, Plug, Plus, Trash2, TriangleAlert } from 'lucide-react';
 import { useCallback, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import type { HubInfo, SkillCard, SkillView } from '@/api';
 import { hubApi, skillApi } from '@/api';
 import { ApiError } from '@/api/client';
+import { ManageSkillDialog } from '@/components/dialog/ManageSkillDialog';
 import { ResourceDetailDrawer } from '@/components/drawer/ResourceDetailDrawer.tsx';
 import { LoadMore } from '@/components/hub/LoadMore.tsx';
+import { ResourceUpgrade } from '@/components/hub/ResourceControls';
 import { ResourcePanel } from '@/components/hub/ResourcePanel.tsx';
+import { SkillVersion } from '@/components/hub/SkillVersion';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar.tsx';
 import { Badge } from '@/components/ui/badge.tsx';
 import { Button } from '@/components/ui/button.tsx';
@@ -309,10 +312,24 @@ function HubPanel({ hubId, hub, installedNames, onInstalled }: HubPanelProps) {
 interface MinePanelProps {
 	skills: SkillView[];
 	loading: boolean;
+	error: Error | null;
+	onRetry: () => Promise<void>;
 	onRemove: (skillId: string) => void;
+	onCreate: () => void;
+	onEdit: (skill: SkillView) => void;
+	onUpgrade: (id: string) => Promise<unknown>;
 }
 
-function MinePanel({ skills, loading, onRemove }: MinePanelProps) {
+function MinePanel({
+	skills,
+	loading,
+	error,
+	onRetry,
+	onRemove,
+	onCreate,
+	onEdit,
+	onUpgrade,
+}: MinePanelProps) {
 	const { t } = useTranslation();
 	const [query, setQuery] = useState('');
 	// The list view omits SKILL.md; the detail endpoint carries it.
@@ -334,8 +351,14 @@ function MinePanel({ skills, loading, onRemove }: MinePanelProps) {
 	return (
 		<ResourcePanel
 			title={t('common.my-skill')}
-			description={t('skill.mineDescription')}
+			description={`${t('resource.switchHelp')} ${t('resource.skillUpgradeHelp')}`}
 			icon={<Plug className="size-5 text-muted-foreground" />}
+			actions={
+				<Button onClick={onCreate}>
+					<Plus />
+					{t('resource.manage.createSkill')}
+				</Button>
+			}
 			search={
 				// Hidden while there is nothing to search through.
 				skills.length > 0
@@ -351,6 +374,18 @@ function MinePanel({ skills, loading, onRemove }: MinePanelProps) {
 				<div className="flex justify-center py-10">
 					<Spinner />
 				</div>
+			) : error ? (
+				<Empty role="alert" className="border-none py-10">
+					<EmptyHeader>
+						<EmptyTitle>{t('skill.loadFailedTitle')}</EmptyTitle>
+						<EmptyDescription>{error.message}</EmptyDescription>
+					</EmptyHeader>
+					<EmptyContent>
+						<Button variant="outline" size="sm" onClick={onRetry}>
+							{t('skill.retry')}
+						</Button>
+					</EmptyContent>
+				</Empty>
 			) : skills.length === 0 ? (
 				<Empty className="border-none py-10">
 					<EmptyHeader>
@@ -403,6 +438,9 @@ function MinePanel({ skills, loading, onRemove }: MinePanelProps) {
 										{skill.display_name || skill.name}
 									</span>
 									{/* A hand-added skill has no hub to name. */}
+									<span className="text-xs text-muted-foreground">
+										{t(`resource.${skill.source}`)}
+									</span>
 									{skill.hub_id && (
 										<span className="text-xs text-muted-foreground">
 											@{skill.hub_id}
@@ -420,13 +458,26 @@ function MinePanel({ skills, loading, onRemove }: MinePanelProps) {
 								<ItemDescription className="line-clamp-1">
 									{skill.description}
 								</ItemDescription>
+								<SkillVersion
+									version={skill.version}
+									updatedAt={skill.version_updated_at}
+								/>
 							</ItemContent>
 
 							<ItemActions>
-								{skill.version && (
-									<span className="text-xs text-muted-foreground whitespace-nowrap">
-										{skill.version}
-									</span>
+								<Button
+									size="icon-sm"
+									variant="ghost"
+									title={t('common.edit')}
+									onClick={(event) => {
+										event.stopPropagation();
+										onEdit(skill);
+									}}
+								>
+									<Pencil />
+								</Button>
+								{skill.source === 'hub' && (
+									<ResourceUpgrade onUpgrade={() => onUpgrade(skill.id)} />
 								)}
 								<Button
 									size="icon-sm"
@@ -478,8 +529,16 @@ export function SkillHubPage() {
 	const { hubs, loading: hubsLoading, error: hubsError, refetch } = useSkillHubs();
 	// Loaded page-wide, not per panel: the hub view needs it to mark cards
 	// as already installed, and the "mine" view to list them.
-	const { skills, loading: skillsLoading, refetch: refetchSkills, remove } = useSkills();
+	const {
+		skills,
+		loading: skillsLoading,
+		error: skillsError,
+		refetch: refetchSkills,
+		remove,
+		upgrade,
+	} = useSkills();
 	const installedNames = new Set(skills.map((skill) => skill.name));
+	const [editing, setEditing] = useState<SkillView | 'new' | null>(null);
 
 	return (
 		<div className="flex size-full p-2 gap-2">
@@ -604,9 +663,25 @@ export function SkillHubPage() {
 						onInstalled={refetchSkills}
 					/>
 				) : (
-					<MinePanel skills={skills} loading={skillsLoading} onRemove={remove} />
+					<MinePanel
+						skills={skills}
+						loading={skillsLoading}
+						error={skillsError}
+						onRetry={refetchSkills}
+						onRemove={remove}
+						onUpgrade={upgrade}
+						onCreate={() => setEditing('new')}
+						onEdit={setEditing}
+					/>
 				)}
 			</main>
+			{editing && (
+				<ManageSkillDialog
+					key={typeof editing === 'string' ? editing : editing.id}
+					record={typeof editing === 'string' ? null : editing}
+					onClose={() => setEditing(null)}
+				/>
+			)}
 		</div>
 	);
 }

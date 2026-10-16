@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """Schemas for installing and editing MCPs from a hub."""
-from pydantic import BaseModel, Field
+
+from pydantic import ConfigDict, BaseModel, Field
 
 from ...storage import MCPRecord
+from ....mcp import MCPClient
 
 
 class InstallMCPRequest(BaseModel):
@@ -35,7 +37,7 @@ class MCPView(BaseModel):
     id: str = Field(description="The installed-MCP record id.")
     name: str = Field(description="The MCP name, unique for this user.")
     is_stateful: bool = Field(description="Whether it needs a session.")
-    enabled: bool = Field(description="Whether the user has it turned on.")
+    source: str = "custom"
     display_name: str | None = Field(
         default=None,
         description="The card's user-facing name at install time.",
@@ -89,7 +91,7 @@ class MCPView(BaseModel):
             id=record.id,
             name=record.client.name,
             is_stateful=record.client.is_stateful,
-            enabled=record.enabled,
+            source="hub" if record.hub_id else "custom",
             display_name=record.display_name,
             description=record.description,
             tags=record.tags,
@@ -103,6 +105,7 @@ class MCPView(BaseModel):
 
 
 class UpdateMCPRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
     """The body of a library edit. Omitted fields are left alone."""
 
     name: str | None = Field(
@@ -117,11 +120,31 @@ class UpdateMCPRequest(BaseModel):
         description=(
             "New answers to the card's ``inputs_schema``, merged over "
             "the stored ones — send only the keys that changed. The "
-            "config is re-rendered from the card, so this needs the "
-            "originating hub to still be registered and reachable."
+            "config is re-rendered from the pinned card snapshot. "
+            "A saved template is required; missing templates are not "
+            "backfilled."
         ),
     )
-    enabled: bool | None = Field(
+    client: MCPClient | None = Field(
         default=None,
-        description="Whether the MCP is turned on.",
+        description=(
+            "Explicit replacement configuration; secrets are write-only."
+        ),
     )
+    description: str | None = None
+    version: str | None = Field(default=None, min_length=1)
+
+
+class CreateMCPRequest(BaseModel):
+    """Create a user-owned MCP without installing from a hub."""
+
+    model_config = ConfigDict(extra="forbid")
+    client: MCPClient
+    description: str = ""
+    version: str | None = Field(default=None, min_length=1)
+
+
+class MCPDetail(MCPView):
+    """Editable configuration with placeholders for stored secrets."""
+
+    client: dict

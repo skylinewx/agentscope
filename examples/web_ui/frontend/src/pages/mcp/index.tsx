@@ -1,12 +1,14 @@
-import { Blocks, Check, Download, Pencil, Plug, Trash2, TriangleAlert } from 'lucide-react';
-import { useCallback, useEffect, useState } from 'react';
+import { Blocks, Check, Download, Pencil, Plug, Plus, Trash2, TriangleAlert } from 'lucide-react';
+import { useCallback, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import { hubApi } from '@/api';
 import type { HubInfo, MCPCard, MCPView } from '@/api';
 import { InstallMCPDialog } from '@/components/dialog/InstallMCPDialog.tsx';
+import { ManageMCPDialog } from '@/components/dialog/ManageMCPDialog';
 import { ResourceDetailDrawer } from '@/components/drawer/ResourceDetailDrawer.tsx';
 import { LoadMore } from '@/components/hub/LoadMore.tsx';
+import { ResourceUpgrade } from '@/components/hub/ResourceControls';
 import { ResourcePanel } from '@/components/hub/ResourcePanel.tsx';
 import { Markdown } from '@/components/markdown';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar.tsx';
@@ -329,11 +331,24 @@ function HubPanel({ hubId, hub, installedNames, onInstalled }: HubPanelProps) {
 interface MinePanelProps {
 	mcps: MCPView[];
 	loading: boolean;
+	error: Error | null;
+	onRetry: () => Promise<void>;
 	onEdit: (mcp: MCPView) => void;
+	onCreate: () => void;
 	onRemove: (mcpId: string) => void;
+	onUpgrade: (id: string) => Promise<unknown>;
 }
 
-function MinePanel({ mcps, loading, onEdit, onRemove }: MinePanelProps) {
+function MinePanel({
+	mcps,
+	loading,
+	error,
+	onRetry,
+	onEdit,
+	onCreate,
+	onRemove,
+	onUpgrade,
+}: MinePanelProps) {
 	const { t } = useTranslation();
 	const [query, setQuery] = useState('');
 
@@ -351,8 +366,14 @@ function MinePanel({ mcps, loading, onEdit, onRemove }: MinePanelProps) {
 	return (
 		<ResourcePanel
 			title={t('common.my-mcp')}
-			description={t('mcp.mineDescription')}
+			description={t('resource.switchHelp')}
 			icon={<Plug className="size-5 text-muted-foreground" />}
+			actions={
+				<Button onClick={onCreate}>
+					<Plus />
+					{t('resource.manage.createMcp')}
+				</Button>
+			}
 			search={
 				// Hidden while there is nothing to search through.
 				mcps.length > 0
@@ -368,6 +389,18 @@ function MinePanel({ mcps, loading, onEdit, onRemove }: MinePanelProps) {
 				<div className="flex justify-center py-10">
 					<Spinner />
 				</div>
+			) : error ? (
+				<Empty role="alert" className="border-none py-10">
+					<EmptyHeader>
+						<EmptyTitle>{t('mcp.loadFailedTitle')}</EmptyTitle>
+						<EmptyDescription>{error.message}</EmptyDescription>
+					</EmptyHeader>
+					<EmptyContent>
+						<Button variant="outline" size="sm" onClick={onRetry}>
+							{t('mcp.retry')}
+						</Button>
+					</EmptyContent>
+				</Empty>
 			) : mcps.length === 0 ? (
 				<Empty className="border-none py-10">
 					<EmptyHeader>
@@ -418,6 +451,9 @@ function MinePanel({ mcps, loading, onEdit, onRemove }: MinePanelProps) {
 											@{mcp.author}
 										</span>
 									)}
+									<span className="text-xs text-muted-foreground">
+										{t(`resource.${mcp.source}`)}
+									</span>
 									{mcp.is_stateful && (
 										<span
 											key={'state'}
@@ -441,22 +477,23 @@ function MinePanel({ mcps, loading, onEdit, onRemove }: MinePanelProps) {
 							</ItemContent>
 
 							<ItemActions className="gap-1">
+								{mcp.source === 'hub' && (
+									<ResourceUpgrade onUpgrade={() => onUpgrade(mcp.id)} />
+								)}
 								{mcp.version && (
 									<span className="text-xs text-muted-foreground whitespace-nowrap">
 										{mcp.version}
 									</span>
 								)}
-								{mcp.hub_id && mcp.card_id && (
-									<Button
-										size="icon-sm"
-										variant="ghost"
-										className="text-muted-foreground"
-										onClick={() => onEdit(mcp)}
-										title={t('common.edit')}
-									>
-										<Pencil />
-									</Button>
-								)}
+								<Button
+									size="icon-sm"
+									variant="ghost"
+									className="text-muted-foreground"
+									onClick={() => onEdit(mcp)}
+									title={t('common.edit')}
+								>
+									<Pencil />
+								</Button>
 								<Button
 									size="icon-sm"
 									variant="ghost"
@@ -483,30 +520,16 @@ export function MCPHubPage() {
 	const { hubs, loading: hubsLoading, error: hubsError, refetch } = useMCPHubs();
 	// Loaded page-wide, not per panel: the hub view needs it to mark cards
 	// as already installed, and the "mine" view to list them.
-	const { mcps, loading: mcpsLoading, refetch: refetchMcps, remove } = useMCPs();
+	const {
+		mcps,
+		loading: mcpsLoading,
+		error: mcpsError,
+		refetch: refetchMcps,
+		remove,
+		upgrade,
+	} = useMCPs();
 	const installedNames = new Set(mcps.map((mcp) => mcp.name));
-	// Editing re-opens the install form against the originating card, so
-	// the card has to be fetched before the dialog can render its inputs.
-	const [editing, setEditing] = useState<MCPView | null>(null);
-	const [editingCard, setEditingCard] = useState<MCPCard | null>(null);
-
-	useEffect(() => {
-		if (!editing?.hub_id || !editing.card_id) return;
-		let current = true;
-		hubApi.mcp
-			.getCard(editing.hub_id, editing.card_id)
-			.then((card) => {
-				if (current) setEditingCard(card);
-			})
-			.catch(() => {
-				// The hub is gone or the card was dropped; the dialog stays
-				// shut and the toast from the client says why.
-				if (current) setEditing(null);
-			});
-		return () => {
-			current = false;
-		};
-	}, [editing]);
+	const [editing, setEditing] = useState<MCPView | 'new' | null>(null);
 
 	return (
 		<div className="flex size-full p-2 gap-2">
@@ -634,23 +657,23 @@ export function MCPHubPage() {
 					<MinePanel
 						mcps={mcps}
 						loading={mcpsLoading}
+						error={mcpsError}
+						onRetry={refetchMcps}
 						onEdit={setEditing}
+						onCreate={() => setEditing('new')}
 						onRemove={remove}
+						onUpgrade={upgrade}
 					/>
 				)}
 			</main>
 
-			<InstallMCPDialog
-				card={editing ? editingCard : null}
-				editing={editing}
-				onOpenChange={(open) => {
-					if (!open) {
-						setEditing(null);
-						setEditingCard(null);
-					}
-				}}
-				onInstalled={refetchMcps}
-			/>
+			{editing && (
+				<ManageMCPDialog
+					key={typeof editing === 'string' ? editing : editing.id}
+					record={typeof editing === 'string' ? null : editing}
+					onClose={() => setEditing(null)}
+				/>
+			)}
 		</div>
 	);
 }

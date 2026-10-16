@@ -1,0 +1,14 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>聊天滚动回归</title></head>
+<body class="p-6">
+  <h1 class="text-xl">聊天滚动回归</h1>
+  <p>使用真实滚动组件和本地测试数据，不发送对话。</p>
+  <button id="run" class="my-4 rounded border px-3 py-2">运行滚动测试</button>
+  <button id="append" class="my-4 rounded border px-3 py-2">追加内容</button>
+  <p id="summary" role="status">准备就绪</p>
+  <div id="harness" class="my-4 max-w-3xl border p-4"></div>
+  <ol id="results" class="space-y-1"></ol>
+  <script type="module" src="./message-scroll.browser.tsx"></script>
+</body>
+</html>

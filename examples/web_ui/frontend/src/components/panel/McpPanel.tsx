@@ -9,6 +9,7 @@ import {
 } from 'lucide-react';
 import { useState } from 'react';
 
+import { ResourceScopeControls } from './ResourceScopeControls';
 import type { MCPClient, MCPClientStatus, MCPView } from '@/api';
 import { AddMCPDialog } from '@/components/dialog/AddMCPDialog.tsx';
 import { DeleteDialog } from '@/components/dialog/DeleteDialog.tsx';
@@ -51,19 +52,19 @@ interface McpPanelProps {
 	 *
 	 * @param name - The MCP server name to remove.
 	 */
-	onRemove: (name: string) => Promise<void>;
+	onRemove: (id: string) => Promise<void>;
+	onChange: (id: string, enabled: boolean | null) => Promise<void>;
 }
 
 interface McpRowProps {
 	mcp: MCPClientStatus;
 	/**
-	 * The same MCP in the user's library, matched by name. The workspace
-	 * stores only what it needs to connect, so the icon, author and
-	 * description come from there — and are absent for one that was never
-	 * installed through the library.
+	 * The same MCP in the user's library, matched by stable resource ID.
+	 * Its icon, author and description come from the library record.
 	 */
 	installed?: MCPView;
 	onDelete: () => void;
+	onToggle: (enabled: boolean | null) => Promise<unknown>;
 }
 
 /**
@@ -73,7 +74,7 @@ interface McpRowProps {
  * behind a count. A failed MCP has no tools to show, so it gets the
  * reason instead.
  */
-function McpRow({ mcp, installed, onDelete }: McpRowProps) {
+function McpRow({ mcp, installed, onDelete, onToggle }: McpRowProps) {
 	const { t } = useTranslation();
 	const [open, setOpen] = useState(false);
 
@@ -99,7 +100,7 @@ function McpRow({ mcp, installed, onDelete }: McpRowProps) {
 						<span className="text-xs text-muted-foreground">@{installed.author}</span>
 					)}
 					<span className="text-xs text-muted-foreground/50">
-						{mcp.mcp_config.type === 'stdio_mcp' ? '#stdio' : '#http'}
+						{mcp.transport === 'stdio_mcp' ? '#stdio' : '#http'}
 					</span>
 				</ItemTitle>
 				{installed?.description && (
@@ -110,20 +111,29 @@ function McpRow({ mcp, installed, onDelete }: McpRowProps) {
 			</ItemContent>
 
 			<ItemActions>
+				<ResourceScopeControls resource={mcp} name={mcp.name} onChange={onToggle} />
 				<span
-					className={`size-2 shrink-0 rounded-full ${mcp.is_healthy ? 'bg-green-500' : 'bg-red-500'}`}
-					title={t(mcp.is_healthy ? 'panel.mcp.healthy' : 'panel.mcp.unhealthy')}
+					className="text-xs text-muted-foreground"
+					title={mcp.status === 'not_loaded' ? t('resource.notLoadedHelp') : undefined}
+				>
+					{t(`resource.${mcp.status}`)}
+				</span>
+				<span
+					className={`size-2 shrink-0 rounded-full ${mcp.status === 'ready' ? 'bg-green-500' : mcp.status === 'error' ? 'bg-red-500' : 'bg-muted-foreground'}`}
+					title={t(`resource.${mcp.status}`)}
 				/>
 				{/* Only on hover: deleting is rare, and a delete button on
 				    every row competes with the status for attention. */}
-				<Button
-					variant="secondary"
-					size="icon-sm"
-					onClick={onDelete}
-					title={t('common.delete')}
-				>
-					<Trash className="size-3" />
-				</Button>
+				{mcp.binding_sources.includes('session') && (
+					<Button
+						variant="secondary"
+						size="icon-sm"
+						onClick={onDelete}
+						title={t('common.delete')}
+					>
+						<Trash className="size-3" />
+					</Button>
+				)}
 			</ItemActions>
 
 			<ItemFooter className="min-w-0">
@@ -161,7 +171,7 @@ function McpRow({ mcp, installed, onDelete }: McpRowProps) {
 							))}
 						</CollapsibleContent>
 					</Collapsible>
-				) : (
+				) : mcp.status === 'error' ? (
 					<Alert
 						variant="destructive"
 						className="basis-full border-red-200 bg-red-50 text-destructive dark:border-red-900 dark:bg-red-950 dark:text-red-50"
@@ -172,7 +182,7 @@ function McpRow({ mcp, installed, onDelete }: McpRowProps) {
 							<AlertDescription className="break-words">{mcp.error}</AlertDescription>
 						)}
 					</Alert>
-				)}
+				) : null}
 			</ItemFooter>
 		</Item>
 	);
@@ -200,6 +210,7 @@ export function McpPanel({
 	onAdd,
 	onAddFromLibrary,
 	onRemove,
+	onChange,
 }: McpPanelProps) {
 	const { t } = useTranslation();
 	const [search, setSearch] = useState('');
@@ -208,7 +219,7 @@ export function McpPanel({
 	// The workspace stores only what it takes to connect, so the display
 	// fields are looked up in the library, matched on the shared name.
 	const { mcps: library } = useMCPs();
-	const byName = new Map(library.map((mcp) => [mcp.name, mcp]));
+	const byId = new Map(library.map((mcp) => [mcp.id, mcp]));
 
 	const filtered = search
 		? mcps.filter((m) => m.name.toLowerCase().includes(search.toLowerCase()))
@@ -216,7 +227,7 @@ export function McpPanel({
 
 	return (
 		<div className="flex flex-col flex-1 min-h-0 gap-y-2">
-			<span className="text-muted-foreground text-sm">{t('panel.mcp.description')}</span>
+			<span className="text-muted-foreground text-sm">{t('resource.sessionHelp')}</span>
 			<InputGroup>
 				<InputGroupInput
 					placeholder={t('panel.mcp.searchPlaceholder')}
@@ -246,11 +257,12 @@ export function McpPanel({
 				<div className="flex flex-col flex-1 min-h-0 gap-y-2 overflow-y-auto scroll-fade-y">
 					{filtered.map((mcp) => (
 						<McpRow
-							key={mcp.name}
+							key={mcp.resource_id}
 							mcp={mcp}
-							installed={byName.get(mcp.name)}
+							installed={byId.get(mcp.resource_id)}
+							onToggle={(enabled) => onChange(mcp.resource_id, enabled)}
 							onDelete={() => {
-								setDeleteTarget(mcp.name);
+								setDeleteTarget(mcp.resource_id);
 								setDeleteOpen(true);
 							}}
 						/>
@@ -259,7 +271,20 @@ export function McpPanel({
 			)}
 
 			<AddMCPDialog
-				present={new Set(mcps.map((m) => m.name))}
+				present={
+					new Set(
+						mcps
+							.filter((m) => m.binding_sources.includes('session'))
+							.map((m) => m.name),
+					)
+				}
+				presentResourceIds={
+					new Set(
+						mcps
+							.filter((m) => m.binding_sources.includes('session'))
+							.map((m) => m.resource_id),
+					)
+				}
 				onAdd={onAdd}
 				onAddFromLibrary={onAddFromLibrary}
 			>
@@ -274,7 +299,7 @@ export function McpPanel({
 				onOpenChange={setDeleteOpen}
 				title={t('common.deleteTitle', {
 					entity: t('dialog-mcp-delete.entity'),
-					name: deleteTarget ?? '',
+					name: mcps.find((m) => m.resource_id === deleteTarget)?.name ?? '',
 				})}
 				description={t('common.deleteDescription')}
 				onConfirm={async () => {

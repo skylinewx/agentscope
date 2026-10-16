@@ -6,11 +6,14 @@ class names, walking the ``__cause__`` / ``__context__`` chain (AgentScope
 often wraps a provider error one layer deep). No provider SDK is imported;
 matching is by class name so httpx / openai / anthropic / aiohttp are all
 covered whether or not they are installed."""
+
 from typing import Iterator
+
+from pydantic import ValidationError
 
 from ...exception import DeveloperOrientedException
 from ...types import ErrorType, ErrorInfo
-
+from ...model._diagnostics import error_diagnostics
 
 _STATUS_MAP: dict[int, ErrorType] = {
     401: ErrorType.AUTHENTICATION,
@@ -45,6 +48,10 @@ _GENERIC_MESSAGE: dict[ErrorType, str] = {
     ErrorType.RATE_LIMIT: "Rate limit or quota exceeded — try again later.",
     ErrorType.INVALID_REQUEST: (
         "The request to the model was rejected as invalid."
+    ),
+    ErrorType.CONTEXT_LENGTH: (
+        "The conversation and tool results exceed the model's context "
+        "capacity. The reply has stopped."
     ),
     ErrorType.UPSTREAM: "The upstream model service returned an error.",
     ErrorType.CONNECTION: (
@@ -111,17 +118,81 @@ def _is_network_error(e: BaseException) -> bool:
     return False
 
 
+def _is_invalid_api_key(e: BaseException) -> bool:
+    """Recognize malformed credentials, including legacy Bearer headers."""
+    for exc in _causes(e):
+        if isinstance(exc, ValidationError):
+            errors = exc.errors(
+                include_input=False,
+                include_context=False,
+                include_url=False,
+            )
+            if any(error["type"] == "invalid_api_key" for error in errors):
+                return True
+        if (
+            isinstance(exc, UnicodeEncodeError)
+            and exc.encoding == "ascii"
+            and exc.object.startswith("Bearer ")
+        ):
+            return True
+    return False
+
+
+def _is_context_length_error(e: BaseException) -> bool:
+    """Recognize provider overflow without forwarding raw error content."""
+    markers = (
+        "maximum context length",
+        "context length exceeded",
+        "context window exceeded",
+        "exceeds the context window",
+        "prompt is too long",
+        "input is too long",
+    )
+    for exc in _causes(e):
+        bodies = [getattr(exc, "body", None)]
+        response = getattr(exc, "response", None)
+        if response is not None:
+            try:
+                bodies.append(response.json())
+            except (ValueError, AttributeError, RuntimeError):
+                pass
+        messages = [str(exc)]
+        codes = [getattr(exc, "code", None)]
+        for body in bodies:
+            if not isinstance(body, dict):
+                continue
+            detail = body.get("error", body)
+            if isinstance(detail, dict):
+                codes.append(detail.get("code"))
+                message = detail.get("message")
+                if isinstance(message, str):
+                    messages.append(message)
+        if "context_length_exceeded" in codes:
+            return True
+        if any(
+            marker in message.lower()
+            for message in messages
+            for marker in markers
+        ):
+            return True
+    return False
+
+
 def _classify_type(e: Exception) -> ErrorType:
     """Map an exception to an :class:`ErrorType` without importing any
     provider SDK."""
     status = _extract_status(e)
     if status is not None:
+        if status in (400, 413, 422) and _is_context_length_error(e):
+            return ErrorType.CONTEXT_LENGTH
         if status in _STATUS_MAP:
             return _STATUS_MAP[status]
         if status >= 500:
             return ErrorType.UPSTREAM
         return ErrorType.INVALID_REQUEST
 
+    if _is_invalid_api_key(e):
+        return ErrorType.AUTHENTICATION
     if _is_network_error(e):
         return ErrorType.CONNECTION
     if isinstance(e, DeveloperOrientedException):
@@ -174,4 +245,5 @@ def _classify_error(e: Exception) -> ErrorInfo:
     return ErrorInfo(
         type=error_type,
         message=_GENERIC_MESSAGE[error_type],
+        diagnostics=error_diagnostics(e),
     )

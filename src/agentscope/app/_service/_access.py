@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Resource access service — cross-owner reads with viewer-relative views."""
+
 from __future__ import annotations
 
 from datetime import datetime
@@ -27,7 +28,6 @@ from ..storage import (
     KnowledgeBaseRecord,
     StorageBase,
 )
-
 
 # ---------------------------------------------------------------------
 # Views — viewer-relative projections of storage records.
@@ -233,32 +233,28 @@ class ResourceAccessService:
         self,
         viewer_id: str,
         kind: Literal["credential"],
-    ) -> list[CredentialView]:
-        ...
+    ) -> list[CredentialView]: ...
 
     @overload
     async def list_resource(
         self,
         viewer_id: str,
         kind: Literal["agent"],
-    ) -> list[AgentView]:
-        ...
+    ) -> list[AgentView]: ...
 
     @overload
     async def list_resource(
         self,
         viewer_id: str,
         kind: Literal["knowledge_base"],
-    ) -> list[KnowledgeBaseView]:
-        ...
+    ) -> list[KnowledgeBaseView]: ...
 
     @overload
     async def list_resource(
         self,
         viewer_id: str,
         kind: ResourceKind,
-    ) -> ResourceViewList:
-        ...
+    ) -> ResourceViewList: ...
 
     async def list_resource(
         self,
@@ -275,6 +271,8 @@ class ResourceAccessService:
         is required for runtime provider calls.
         """
         resource_kind = ResourceKind(kind)
+        if resource_kind in (ResourceKind.MCP, ResourceKind.SKILL):
+            raise ValueError("Use library or scoped views for MCP and Skill.")
         if resource_kind is ResourceKind.CREDENTIAL:
             own = await self._storage.list_credentials(viewer_id)
         elif resource_kind is ResourceKind.AGENT:
@@ -326,8 +324,7 @@ class ResourceAccessService:
         viewer_id: str,
         kind: Literal["credential"],
         resource_id: str,
-    ) -> CredentialView:
-        ...
+    ) -> CredentialView: ...
 
     @overload
     async def get_resource(
@@ -335,8 +332,7 @@ class ResourceAccessService:
         viewer_id: str,
         kind: Literal["agent"],
         resource_id: str,
-    ) -> AgentView:
-        ...
+    ) -> AgentView: ...
 
     @overload
     async def get_resource(
@@ -344,8 +340,7 @@ class ResourceAccessService:
         viewer_id: str,
         kind: Literal["knowledge_base"],
         resource_id: str,
-    ) -> KnowledgeBaseView:
-        ...
+    ) -> KnowledgeBaseView: ...
 
     @overload
     async def get_resource(
@@ -353,8 +348,7 @@ class ResourceAccessService:
         viewer_id: str,
         kind: ResourceKind,
         resource_id: str,
-    ) -> ResourceView:
-        ...
+    ) -> ResourceView: ...
 
     async def get_resource(
         self,
@@ -373,6 +367,8 @@ class ResourceAccessService:
         for runtime provider calls.
         """
         resource_kind = ResourceKind(kind)
+        if resource_kind in (ResourceKind.MCP, ResourceKind.SKILL):
+            raise ValueError("Use library or scoped views for MCP and Skill.")
         own = await self._get_owned(
             resource_kind,
             viewer_id,
@@ -509,6 +505,22 @@ class ResourceAccessService:
             knowledge_base_id,
         )
 
+    async def try_resolve_bound_resource(
+        self, viewer_id, owner_id, kind, resource_id
+    ):
+        """Check MCP/Skill use grants independently of agent sharing."""
+        kind = ResourceKind(kind)
+        if kind not in (ResourceKind.MCP, ResourceKind.SKILL):
+            raise ValueError("Expected an MCP or Skill resource.")
+        if viewer_id != owner_id:
+            refs = await self._list_refs(viewer_id, kind)
+            if not any(
+                ref.owner_id == owner_id and ref.resource_id == resource_id
+                for ref in refs
+            ):
+                return None
+        return await self._get_owned(kind, owner_id, resource_id)
+
     # ------------------------------------------------------------------
     # Edit resolution
     # ------------------------------------------------------------------
@@ -577,6 +589,10 @@ class ResourceAccessService:
             return await self._storage.get_credential(owner_id, resource_id)
         if kind is ResourceKind.AGENT:
             return await self._storage.get_agent(owner_id, resource_id)
+        if kind is ResourceKind.MCP:
+            return await self._storage.get_mcp(owner_id, resource_id)
+        if kind is ResourceKind.SKILL:
+            return await self._storage.get_skill(owner_id, resource_id)
         return await self._storage.get_knowledge_base(owner_id, resource_id)
 
     def _build_view(

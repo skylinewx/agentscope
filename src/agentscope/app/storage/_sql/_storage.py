@@ -16,7 +16,10 @@ nodes in a distributed deployment regardless of each node's local
 timezone, while staying tz-naive so the plain ``DateTime`` columns
 need no dialect-specific timezone handling.
 """
+
 from datetime import datetime, timedelta, timezone
+import asyncio
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Self
 
 from .._base import StorageBase
@@ -1005,6 +1008,89 @@ class AsyncSQLAlchemyStorage(StorageBase):
         await self._write_row(AgentRow, agent_record)
         return agent_record.id
 
+    async def _mutate_record(
+        self,
+        row_cls: type,
+        record_cls: type,
+        user_id: str,
+        record_id: str,
+        mutate: Callable,
+        *,
+        agent_id: str | None = None,
+    ) -> Any:
+        """Compare-and-swap a payload using its strictly increasing timestamp.
+
+        This works on SQLite as well as databases supporting row locks. The
+        callback is evaluated against a fresh record on every retry.
+        """
+        from sqlalchemy import update
+        from sqlalchemy.exc import OperationalError
+
+        for attempt in range(32):
+            try:
+                async with self._session() as sess:
+                    row = await sess.get(row_cls, record_id)
+                    if (
+                        row is None
+                        or row.user_id != user_id
+                        or (agent_id is not None and row.agent_id != agent_id)
+                    ):
+                        raise KeyError(record_id)
+                    previous_time = row.updated_at
+                    record = _to_record(row, record_cls)
+                    mutate(record)
+                    record.updated_at = max(
+                        _utcnow(),
+                        previous_time + timedelta(microseconds=1),
+                    )
+                    new_row = _from_record(row_cls, record)
+                    result = await sess.execute(
+                        update(row_cls)
+                        .where(
+                            row_cls.id == record_id,
+                            row_cls.user_id == user_id,
+                            row_cls.updated_at == previous_time,
+                        )
+                        .values(
+                            payload=new_row.payload,
+                            updated_at=record.updated_at,
+                        )
+                        .execution_options(synchronize_session=False),
+                    )
+                    await sess.commit()
+                    if result.rowcount == 1:
+                        return record
+            except OperationalError as exc:
+                if "locked" not in str(exc).lower():
+                    raise
+            await asyncio.sleep(min(0.002 * (attempt + 1), 0.05))
+        raise RuntimeError("Record changed too frequently; retry the update.")
+
+    async def mutate_agent(
+        self, user_id: str, agent_id: str, mutate: Callable
+    ) -> AgentRecord:
+        """Atomically update an agent's latest data."""
+        return await self._mutate_record(
+            AgentRow, AgentRecord, user_id, agent_id, mutate
+        )
+
+    async def mutate_session(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        mutate: Callable,
+    ) -> SessionRecord:
+        """Atomically update a session's latest config or state."""
+        return await self._mutate_record(
+            SessionRow,
+            SessionRecord,
+            user_id,
+            session_id,
+            mutate,
+            agent_id=agent_id,
+        )
+
     async def list_agents(self, user_id: str) -> list[AgentRecord]:
         """Return the user's ``source='user'`` agents only.
 
@@ -1288,18 +1374,12 @@ class AsyncSQLAlchemyStorage(StorageBase):
         state: AgentState,
     ) -> None:
         """Read-modify-write on the payload; raises if absent."""
-        _ = user_id, agent_id  # scoping enforced by caller
-        async with self._session() as sess:
-            row = await sess.get(SessionRow, session_id)
-            if row is None:
-                raise KeyError(f"Session {session_id!r} not found.")
-            record = _to_record(row, SessionRecord)
-            record.state = state
-            record.updated_at = _utcnow()
-            new_row = _from_record(SessionRow, record)
-            row.payload = new_row.payload
-            row.updated_at = new_row.updated_at
-            await sess.commit()
+        await self.mutate_session(
+            user_id,
+            agent_id,
+            session_id,
+            lambda record: setattr(record, "state", state),
+        )
 
     async def list_sessions(
         self,

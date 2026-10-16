@@ -305,6 +305,7 @@ class AgentBasicTest(IsolatedAsyncioTestCase):
             },
             {
                 "type": "REPLY_END",
+                "metadata": {"presentation": {"answer_block_ids": [AnyString()]}},
                 "error": None,
                 "session_id": session_id,
                 "finished_reason": "completed",
@@ -519,6 +520,7 @@ class AgentBasicTest(IsolatedAsyncioTestCase):
             },
             {
                 "type": "REPLY_END",
+                "metadata": {"presentation": {"answer_block_ids": [AnyString()]}},
                 "error": None,
                 "session_id": session_id,
                 "finished_reason": "completed",
@@ -1062,6 +1064,7 @@ class AgentBasicTest(IsolatedAsyncioTestCase):
                 {
                     **event_base,
                     "type": "REPLY_END",
+                    "metadata": {"presentation": {"answer_block_ids": [AnyString()]}},
                     "error": None,
                     "session_id": agent.state.session_id,
                     "finished_reason": (ReplyFinishedReason.EXCEED_MAX_ITERS),
@@ -1407,6 +1410,7 @@ class AgentBasicTest(IsolatedAsyncioTestCase):
             },
             {
                 "type": "REPLY_END",
+                "metadata": {"presentation": {"answer_block_ids": [AnyString()]}},
                 "error": None,
                 "session_id": session_id,
                 "finished_reason": "completed",
@@ -1665,6 +1669,7 @@ class AgentBasicTest(IsolatedAsyncioTestCase):
             },
             {
                 "type": "REPLY_END",
+                "metadata": {"presentation": {"answer_block_ids": [AnyString()]}},
                 "error": None,
                 "session_id": session_id,
                 "finished_reason": "completed",
@@ -1962,6 +1967,7 @@ class AgentBasicTest(IsolatedAsyncioTestCase):
             },
             {
                 "type": "REPLY_END",
+                "metadata": {"presentation": {"answer_block_ids": [AnyString()]}},
                 "error": None,
                 "session_id": session_id,
                 "finished_reason": "completed",

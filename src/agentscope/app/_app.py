@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """AgentScope app factory."""
+
 import json
 import os
 import secrets
@@ -42,13 +43,14 @@ from ._types import (
 from .channel import ChannelBase, ChannelTypeRegistry
 from .message_bus import MessageBus
 from .storage import StorageBase
+from .resources import LocalSkillStore
+from ._service._resources import ResourceService
 from ..agent import Agent
 from ..credential import CredentialFactory, CredentialBase
 from ..rag import ApproxTokenChunker, ChunkerBase, ParserBase, TextParser
 
 from .._logging import logger
 from .._version import __version__
-
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -134,6 +136,7 @@ def create_app(
     channels: list[Type[ChannelBase]] | None = None,
     download_secret: str | None = None,
     realtime_ice_servers: list[dict[str, Any]] | None = None,
+    skill_store: LocalSkillStore | None = None,
     title: str = "AgentScope",
     version: str = __version__,
     **kwargs: Any,
@@ -227,6 +230,9 @@ def create_app(
             The MCP hubs that provide MCPs.
         skill_hubs (`list[SkillHubBase] | None`, optional):
             The SkillHubs that provide skills.
+        skill_store (`LocalSkillStore | None`, optional):
+            Immutable Skill packages, independent of knowledge bases.
+            Defaults to ``./resource-artifacts``; persist this directory.
         enable_channel_worker (`bool`, defaults to ``True``):
             Whether this process holds the channels' long connections.
             ``True`` (embedded deployment) suits a desktop build or a
@@ -352,6 +358,10 @@ def create_app(
     app.state.channel_type_registry = ChannelTypeRegistry(channels or [])
     app.state.mcp_hubs = _index_hubs(mcp_hubs, "MCP")
     app.state.skill_hubs = _index_hubs(skill_hubs, "skill")
+    app.state.resource_service = ResourceService(
+        storage,
+        skill_store,
+    )
     app.state.download_secret = download_secret or secrets.token_urlsafe(32)
     app.state.realtime_ice_servers = _load_realtime_ice_servers(
         realtime_ice_servers,
@@ -377,9 +387,11 @@ def create_app(
             else [TextParser()]
         )
         chunker_classes = list(
-            knowledge_chunkers
-            if knowledge_chunkers is not None
-            else [ApproxTokenChunker],
+            (
+                knowledge_chunkers
+                if knowledge_chunkers is not None
+                else [ApproxTokenChunker]
+            ),
         )
         # Backward compatibility: the deprecated ``knowledge_chunker``
         # instance is only used for its class.

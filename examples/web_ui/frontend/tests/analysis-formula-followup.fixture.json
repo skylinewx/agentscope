@@ -1,0 +1,112 @@
+{
+  "actions": [
+    {
+      "actionRef": "ana_4f158417c439481f8374beb82134bc8e:1#action_74ec5955173325cf11cc0616",
+      "availability": "AVAILABLE",
+      "availabilityReason": "当前已发现同来源执行与核验能力；只判定所选检查是否完成，不自动证明目标文字中的其他结论。",
+      "expectedDecision": "区分一致、差额和断点",
+      "findingRefs": [
+        "finding_910756002166a1f46216ac7a"
+      ],
+      "goal": "继续核对本次表内公式",
+      "priorityBasis": "用户指定",
+      "requiredEvidence": [
+        "同一目标和依赖的新来源及核验"
+      ],
+      "scopeLabel": "合成成员 0（2026N0001，结果）、合成成员 0（2026N0001，成本）、合成成员 0（2026N0001，收入）"
+    }
+  ],
+  "activeColumnKey": null,
+  "analysisRef": "ana_4f158417c439481f8374beb82134bc8e:1",
+  "chartUnavailable": null,
+  "chartsRequested": false,
+  "claims": [],
+  "claimsCollapsed": false,
+  "claimsScopeLabel": "",
+  "columns": [],
+  "dataDigest": "6624112d1b3d1fff6788ae2cd0041a7933754e3699fea397653f7151a00a379e",
+  "engineVersion": "1.5.0",
+  "findings": [
+    {
+      "applicability": "只支持该计算关系",
+      "basis": "AnalysisArtifact v1 / findings",
+      "explanations": [
+        {
+          "kind": "observation",
+          "missingEvidence": [],
+          "statement": "-5",
+          "support": "SUPPORTED"
+        }
+      ],
+      "findingId": "finding_910756002166a1f46216ac7a",
+      "previousAnalysisRef": null,
+      "ruleVersion": "1.1.0",
+      "sourceType": "observation",
+      "statement": "-5",
+      "support": "SUPPORTED",
+      "type": "calculation"
+    }
+  ],
+  "findingsScopeLabel": "原发布范围的发现与建议",
+  "isFiltered": false,
+  "limitations": [],
+  "memberKeys": [],
+  "metrics": [],
+  "objectCount": 0,
+  "originalObjectCount": 0,
+  "originalTotal": 0,
+  "publishedAt": "2026-10-12T16:22:44.943885+00:00",
+  "rendererVersion": "1.11.1",
+  "rows": [],
+  "schemaVersion": 1,
+  "scopeId": "scope_9f3006908373ec3827c1955a",
+  "scopeLabel": "合成数据的指定对象",
+  "sections": [],
+  "sources": [],
+  "statuses": {
+    "calculationValidation": "PASS",
+    "comparability": "UNCONFIRMED",
+    "coverage": "COMPLETE",
+    "publicationState": "PUBLISHED",
+    "receiptVerification": "VALID"
+  },
+  "tables": [],
+  "technicalDetails": false,
+  "total": 0,
+  "verificationRecordedAt": "2026-10-12T16:22:44.923657+00:00",
+  "viewDerivedValues": [],
+  "viewId": "view_f2cd6c9432aafc79d995f9e3",
+  "viewParameters": {
+    "columnKey": null,
+    "filter": "all",
+    "sort": "published",
+    "topN": null
+  },
+  "page": {
+    "offset": 0,
+    "limit": 12,
+    "total": 0,
+    "nextOffset": null
+  },
+  "capabilities": {
+    "cards": true,
+    "generateReports": true,
+    "followUp": true
+  },
+  "actionRuns": [
+    {
+      "actionRunId": "run_21c2121d2eee4ca199232778d4147d6b",
+      "actionRef": "ana_4f158417c439481f8374beb82134bc8e:1#action_74ec5955173325cf11cc0616",
+      "status": "COMPLETED",
+      "resultAnalysisRef": "ana_4f158417c439481f8374beb82134bc8e:2",
+      "updatedAt": "2026-10-12T16:22:45.077651+00:00",
+      "resultNote": "本次公式核对完成，存在差额；核对完成不代表公式一致。"
+    }
+  ],
+  "reports": [],
+  "scenes": [],
+  "summaryPosition": "end",
+  "summaryTitle": "分析总结",
+  "reportTitle": "",
+  "summaryClaimIndexes": []
+}

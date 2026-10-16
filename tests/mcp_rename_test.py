@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """MCP library rename test cases."""
+
 import tempfile
 from typing import Any
 from unittest import IsolatedAsyncioTestCase
@@ -79,7 +80,7 @@ class MCPLibraryRenameTest(IsolatedAsyncioTestCase):
             "id": self._mcp_id,
             "name": name,
             "is_stateful": False,
-            "enabled": True,
+            "source": "custom",
             "display_name": None,
             "description": "",
             "tags": [],

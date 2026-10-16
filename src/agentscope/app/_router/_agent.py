@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """Agent router — CRUD endpoints for agent configurations."""
-from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import ValidationError
@@ -24,6 +23,7 @@ from ._schema import (
 )
 from .._service import AgentView, ResourceAccessService, SessionService
 from ..storage import StorageBase, AgentData, AgentRecord
+from .._service._resource_config_service import ResourceConfigService
 
 agent_router = APIRouter(
     prefix="/agent",
@@ -176,6 +176,7 @@ async def create_agent(
     body: CreateAgentRequest,
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
+    access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> CreateAgentResponse:
     """Create and persist a new agent configuration.
 
@@ -206,6 +207,13 @@ async def create_agent(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=exc.errors(),
         ) from exc
+    data.resource_config = await ResourceConfigService(
+        storage, access
+    ).validate_config(
+        user_id,
+        user_id,
+        data.resource_config,
+    )
     record = AgentRecord(user_id=user_id, data=data)
     agent_id = await storage.upsert_agent(user_id, record)
     return CreateAgentResponse(agent_id=agent_id)
@@ -249,6 +257,14 @@ async def update_agent(
     )
 
     updates = body.model_dump(exclude_none=True, exclude_unset=True)
+    if body.resource_config is not None:
+        config = await ResourceConfigService(storage, access).validate_config(
+            user_id,
+            owner_id,
+            body.resource_config,
+            existing.data.resource_config,
+        )
+        updates["resource_config"] = config.model_dump()
     current_data = existing.data.model_dump()
     chat_updates = updates.pop("chat_config", None)
     if chat_updates is not None:
@@ -265,7 +281,7 @@ async def update_agent(
     # pre-``chat_config`` field names is folded in there too, on top of
     # the stored block rather than over it.
     try:
-        updated_data = AgentData.model_validate(
+        AgentData.model_validate(
             {**current_data, **updates},
         )
     except ValidationError as exc:
@@ -273,10 +289,27 @@ async def update_agent(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail=exc.errors(),
         ) from exc
-    updated_agent = existing.model_copy(
-        update={"data": updated_data, "updated_at": datetime.now()},
-    )
-    await storage.upsert_agent(owner_id, updated_agent)
+
+    def mutate(latest):
+        if (
+            body.resource_config is not None
+            and latest.data.resource_config != existing.data.resource_config
+        ):
+            raise HTTPException(
+                409,
+                "Resource bindings changed. Reload the agent before saving.",
+            )
+        changes = dict(updates)
+        if "chat_config" in changes:
+            changes["chat_config"] = {
+                **latest.data.chat_config.model_dump(),
+                **chat_updates,
+            }
+        latest.data = AgentData.model_validate(
+            {**latest.data.model_dump(), **changes}
+        )
+
+    updated_agent = await storage.mutate_agent(owner_id, agent_id, mutate)
     # Only reachable via ``resolve_for_edit``, so the caller has edit
     # permission by construction.
     return AgentView.model_validate(

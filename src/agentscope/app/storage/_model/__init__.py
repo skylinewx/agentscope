@@ -21,6 +21,13 @@ from ._knowledge_document import (
     KnowledgeDocumentStatus,
 )
 from ._mcp import MCPRecord
+from ._resource_config import (
+    AgentResourceConfig,
+    ResourceBinding,
+    ResourceOverride,
+    SessionResourceConfig,
+    SkillResourceBinding,
+)
 from ._schedule import ScheduleData, ScheduleRecord, ScheduleSource
 from ._session import (
     SessionRecord,
@@ -55,6 +62,11 @@ from ._team import TeamRecord, TeamData, TeamMember
 from ._user import UserRecord
 
 __all__ = [
+    "AgentResourceConfig",
+    "ResourceBinding",
+    "ResourceOverride",
+    "SessionResourceConfig",
+    "SkillResourceBinding",
     "AgentData",
     "AgentRecord",
     "ChannelBinding",

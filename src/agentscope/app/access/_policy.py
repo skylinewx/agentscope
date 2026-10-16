@@ -6,6 +6,7 @@ decide whether a viewer can access resources owned by another user. The
 default policy denies all cross-owner access, preserving the historical
 owner-isolated behavior.
 """
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
@@ -27,6 +28,12 @@ class ResourceKind(StrEnum):
 
     KNOWLEDGE_BASE = "knowledge_base"
     """A stored knowledge base."""
+
+    MCP = "mcp"
+    """An MCP definition, with use permission separate from agent access."""
+
+    SKILL = "skill"
+    """A stored Skill package."""
 
 
 class ResourcePermission(StrEnum):

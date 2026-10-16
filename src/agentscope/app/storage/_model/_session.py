@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """The session data class for storage."""
+
 import warnings
 from datetime import datetime
 from enum import Enum
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field, model_validator
 from typing_extensions import deprecated
 
 from ._base import _RecordBase
+from ._resource_config import SessionResourceConfig
 from ....state import AgentState
 
 
@@ -310,6 +312,11 @@ class SessionConfig(BaseModel):
     """Knowledge bases attached to this session and the corresponding
     :class:`~agentscope.middleware.RAGMiddleware` parameters.
     ``None`` means no knowledge base is wired."""
+
+    resource_config: SessionResourceConfig = Field(
+        default_factory=SessionResourceConfig,
+        description="Session-only additions and inherited resource switches.",
+    )
 
 
 class SessionRecord(_RecordBase):

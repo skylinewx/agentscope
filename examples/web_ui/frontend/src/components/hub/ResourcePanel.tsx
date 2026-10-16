@@ -1,7 +1,7 @@
 import { Search } from 'lucide-react';
 
 import { Input } from '@/components/ui/input.tsx';
-import { Item, ItemContent, ItemDescription, ItemMedia, ItemTitle } from '@/components/ui/item.tsx';
+import { Item, ItemActions, ItemContent, ItemDescription, ItemMedia, ItemTitle } from '@/components/ui/item.tsx';
 import { Separator } from '@/components/ui/separator.tsx';
 
 interface Props {
@@ -9,6 +9,7 @@ interface Props {
 	description?: string;
 	/** Shown beside the title — a hub's icon, or a lucide glyph for "mine". */
 	icon?: React.ReactNode;
+	actions?: React.ReactNode;
 	/** Renders a search box under the header when given. */
 	search?: { value: string; onChange: (value: string) => void; placeholder: string };
 	children: React.ReactNode;
@@ -23,7 +24,7 @@ interface Props {
  * separator sits outside the padded header so it spans the full panel
  * width, matching the credential detail panel.
  */
-export function ResourcePanel({ title, description, icon, search, children }: Props) {
+export function ResourcePanel({ title, description, icon, actions, search, children }: Props) {
 	return (
 		<div className="flex h-full flex-col">
 			<div className="flex shrink-0 flex-col gap-y-4 p-[18px_18px_16px]">
@@ -35,6 +36,7 @@ export function ResourcePanel({ title, description, icon, search, children }: Pr
 						<ItemTitle className="text-lg">{title}</ItemTitle>
 						{description ? <ItemDescription>{description}</ItemDescription> : null}
 					</ItemContent>
+					{actions && <ItemActions>{actions}</ItemActions>}
 				</Item>
 				{search && (
 					<div className="relative">

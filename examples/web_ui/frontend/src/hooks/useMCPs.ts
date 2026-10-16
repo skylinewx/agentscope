@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 import { mcpApi } from '@/api';
 import type { MCPView, UpdateMCPRequest } from '@/api';
+import { notifyResourceChanged, RESOURCE_CHANGED } from '@/lib/resource-events';
 
 /**
  * The user's library of installed MCPs.
@@ -31,23 +32,29 @@ export function useMCPs() {
 
 	useEffect(() => {
 		refetch();
+		window.addEventListener(RESOURCE_CHANGED, refetch);
+		return () => window.removeEventListener(RESOURCE_CHANGED, refetch);
 	}, [refetch]);
 
 	const update = useCallback(
 		async (mcpId: string, body: UpdateMCPRequest) => {
 			await mcpApi.update(mcpId, body);
-			await refetch();
+			notifyResourceChanged();
 		},
-		[refetch],
+		[],
 	);
 
 	const remove = useCallback(
 		async (mcpId: string) => {
 			await mcpApi.remove(mcpId);
-			await refetch();
+			notifyResourceChanged();
 		},
-		[refetch],
+		[],
 	);
 
-	return { mcps, loading, error, refetch, update, remove };
+	const upgrade = useCallback(async (mcpId: string) => {
+		await mcpApi.upgrade(mcpId);
+		notifyResourceChanged();
+	}, []);
+	return { mcps, loading, error, refetch, update, remove, upgrade };
 }

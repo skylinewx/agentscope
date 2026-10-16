@@ -1,0 +1,60 @@
+.relation-container { container-type: inline-size; }
+.relation-equation { margin: 0 0 20px; font-weight: 600; line-height: 1.8; overflow-wrap: anywhere; word-break: normal; }
+.relation-layout { display: grid; grid-template-columns: minmax(0, 1fr) 40px minmax(0, 1fr); align-items: center; gap: 12px; }
+.relation-inputs { display: grid; gap: 12px; min-width: 0; }
+.relation-output { min-width: 0; }
+.relation-node { padding: 16px; border-left: 3px solid #185fa5; border-radius: 8px; background: #f1f5f9; overflow-wrap: anywhere; }
+.relation-node p { margin: 0; line-height: 1.7; }
+.relation-value { font-weight: 600; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.relation-caption { font-size: 12px; color: #606b7b; line-height: 1.8; overflow-wrap: anywhere; }
+.relation-result { border-left-color: #426b86; }
+/* Keep a rotated arrow's box intrinsic so it cannot overflow and scroll the card. */
+.relation-arrow { justify-self: center; text-align: center; color: #9aa9b4; font-size: 28px; }
+.relation-checks { display: grid; gap: 8px; margin-top: 12px; padding: 12px 16px; border: 1px solid #e2e6ec; border-radius: 8px; }
+.relation-checks p { margin: 0; }
+.diagram-content { min-width: 0; }
+.diagram-content + .diagram-content, .diagram-fold + .diagram-content, .diagram-content + .diagram-fold, .diagram-fold + .diagram-fold { margin-top: 20px; }
+.diagram-content h3, .presentation-block h3 { margin: 0 0 12px; font-size: 16px; line-height: 1.7; }
+.diagram-fold { border: 1px solid #e2e6ec; border-radius: 8px; padding: 14px; }
+.diagram-fold summary { cursor: pointer; font-weight: 500; overflow-wrap: anywhere; }
+.diagram-fold .diagram-content { padding-top: 16px; }
+.presentation-block + .presentation-block { margin-top: 24px; padding-top: 24px; border-top: 1px solid #e2e6ec; }
+.presentation-group > h2, .metric-group > h2 { margin-bottom: 14px; }
+@container (max-width: 560px) {
+  .relation-layout { grid-template-columns: minmax(0, 1fr); }
+  .relation-arrow { transform: rotate(90deg); line-height: 1; }
+}
+@media print {
+  .diagram-fold::details-content { display: block !important; content-visibility: visible !important; height: auto !important; }
+  .diagram-fold > .diagram-content { display: block !important; }
+  .relation-node { break-inside: avoid; }
+}
+
+/* Model-selected composition within the approved visual style. */
+.presentation-composition { container-type: inline-size; }
+.presentation-grid { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 24px; margin-bottom: 24px; }
+.presentation-grid > [data-width="full"] { grid-column: 1 / -1; }
+.presentation-grid > [data-width="half"] { grid-column: auto; }
+.presentation-grid > [data-width="half"] svg { min-width: 400px; }
+.topic-claims { margin: 20px 0; }
+.topic-claims p + p { margin-top: 12px; }
+.summary[data-position="start"] { margin-top: 0; margin-bottom: 24px; }
+@container (min-width: 900px) {
+  .presentation-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media print {
+  .presentation-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* Relationship component options; outer report styles are unchanged. */
+.relation-compact { grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.relation-compact .relation-inputs { grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); align-items: stretch; }
+.relation-compact .relation-arrow { transform: rotate(90deg); line-height: 1; }
+.relation-compact .relation-output { width: 100%; }
+.relation-compact .relation-result { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 24px; }
+.relation-node[data-tone="negative"] { border-left-color: #c3502f; }
+.relation-node[data-emphasis="true"] { border-left-width: 6px; box-shadow: inset 0 0 0 1px #9aa9b4; }
+.relation-operator { display: inline-block; font-weight: 700; margin-right: 8px; }
+.relation-magnitude { height: 5px; margin-top: 10px; background: #e2e6ec; }
+.relation-magnitude span { height: 100%; display: block; background: #185fa5; }
+.relation-node[data-tone="negative"] .relation-magnitude span { background: #c3502f; }

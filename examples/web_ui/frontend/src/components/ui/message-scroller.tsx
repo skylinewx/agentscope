@@ -10,10 +10,21 @@ import { cn } from '@/lib/utils';
 import { Button } from '@/components/ui/button';
 import { ArrowDownIcon } from 'lucide-react';
 
-function MessageScrollerProvider(
-	props: React.ComponentProps<typeof MessageScrollerPrimitive.Provider>,
-) {
-	return <MessageScrollerPrimitive.Provider {...props} />;
+const ScrollOptionsContext = React.createContext({ autoScroll: false, scrollEdgeThreshold: 8 });
+const SCROLL_KEYS = new Set(['ArrowDown', 'ArrowUp', 'End', 'Home', 'PageDown', 'PageUp', ' ']);
+
+function MessageScrollerProvider({
+	autoScroll = false,
+	scrollEdgeThreshold = 8,
+	children,
+	...props
+}: React.ComponentProps<typeof MessageScrollerPrimitive.Provider>) {
+	const options = React.useMemo(() => ({ autoScroll, scrollEdgeThreshold }), [autoScroll, scrollEdgeThreshold]);
+	return <ScrollOptionsContext.Provider value={options}>
+		<MessageScrollerPrimitive.Provider autoScroll={autoScroll} scrollEdgeThreshold={scrollEdgeThreshold} {...props}>
+			{children}
+		</MessageScrollerPrimitive.Provider>
+	</ScrollOptionsContext.Provider>;
 }
 
 function MessageScroller({
@@ -34,11 +45,42 @@ function MessageScroller({
 
 function MessageScrollerViewport({
 	className,
+	onWheel,
+	onTouchMove,
+	onKeyDown,
 	...props
 }: React.ComponentProps<typeof MessageScrollerPrimitive.Viewport>) {
+	const { autoScroll, scrollEdgeThreshold } = React.useContext(ScrollOptionsContext);
+	const { scrollToEnd } = useMessageScroller();
+	const frame = React.useRef<number | null>(null);
+	React.useEffect(() => () => {
+		if (frame.current !== null) cancelAnimationFrame(frame.current);
+	}, []);
+	const resumeIfAtBottom = (viewport: HTMLDivElement) => {
+		if (!autoScroll) return;
+		if (frame.current !== null) cancelAnimationFrame(frame.current);
+		const beforeTop = viewport.scrollTop;
+		const wasAtBottom = viewport.scrollHeight - viewport.clientHeight - beforeTop <= scrollEdgeThreshold;
+		// The primitive pauses on every input gesture, even a downward wheel
+		// at the bottom or a gesture consumed by a nested scroll area. Wait
+		// for native scrolling, then resume only if the viewport stayed at end.
+		// Streaming can increase scrollHeight in the same frame; that alone
+		// must not be mistaken for the user scrolling up.
+		frame.current = requestAnimationFrame(() => {
+			frame.current = null;
+			const atBottom = viewport.scrollHeight - viewport.clientHeight - viewport.scrollTop <= scrollEdgeThreshold;
+			const stayedAtBottom = wasAtBottom && viewport.scrollTop >= beforeTop - 0.5;
+			if (viewport.isConnected && (atBottom || stayedAtBottom)) {
+				scrollToEnd({ behavior: 'auto' });
+			}
+		});
+	};
 	return (
 		<MessageScrollerPrimitive.Viewport
 			data-slot="message-scroller-viewport"
+			onWheel={(event) => { onWheel?.(event); resumeIfAtBottom(event.currentTarget); }}
+			onTouchMove={(event) => { onTouchMove?.(event); resumeIfAtBottom(event.currentTarget); }}
+			onKeyDown={(event) => { onKeyDown?.(event); if (SCROLL_KEYS.has(event.key)) resumeIfAtBottom(event.currentTarget); }}
 			className={cn(
 				// `no-scrollbar`: the stock thin scrollbar is hidden while
 				// autoscrolling and shown otherwise, so a streaming reply

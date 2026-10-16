@@ -1,0 +1,252 @@
+{
+  "details": {
+    "path": "./analysis/ana_cbe35208f6bd4d5188953f07949c4ed8/revisions/1/analysis.json",
+    "snapshot": {
+      "actions": [],
+      "activeColumnKey": null,
+      "analysisRef": "ana_cbe35208f6bd4d5188953f07949c4ed8:1",
+      "chartUnavailable": null,
+      "chartsRequested": false,
+      "claims": [],
+      "claimsCollapsed": false,
+      "claimsScopeLabel": "",
+      "columns": [],
+      "dataDigest": "fc239baaaacad30b6ba1204e2fb5317baacb6a57336e3e9d899eb614489e9d31",
+      "engineVersion": "1.5.0",
+      "findings": [],
+      "findingsScopeLabel": "原发布范围的发现与建议",
+      "isFiltered": false,
+      "limitations": [],
+      "memberKeys": [],
+      "metrics": [],
+      "objectCount": 0,
+      "originalObjectCount": 0,
+      "originalTotal": 0,
+      "publishedAt": "2026-10-12T16:22:43.729410+00:00",
+      "rendererVersion": "1.11.1",
+      "rows": [],
+      "schemaVersion": 1,
+      "scopeId": "scope_910017aaad08a538c55de54c",
+      "scopeLabel": "合成数据的指定对象",
+      "sections": [],
+      "sources": [],
+      "statuses": {
+        "calculationValidation": "NOT_APPLICABLE",
+        "comparability": "CONFIRMED",
+        "coverage": "COMPLETE",
+        "publicationState": "PUBLISHED",
+        "receiptVerification": "VALID"
+      },
+      "tables": [],
+      "technicalDetails": false,
+      "total": 0,
+      "verificationRecordedAt": "2026-10-12T16:22:43.710582+00:00",
+      "viewDerivedValues": [],
+      "viewId": "view_e6e3de3a654603c892c8b770",
+      "viewParameters": {
+        "columnKey": null,
+        "filter": "all",
+        "sort": "published",
+        "topN": null
+      },
+      "page": {
+        "offset": 0,
+        "limit": 12,
+        "total": 0,
+        "nextOffset": null
+      },
+      "capabilities": {
+        "cards": true,
+        "generateReports": true,
+        "followUp": true
+      },
+      "actionRuns": [],
+      "reports": [],
+      "scenes": [],
+      "summaryPosition": "end",
+      "summaryTitle": "分析总结",
+      "reportTitle": "",
+      "summaryClaimIndexes": []
+    }
+  },
+  "planned": {
+    "path": "./analysis/ana_642e2c1858934ae28b95f57609b5b537/revisions/1/analysis.json",
+    "snapshot": {
+      "actions": [
+        {
+          "actionRef": "ana_642e2c1858934ae28b95f57609b5b537:1#action_de293a8ecb12aa8696bd78dc",
+          "availability": "AVAILABLE",
+          "availabilityReason": "当前已发现同来源执行与核验能力；只判定所选检查是否完成，不自动证明目标文字中的其他结论。",
+          "expectedDecision": "确认所选检查的结果",
+          "findingRefs": [
+            "finding_f5e908eecd43c2dd6ec60a58"
+          ],
+          "goal": "核对合成测试所选输入",
+          "priorityBasis": "测试明确选择此检查",
+          "requiredEvidence": [
+            "新的来源与核验"
+          ],
+          "scopeLabel": "合成成员 2（2026N0001，合成采购数量）"
+        }
+      ],
+      "activeColumnKey": "column_7d776e882769c7296b205bb0",
+      "analysisRef": "ana_642e2c1858934ae28b95f57609b5b537:1",
+      "chartUnavailable": null,
+      "chartsRequested": false,
+      "claims": [],
+      "claimsCollapsed": false,
+      "claimsScopeLabel": "",
+      "columns": [
+        {
+          "key": "column_7d776e882769c7296b205bb0",
+          "label": "合成采购数量",
+          "unit": "件"
+        }
+      ],
+      "dataDigest": "2c7cd7f26668ad21f64430d6b1220121bf89dfa0675a5abc8c4c665e98d95727",
+      "engineVersion": "1.5.0",
+      "findings": [
+        {
+          "applicability": "仅检查被选择的正值、负值或零值条件",
+          "basis": "AnalysisArtifact v1 / findings",
+          "explanations": [
+            {
+              "kind": "observation",
+              "missingEvidence": [],
+              "statement": "合成成员 2（2026N0001，合成采购数量）的来源原值为 12 件，是正值。该检查仅说明数值符号。",
+              "support": "SUPPORTED"
+            }
+          ],
+          "findingId": "finding_f5e908eecd43c2dd6ec60a58",
+          "previousAnalysisRef": null,
+          "ruleVersion": "1.1.0",
+          "sourceType": "observation",
+          "statement": "合成成员 2（2026N0001，合成采购数量）的来源原值为 12 件，是正值。该检查仅说明数值符号。",
+          "support": "SUPPORTED",
+          "type": "sign"
+        }
+      ],
+      "findingsScopeLabel": "原发布范围的发现与建议",
+      "isFiltered": false,
+      "limitations": [],
+      "memberKeys": [
+        "member_e125d0cbc9d494b91d388faa",
+        "member_a9c93e95164623f7f3113647",
+        "member_547c813d0f1d5da3bfcac7b1"
+      ],
+      "metrics": [
+        {
+          "display": "3",
+          "label": "有效数值",
+          "scopeId": "scope_910017aaad08a538c55de54c",
+          "unit": "",
+          "valueRef": "value_e46a681efcc78bd3fb962013",
+          "viewId": "count"
+        }
+      ],
+      "objectCount": 3,
+      "originalObjectCount": 3,
+      "originalTotal": 3,
+      "publishedAt": "2026-10-12T16:22:43.913268+00:00",
+      "rendererVersion": "1.11.1",
+      "rows": [
+        {
+          "display": "-8",
+          "exact": "-8",
+          "label": "合成成员 0",
+          "measure": "合成采购数量",
+          "memberKey": "member_e125d0cbc9d494b91d388faa",
+          "rowKey": "row_959329aae27509affc68e1a4",
+          "state": "已取得",
+          "unit": "件",
+          "valueRef": "value_959329aae27509affc68e1a4"
+        },
+        {
+          "display": "0",
+          "exact": "0",
+          "label": "合成成员 1",
+          "measure": "合成采购数量",
+          "memberKey": "member_a9c93e95164623f7f3113647",
+          "rowKey": "row_aeffe5cffb5f5588498ca2da",
+          "state": "已取得",
+          "unit": "件",
+          "valueRef": "value_aeffe5cffb5f5588498ca2da"
+        },
+        {
+          "display": "12",
+          "exact": "12",
+          "label": "合成成员 2",
+          "measure": "合成采购数量",
+          "memberKey": "member_547c813d0f1d5da3bfcac7b1",
+          "rowKey": "row_bf393e0f188a62a1c86e4d70",
+          "state": "已取得",
+          "unit": "件",
+          "valueRef": "value_bf393e0f188a62a1c86e4d70"
+        }
+      ],
+      "schemaVersion": 1,
+      "scopeId": "scope_910017aaad08a538c55de54c",
+      "scopeLabel": "合成数据的指定对象",
+      "sections": [
+        {
+          "blocks": [
+            {
+              "description": "",
+              "metricIndexes": [
+                0
+              ],
+              "sceneIndexes": [],
+              "tableIndexes": [],
+              "title": "",
+              "viewId": "count"
+            }
+          ],
+          "description": "",
+          "groupId": "view:count",
+          "title": "",
+          "width": "full",
+          "claimsPosition": "after",
+          "claimIndexes": []
+        }
+      ],
+      "sources": [],
+      "statuses": {
+        "calculationValidation": "PASS",
+        "comparability": "CONFIRMED",
+        "coverage": "COMPLETE",
+        "publicationState": "PUBLISHED",
+        "receiptVerification": "VALID"
+      },
+      "tables": [],
+      "technicalDetails": false,
+      "total": 3,
+      "verificationRecordedAt": "2026-10-12T16:22:43.889607+00:00",
+      "viewDerivedValues": [],
+      "viewId": "view_02c72974d02ca7aab10eca90",
+      "viewParameters": {
+        "columnKey": null,
+        "filter": "all",
+        "sort": "published",
+        "topN": null
+      },
+      "page": {
+        "offset": 0,
+        "limit": 12,
+        "total": 3,
+        "nextOffset": null
+      },
+      "capabilities": {
+        "cards": true,
+        "generateReports": true,
+        "followUp": true
+      },
+      "actionRuns": [],
+      "reports": [],
+      "scenes": [],
+      "summaryPosition": "end",
+      "summaryTitle": "分析总结",
+      "reportTitle": "",
+      "summaryClaimIndexes": []
+    }
+  }
+}

@@ -9,15 +9,19 @@ for aiohttp), connection failures are provider ``TransportError`` subclasses
 rather than builtin ``ConnectionError``, and the real error is often one
 ``__cause__`` deep.
 """
+
 import unittest
 
 import httpx
+from pydantic import ValidationError
 
 from agentscope.app._service._errors import (
     _classify_error,
     _classify_type,
+    _classify_setup_error,
     _GENERIC_MESSAGE,
 )
+from agentscope.credential import DeepSeekCredential
 from agentscope.exception import DeveloperOrientedException
 from agentscope.types import ErrorType
 
@@ -135,6 +139,43 @@ class ClassifyErrorTest(unittest.TestCase):
         )
         self.assertEqual(_classify_type(ValueError("x")), ErrorType.UNKNOWN)
 
+    def test_invalid_api_key_is_authentication_failure(self) -> None:
+        """A stored malformed key is actionable even through wrapped errors."""
+        try:
+            DeepSeekCredential(api_key="sk-private-test-key 中文备注")
+        except ValidationError as exc:
+            wrapped = RuntimeError("wrapped")
+            wrapped.__cause__ = exc
+            for error in (exc, wrapped, ExceptionGroup("group", [exc])):
+                with self.subTest(error=type(error).__name__):
+                    info = _classify_error(error)
+                    self.assertEqual(info.type, ErrorType.AUTHENTICATION)
+                    self.assertNotIn("sk-private-test-key", info.message)
+                    self.assertEqual(
+                        _classify_setup_error(error).type,
+                        ErrorType.AUTHENTICATION,
+                    )
+        else:
+            self.fail("Malformed API key was accepted")
+
+    def test_legacy_bearer_header_encoding_failure(self) -> None:
+        """The original HTTP-header error also points to the credential."""
+        with self.assertRaises(UnicodeEncodeError) as caught:
+            httpx.Headers({"Authorization": "Bearer sk-test-key 中文备注"})
+        self.assertEqual(
+            _classify_type(caught.exception),
+            ErrorType.AUTHENTICATION,
+        )
+        wrapped = RuntimeError("wrapped")
+        wrapped.__cause__ = caught.exception
+        self.assertEqual(_classify_type(wrapped), ErrorType.AUTHENTICATION)
+
+    def test_unrelated_encoding_error_remains_unknown(self) -> None:
+        """Encoding errors outside authentication keep their classification."""
+        with self.assertRaises(UnicodeEncodeError) as caught:
+            "中文输出".encode("ascii")
+        self.assertEqual(_classify_type(caught.exception), ErrorType.UNKNOWN)
+
     def test_classify_error_returns_generic_message(self) -> None:
         """The ErrorInfo carries the generic per-type message, never the
         raw exception text."""
@@ -148,6 +189,53 @@ class ClassifyErrorTest(unittest.TestCase):
         """Every ErrorType has a generic message entry."""
         for error_type in ErrorType:
             self.assertIn(error_type, _GENERIC_MESSAGE)
+
+    def test_context_overflow_is_specific_and_sanitized(self) -> None:
+        """The observed DeepSeek 400 must not lose its cause or leak details."""
+        response = httpx.Response(
+            400,
+            request=httpx.Request("POST", "https://api.example.com/v1/chat"),
+            json={
+                "error": {
+                    "message": (
+                        "This model's maximum context length is 1048576 tokens. "
+                        "However, you requested 1051259 tokens. private-request-id"
+                    ),
+                    "code": "invalid_request_error",
+                }
+            },
+        )
+        error = httpx.HTTPStatusError(
+            "Bad Request",
+            request=response.request,
+            response=response,
+        )
+        wrapped = RuntimeError("wrapped")
+        wrapped.__cause__ = error
+        for exc in (error, wrapped, ExceptionGroup("group", [error])):
+            info = _classify_error(exc)
+            self.assertEqual(info.type, ErrorType.CONTEXT_LENGTH)
+            self.assertNotIn("private-request-id", info.message)
+            self.assertNotIn("1051259", info.message)
+
+    def test_context_code_and_long_prompt_message(self) -> None:
+        """Recognize both structured codes and provider error messages."""
+        for detail in (
+            {"code": "context_length_exceeded", "message": "limit reached"},
+            {"message": "prompt is too long: 1001 tokens > 1000 maximum"},
+        ):
+            error = _StatusError(400)
+            error.body = {"error": detail}
+            self.assertEqual(_classify_type(error), ErrorType.CONTEXT_LENGTH)
+
+    def test_ordinary_bad_requests_and_auth_keep_their_meaning(self) -> None:
+        """Overflow recognition must not mask other request failures."""
+        error = _StatusError(400)
+        error.body = {"error": {"message": "Invalid function parameters"}}
+        self.assertEqual(_classify_type(error), ErrorType.INVALID_REQUEST)
+        error.status_code = 401
+        error.body = {"error": {"code": "context_length_exceeded"}}
+        self.assertEqual(_classify_type(error), ErrorType.AUTHENTICATION)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@ import type { ReactNode } from 'react';
 
 import type { SkillView } from '@/api';
 import type { UploadOptions } from '@/api/workspace';
+import { SkillVersion } from '@/components/hub/SkillVersion';
 import { Alert, AlertDescription } from '@/components/ui/alert.tsx';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar.tsx';
 import { Button } from '@/components/ui/button.tsx';
@@ -42,6 +43,7 @@ interface Props {
 	children: ReactNode;
 	/** Names already in this workspace, which cannot be picked again. */
 	present: Set<string>;
+	presentResourceIds: Set<string>;
 	onUpload: (files: File[], options?: UploadOptions) => Promise<void>;
 	onAddFromLibrary: (skillIds: string[]) => Promise<void>;
 }
@@ -53,7 +55,13 @@ interface Props {
  * Mirrors the MCP dialog: two peer tabs, a fixed-height body, and a
  * footer outside the tabs so switching moves nothing but the content.
  */
-export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }: Props) {
+export function AddSkillDialog({
+	children,
+	present,
+	presentResourceIds,
+	onUpload,
+	onAddFromLibrary,
+}: Props) {
 	const { t } = useTranslation();
 	const [open, setOpen] = useState(false);
 	const [tab, setTab] = useState('installed');
@@ -63,11 +71,15 @@ export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }
 	const [busy, setBusy] = useState(false);
 	const [error, setError] = useState<string | null>(null);
 	const input = useRef<HTMLInputElement>(null);
-	const { skills, loading } = useSkills();
+	const { skills, loading, error: loadError, refetch } = useSkills();
 
-	const selectable = skills.filter((skill) => !present.has(skill.name));
+	const selectable = skills.filter(
+		(skill) => !present.has(skill.name) && !presentResourceIds.has(skill.id),
+	);
+	const selectedIds = [...picked].filter((id) => selectable.some((skill) => skill.id === id));
 
 	const toggle = (skill: SkillView) => {
+		if (busy || !selectable.some((item) => item.id === skill.id)) return;
 		setPicked((prev) => {
 			const next = new Set(prev);
 			if (next.has(skill.id)) next.delete(skill.id);
@@ -85,10 +97,11 @@ export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }
 	};
 
 	const handleAddPicked = async () => {
+		if (selectedIds.length === 0 || busy || loading || loadError) return;
 		setBusy(true);
 		setError(null);
 		try {
-			await onAddFromLibrary([...picked]);
+			await onAddFromLibrary(selectedIds);
 			close();
 		} catch (e) {
 			setError((e as Error).message);
@@ -145,6 +158,16 @@ export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }
 								<div className="flex justify-center py-10">
 									<Spinner />
 								</div>
+							) : loadError ? (
+								<Alert variant="destructive">
+									<CircleAlert />
+									<AlertDescription>
+										{loadError.message}
+										<Button variant="ghost" size="sm" onClick={refetch}>
+											{t('error.retry')}
+										</Button>
+									</AlertDescription>
+								</Alert>
 							) : skills.length === 0 ? (
 								<Empty className="border-none py-10">
 									<EmptyHeader>
@@ -162,15 +185,18 @@ export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }
 							) : (
 								<ItemGroup className="gap-1">
 									{skills.map((skill) => {
-										const already = present.has(skill.name);
+										const already =
+											present.has(skill.name) ||
+											presentResourceIds.has(skill.id);
+										const unavailable = already;
 										return (
 											<Item
 												key={skill.id}
-												data-disabled={already || undefined}
+												data-disabled={unavailable || undefined}
 											>
 												<Checkbox
 													checked={already || picked.has(skill.id)}
-													disabled={already}
+													disabled={unavailable || busy}
 													onCheckedChange={() => toggle(skill)}
 												/>
 												<ItemMedia>
@@ -201,6 +227,10 @@ export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }
 													<ItemDescription className="line-clamp-1">
 														{skill.description}
 													</ItemDescription>
+													<SkillVersion
+														version={skill.version}
+														updatedAt={skill.version_updated_at}
+													/>
 												</ItemContent>
 											</Item>
 										);
@@ -302,7 +332,7 @@ export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }
 					<span className="self-center text-xs text-muted-foreground">
 						{tab === 'installed' && selectable.length > 0
 							? t('common.selectedCount', {
-									selected: picked.size,
+									selected: selectedIds.length,
 									total: selectable.length,
 								})
 							: null}
@@ -312,7 +342,12 @@ export function AddSkillDialog({ children, present, onUpload, onAddFromLibrary }
 							{t('common.cancel')}
 						</Button>
 						{tab === 'installed' ? (
-							<Button onClick={handleAddPicked} disabled={picked.size === 0 || busy}>
+							<Button
+								onClick={handleAddPicked}
+								disabled={
+									selectedIds.length === 0 || busy || loading || !!loadError
+								}
+							>
 								{busy ? <Spinner /> : <PlusCircle />}
 								{t('common.add')}
 							</Button>

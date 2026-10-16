@@ -2,6 +2,7 @@ import { CircleAlert, Loader2, Save } from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import type { AgentResourceConfig } from '@/api';
 import type { AgentView, ContextConfig, InviteConfig, ReActConfig } from '@/api';
 import {
 	AgentFormFields,
@@ -9,6 +10,7 @@ import {
 	type AgentFormValues,
 	type AgentSection,
 } from '@/components/form/AgentFormFields';
+import { AgentResources } from '@/components/form/AgentResources';
 import type { SchemaFormValue } from '@/components/form/SchemaForm';
 import { Alert, AlertDescription } from '@/components/ui/alert.tsx';
 import { Button } from '@/components/ui/button';
@@ -38,6 +40,7 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 	const [submitting, setSubmitting] = useState(false);
 	const [values, setValues] = useState<AgentFormValues | null>(null);
 	const [errorMsg, setErrorMsg] = useState('');
+	const [resources, setResources] = useState<AgentResourceConfig>({ mcps: {}, skills: {} });
 
 	useEffect(() => {
 		if (!open || !schema) {
@@ -51,6 +54,7 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 		// any unset fields fall back to defaults rather than empty.
 		const base = defaultAgentFormValues(schema);
 		const d = agent.data;
+		setResources(d.resource_config);
 		setValues({
 			identity: {
 				...base.identity,
@@ -82,6 +86,7 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 				agent.id,
 				{
 					name,
+					resource_config: resources,
 					system_prompt: values.identity.system_prompt as string | undefined,
 					chat_config: {
 						context_config: values.context_config as unknown as ContextConfig,
@@ -113,7 +118,18 @@ export function EditAgentDialog({ open, onOpenChange, agent, onUpdated }: Props)
 				</DialogHeader>
 				<div className="no-scrollbar -mx-4 max-h-[75vh] overflow-y-auto px-4">
 					{schema && values ? (
-						<AgentFormFields schema={schema} values={values} onChange={handleChange} />
+						<>
+							<AgentFormFields
+								schema={schema}
+								values={values}
+								onChange={handleChange}
+							/>
+							<AgentResources
+								value={resources}
+								onChange={setResources}
+								disabled={submitting}
+							/>
+						</>
 					) : (
 						<p className="text-muted-foreground text-sm">{t('common.loading')}</p>
 					)}

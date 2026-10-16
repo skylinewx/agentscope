@@ -26,11 +26,57 @@ from ._base import (
 )
 
 
+def _hash_skill_directory(skill_path: str) -> str:
+    """Hash relative paths and file bytes, independently of root and mtimes.
+
+    Follow symlinks like ``shutil.copytree`` does, but reject cycles. Each
+    path is length-prefixed and each file contributes a fixed-size digest
+    so entry boundaries cannot be confused with file contents.
+    """
+    tree_hash = hashlib.sha256(b"agentscope-skill-tree-v2\0")
+    ancestors: set[str] = set()
+
+    def visit(directory: str, relative_dir: str) -> None:
+        """Visit one directory in stable name order."""
+        real_dir = os.path.normcase(os.path.realpath(directory))
+        if real_dir in ancestors:
+            raise ValueError(f"Cyclic skill directory: {directory!r}")
+        ancestors.add(real_dir)
+        try:
+            with os.scandir(directory) as entries:
+                children = sorted(entries, key=lambda entry: entry.name)
+            for entry in children:
+                relative_path = (
+                    f"{relative_dir}/{entry.name}"
+                    if relative_dir
+                    else entry.name
+                )
+                path_bytes = relative_path.encode("utf-8", "surrogateescape")
+                is_dir = entry.is_dir()
+                if not is_dir and not entry.is_file():
+                    raise ValueError(f"Unsupported skill file: {entry.path!r}")
+                tree_hash.update(b"D" if is_dir else b"F")
+                tree_hash.update(len(path_bytes).to_bytes(8, "big"))
+                tree_hash.update(path_bytes)
+                if is_dir:
+                    visit(entry.path, relative_path)
+                else:
+                    with open(entry.path, "rb") as source:
+                        tree_hash.update(
+                            hashlib.file_digest(source, "sha256").digest(),
+                        )
+        finally:
+            ancestors.remove(real_dir)
+
+    visit(skill_path, "")
+    return tree_hash.hexdigest()
+
+
 class _SkillEntry(TypedDict):
     """A single entry in the .skills index file."""
 
     hash: str
-    """SHA-256 hash of the skill's SKILL.md content."""
+    """SHA-256 hash of the skill's directory paths and file contents."""
     skill_name: str
     """The name exposed to the agent (may differ from the directory name)."""
 
@@ -185,7 +231,10 @@ class LocalWorkspace(WorkspaceBase):
         skills_dir = self._skill_seed_dir
         os.makedirs(skills_dir, exist_ok=True)
 
-        skills_file = await self._load_skills_file(skills_dir)
+        skills_file = await self._load_skills_file(
+            skills_dir,
+            refresh_hashes=True,
+        )
         existing: dict[str, _SkillEntry] = skills_file["skills"]
 
         # Build fast-lookup sets from the current index
@@ -286,29 +335,63 @@ class LocalWorkspace(WorkspaceBase):
         """Get the workspace instructions."""
         return self.instructions
 
-    async def _load_skills_file(self, skills_dir: str) -> _SkillsFile:
+    async def _load_skills_file(
+        self,
+        skills_dir: str,
+        *,
+        refresh_hashes: bool = False,
+    ) -> _SkillsFile:
         """Load the .index file, returning an empty structure if absent.
 
         Args:
             skills_dir (`str`): The partition directory path.
+            refresh_hashes (`bool`): Rehash installed directories before
+                comparing imports, including edits to their extra files.
 
         Returns:
             `_SkillsFile`: The parsed index, or a fresh empty structure.
         """
         path = os.path.join(skills_dir, ".index")
         if not await self._backend.file_exists(path):
-            return {"skills_dir_mtime": 0.0, "skills": {}}
+            return {
+                "skills_dir_mtime": 0.0,
+                "skills": {},
+            }
 
         try:
             raw = await self._backend.read_file(path)
             data = json.loads(raw.decode("utf-8"))
-            return _SkillsFile(
+            skills_file = _SkillsFile(
                 skills_dir_mtime=float(data.get("skills_dir_mtime", 0.0)),
                 skills=data.get("skills", {}),
             )
+            if refresh_hashes and await self._refresh_skill_hashes(
+                skills_dir, skills_file
+            ):
+                await self._save_skills_file(skills_dir, skills_file)
+            return skills_file
         except Exception as e:
             logger.warning("Failed to load .skills from %s: %s", path, str(e))
-            return {"skills_dir_mtime": 0.0, "skills": {}}
+            return {
+                "skills_dir_mtime": 0.0,
+                "skills": {},
+            }
+
+    async def _refresh_skill_hashes(
+        self,
+        skills_dir: str,
+        skills_file: _SkillsFile,
+    ) -> bool:
+        """Refresh content hashes while preserving directory names/aliases."""
+        updated = False
+        for dir_name, entry in skills_file["skills"].items():
+            result = await self._validate_and_hash_skill(
+                os.path.join(skills_dir, dir_name),
+            )
+            if result is not None and entry["hash"] != result[2]:
+                entry["hash"] = result[2]
+                updated = True
+        return updated
 
     async def _save_skills_file(
         self,
@@ -387,7 +470,7 @@ class LocalWorkspace(WorkspaceBase):
         self,
         skill_path: str,
     ) -> tuple[str, str, str] | None:
-        """Validate a skill and compute its hash.
+        """Validate a skill and hash its complete directory off the event loop.
 
         Args:
             skill_path (`str`):
@@ -402,12 +485,15 @@ class LocalWorkspace(WorkspaceBase):
         if validation_result is None:
             return None
 
-        skill_name, _, skill_md_content = validation_result
-
-        # Compute hash
-        skill_hash = hashlib.sha256(
-            skill_md_content.encode("utf-8"),
-        ).hexdigest()
+        skill_name = validation_result[0]
+        try:
+            skill_hash = await asyncio.to_thread(
+                _hash_skill_directory,
+                skill_path,
+            )
+        except (OSError, ValueError) as e:
+            logger.warning("Failed to hash skill at %s: %s", skill_path, e)
+            return None
 
         return skill_path, skill_name, skill_hash
 
@@ -573,6 +659,10 @@ class LocalWorkspace(WorkspaceBase):
             updated = True
 
         # Add entries for directories not yet in the index
+        updated = (
+            await self._refresh_skill_hashes(skills_dir, skills_file)
+            or updated
+        )
         existing_agent_names: set[str] = {
             e["skill_name"] for e in existing.values()
         }
@@ -777,7 +867,7 @@ class LocalWorkspace(WorkspaceBase):
 
         The skill directory must contain a valid ``SKILL.md`` file with
         ``name`` and ``description`` frontmatter fields.  Duplicate skills
-        (identified by the SHA-256 hash of ``SKILL.md``) are silently skipped.
+        (identified by relative paths and all file contents) are skipped.
         Name and directory conflicts are resolved by appending a numeric
         suffix. All three are scoped to the partition: what another agent
         installed neither collides with this one nor dedups against it,
@@ -808,7 +898,10 @@ class LocalWorkspace(WorkspaceBase):
 
             _, raw_name, skill_hash = result
 
-            skills_file = await self._load_skills_file(skills_dir)
+            skills_file = await self._load_skills_file(
+                skills_dir,
+                refresh_hashes=True,
+            )
             existing: dict[str, _SkillEntry] = skills_file["skills"]
 
             existing_hashes: set[str] = {e["hash"] for e in existing.values()}

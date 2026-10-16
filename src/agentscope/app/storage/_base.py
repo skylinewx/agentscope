@@ -1,7 +1,11 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=too-many-public-methods
 """The storage base class."""
+
 from abc import ABC, abstractmethod
+import asyncio
+from collections.abc import Callable
+from weakref import WeakValueDictionary
 from datetime import datetime, timedelta
 from typing import Any, Self
 
@@ -47,6 +51,59 @@ class StorageBase(ABC):
 
     async def aclose(self) -> None:
         """Release underlying connection resources. Default is a no-op."""
+
+    def _mutation_lock(self, key: tuple) -> asyncio.Lock:
+        """Fallback serialization for in-process storage implementations."""
+        if not hasattr(self, "_record_mutation_locks"):
+            self._record_mutation_locks = WeakValueDictionary()
+        lock = self._record_mutation_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._record_mutation_locks[key] = lock
+        return lock
+
+    async def mutate_agent(
+        self,
+        user_id: str,
+        agent_id: str,
+        mutate: Callable[[AgentRecord], None],
+    ) -> AgentRecord:
+        """Update the latest record. Persistent backends provide atomic CAS.
+
+        The synchronous callback may be retried and must have no side effects.
+        """
+        async with self._mutation_lock(("agent", user_id, agent_id)):
+            record = await self.get_agent(user_id, agent_id)
+            if record is None:
+                raise KeyError(agent_id)
+            record = record.model_copy(deep=True)
+            mutate(record)
+            record.updated_at = datetime.now()
+            await self.upsert_agent(user_id, record)
+            return record
+
+    async def mutate_session(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        mutate: Callable[[SessionRecord], None],
+    ) -> SessionRecord:
+        """Atomically mutate the latest session without stale config writes."""
+        async with self._mutation_lock(("session", user_id, session_id)):
+            record = await self.get_session(user_id, agent_id, session_id)
+            if record is None:
+                raise KeyError(session_id)
+            record = record.model_copy(deep=True)
+            mutate(record)
+            record.updated_at = datetime.now()
+            return await self.upsert_session(
+                user_id,
+                agent_id,
+                config=record.config,
+                state=record.state,
+                session_id=session_id,
+            )
 
     @abstractmethod
     async def upsert_credential(
@@ -140,7 +197,7 @@ class StorageBase(ABC):
 
     @abstractmethod
     async def list_mcps(self, user_id: str) -> list[MCPRecord]:
-        """List every MCP a user has installed, enabled or not.
+        """List every MCP definition in a user's resource library.
 
         Args:
             user_id (`str`):
@@ -212,7 +269,8 @@ class StorageBase(ABC):
         """Create or update an installed-skill record.
 
         The record's ``name`` is unique per user, for the same reason
-        MCP names are: a workspace refers to a skill by name.
+        MCP names are: humans identify resources by name in the library.
+        Agent and session bindings reference their stable resource IDs.
 
         Args:
             user_id (`str`):
@@ -231,7 +289,7 @@ class StorageBase(ABC):
 
     @abstractmethod
     async def list_skills(self, user_id: str) -> list[SkillRecord]:
-        """List every skill a user has installed, enabled or not.
+        """List every Skill package in a user's resource library.
 
         Named apart from the workspace's ``list_skills`` because these
         are library records, not skills present in any workspace.

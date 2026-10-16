@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """The base class for the chat models."""
+
 import asyncio
 import inspect
 import json
@@ -14,6 +15,7 @@ from pydantic import BaseModel, ValidationError as PydanticValidationError
 from ._model_response import StructuredResponse, ChatResponse, FinishedReason
 from ._model_card import ModelCard
 from ._utils import _StreamAccumulator
+from ._diagnostics import ModelCallDiagnostic
 from .._logging import logger
 from .._utils._common import _json_loads_with_repair
 from ..credential import CredentialBase
@@ -36,6 +38,9 @@ _MULTIMODAL_DATA_BLOCK_TOKEN_ESTIMATE = 2000
 
 class ChatModelBase:
     """The base class for chat models."""
+
+    _text_bytes_per_token: float = 4
+    """Fallback text estimate; providers can choose a conservative ratio."""
 
     class Parameters(BaseModel):
         """Each subclass should implement this inner class to define its
@@ -203,6 +208,7 @@ class ChatModelBase:
                 Additional keyword arguments passed to the underlying API.
         """
 
+        diagnostic = ModelCallDiagnostic()
         retryable = self._get_retryable_exceptions()
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
@@ -224,6 +230,7 @@ class ChatModelBase:
                 )
 
             except Exception as e:
+                diagnostic.failed(e, 'request', attempt + 1)
                 if not isinstance(e, retryable):
                     raise
                 last_error = e
@@ -233,7 +240,7 @@ class ChatModelBase:
                         "Retrying in %.1fs...",
                         attempt + 1,
                         self.model,
-                        str(e),
+                        type(e).__name__,
                         self.retry_delay,
                     )
                     await asyncio.sleep(self.retry_delay)
@@ -262,8 +269,10 @@ class ChatModelBase:
             # For backward compatibility
             yield_acc_res = True
             acc_res = _StreamAccumulator()
+            received_chunks = 0
             try:
                 async for chunk in res:
+                    received_chunks += 1
                     if not chunk.is_last:
                         acc_res.append_chat_response(chunk)
                         acc_res.id = chunk.id
@@ -283,6 +292,9 @@ class ChatModelBase:
             except asyncio.CancelledError:
                 acc_res.finished_reason = FinishedReason.INTERRUPTED
                 yield_acc_res = True
+            except Exception as error:
+                diagnostic.failed(error, 'stream', attempt + 1, chunks=received_chunks)
+                raise
             finally:
                 # Closing this wrapper does not close the delegated iterator.
                 # Wait for provider cleanup before ``aclose`` returns.
@@ -380,7 +392,9 @@ class ChatModelBase:
         tools: list[dict] | None,
     ) -> int:
         """A quick and unified method to estimate the token count of the
-        model input by dividing the total input size in bytes by 4.
+        model input using the provider's fallback bytes-per-token ratio.
+        The default ratio is four; providers with denser tokenization can
+        lower it to leave more room for context compression.
 
         Note a standard way to count the tokens is first formatting the input
         messages into the API required format, then use the tokenizer of the
@@ -458,7 +472,9 @@ class ChatModelBase:
 
         # Count the text tokens
         acc_text = "".join(acc_texts)
-        cnt += int(len(acc_text.encode("utf-8")) / 4 + 0.5)
+        cnt += int(
+            len(acc_text.encode("utf-8")) / self._text_bytes_per_token + 0.5,
+        )
 
         return cnt
 
@@ -523,6 +539,7 @@ class ChatModelBase:
         else:
             strategies = (("explicit", {}, user_tool_choice),)
 
+        diagnostic = ModelCallDiagnostic()
         retryable = tuple(self._get_retryable_exceptions())
         fallback: tuple[Type[Exception], ...] = (
             StructuredOutputError,
@@ -556,6 +573,7 @@ class ChatModelBase:
                         )
                     return result
                 except Exception as e:  # pylint: disable=broad-except
+                    diagnostic.failed(e, 'structured_output', attempt + 1, strategy=name)
                     # CancelledError / KeyboardInterrupt derive from
                     # BaseException and are not caught here, so they
                     # propagate as expected.
@@ -572,7 +590,7 @@ class ChatModelBase:
                                 "failed: %s. Retrying in %.1fs...",
                                 attempt + 1,
                                 self.model,
-                                e,
+                                type(e).__name__,
                                 self.retry_delay,
                             )
                             await asyncio.sleep(self.retry_delay)
@@ -587,7 +605,7 @@ class ChatModelBase:
                         "Trying next.",
                         name,
                         self.model,
-                        e,
+                        type(e).__name__,
                     )
                     break
 

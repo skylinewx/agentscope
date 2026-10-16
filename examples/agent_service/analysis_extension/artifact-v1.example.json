@@ -1,0 +1,524 @@
+{
+  "actions": [],
+  "agentId": "fixture-agent",
+  "analysisId": "ana_93bf15289563480bb76b637889eefd2b",
+  "analysisRef": "ana_93bf15289563480bb76b637889eefd2b:1",
+  "baseRevision": 0,
+  "calculationValidation": "PASS",
+  "captureRefs": [
+    "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c"
+  ],
+  "claims": [],
+  "comparability": "CONFIRMED",
+  "context": {
+    "asOf": "2026-01-01T00:00:00Z",
+    "contextId": "context-A",
+    "permissionStatus": "NOT_INTEGRATED",
+    "schemaHash": "schema-A",
+    "snapshotId": "snapshot-A",
+    "sourceId": "source-A"
+  },
+  "coverage": "COMPLETE",
+  "createdAt": "2026-10-12T16:22:43.329457+00:00",
+  "derivedValues": [
+    {
+      "calculationValidation": "PASS",
+      "derivedId": "derived_order",
+      "diagnostics": [],
+      "direction": "desc",
+      "executionStatus": "COMPLETED",
+      "inputRefs": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_edcd93576292e606d0c101db",
+        "fact_d6bf8e2bde5d6e071f62ca1c"
+      ],
+      "meaning": "source_value_order",
+      "operator": "SORT",
+      "orderedFactIds": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_edcd93576292e606d0c101db",
+        "fact_d6bf8e2bde5d6e071f62ca1c"
+      ],
+      "precision": "derived_decimal",
+      "rounding": null,
+      "ruleRef": null,
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "scopeMeaning": "selected_members",
+      "sourceFactIds": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_d6bf8e2bde5d6e071f62ca1c",
+        "fact_edcd93576292e606d0c101db"
+      ],
+      "unavailableFactIds": [],
+      "value": null,
+      "valueState": "NOT_APPLICABLE"
+    },
+    {
+      "calculationValidation": "PASS",
+      "derivedId": "derived_rank",
+      "diagnostics": [],
+      "direction": "desc",
+      "executionStatus": "COMPLETED",
+      "inputRefs": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_edcd93576292e606d0c101db",
+        "fact_d6bf8e2bde5d6e071f62ca1c"
+      ],
+      "meaning": "comparable_metric_ranking",
+      "operator": "RANK",
+      "orderedFactIds": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_edcd93576292e606d0c101db",
+        "fact_d6bf8e2bde5d6e071f62ca1c"
+      ],
+      "precision": "derived_decimal",
+      "rounding": null,
+      "ruleRef": null,
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "scopeMeaning": "selected_members",
+      "sourceFactIds": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_d6bf8e2bde5d6e071f62ca1c",
+        "fact_edcd93576292e606d0c101db"
+      ],
+      "unavailableFactIds": [],
+      "value": null,
+      "valueState": "NOT_APPLICABLE"
+    },
+    {
+      "calculationValidation": "PASS",
+      "counts": {
+        "negative": 2,
+        "observed": 3,
+        "positive": 1,
+        "unavailable": 0,
+        "zero": 0
+      },
+      "derivedId": "derived_count",
+      "diagnostics": [],
+      "executionStatus": "COMPLETED",
+      "inputRefs": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_edcd93576292e606d0c101db",
+        "fact_d6bf8e2bde5d6e071f62ca1c"
+      ],
+      "operator": "COUNT",
+      "precision": "derived_decimal",
+      "rounding": null,
+      "ruleRef": null,
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "scopeMeaning": "selected_members",
+      "sourceFactIds": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_d6bf8e2bde5d6e071f62ca1c",
+        "fact_edcd93576292e606d0c101db"
+      ],
+      "unit": "项",
+      "value": "3",
+      "valueState": "PRESENT"
+    },
+    {
+      "calculationValidation": "PASS",
+      "derivedId": "derived_sum",
+      "diagnostics": [],
+      "executionStatus": "COMPLETED",
+      "inputRefs": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_edcd93576292e606d0c101db",
+        "fact_d6bf8e2bde5d6e071f62ca1c"
+      ],
+      "operator": "SUM",
+      "precision": "derived_decimal",
+      "rounding": null,
+      "ruleRef": "fixture-additive",
+      "ruleSource": "Synthetic additive metric definition for regression only",
+      "ruleVersion": "1",
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "scopeMeaning": "selected_members",
+      "sourceFactIds": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_d6bf8e2bde5d6e071f62ca1c",
+        "fact_edcd93576292e606d0c101db"
+      ],
+      "unit": "元",
+      "value": "-9233.14",
+      "valueState": "PRESENT"
+    }
+  ],
+  "engineVersion": "1.5.0",
+  "facts": [
+    {
+      "bindingRef": "binding-A",
+      "captureRefs": [
+        "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c"
+      ],
+      "cellAddress": "A2",
+      "cellKey": "2:1",
+      "column": 1,
+      "contentDigest": "digest-0",
+      "context": {
+        "asOf": "2026-01-01T00:00:00Z",
+        "contextId": "context-A",
+        "permissionStatus": "NOT_INTEGRATED",
+        "schemaHash": "schema-A",
+        "snapshotId": "snapshot-A",
+        "sourceId": "source-A"
+      },
+      "dimensions": {
+        "ACCOUNT": "profit",
+        "DATATIME": "2026N0001",
+        "MD_CURRENCY": "CNY",
+        "MD_ORG": "object-0",
+        "MD_STAGE": "FINAL",
+        "SCENE": "budget"
+      },
+      "displayValue": "100",
+      "evidenceIds": [
+        "evidence-observation-0"
+      ],
+      "executionId": "execution-A",
+      "factId": "fact_7251f4bb25fe11c225a52d15",
+      "formName": "合成利润表",
+      "formula": null,
+      "headers": [
+        "净利润"
+      ],
+      "measureCode": "AMOUNT",
+      "objectId": "object-0",
+      "objectLabel": "合成成员 0",
+      "objectLabelState": "RESOLVED",
+      "objectModelCode": null,
+      "observationId": "observation-0",
+      "period": "2026N0001",
+      "precision": "raw_json",
+      "rawValueJson": "\"100\"",
+      "readAt": "2026-01-01T00:00:01Z",
+      "row": 2,
+      "scale": "1",
+      "scaleBasis": "source_unit_label",
+      "sourceOrigins": [
+        "4126e53b2863e6c88af5b7e7eeffa602649c5e0a5302bf6c7c9e4921cb433300"
+      ],
+      "stepId": "form-0",
+      "taskName": "合成任务",
+      "unit": "元",
+      "value": "100",
+      "valueState": "PRESENT"
+    },
+    {
+      "bindingRef": "binding-A",
+      "captureRefs": [
+        "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c"
+      ],
+      "cellAddress": "A2",
+      "cellKey": "2:1",
+      "column": 1,
+      "contentDigest": "digest-1",
+      "context": {
+        "asOf": "2026-01-01T00:00:00Z",
+        "contextId": "context-A",
+        "permissionStatus": "NOT_INTEGRATED",
+        "schemaHash": "schema-A",
+        "snapshotId": "snapshot-A",
+        "sourceId": "source-A"
+      },
+      "dimensions": {
+        "ACCOUNT": "profit",
+        "DATATIME": "2026N0001",
+        "MD_CURRENCY": "CNY",
+        "MD_ORG": "object-1",
+        "MD_STAGE": "FINAL",
+        "SCENE": "budget"
+      },
+      "displayValue": "-1033.14",
+      "evidenceIds": [
+        "evidence-observation-1"
+      ],
+      "executionId": "execution-A",
+      "factId": "fact_edcd93576292e606d0c101db",
+      "formName": "合成利润表",
+      "formula": null,
+      "headers": [
+        "净利润"
+      ],
+      "measureCode": "AMOUNT",
+      "objectId": "object-1",
+      "objectLabel": "合成成员 1",
+      "objectLabelState": "RESOLVED",
+      "objectModelCode": null,
+      "observationId": "observation-1",
+      "period": "2026N0001",
+      "precision": "raw_json",
+      "rawValueJson": "\"-1033.14\"",
+      "readAt": "2026-01-01T00:00:01Z",
+      "row": 2,
+      "scale": "1",
+      "scaleBasis": "source_unit_label",
+      "sourceOrigins": [
+        "4126e53b2863e6c88af5b7e7eeffa602649c5e0a5302bf6c7c9e4921cb433300"
+      ],
+      "stepId": "form-1",
+      "taskName": "合成任务",
+      "unit": "元",
+      "value": "-1033.14",
+      "valueState": "PRESENT"
+    },
+    {
+      "bindingRef": "binding-A",
+      "captureRefs": [
+        "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c"
+      ],
+      "cellAddress": "A2",
+      "cellKey": "2:1",
+      "column": 1,
+      "contentDigest": "digest-2",
+      "context": {
+        "asOf": "2026-01-01T00:00:00Z",
+        "contextId": "context-A",
+        "permissionStatus": "NOT_INTEGRATED",
+        "schemaHash": "schema-A",
+        "snapshotId": "snapshot-A",
+        "sourceId": "source-A"
+      },
+      "dimensions": {
+        "ACCOUNT": "profit",
+        "DATATIME": "2026N0001",
+        "MD_CURRENCY": "CNY",
+        "MD_ORG": "object-2",
+        "MD_STAGE": "FINAL",
+        "SCENE": "budget"
+      },
+      "displayValue": "-8300",
+      "evidenceIds": [
+        "evidence-observation-2"
+      ],
+      "executionId": "execution-A",
+      "factId": "fact_d6bf8e2bde5d6e071f62ca1c",
+      "formName": "合成利润表",
+      "formula": null,
+      "headers": [
+        "净利润"
+      ],
+      "measureCode": "AMOUNT",
+      "objectId": "object-2",
+      "objectLabel": "合成成员 2",
+      "objectLabelState": "RESOLVED",
+      "objectModelCode": null,
+      "observationId": "observation-2",
+      "period": "2026N0001",
+      "precision": "raw_json",
+      "rawValueJson": "\"-8300\"",
+      "readAt": "2026-01-01T00:00:01Z",
+      "row": 2,
+      "scale": "1",
+      "scaleBasis": "source_unit_label",
+      "sourceOrigins": [
+        "4126e53b2863e6c88af5b7e7eeffa602649c5e0a5302bf6c7c9e4921cb433300"
+      ],
+      "stepId": "form-2",
+      "taskName": "合成任务",
+      "unit": "元",
+      "value": "-8300",
+      "valueState": "PRESENT"
+    }
+  ],
+  "findingRules": {},
+  "findingVersion": "1.1.0",
+  "findings": [],
+  "inputDigest": "34315c74b8cf5786348426e229f3094814805c9e6246ea18c9dbf9c6a8b1692e",
+  "ownerUserId": "fixture-user",
+  "plan": {
+    "operations": [
+      {
+        "id": "order",
+        "operator": "SORT"
+      },
+      {
+        "id": "rank",
+        "operator": "RANK"
+      },
+      {
+        "id": "count",
+        "operator": "COUNT"
+      },
+      {
+        "id": "sum",
+        "operator": "SUM",
+        "ruleRef": "fixture-additive"
+      }
+    ],
+    "scope": {
+      "expectedDimensions": {
+        "DATATIME": "2026N0001"
+      },
+      "label": "合成数据的指定对象",
+      "memberDimension": "MD_ORG",
+      "members": [
+        "object-0",
+        "object-1",
+        "object-2"
+      ],
+      "population": {
+        "captureRef": "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c",
+        "memberPointer": "/id",
+        "stepId": "population"
+      },
+      "selectionReason": "由已穷尽的合成成员清单选择"
+    },
+    "selections": [
+      {
+        "captureRef": "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c",
+        "cellKeys": [
+          "2:1"
+        ],
+        "stepId": "form-0"
+      },
+      {
+        "captureRef": "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c",
+        "cellKeys": [
+          "2:1"
+        ],
+        "stepId": "form-1"
+      },
+      {
+        "captureRef": "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c",
+        "cellKeys": [
+          "2:1"
+        ],
+        "stepId": "form-2"
+      }
+    ],
+    "workPlan": []
+  },
+  "planDigest": "c438dfa24a80722e255b79895c4eacfaa58de0e1157e93a1dfa3b2b83fb53881",
+  "presentation": {},
+  "presentationPolicy": "explicit",
+  "publicationState": "PUBLISHED",
+  "publishedAt": "2026-10-12T16:22:43.352241+00:00",
+  "receiptVerification": "UNVERIFIED",
+  "relations": [],
+  "revision": 1,
+  "ruleVersion": "2e6d97b5ea0a6bd10b2a72b09edb75de818ed064af8870e399615337056a35ea",
+  "schemaVersion": 1,
+  "scope": {
+    "coverage": "COMPLETE",
+    "excludedMembers": [],
+    "expectedDimensions": {
+      "DATATIME": "2026N0001"
+    },
+    "label": "合成数据的指定对象",
+    "memberDimension": "MD_ORG",
+    "members": [
+      "object-0",
+      "object-1",
+      "object-2"
+    ],
+    "observedMembers": [
+      "object-0",
+      "object-1",
+      "object-2"
+    ],
+    "pendingMembers": [],
+    "population": {
+      "captureRef": "cap_c83b4f2416c1b0342177ea3e7e0b85eb8f83b2c35f89760ba1dc290570240b2c",
+      "memberPointer": "/id",
+      "stepId": "population"
+    },
+    "populationComplete": true,
+    "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+    "selectedDataComplete": true,
+    "selectionReason": "由已穷尽的合成成员清单选择",
+    "semanticCompleteness": "UNVERIFIED"
+  },
+  "sessionId": "fixture-session",
+  "skillVersions": {},
+  "sourceOrigins": [
+    "4126e53b2863e6c88af5b7e7eeffa602649c5e0a5302bf6c7c9e4921cb433300"
+  ],
+  "sourceResourceIds": [
+    "fixture-resource"
+  ],
+  "technicalDetails": false,
+  "verificationRecordedAt": "2026-10-12T16:22:43.329096+00:00",
+  "verificationRecords": [],
+  "viewPlan": [
+    {
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "BAR_RANK",
+      "valueRefs": [
+        "derived_rank"
+      ],
+      "viewId": "view-derived_rank"
+    },
+    {
+      "field": "positive",
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "METRIC",
+      "valueRefs": [
+        "derived_count"
+      ],
+      "viewId": "view-derived_count-positive"
+    },
+    {
+      "field": "negative",
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "METRIC",
+      "valueRefs": [
+        "derived_count"
+      ],
+      "viewId": "view-derived_count-negative"
+    },
+    {
+      "field": "zero",
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "METRIC",
+      "valueRefs": [
+        "derived_count"
+      ],
+      "viewId": "view-derived_count-zero"
+    },
+    {
+      "field": "unavailable",
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "METRIC",
+      "valueRefs": [
+        "derived_count"
+      ],
+      "viewId": "view-derived_count-unavailable"
+    },
+    {
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "METRIC",
+      "valueRefs": [
+        "derived_sum"
+      ],
+      "viewId": "view-derived_sum"
+    },
+    {
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "ORDER",
+      "valueRefs": [
+        "derived_order"
+      ],
+      "viewId": "display-order"
+    },
+    {
+      "scopeId": "scope_0f933de6f54843bb0c5cb45d",
+      "showUnit": true,
+      "type": "TABLE",
+      "valueRefs": [
+        "fact_7251f4bb25fe11c225a52d15",
+        "fact_edcd93576292e606d0c101db",
+        "fact_d6bf8e2bde5d6e071f62ca1c"
+      ],
+      "viewId": "details"
+    }
+  ]
+}

@@ -1443,6 +1443,7 @@ class TestMCP(IsolatedAsyncioTestCase):
             hub_id="static",
             card_id="deepwiki",
             version="1.0.0",
+            card_snapshot={"name": "deepwiki", "version": "1.0.0"},
         )
         mcp_id = await self.storage.upsert_mcp(self.user_id, record)
 
@@ -1453,7 +1454,7 @@ class TestMCP(IsolatedAsyncioTestCase):
         self.assertEqual(fetched.hub_id, "static")
         self.assertEqual(fetched.card_id, "deepwiki")
         self.assertEqual(fetched.version, "1.0.0")
-        self.assertTrue(fetched.enabled)
+        self.assertEqual(fetched.card_snapshot, record.card_snapshot)
 
     async def test_manually_added_mcp_has_no_provenance(self) -> None:
         """An MCP added by hand still gets a record, just without a hub."""
@@ -1497,11 +1498,11 @@ class TestMCP(IsolatedAsyncioTestCase):
         record = make_mcp_record(self.user_id)
         mcp_id = await self.storage.upsert_mcp(self.user_id, record)
 
-        record.enabled = False
+        record.description = "updated description"
         await self.storage.upsert_mcp(self.user_id, record)
 
         fetched = await self.storage.get_mcp(self.user_id, mcp_id)
-        self.assertFalse(fetched.enabled)
+        self.assertEqual(fetched.description, "updated description")
         self.assertEqual(len(await self.storage.list_mcps(self.user_id)), 1)
 
     async def test_rename_releases_the_old_name(self) -> None:
@@ -1580,6 +1581,7 @@ class TestSkill(IsolatedAsyncioTestCase):
             version="1.0.1",
             markdown="# gifgrep",
         )
+        record.update_version("a" * 64, "1.0.1")
         skill_id = await self.storage.upsert_skill(self.user_id, record)
 
         fetched = await self.storage.get_skill(
@@ -1590,7 +1592,9 @@ class TestSkill(IsolatedAsyncioTestCase):
         self.assertEqual(fetched.name, "gifgrep")
         self.assertEqual(fetched.hub_id, "clawhub")
         self.assertEqual(fetched.markdown, "# gifgrep")
-        self.assertTrue(fetched.enabled)
+        self.assertEqual(fetched.artifact_id, "a" * 64)
+        self.assertEqual(fetched.version_updated_at, record.version_updated_at)
+        self.assertIsNotNone(fetched.version_updated_at.tzinfo)
 
     async def test_duplicate_name_rejected(self) -> None:
         """Two records may not share a name."""
@@ -1623,14 +1627,14 @@ class TestSkill(IsolatedAsyncioTestCase):
         record = make_skill_record(self.user_id)
         skill_id = await self.storage.upsert_skill(self.user_id, record)
 
-        record.enabled = False
+        record.description = "updated description"
         await self.storage.upsert_skill(self.user_id, record)
 
         fetched = await self.storage.get_skill(
             self.user_id,
             skill_id,
         )
-        self.assertFalse(fetched.enabled)
+        self.assertEqual(fetched.description, "updated description")
         self.assertEqual(
             len(await self.storage.list_skills(self.user_id)),
             1,

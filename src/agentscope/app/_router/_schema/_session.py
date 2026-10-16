@@ -1,9 +1,11 @@
 # -*- coding: utf-8 -*-
 """Request / response schemas for the session router."""
+
 from pydantic import BaseModel, Field
 
 from ....permission import PermissionMode
 from ...storage import (
+    SessionResourceConfig,
     ChatModelConfig,
     RealtimeModelConfig,
     SessionKnowledgeConfig,
@@ -57,6 +59,9 @@ class TeamDetailResponse(BaseModel):
 class CreateSessionRequest(BaseModel):
     """Request body for creating a new session."""
 
+    resource_config: SessionResourceConfig = Field(
+        default_factory=SessionResourceConfig
+    )
     agent_id: str = Field(description="Agent this session belongs to.")
     workspace_id: str | None = Field(
         default=None,
@@ -115,6 +120,7 @@ class UpdateSessionRequest(BaseModel):
     Omit any field to keep its current value.
     """
 
+    resource_config: SessionResourceConfig | None = None
     name: str | None = Field(
         default=None,
         description="New display name.",

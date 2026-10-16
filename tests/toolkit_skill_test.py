@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Test cases for Toolkit skill-related functionality."""
+
 import json
 import os
 import tempfile
@@ -86,6 +87,8 @@ Skills are a collection of instructions, scripts, and resources to extend your c
 
 **IMPORTANT**: Skills are NOT tools, and you cannot call a skill directly. To use a skill, you MUST use the `Skill` tool to read the skill's full instructions, and then follow those instructions to use the tools and resources provided by the skill.
 
+Read linked text resources with `Skill` using the skill name and `resource` relative path, without copying installation paths. If reading fails, reload the skill instructions and retry the current reference before continuing work that depends on it.
+
 # Available Skills:
 <skill>
 <name>path_skill</name>
@@ -128,6 +131,8 @@ Skills are a collection of instructions, scripts, and resources to extend your c
 Skills are a collection of instructions, scripts, and resources to extend your capabilities.
 
 **IMPORTANT**: Skills are NOT tools, and you cannot call a skill directly. To use a skill, you MUST use the `Skill` tool to read the skill's full instructions, and then follow those instructions to use the tools and resources provided by the skill.
+
+Read linked text resources with `Skill` using the skill name and `resource` relative path, without copying installation paths. If reading fails, reload the skill instructions and retry the current reference before continuing work that depends on it.
 
 # Available Skills:
 <skill>
@@ -231,7 +236,11 @@ class ToolkitSkillViewerTest(IsolatedAsyncioTestCase):
                             "When users asks you to perform tasks, check if "
                             "any of the available skills match. "
                             "Skills provide specialized capabilities and "
-                            "domain knowledge."
+                            "domain knowledge. "
+                            "To read a referenced text file, use resource with its path relative "
+                            "to this skill (for example references/guide.md); do not reconstruct "
+                            "installation paths. On a missing reference, read the skill again "
+                            "and retry its current relative path before continuing dependent work."
                         ),
                         "parameters": {
                             "type": "object",
@@ -240,6 +249,11 @@ class ToolkitSkillViewerTest(IsolatedAsyncioTestCase):
                                     "type": "string",
                                     "description": "The exact name of the "
                                     "skill to view. ",
+                                },
+                                "resource": {
+                                    "type": "string",
+                                    "description": "Optional UTF-8 text file path relative to the "
+                                    "active skill directory. Omit to read the skill instructions.",
                                 },
                             },
                             "required": ["skill"],
@@ -346,7 +360,8 @@ class ToolkitSkillViewerTest(IsolatedAsyncioTestCase):
                         "finished_at": None,
                         "id": AnyString(),
                         "text": "SkillNotFoundError: "
-                        "Skill 'non_existent_skill' not found.",
+                        "Skill 'non_existent_skill' not found. "
+                        "Available skills: ['existing_skill']",
                     },
                 ],
                 "state": "error",
@@ -367,7 +382,8 @@ class ToolkitSkillViewerTest(IsolatedAsyncioTestCase):
                         "finished_at": None,
                         "id": AnyString(),
                         "text": "SkillNotFoundError: "
-                        "Skill 'non_existent_skill' not found.",
+                        "Skill 'non_existent_skill' not found. "
+                        "Available skills: ['existing_skill']",
                     },
                 ],
                 "state": "error",

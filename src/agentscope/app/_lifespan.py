@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """The lifespan of the agent service."""
+
 import asyncio
 import socket
 import uuid
@@ -68,6 +69,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         if blob_store is not None:
             await stack.enter_async_context(blob_store)
 
+        resource_service = app.state.resource_service
+        # Registered before runtimes: connections close after their users.
+        stack.push_async_callback(resource_service.close)
+
         # Hubs live as long as the process so each can hold one client
         # to its registry, instead of re-handshaking per catalog page.
         for hub in (
@@ -110,6 +115,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             policy=resource_access_policy,
         )
         app.state.resource_access_service = resource_access_service
+        app.state.resource_service.access = resource_access_service
 
         # Channel wiring is built here (before ChatService) so the chat
         # service can hand the client factory to get_toolkit: a session
@@ -165,6 +171,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.channel_dispatcher = channel_dispatcher
 
         chat_service = ChatService(
+            resource_service=resource_service,
             storage=storage,
             workspace_manager=workspace_manager,
             scheduler_manager=scheduler,
@@ -181,6 +188,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         app.state.chat_service = chat_service
 
         app.state.realtime_service = RealtimeService(
+            resource_service=resource_service,
             storage=storage,
             workspace_manager=workspace_manager,
             scheduler_manager=scheduler,
@@ -196,6 +204,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
             storage=storage,
             message_bus=message_bus,
             workspace_manager=workspace_manager,
+            resource_service=app.state.resource_service,
         )
 
         # On the stack so its detached advances stop before storage closes.

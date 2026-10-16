@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="zh">
+	<head>
+		<meta charset="UTF-8" />
+		<meta name="viewport" content="width=device-width,initial-scale=1" />
+		<title>资源作用域交互测试</title>
+	</head>
+	<body class="p-8">
+		<h1>资源作用域交互测试</h1>
+		<p>真实 React 组件，模拟资源 API，不修改已有用户数据。</p>
+		<button id="run" class="my-4 rounded border p-2">运行测试</button>
+		<p id="summary" role="status">准备就绪</p>
+		<ol id="results" class="space-y-2"></ol>
+		<div id="harness" class="mt-6 max-w-xl rounded border p-4"></div>
+		<script type="module" src="./resource-scopes.browser.tsx"></script>
+	</body>
+</html>

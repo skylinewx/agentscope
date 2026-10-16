@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Workspace MCP status regression tests</title>
+  <style>
+    body { margin: 32px; font: 16px/1.6 system-ui, sans-serif; color: #182230; }
+    button { font: inherit; padding: 8px 16px; }
+    li { margin: 8px 0; }
+    [data-result="passed"] { color: #18713f; }
+    [data-result="failed"] { color: #b42318; }
+    #harness { border: 1px solid #ddd; padding: 12px; margin-top: 24px; }
+  </style>
+</head>
+<body>
+  <h1>Workspace MCP status regression tests</h1>
+  <p>Uses the real React hook with simulated API responses. No backend calls or saved configuration changes.</p>
+  <p>Run the frontend dev server and open <code>/tests/workspace-mcp.html</code>.</p>
+  <button id="run">Run tests</button>
+  <p id="summary" role="status">Ready</p>
+  <ol id="results"></ol>
+  <div id="harness"></div>
+  <script type="module" src="./workspace-mcp.browser.ts"></script>
+</body>
+</html>

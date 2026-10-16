@@ -1,5 +1,6 @@
 import { ExternalLink } from 'lucide-react';
 
+import { SkillVersionDate } from '@/components/hub/SkillVersion';
 import { Markdown } from '@/components/markdown';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar.tsx';
 import { Badge } from '@/components/ui/badge.tsx';
@@ -26,6 +27,7 @@ export interface ResourceDetail {
 	description: string;
 	tags: string[];
 	version?: string | null;
+	version_updated_at?: string | null;
 	hub_id?: string | null;
 	author?: string | null;
 	icon_url?: string | null;
@@ -117,6 +119,11 @@ export function ResourceDetailDrawer({
 					<div className="flex flex-col">
 						{skill?.version && (
 							<Fact label={t('skill.versionLabel')}>{skill.version}</Fact>
+						)}
+						{skill && 'version_updated_at' in skill && (
+							<Fact label={t('skill.versionUpdatedLabel')}>
+								<SkillVersionDate value={skill.version_updated_at} />
+							</Fact>
 						)}
 						{skill?.hub_id && <Fact label={t('skill.hubLabel')}>{skill.hub_id}</Fact>}
 						{skill?.updated_at && (

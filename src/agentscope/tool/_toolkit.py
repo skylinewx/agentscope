@@ -53,6 +53,8 @@ Skills are a collection of instructions, scripts, and resources to extend your c
 
 **IMPORTANT**: Skills are NOT tools, and you cannot call a skill directly. To use a skill, you MUST use the `{{ skill_viewer }}` tool to read the skill's full instructions, and then follow those instructions to use the tools and resources provided by the skill.
 
+Read linked text resources with `{{ skill_viewer }}` using the skill name and `resource` relative path, without copying installation paths. If reading fails, reload the skill instructions and retry the current reference before continuing work that depends on it.
+
 # Available Skills:{% for skill in skills %}
 <skill>
 <name>{{ skill.name }}</name>

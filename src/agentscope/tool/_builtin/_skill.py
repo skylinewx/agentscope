@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """The builtin skill viewer tool."""
 from typing import Any, Callable, Awaitable, List
+from pathlib import Path, PurePosixPath, PureWindowsPath
+import stat
 
 from ...exception import DeveloperOrientedException
 from ...permission import (
@@ -25,7 +27,11 @@ class SkillViewer(ToolBase):
         "Retrieve a skill within the conversation. "
         "When users asks you to perform tasks, check if any of the available "
         "skills match. "
-        "Skills provide specialized capabilities and domain knowledge."
+        "Skills provide specialized capabilities and domain knowledge. "
+        "To read a referenced text file, use resource with its path relative "
+        "to this skill (for example references/guide.md); do not reconstruct "
+        "installation paths. On a missing reference, read the skill again "
+        "and retry its current relative path before continuing dependent work."
     )
     """The tool description of the skill viewer tool to the agent."""
 
@@ -35,6 +41,11 @@ class SkillViewer(ToolBase):
             "skill": {
                 "type": "string",
                 "description": "The exact name of the skill to view. ",
+            },
+            "resource": {
+                "type": "string",
+                "description": "Optional UTF-8 text file path relative to the "
+                "active skill directory. Omit to read the skill instructions.",
             },
         },
         "required": ["skill"],
@@ -91,6 +102,7 @@ class SkillViewer(ToolBase):
         self,
         skill: str,
         _agent_state: AgentState,
+        resource: str | None = None,
     ) -> ToolChunk:
         """View the details of the skill with the given name.
 
@@ -118,10 +130,51 @@ class SkillViewer(ToolBase):
                 content=[
                     TextBlock(
                         text=f"SkillNotFoundError: Skill '{skill}' "
-                        f"not found.",
+                        f"not found. Available skills: {list(skills)[:50]}",
                     ),
                 ],
                 state=ToolResultState.ERROR,
             )
 
-        return ToolChunk(content=[TextBlock(text=target_skill.markdown)])
+        if resource is None:
+            return ToolChunk(content=[TextBlock(text=target_skill.markdown)])
+        return self._read_resource(target_skill, resource)
+
+    @staticmethod
+    def _read_resource(skill: Skill, resource: str) -> ToolChunk:
+        """Read bounded text within the currently activated skill, never cwd."""
+        try:
+            if not isinstance(resource, str) or not resource.strip():
+                raise ValueError("resource must be a non-empty relative path")
+            relative = PurePosixPath(resource.replace("\\", "/"))
+            if (relative.is_absolute() or PureWindowsPath(resource).drive
+                    or ".." in relative.parts or ":" in resource
+                    or "\x00" in resource):
+                raise ValueError("resource must stay within the skill directory")
+            root = Path(skill.dir).resolve(strict=True)
+            path = (root / str(relative)).resolve()
+            if not path.is_relative_to(root):
+                raise ValueError("resource resolves outside the skill directory")
+            info = path.stat()
+            limit = 256 * 1024
+            if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+                raise ValueError("resource must be a regular text file up to 256 KiB")
+            with path.open("rb") as source:
+                raw = source.read(limit + 1)
+            if len(raw) > limit or b"\x00" in raw:
+                raise ValueError("resource must be UTF-8 text up to 256 KiB")
+            text = raw.decode("utf-8-sig")
+            return ToolChunk(content=[TextBlock(text=text)])
+        except (OSError, ValueError, RuntimeError) as exc:
+            # Do not expose arbitrary absolute paths or silently substitute a
+            # similarly named file. The entry point is the recovery index.
+            reason = str(exc) if isinstance(exc, ValueError) and not isinstance(exc, UnicodeError) else type(exc).__name__
+            return ToolChunk(
+                content=[TextBlock(text=(
+                    f"SkillResourceReadError: {reason}. Read Skill(skill={skill.name!r}) "
+                    "again for current references, then retry Skill with the same "
+                    "skill name and the exact relative resource path. The reference "
+                    "was not read; do not treat dependent instructions as loaded."
+                ))],
+                state=ToolResultState.ERROR,
+            )

@@ -1,10 +1,13 @@
 import { FileX, PlusCircle, Search, SearchX, Trash } from 'lucide-react';
 import { useState } from 'react';
 
+import { ResourceScopeControls } from './ResourceScopeControls';
 import type { Skill } from '@/api';
 import type { UploadOptions } from '@/api/workspace';
 import { AddSkillDialog } from '@/components/dialog/AddSkillDialog.tsx';
 import { DeleteDialog } from '@/components/dialog/DeleteDialog.tsx';
+import { ResourceUpgrade } from '@/components/hub/ResourceControls';
+import { SkillVersion } from '@/components/hub/SkillVersion';
 import { PanelEmpty } from '@/components/panel/PanelEmpty';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar.tsx';
 import { Button } from '@/components/ui/button';
@@ -43,7 +46,9 @@ interface SkillPanelProps {
 	 *
 	 * @param name - The skill name to remove.
 	 */
-	onRemove: (name: string) => Promise<void>;
+	onRemove: (id: string) => Promise<void>;
+	onChange: (id: string, enabled: boolean | null) => Promise<void>;
+	onUpgrade: (name: string) => Promise<void>;
 }
 
 /**
@@ -68,6 +73,8 @@ export function SkillPanel({
 	onUpload,
 	onAddFromLibrary,
 	onRemove,
+	onChange,
+	onUpgrade,
 }: SkillPanelProps) {
 	const { t } = useTranslation();
 	const [search, setSearch] = useState('');
@@ -76,7 +83,7 @@ export function SkillPanel({
 	// The workspace stores only the skill itself, so the icon and author
 	// are looked up in the library, matched on the shared name.
 	const { skills: library } = useSkills();
-	const byName = new Map(library.map((skill) => [skill.name, skill]));
+	const byId = new Map(library.map((skill) => [skill.id, skill]));
 
 	const filtered = search
 		? skills.filter((s) => s.name.toLowerCase().includes(search.toLowerCase()))
@@ -84,7 +91,7 @@ export function SkillPanel({
 
 	return (
 		<div className="flex flex-col flex-1 min-h-0 gap-y-2">
-			<span className="text-muted-foreground text-sm">{t('panel.skill.description')}</span>
+			<span className="text-muted-foreground text-sm">{t('resource.sessionHelp')}</span>
 			<InputGroup>
 				<InputGroupInput
 					placeholder={t('panel.skill.searchPlaceholder')}
@@ -113,9 +120,9 @@ export function SkillPanel({
 			) : (
 				<div className="flex flex-col flex-1 min-h-0 overflow-y-auto scroll-fade gap-y-2">
 					{filtered.map((skill) => {
-						const installed = byName.get(skill.name);
+						const installed = byId.get(skill.resource_id);
 						return (
-							<Item key={skill.name} variant="outline" className="group/skill">
+							<Item key={skill.resource_id} variant="outline" className="group/skill">
 								<ItemMedia>
 									<Avatar className="rounded-md">
 										<AvatarImage
@@ -140,23 +147,43 @@ export function SkillPanel({
 									<ItemDescription className="line-clamp-2">
 										{skill.description}
 									</ItemDescription>
+									<SkillVersion
+										version={skill.installed_version}
+										updatedAt={skill.installed_version_updated_at}
+									/>
 								</ItemContent>
 								<ItemActions>
+									<span className="text-xs text-muted-foreground">
+										{t(`resource.${skill.status}`)}
+									</span>
+									<ResourceScopeControls
+										resource={skill}
+										name={skill.name}
+										onChange={(enabled) => onChange(skill.resource_id, enabled)}
+									/>
+									{skill.enabled && skill.version !== skill.installed_version && (
+										<ResourceUpgrade
+											apply
+											onUpgrade={() => onUpgrade(skill.resource_id)}
+										/>
+									)}
 									{/* Only on hover: deleting is rare, and a
 									    button on every row competes with the
 									    content for attention. */}
-									<Button
-										variant="secondary"
-										size="icon-sm"
-										className="opacity-0 transition-opacity group-hover/skill:opacity-100 focus-visible:opacity-100"
-										onClick={() => {
-											setDeleteTarget(skill.name);
-											setDeleteOpen(true);
-										}}
-										title={t('common.delete')}
-									>
-										<Trash className="size-3" />
-									</Button>
+									{skill.binding_sources.includes('session') && (
+										<Button
+											variant="secondary"
+											size="icon-sm"
+											className="opacity-0 transition-opacity group-hover/skill:opacity-100 focus-visible:opacity-100"
+											onClick={() => {
+												setDeleteTarget(skill.resource_id);
+												setDeleteOpen(true);
+											}}
+											title={t('common.delete')}
+										>
+											<Trash className="size-3" />
+										</Button>
+									)}
 								</ItemActions>
 							</Item>
 						);
@@ -165,7 +192,20 @@ export function SkillPanel({
 			)}
 
 			<AddSkillDialog
-				present={new Set(skills.map((s) => s.name))}
+				present={
+					new Set(
+						skills
+							.filter((s) => s.binding_sources.includes('session'))
+							.map((s) => s.name),
+					)
+				}
+				presentResourceIds={
+					new Set(
+						skills
+							.filter((s) => s.binding_sources.includes('session'))
+							.map((s) => s.resource_id),
+					)
+				}
 				onUpload={onUpload}
 				onAddFromLibrary={onAddFromLibrary}
 			>
@@ -180,9 +220,9 @@ export function SkillPanel({
 				onOpenChange={setDeleteOpen}
 				title={t('common.deleteTitle', {
 					entity: t('dialog-mcp-delete.skillEntity'),
-					name: deleteTarget ?? '',
+					name: skills.find((s) => s.resource_id === deleteTarget)?.name ?? '',
 				})}
-				description={t('dialog-mcp-delete.skillDescription')}
+				description={t('resource.removeLocalHelp')}
 				onConfirm={async () => {
 					if (deleteTarget) await onRemove(deleteTarget);
 				}}

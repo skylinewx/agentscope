@@ -68,6 +68,7 @@ async function streamRequest(path: string, options: RequestOptions = {}): Promis
 		timeoutMs,
 	} = options;
 	const url = new URL(path, baseUrl ?? getBaseUrl());
+	const multipart = body instanceof FormData;
 	if (params) {
 		Object.entries(params).forEach(([k, v]) => url.searchParams.set(k, v));
 	}
@@ -82,8 +83,8 @@ async function streamRequest(path: string, options: RequestOptions = {}): Promis
 	try {
 		res = await fetch(url.toString(), {
 			method,
-			headers: buildHeaders(body !== undefined, userId),
-			body: body ? JSON.stringify(body) : undefined,
+			headers: buildHeaders(body !== undefined && !multipart, userId),
+			body: multipart ? body : body !== undefined ? JSON.stringify(body) : undefined,
 			signal: combined,
 		});
 	} catch (e) {
@@ -122,6 +123,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
 }
 
 export const client = {
+	upload: <T>(path: string, body: FormData, params?: Record<string, string>) =>
+		request<T>(path, { method: 'POST', body, params, silent: true }),
 	get: <T>(
 		path: string,
 		params?: Record<string, string>,

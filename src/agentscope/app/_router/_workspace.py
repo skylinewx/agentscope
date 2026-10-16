@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """Workspace router — manage MCP clients and skills on a workspace."""
+
 import mimetypes
+from typing import Literal
 from urllib.parse import quote
 
 from fastapi import (
@@ -19,16 +21,15 @@ from pydantic import ValidationError
 
 from ..deps import (
     get_current_user_id,
-    get_skill_hubs,
     get_storage,
+    get_resource_service,
     get_workspace_service,
 )
-from ..hub import SkillHubBase
-from .._service import WorkspaceService, WorkspaceStatus
+from .._service import WorkspaceService, WorkspaceStatus, ResourceService
 from .._service._workspace import SkillUploadError, UploadManifest
 from ..storage import MCPRecord, StorageBase
 from ...mcp import MCPClient
-from ...skill import Skill
+from ._schema._workspace import WorkspaceFileInfo, ScopedResourceUpdate
 from ._schema import (
     AddFromLibraryRequest,
     AddFromLibraryResponse,
@@ -38,7 +39,7 @@ from ._schema import (
     DirectoryListing,
     DownloadTokenResponse,
     MCPClientStatus,
-    ToolInfo,
+    WorkspaceSkillView,
 )
 from ..._utils._common import _describe_exception
 
@@ -56,44 +57,23 @@ async def list_mcps(
     session_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> list[MCPClientStatus]:
-    """Return all MCP clients with live tool list and health status."""
+    """Return equipped declarations and cached health without connecting."""
     workspace = await workspace_service.resolve(
         user_id,
         agent_id,
         session_id,
     )
-    clients = await workspace.list_mcps(
-        agent_id=agent_id,
-        session_id=session_id,
-    )
-
-    results = []
-    for client in clients:
-        base = client.model_dump()
-        try:
-            mcp_tools = await client.list_tools()
-            tools = [
-                ToolInfo(name=t.name, description=t.description)
-                for t in mcp_tools
-            ]
-            results.append(
-                MCPClientStatus(
-                    **base,
-                    is_healthy=True,
-                    tools=tools,
-                ),
-            )
-        except Exception as e:
-            results.append(
-                MCPClientStatus(
-                    **base,
-                    is_healthy=False,
-                    error=_describe_exception(e),
-                ),
-            )
-
-    return results
+    return [
+        MCPClientStatus(**item)
+        for item in await resources.list_mcps(
+            user_id,
+            workspace,
+            agent_id,
+            session_id,
+        )
+    ]
 
 
 @workspace_router.post("/mcp", status_code=status.HTTP_201_CREATED)
@@ -104,6 +84,7 @@ async def add_mcp(
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> None:
     """Add an MCP client to the session's workspace.
 
@@ -118,21 +99,25 @@ async def add_mcp(
         agent_id,
         session_id,
     )
+    record = await storage.get_mcp_by_name(user_id, mcp.name)
+    if record is None:
+        record = MCPRecord(user_id=user_id, client=mcp)
+        await storage.upsert_mcp(user_id, record)
+    elif record.client.model_dump() != mcp.model_dump():
+        raise HTTPException(
+            409,
+            "This name is already defined in your library. "
+            "Edit that resource explicitly.",
+        )
     try:
-        await workspace.add_mcp(mcp, agent_id=agent_id, session_id=session_id)
+        await resources.equip_mcp(
+            user_id, workspace, agent_id, session_id, record
+        )
     except ValueError as e:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=str(e),
         ) from e
-
-    if await storage.get_mcp_by_name(user_id, mcp.name) is None:
-        # No hub_id or card_id — this one has no card behind it, which
-        # is what tells the library it cannot be re-keyed or upgraded.
-        await storage.upsert_mcp(
-            user_id,
-            MCPRecord(user_id=user_id, client=mcp),
-        )
 
 
 @workspace_router.post(
@@ -146,6 +131,7 @@ async def add_mcps_from_library(
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> AddFromLibraryResponse:
     """Put MCPs the user has already installed into this workspace.
 
@@ -160,14 +146,6 @@ async def add_mcps_from_library(
         agent_id,
         session_id,
     )
-    present = {
-        client.name
-        for client in await workspace.list_mcps(
-            agent_id=agent_id,
-            session_id=session_id,
-        )
-    }
-
     added: list[str] = []
     failed: dict[str, str] = {}
     for mcp_id in body.mcp_ids:
@@ -175,44 +153,39 @@ async def add_mcps_from_library(
         if record is None:
             failed[mcp_id] = "Not in your library."
             continue
-        if record.client.name in present:
-            # Already there: not an error, just nothing to do.
-            continue
         try:
-            await workspace.add_mcp(
-                record.client,
-                agent_id=agent_id,
-                session_id=session_id,
+            changed = await resources.equip_mcp(
+                user_id, workspace, agent_id, session_id, record
             )
         except Exception as e:
             failed[record.client.name] = _describe_exception(e)
             continue
-        added.append(record.client.name)
+        if changed:
+            added.append(record.client.name)
 
     return AddFromLibraryResponse(added=added, failed=failed)
 
 
 @workspace_router.delete(
-    "/mcp/{mcp_name}",
+    "/mcp/{resource_id}",
     status_code=status.HTTP_204_NO_CONTENT,
 )
 async def remove_mcp(
-    mcp_name: str,
+    resource_id: str,
     agent_id: str = Query(...),
     session_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> None:
-    """Remove an MCP client from the session's workspace by name."""
+    """Remove an MCP session binding by stable resource ID."""
     workspace = await workspace_service.resolve(
         user_id,
         agent_id,
         session_id,
     )
-    await workspace.remove_mcp(
-        mcp_name,
-        agent_id=agent_id,
-        session_id=session_id,
+    await resources.remove_mcp(
+        user_id, workspace, agent_id, session_id, resource_id
     )
 
 
@@ -227,14 +200,20 @@ async def list_skills(
     session_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
-) -> list[Skill]:
-    """Return all skills available in the session's workspace."""
+    resources: ResourceService = Depends(get_resource_service),
+) -> list[WorkspaceSkillView]:
+    """Return equipped Skills, including retained disabled copies."""
     workspace = await workspace_service.resolve(
         user_id,
         agent_id,
         session_id,
     )
-    return await workspace.list_skills(agent_id=agent_id)
+    return [
+        WorkspaceSkillView(**item)
+        for item in await resources.list_skills(
+            user_id, workspace, agent_id, session_id
+        )
+    ]
 
 
 @workspace_router.post(
@@ -248,6 +227,7 @@ async def add_skill(
     session_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> None:
     """Add a skill to the session's workspace from the given path.
 
@@ -261,7 +241,16 @@ async def add_skill(
         agent_id,
         session_id,
     )
-    await workspace.add_skill(body.skill_path, agent_id=agent_id)
+    try:
+        package = await resources.skill_store.capture_directory(
+            body.skill_path
+        )
+        record = await resources.register_skill_package(user_id, package)
+        await resources.equip_skill(
+            user_id, workspace, agent_id, session_id, record
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
 
 
 @workspace_router.post(
@@ -280,6 +269,7 @@ async def upload_skill(
     session_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> None:
     """Install a skill from an uploaded folder.
 
@@ -303,14 +293,14 @@ async def upload_skill(
         session_id,
     )
     try:
-        # The name is unused: the tar members already carry the picked
-        # folder as their first path segment.
-        await workspace_service.install_skill(
-            workspace,
+        package = await resources.skill_store.capture_archive(
             workspace_service.tar_stream(parsed, files),
             "tar",
             "skill",
-            agent_id=agent_id,
+        )
+        record = await resources.register_skill_package(user_id, package)
+        await resources.equip_skill(
+            user_id, workspace, agent_id, session_id, record
         )
     except (SkillUploadError, ValueError) as e:
         raise HTTPException(
@@ -330,13 +320,12 @@ async def add_skills_from_library(
     user_id: str = Depends(get_current_user_id),
     storage: StorageBase = Depends(get_storage),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
-    skill_hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> AddFromLibraryResponse:
     """Put skills the user has already installed into this workspace.
 
-    Each one is re-downloaded from its hub and piped into the
-    workspace; the server holds no copy in between. Adding is
-    per-skill, and the response says which ones landed.
+    A complete package must already be saved at installation or explicit
+    update time. Reads and workspace selection never backfill packages.
     """
     workspace = await workspace_service.resolve(
         user_id,
@@ -351,56 +340,84 @@ async def add_skills_from_library(
         if record is None:
             failed[skill_id] = "Not in your library."
             continue
-        hub = skill_hubs.get(record.hub_id or "")
-        if hub is None:
-            failed[
-                record.name
-            ] = f"Its hub {record.hub_id!r} is no longer registered."
-            continue
         try:
-            archive = await hub.download(
-                user_id,
-                record.card_id or record.name,
-                record.version,
-            )
-            await workspace_service.install_skill(
-                workspace,
-                archive.stream,
-                archive.format,
-                record.name,
-                agent_id=agent_id,
+            changed = await resources.equip_skill(
+                user_id, workspace, agent_id, session_id, record
             )
         except Exception as e:  # pylint: disable=broad-except
             failed[record.name] = _describe_exception(e)
             continue
-        added.append(record.name)
+        if changed:
+            added.append(record.name)
 
     return AddFromLibraryResponse(added=added, failed=failed)
 
 
-@workspace_router.delete(
-    "/skill/{skill_name}",
-    status_code=status.HTTP_204_NO_CONTENT,
-)
-async def remove_skill(
-    skill_name: str,
+@workspace_router.post("/skill/{resource_id}/upgrade")
+async def upgrade_workspace_skill(
+    resource_id: str,
     agent_id: str = Query(...),
     session_id: str = Query(...),
     user_id: str = Depends(get_current_user_id),
+    storage: StorageBase = Depends(get_storage),
     workspace_service: WorkspaceService = Depends(get_workspace_service),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> None:
-    """Remove a skill from the session's workspace by name."""
-    workspace = await workspace_service.resolve(
-        user_id,
-        agent_id,
-        session_id,
+    """Apply a saved version as a new copy; refuse to replace edited Skills."""
+    workspace = await workspace_service.resolve(user_id, agent_id, session_id)
+    bound = next(
+        (
+            record
+            for selection, record in await resources.effective(
+                user_id, agent_id, session_id
+            )
+            if selection.kind == "skill"
+            and selection.resource_id == resource_id
+        ),
+        None,
     )
+    if bound is None or bound.user_id != user_id:
+        raise HTTPException(404, "Skill is not available in your library.")
+    record = bound
     try:
-        await workspace.remove_skill(skill_name, agent_id=agent_id)
-    except KeyError:
-        # ``LocalWorkspace`` already treats a missing skill as a no-op.
-        # Keep DELETE idempotent for the other workspace implementations.
-        return
+        await resources.equip_skill(
+            user_id, workspace, agent_id, session_id, record, upgrade=True
+        )
+    except ValueError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+@workspace_router.delete(
+    "/skill/{resource_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def remove_skill(
+    resource_id: str,
+    agent_id: str = Query(...),
+    session_id: str = Query(...),
+    user_id: str = Depends(get_current_user_id),
+    resources: ResourceService = Depends(get_resource_service),
+) -> None:
+    """Remove only the session binding; retain its files."""
+    await resources.change_session_resource(
+        user_id, agent_id, session_id, "skill", resource_id, remove=True
+    )
+
+
+@workspace_router.patch("/{kind}/{resource_id}", status_code=204)
+async def update_resource_switch(
+    kind: Literal["mcp", "skill"],
+    resource_id: str,
+    body: ScopedResourceUpdate,
+    agent_id: str = Query(...),
+    session_id: str = Query(...),
+    user_id: str = Depends(get_current_user_id),
+    resources: ResourceService = Depends(get_resource_service),
+) -> None:
+    """Change this conversation only, including while a run is active."""
+    await resources.change_session_resource(
+        user_id, agent_id, session_id, kind, resource_id, body.enabled
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -493,6 +510,40 @@ async def get_workspace_status(
     )
 
 
+@workspace_router.get("/files/info")
+async def workspace_file_info(
+    agent_id: str = Query(...),
+    session_id: str = Query(...),
+    path: str = Query(...),
+    user_id: str = Depends(get_current_user_id),
+    workspace_service: WorkspaceService = Depends(get_workspace_service),
+) -> WorkspaceFileInfo:
+    """Verify a file reference without downloading or executing its contents.
+
+    Relative paths use the workspace root, independent of the session's
+    current working directory. The same session access checks as file reads
+    apply; a Markdown link never grants access on its own.
+    """
+    workspace = await workspace_service.resolve(user_id, agent_id, session_id)
+    backend = workspace.get_backend()
+    target = backend.abspath(path, cwd=workspace.workdir)
+    entry = await backend.stat(target)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="File not found.")
+    if entry.is_dir:
+        raise HTTPException(
+            status_code=400,
+            detail="Requested path is a directory, not a file.",
+        )
+    name = backend.basename(target)
+    return WorkspaceFileInfo(
+        path=target,
+        name=name,
+        media_type=mimetypes.guess_type(name)[0] or "application/octet-stream",
+        size_bytes=entry.size_bytes,
+    )
+
+
 @workspace_router.post("/files/download-token")
 async def create_download_token(
     agent_id: str = Query(...),
@@ -542,8 +593,7 @@ async def read_workspace_file(
         default=False,
         description="Force a Content-Disposition attachment.",
     ),
-    token: str
-    | None = Query(
+    token: str | None = Query(
         default=None,
         description=(
             "A token from ``POST /workspace/files/download-token``, "
@@ -597,15 +647,18 @@ async def read_workspace_file(
             detail="Requested path is a directory, not a file.",
         )
 
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = {
+        "Cache-Control": "private, no-store",
+        "X-Content-Type-Options": "nosniff",
+    }
     # Lets the browser show real download progress instead of a
     # spinner of unknown length; omitted when the backend cannot stat.
     if entry.size_bytes is not None:
         headers["Content-Length"] = str(entry.size_bytes)
     if download:
-        headers[
-            "Content-Disposition"
-        ] = f"attachment; filename*=UTF-8''{quote(basename)}"
+        headers["Content-Disposition"] = (
+            f"attachment; filename*=UTF-8''{quote(basename)}"
+        )
 
     return StreamingResponse(
         backend.read_stream(target),

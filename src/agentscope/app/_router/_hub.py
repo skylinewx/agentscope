@@ -8,6 +8,7 @@ never merged across hubs, which keeps ranking a per-hub concern.
 Installing is user-level for both kinds — nothing here touches a
 workspace. See ``_mcp.py`` / ``_skill.py`` for the libraries it writes.
 """
+
 from typing import TypeVar
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -17,6 +18,7 @@ from ..deps import (
     get_mcp_hubs,
     get_skill_hubs,
     get_storage,
+    get_resource_service,
 )
 from ..hub import (
     HubBase,
@@ -28,6 +30,7 @@ from ..hub import (
     SkillHubPage,
 )
 from .._service import MCPRenderError, render_mcp
+from .._service import ResourceService
 from ..storage import MCPRecord, SkillRecord, StorageBase
 from ._schema import HubInfo, InstallMCPRequest, MCPView, SkillView
 
@@ -143,6 +146,7 @@ async def install_mcp(
     user_id: str = Depends(get_current_user_id),
     hubs: dict[str, MCPHubBase] = Depends(get_mcp_hubs),
     storage: StorageBase = Depends(get_storage),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> MCPView:
     """Fill a card's template and add the result to the user's library.
 
@@ -177,6 +181,7 @@ async def install_mcp(
         user_id=user_id,
         client=client,
         values=body.values,
+        card_snapshot=card.model_dump(mode="json"),
         display_name=card.display_name,
         description=card.description,
         tags=card.tags,
@@ -243,14 +248,13 @@ async def install_skill(
     user_id: str = Depends(get_current_user_id),
     hubs: dict[str, SkillHubBase] = Depends(get_skill_hubs),
     storage: StorageBase = Depends(get_storage),
+    resources: ResourceService = Depends(get_resource_service),
 ) -> SkillView:
     """Add a skill card to the user's library.
 
     Mirrors the MCP install: user-level, no workspace involved. The
-    archive is not downloaded here — only the card's metadata is
-    recorded, and the files are fetched when the skill is actually put
-    into a workspace. So a hub that has since dropped the card fails
-    then rather than now.
+    complete package is downloaded and validated now, so later workspace
+    installs can use the saved version while the hub is offline.
     """
     hub = _pick_hub(hubs, hub_id)
     try:
@@ -261,6 +265,14 @@ async def install_skill(
             detail=f"Hub {hub_id!r} has no skill {card_id!r}.",
         ) from e
 
+    archive = await hub.download(user_id, card_id, card.version)
+    try:
+        package = await resources.skill_store.capture_archive(
+            archive.stream, archive.format, name or card.name
+        )
+    except (ValueError, OSError) as exc:
+        raise HTTPException(422, str(exc)) from exc
+
     record = SkillRecord(
         user_id=user_id,
         name=name or card.name,
@@ -270,10 +282,12 @@ async def install_skill(
         author=card.author,
         icon_url=card.icon_url,
         url=card.url,
-        markdown=card.markdown or "",
+        markdown=package.markdown,
         hub_id=card.hub_id,
         card_id=card.id,
-        version=card.version,
+    )
+    record.update_version(
+        package.artifact_id, card.version or package.artifact_id[:12]
     )
     try:
         await storage.upsert_skill(user_id, record)

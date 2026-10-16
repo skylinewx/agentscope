@@ -1,10 +1,16 @@
 # -*- coding: utf-8 -*-
 """The storage module in agentscope."""
+
 from typing import TYPE_CHECKING
 
 from ._base import StorageBase
 from ._redis_storage import RedisStorage
 from ._model import (
+    AgentResourceConfig,
+    ResourceBinding,
+    ResourceOverride,
+    SessionResourceConfig,
+    SkillResourceBinding,
     AgentData,
     AgentRecord,
     ChannelBinding,
@@ -84,6 +90,11 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "AgentResourceConfig",
+    "ResourceBinding",
+    "ResourceOverride",
+    "SessionResourceConfig",
+    "SkillResourceBinding",
     "StorageBase",
     "RedisStorage",
     "AsyncSQLAlchemyStorage",

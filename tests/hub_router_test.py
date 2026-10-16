@@ -1,13 +1,16 @@
 # -*- coding: utf-8 -*-
 # pylint: disable=too-many-public-methods
 """Hub router test case — browse and install, without any network."""
+
 import io
 import json
 import tempfile
 import zipfile
+from pathlib import Path
 from typing import Any, AsyncIterator
 from urllib.parse import quote
 from unittest import IsolatedAsyncioTestCase
+from unittest.mock import AsyncMock, patch
 
 import fakeredis.aioredis
 from fastapi.testclient import TestClient
@@ -18,12 +21,15 @@ from agentscope.app.hub import (
     MCPHubBase,
     MCPHubPage,
     SkillCard,
+    SkillArchive,
     SkillHubBase,
     SkillHubPage,
 )
 from agentscope.app.message_bus import RedisMessageBus
 from agentscope.app.storage import RedisStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
+from agentscope.app.resources import LocalSkillStore
+from agentscope.app._service._resources import ResourceToolkit
 
 HEADERS = {"X-User-ID": "alice"}
 
@@ -193,18 +199,22 @@ class FakeSkillHub(SkillHubBase):
         user_id: str,
         card_id: str,
         version: str | None = None,
-    ) -> AsyncIterator[bytes]:
-        """Yield an in-memory ZIP, or raise for an unknown card."""
+    ) -> SkillArchive:
+        """Return an in-memory archive, or raise for an unknown card."""
         self.download_users.append(user_id)
         if card_id == "nozip":
-            yield b"not a zip at all"
-            return
-        if card_id == "nomd":
-            yield _zip_bytes({"README.md": "nothing here"})
-            return
-        if card_id != "gifgrep":
+            data = b"not a zip at all"
+        elif card_id == "nomd":
+            data = _zip_bytes({"README.md": "nothing here"})
+        elif card_id in ("gifgrep", "runware/music"):
+            data = _zip_bytes({"SKILL.md": SKILL_MD, "notes.md": "x"})
+        else:
             raise KeyError(card_id)
-        yield _zip_bytes({"SKILL.md": SKILL_MD, "notes.md": "x"})
+
+        async def stream() -> AsyncIterator[bytes]:
+            yield data
+
+        return SkillArchive("zip", stream())
 
 
 def _fake_backends() -> tuple:
@@ -247,6 +257,7 @@ class HubRouterTest(IsolatedAsyncioTestCase):
             workspace_manager=LocalWorkspaceManager(workdir),
             mcp_hubs=[FakeMCPHub()],
             skill_hubs=[self._skill_hub],
+            skill_store=LocalSkillStore(f"{workdir}/artifacts"),
             enable_index_worker=False,
         )
         self._client = self.enterContext(TestClient(app))
@@ -365,7 +376,7 @@ class HubRouterTest(IsolatedAsyncioTestCase):
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["hub_id"], "fake")
         self.assertEqual(listed[0]["card_id"], "notion")
-        self.assertTrue(listed[0]["enabled"])
+        self.assertNotIn("enabled", listed[0])
 
     def test_install_snapshots_the_display_fields(self) -> None:
         """Description and tags are copied, so the library can still show
@@ -470,6 +481,28 @@ class HubRouterTest(IsolatedAsyncioTestCase):
         self.assertEqual(auth, "Bearer new")
         self.assertEqual(record.values, {"api_key": "new"})
 
+    async def test_missing_card_template_is_not_backfilled(self) -> None:
+        """Editing inputs does not fetch or save a template for old records."""
+        mcp_id = self._install_mcp("notion", values={"api_key": "old"}).json()[
+            "id"
+        ]
+        storage = self._client.app.state.storage
+        record = await storage.get_mcp("alice", mcp_id)
+        record.card_snapshot = None
+        await storage.upsert_mcp("alice", record)
+        original = record.model_dump(mode="json")
+        hub = self._client.app.state.mcp_hubs["fake"]
+        with patch.object(hub, "get_mcp", new_callable=AsyncMock) as fetch:
+            response = self._client.patch(
+                f"/mcp/{mcp_id}",
+                json={"values": {"api_key": "new"}},
+                headers=HEADERS,
+            )
+            self.assertEqual(response.status_code, 400, response.text)
+            fetch.assert_not_awaited()
+        saved = await storage.get_mcp("alice", mcp_id)
+        self.assertEqual(saved.model_dump(mode="json"), original)
+
     async def test_rekey_merges_over_the_stored_answers(self) -> None:
         """Only the changed key is sent, so a write-only field the form
         never echoed back must survive untouched."""
@@ -547,30 +580,20 @@ class HubRouterTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 409)
 
-    def test_disable_keeps_the_record(self) -> None:
-        """A disabled MCP is kept so re-enabling does not lose config."""
+    def test_library_rejects_global_switch(self):
         mcp_id = self._install_mcp("echo").json()["id"]
-
         response = self._client.patch(
-            f"/mcp/{mcp_id}",
-            json={"enabled": False},
-            headers=HEADERS,
+            f"/mcp/{mcp_id}", json={"enabled": False}, headers=HEADERS
         )
-
-        self.assertFalse(response.json()["enabled"])
+        self.assertEqual(response.status_code, 422)
         self.assertEqual(
-            len(self._client.get("/mcp", headers=HEADERS).json()),
-            1,
+            len(self._client.get("/mcp", headers=HEADERS).json()), 1
         )
 
-    def test_update_missing_returns_404(self) -> None:
-        """Editing an MCP that is not in the library is a 404."""
+    def test_update_missing_returns_404(self):
         response = self._client.patch(
-            "/mcp/no-such-id",
-            json={"enabled": False},
-            headers=HEADERS,
+            "/mcp/no-such-id", json={"description": "edit"}, headers=HEADERS
         )
-
         self.assertEqual(response.status_code, 404)
 
     # ── workspace <-> library ─────────────────────────────────────
@@ -691,6 +714,31 @@ class HubRouterTest(IsolatedAsyncioTestCase):
         ).json()
 
         self.assertFalse(listed[0]["is_healthy"])
+        self.assertEqual(listed[0]["status"], "not_loaded")
+        self.assertIsNone(listed[0]["error"])
+
+        async def load() -> None:
+            app = self._client.app
+            workspace = await app.state.workspace_service.resolve(
+                "alice", **self._scope
+            )
+            tools, skills, entries = await app.state.resource_service.snapshot(
+                "alice",
+                workspace,
+                self._scope["agent_id"],
+                self._scope["session_id"],
+            )
+            await ResourceToolkit(
+                entries=entries, tools=tools, skills_or_loaders=skills
+            ).aclose()
+
+        self._client.portal.call(load)
+        listed = self._client.get(
+            "/workspace/mcp",
+            params=self._scope,
+            headers=HEADERS,
+        ).json()
+        self.assertEqual(listed[0]["status"], "error")
         detail = listed[0]["error"]
         self.assertTrue(detail)
         # The bare ExceptionGroup message says nothing useful; the leaf
@@ -713,11 +761,28 @@ class HubRouterTest(IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(response.json()["name"], "gifgrep")
+        self.assertIsNotNone(response.json()["version_updated_at"])
 
         listed = self._client.get("/skill", headers=HEADERS).json()
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["hub_id"], "fakeskills")
         self.assertEqual(listed[0]["card_id"], "gifgrep")
+        self.assertEqual(
+            listed[0]["version_updated_at"],
+            response.json()["version_updated_at"],
+        )
+
+    def test_hub_skill_same_revision_upgrade_preserves_date(self) -> None:
+        """Checking an unchanged source does not date a new revision."""
+        installed = self._install_skill("gifgrep").json()
+        response = self._client.post(
+            f"/skill/{installed['id']}/upgrade", headers=HEADERS
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["version_updated_at"],
+            installed["version_updated_at"],
+        )
 
     def test_installs_owner_scoped_skill_card(self) -> None:
         """An owner-scoped card id is accepted by the install route."""
@@ -749,12 +814,164 @@ class HubRouterTest(IsolatedAsyncioTestCase):
         ).json()
         self.assertEqual([s["name"] for s in listed], [])
 
-    def test_install_skill_does_not_download(self) -> None:
-        """The archive is fetched when the skill reaches a workspace,
-        not when it is added to the library."""
+    def test_install_skill_saves_the_complete_package(self) -> None:
+        """Library installs save packages for later use without the hub."""
         self._install_skill("gifgrep")
 
-        self.assertEqual(self._skill_hub.download_users, [])
+        self.assertEqual(self._skill_hub.download_users, ["alice"])
+        self.assertTrue(
+            self._client.get("/skill", headers=HEADERS).json()[0][
+                "package_saved"
+            ]
+        )
+
+    async def test_hub_skill_upgrade_preserves_id_switch_and_workcopy(
+        self,
+    ) -> None:
+        """A saved Hub revision changes only after explicit library/apply."""
+        skill_id = self._install_skill("gifgrep").json()["id"]
+        equip = self._client.post(
+            "/workspace/skill/from-library",
+            params=self._scope,
+            json={"skill_ids": [skill_id]},
+            headers=HEADERS,
+        )
+        self.assertEqual(equip.json()["failed"], {})
+        listing = self._client.get(
+            "/workspace/skill", params=self._scope, headers=HEADERS
+        ).json()[0]
+        old_copy = Path(listing["dir"])
+        storage = self._client.app.state.storage
+        previous = await storage.get_skill("alice", skill_id)
+        self._client.patch(
+            f"/workspace/skill/{skill_id}",
+            params=self._scope,
+            json={"enabled": False},
+            headers=HEADERS,
+        )
+        self._skill_hub.card.version = "2"
+
+        async def download(*_args: Any) -> SkillArchive:
+            async def stream() -> AsyncIterator[bytes]:
+                yield _zip_bytes(
+                    {"SKILL.md": SKILL_MD, "notes.md": "new script revision"}
+                )
+
+            return SkillArchive("zip", stream())
+
+        with patch.object(self._skill_hub, "download", new=download):
+            response = self._client.post(
+                f"/skill/{skill_id}/upgrade", headers=HEADERS
+            )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["id"], skill_id)
+        self.assertFalse(
+            self._client.get(
+                "/workspace/skill", params=self._scope, headers=HEADERS
+            ).json()[0]["enabled"]
+        )
+        self.assertEqual(response.json()["version"], "2")
+        updated = await storage.get_skill("alice", skill_id)
+        self.assertIsNotNone(previous.version_updated_at)
+        self.assertGreater(
+            updated.version_updated_at, previous.version_updated_at
+        )
+        self.assertNotEqual(updated.artifact_id, previous.artifact_id)
+        self.assertEqual(updated.markdown, previous.markdown)
+        self.assertEqual((old_copy / "notes.md").read_text("utf-8"), "x")
+        self.assertEqual(
+            self._client.get(
+                "/workspace/skill", params=self._scope, headers=HEADERS
+            ).json()[0]["installed_version"],
+            listing["installed_version"],
+        )
+        self._client.patch(
+            f"/workspace/skill/{skill_id}",
+            params=self._scope,
+            json={"enabled": True},
+            headers=HEADERS,
+        )
+        applied = self._client.post(
+            f"/workspace/skill/{skill_id}/upgrade",
+            params=self._scope,
+            headers=HEADERS,
+        )
+        self.assertEqual(applied.status_code, 200, applied.text)
+        selected = self._client.get(
+            "/workspace/skill", params=self._scope, headers=HEADERS
+        ).json()[0]
+        self.assertEqual(selected["resource_id"], skill_id)
+        self.assertEqual(selected["installed_version"], "2")
+        self.assertEqual(
+            selected["installed_version_updated_at"],
+            response.json()["version_updated_at"],
+        )
+        self.assertEqual(
+            Path(selected["dir"], "notes.md").read_text("utf-8"),
+            "new script revision",
+        )
+        self.assertEqual((old_copy / "notes.md").read_text("utf-8"), "x")
+
+    async def test_hub_skill_upgrade_failures_preserve_saved_package(
+        self,
+    ) -> None:
+        """Unavailable hubs and invalid archives leave the revision intact."""
+        skill_id = self._install_skill("gifgrep").json()["id"]
+        storage = self._client.app.state.storage
+        previous = await storage.get_skill("alice", skill_id)
+        self._client.app.state.skill_hubs.clear()
+        response = self._client.post(
+            f"/skill/{skill_id}/upgrade", headers=HEADERS
+        )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(await storage.get_skill("alice", skill_id), previous)
+        self._client.app.state.skill_hubs["fakeskills"] = self._skill_hub
+
+        async def download(*_args: Any) -> SkillArchive:
+            async def stream() -> AsyncIterator[bytes]:
+                yield _zip_bytes({"README.md": "missing Skill"})
+
+            return SkillArchive("zip", stream())
+
+        with patch.object(self._skill_hub, "download", new=download):
+            response = self._client.post(
+                f"/skill/{skill_id}/upgrade", headers=HEADERS
+            )
+        self.assertEqual(response.status_code, 409, response.text)
+        self.assertEqual(await storage.get_skill("alice", skill_id), previous)
+
+    def test_equal_skill_packages_keep_independent_bindings_and_copies(self):
+        first = self._install_skill("gifgrep").json()["id"]
+        second = self._install_skill("gifgrep", name="gifgrep-2").json()["id"]
+        for resource_id in (first, second):
+            result = self._client.post(
+                "/workspace/skill/from-library",
+                params=self._scope,
+                json={"skill_ids": [resource_id]},
+                headers=HEADERS,
+            ).json()
+            self.assertEqual(result["failed"], {})
+        self._client.patch(
+            f"/workspace/skill/{second}",
+            params=self._scope,
+            json={"enabled": False},
+            headers=HEADERS,
+        )
+        selected = self._client.get(
+            "/workspace/skill", params=self._scope, headers=HEADERS
+        ).json()
+        by_id = {row["resource_id"]: row for row in selected}
+        self.assertEqual(set(by_id), {first, second})
+        self.assertTrue(by_id[first]["enabled"])
+        self.assertFalse(by_id[second]["enabled"])
+        self.assertNotEqual(by_id[first]["dir"], by_id[second]["dir"])
+        self._client.delete(
+            f"/workspace/skill/{first}", params=self._scope, headers=HEADERS
+        )
+        selected = self._client.get(
+            "/workspace/skill", params=self._scope, headers=HEADERS
+        ).json()
+        self.assertEqual([row["resource_id"] for row in selected], [second])
 
     def test_skill_detail_carries_the_markdown(self) -> None:
         """The list view omits ``SKILL.md``; the detail view has it."""

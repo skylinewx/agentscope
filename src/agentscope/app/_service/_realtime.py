@@ -16,6 +16,7 @@ from ..storage import ChannelOrigin, SessionRecord, StorageBase
 from ..workspace_manager import WorkspaceManagerBase
 from ._access import ResourceAccessService
 from ._toolkit import get_toolkit
+from ._resources import ResourceService, close_resource_toolkit
 
 
 class RealtimeService:
@@ -33,6 +34,7 @@ class RealtimeService:
         extra_agent_tools: AgentToolFactory | None = None,
         custom_subagent_templates: dict[str, SubAgentTemplate] | None = None,
         channel_clients: ChannelClients | None = None,
+        resource_service: ResourceService | None = None,
     ) -> None:
         self._storage = storage
         self._workspace_manager = workspace_manager
@@ -40,6 +42,7 @@ class RealtimeService:
         self._background_task_manager = background_task_manager
         self._message_bus = message_bus
         self._access = resource_access_service
+        self._resources = resource_service
         self._extra_agent_tools = extra_agent_tools
         self._subagent_templates = custom_subagent_templates or {}
         self._channel_clients = channel_clients
@@ -94,14 +97,17 @@ class RealtimeService:
         channel_tools = (
             await channel.list_tools(
                 workspace,
-                channel_origin.channel_user_id
-                if chat_kind is ChatKind.PRIVATE
-                else None,
+                (
+                    channel_origin.channel_user_id
+                    if chat_kind is ChatKind.PRIVATE
+                    else None
+                ),
             )
             if channel is not None and channel_origin is not None
             else []
         )
         toolkit = await get_toolkit(
+            resource_service=self._resources,
             storage=self._storage,
             workspace=workspace,
             workspace_manager=self._workspace_manager,
@@ -119,21 +125,25 @@ class RealtimeService:
             channel_tools=channel_tools,
         )
 
-        session.state.session_id = session_id
-        system_prompt = await self._build_system_prompt(
-            agent_record.data.system_prompt,
-            session,
-            channel,
-            channel_tools,
-            chat_kind,
-        )
-        return RealtimeAgent(
-            name=agent_record.data.name,
-            system_prompt=system_prompt,
-            model=model,
-            toolkit=toolkit,
-            state=session.state,
-        )
+        try:
+            session.state.session_id = session_id
+            system_prompt = await self._build_system_prompt(
+                agent_record.data.system_prompt,
+                session,
+                channel,
+                channel_tools,
+                chat_kind,
+            )
+            return RealtimeAgent(
+                name=agent_record.data.name,
+                system_prompt=system_prompt,
+                model=model,
+                toolkit=toolkit,
+                state=session.state,
+            )
+        except BaseException:
+            await close_resource_toolkit(toolkit)
+            raise
 
     async def _resolve_team_role(
         self,

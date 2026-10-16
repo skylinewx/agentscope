@@ -1,0 +1,180 @@
+{
+  "actions": [
+    {
+      "actionRef": "ana_c9b6b5e0f067451aa1183d77fa18537f:1#action_1f5e0ee755227d8781ec766f",
+      "availability": "AVAILABLE",
+      "availabilityReason": "当前已发现同来源执行与核验能力；只判定所选检查是否完成，不自动证明目标文字中的其他结论。",
+      "expectedDecision": "确认所选检查的结果",
+      "findingRefs": [
+        "finding_c2fd9d53c8feb3ef73789686"
+      ],
+      "goal": "核对合成测试所选输入",
+      "priorityBasis": "测试明确选择此检查",
+      "requiredEvidence": [
+        "新的来源与核验"
+      ],
+      "scopeLabel": "合成成员 0（2026N0001，净利润）"
+    }
+  ],
+  "activeColumnKey": "column_1e6de4c5555748954187fccf",
+  "analysisRef": "ana_c9b6b5e0f067451aa1183d77fa18537f:1",
+  "chartUnavailable": null,
+  "chartsRequested": false,
+  "claims": [],
+  "claimsCollapsed": false,
+  "claimsScopeLabel": "",
+  "columns": [
+    {
+      "key": "column_1e6de4c5555748954187fccf",
+      "label": "净利润",
+      "unit": "元"
+    }
+  ],
+  "dataDigest": "37fd054e343b8113a23360efecf7e4124172c3b711ad61abfb1c858adeef9c09",
+  "engineVersion": "1.5.0",
+  "findings": [
+    {
+      "applicability": "仅检查被选择的正值、负值或零值条件",
+      "basis": "AnalysisArtifact v1 / findings",
+      "explanations": [
+        {
+          "kind": "observation",
+          "missingEvidence": [],
+          "statement": "合成成员 0（2026N0001，净利润）的来源原值为 -8 元，是负值。该检查仅说明数值符号。",
+          "support": "SUPPORTED"
+        }
+      ],
+      "findingId": "finding_c2fd9d53c8feb3ef73789686",
+      "previousAnalysisRef": null,
+      "ruleVersion": "1.1.0",
+      "sourceType": "observation",
+      "statement": "合成成员 0（2026N0001，净利润）的来源原值为 -8 元，是负值。该检查仅说明数值符号。",
+      "support": "SUPPORTED",
+      "type": "sign"
+    }
+  ],
+  "findingsScopeLabel": "原发布范围的发现与建议",
+  "isFiltered": false,
+  "limitations": [],
+  "memberKeys": [
+    "member_e125d0cbc9d494b91d388faa"
+  ],
+  "metrics": [],
+  "objectCount": 1,
+  "originalObjectCount": 1,
+  "originalTotal": 1,
+  "publishedAt": "2026-10-12T16:22:43.543159+00:00",
+  "rendererVersion": "1.11.1",
+  "rows": [
+    {
+      "display": "-8",
+      "exact": "-8",
+      "label": "合成成员 0",
+      "measure": "净利润",
+      "memberKey": "member_e125d0cbc9d494b91d388faa",
+      "rowKey": "row_cbe67a953e05ecf15272e0dd",
+      "state": "已取得",
+      "unit": "元",
+      "valueRef": "value_cbe67a953e05ecf15272e0dd"
+    }
+  ],
+  "schemaVersion": 1,
+  "scopeId": "scope_1bd8701eff33cf10a669114f",
+  "scopeLabel": "合成数据的指定对象",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "description": "",
+          "metricIndexes": [],
+          "sceneIndexes": [],
+          "tableIndexes": [
+            0
+          ],
+          "title": "",
+          "viewId": "details"
+        }
+      ],
+      "description": "",
+      "groupId": "view:details",
+      "title": "",
+      "width": "full",
+      "claimsPosition": "after",
+      "claimIndexes": []
+    }
+  ],
+  "sources": [],
+  "statuses": {
+    "calculationValidation": "NOT_APPLICABLE",
+    "comparability": "CONFIRMED",
+    "coverage": "COMPLETE",
+    "publicationState": "PUBLISHED",
+    "receiptVerification": "VALID"
+  },
+  "tables": [
+    {
+      "collapsed": false,
+      "columns": [
+        {
+          "key": "column_1e6de4c5555748954187fccf",
+          "label": "净利润",
+          "unit": ""
+        }
+      ],
+      "kind": "values",
+      "note": "",
+      "pageSize": 12,
+      "rows": [
+        {
+          "cells": {
+            "column_1e6de4c5555748954187fccf": {
+              "display": "-8",
+              "exact": "-8",
+              "label": "合成成员 0",
+              "measure": "净利润",
+              "memberKey": "member_e125d0cbc9d494b91d388faa",
+              "rowKey": "row_cbe67a953e05ecf15272e0dd",
+              "state": "已取得",
+              "unit": "",
+              "valueRef": "value_cbe67a953e05ecf15272e0dd"
+            }
+          },
+          "label": "合成成员 0",
+          "memberKey": "member_e125d0cbc9d494b91d388faa"
+        }
+      ],
+      "tableKey": "table_521bcb5e201a81f3dcbc35ed",
+      "title": "合成成员 0 · 净利润",
+      "viewId": "details"
+    }
+  ],
+  "technicalDetails": false,
+  "total": 1,
+  "verificationRecordedAt": "2026-10-12T16:22:43.522516+00:00",
+  "viewDerivedValues": [],
+  "viewId": "view_c1f974293ea72bf5375b08b9",
+  "viewParameters": {
+    "columnKey": null,
+    "filter": "all",
+    "sort": "published",
+    "topN": null
+  },
+  "page": {
+    "offset": 0,
+    "limit": 12,
+    "total": 1,
+    "nextOffset": null
+  },
+  "capabilities": {
+    "cards": true,
+    "generateReports": true,
+    "followUp": true
+  },
+  "actionRuns": [],
+  "reports": [],
+  "scenes": [],
+  "summaryPosition": "end",
+  "summaryTitle": "分析总结",
+  "reportTitle": "",
+  "summaryClaimIndexes": []
+}

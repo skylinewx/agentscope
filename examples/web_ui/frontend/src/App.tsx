@@ -19,6 +19,7 @@ import { CredentialPage } from '@/pages/credential';
 import { KnowledgePage } from '@/pages/knowledge';
 import { SchedulePage } from '@/pages/schedule';
 import { SetupPage } from '@/pages/setup';
+import { AnalysisPreviewPage } from '@/pages/analysis-preview';
 
 function SetupPageRoute() {
 	const navigate = useNavigate();
@@ -50,6 +51,7 @@ const router = createBrowserRouter([
 						element: <ChatPage />,
 					},
 					{ path: '/schedule', element: <SchedulePage /> },
+					{ path: '/analysis-preview/:agentId/:sessionId/:previewRef', element: <AnalysisPreviewPage /> },
 					{ path: '/channel', element: <ChannelPage /> },
 					{ path: '/credential', element: <CredentialPage /> },
 					{ path: '/mcp', element: <MCPHubPage /> },

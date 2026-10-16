@@ -2,7 +2,8 @@
 """The credential base class."""
 from typing import TYPE_CHECKING, Type
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic_core import PydanticCustomError
 
 from .._utils._common import _generate_id
 
@@ -17,6 +18,8 @@ if TYPE_CHECKING:
 class CredentialBase(BaseModel):
     """The credential base class."""
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     id: str = Field(
         default_factory=_generate_id,
         description="The credential id",
@@ -26,6 +29,19 @@ class CredentialBase(BaseModel):
         default="",
         description="User-facing display name for this credential.",
     )
+
+    @field_validator("api_key", check_fields=False)
+    @classmethod
+    def _validate_api_key(cls, value: SecretStr) -> SecretStr:
+        """Trim pasted whitespace and reject invalid authentication headers."""
+        key = value.get_secret_value().strip()
+        if not key or any(not 33 <= ord(char) <= 126 for char in key):
+            raise PydanticCustomError(
+                "invalid_api_key",
+                "API key must contain only printable ASCII characters "
+                "without spaces. Paste only the key, without notes.",
+            )
+        return SecretStr(key)
 
     @classmethod
     def get_chat_model_class(cls) -> Type["ChatModelBase"]:

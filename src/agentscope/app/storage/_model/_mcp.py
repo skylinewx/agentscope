@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """The installed-MCP record."""
+
 from pydantic import Field, computed_field
 
 from ._base import _RecordBase
@@ -10,21 +11,21 @@ class MCPRecord(_RecordBase):
     """One MCP a user has installed, at the user level rather than in any
     one workspace.
 
-    This table is the *desired* state: a workspace's ``.mcp`` file is the
-    actual state, and the app converges the two. Every MCP a user owns
-    has a record here — installing from a hub and adding one by hand both
-    write one — because a workspace MCP with no record would be
-    indistinguishable from one the user removed.
+    This record holds the user's configuration and availability. A workspace's
+    ``.mcp`` file holds its selections; runtime health is cached separately.
 
-    The workspace relation is derived, not stored: it joins on the MCP
-    name, which is why :attr:`MCPClient.name` must be unique per user.
+    Service workspaces bind to this record's stable ID at installation.
     """
 
     user_id: str
 
+    card_snapshot: dict | None = None
+    """Pinned hub template/schema, so re-keying does not upgrade silently."""
+
     client: MCPClient
-    """The connectable instance, ready to hand to ``workspace.add_mcp``.
-    Its ``name`` is the user-unique handle the workspace joins on."""
+    """Configuration cloned before resolving runtime environment references.
+    ``name`` is unique per user; workspace bindings use the record ID.
+    """
 
     # mypy cannot see through the decorator pair; the ignore is what
     # pydantic's own docs prescribe for a computed property.
@@ -82,7 +83,3 @@ class MCPRecord(_RecordBase):
 
     version: str | None = Field(default=None)
     """The card version installed, as reported by the hub at the time."""
-
-    enabled: bool = Field(default=True)
-    """Whether the MCP should be present in the user's workspaces. A
-    disabled record is kept so re-enabling does not lose its config."""

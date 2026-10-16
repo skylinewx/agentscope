@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Tests for reconnecting stateful MCP clients."""
+
 import asyncio
 from types import TracebackType
 from typing import Any
@@ -256,6 +257,66 @@ class MCPClientReconnectTest(IsolatedAsyncioTestCase):
         await asyncio.wait_for(transport_closed.wait(), 1)
         self.assertEqual(transport.exit_count, 1)
         self.assertFalse(client.is_connected)
+
+    async def test_cancelled_connect_closes_anyio_in_its_owner_task(
+        self,
+    ) -> None:
+        """Partial transport cleanup must preserve AnyIO task ownership."""
+        initialize_started = asyncio.Event()
+        transports = []
+
+        class _TaskBoundTransport(_OneShotTransport):
+            """Use the real task-group scope opened by MCP transports."""
+
+            async def __aenter__(self) -> tuple[object, object]:
+                self.entered_by = asyncio.current_task()
+                self.group = anyio.create_task_group()
+                await self.group.__aenter__()
+                return await super().__aenter__()
+
+            async def __aexit__(self, exc_type, exc, traceback) -> bool:
+                self.closed_by = asyncio.current_task()
+                await self.group.__aexit__(exc_type, exc, traceback)
+                return await super().__aexit__(exc_type, exc, traceback)
+
+        class _BlockingSession(_FakeSession):
+            """Wait for cancellation only on the first initialization."""
+
+            attempts = 0
+
+            async def initialize(self) -> None:
+                _BlockingSession.attempts += 1
+                if _BlockingSession.attempts == 1:
+                    initialize_started.set()
+                    await asyncio.Event().wait()
+
+        def create_transport(_parameters: Any) -> _TaskBoundTransport:
+            transport = _TaskBoundTransport()
+            transports.append(transport)
+            return transport
+
+        with patch(
+            "agentscope.mcp._mcp_client.stdio_client",
+            side_effect=create_transport,
+        ), patch("agentscope.mcp._mcp_client.ClientSession", _BlockingSession):
+            client = MCPClient(
+                name="cancelled_anyio_transport",
+                is_stateful=True,
+                mcp_config=StdioMCPConfig(command="unused"),
+            )
+            task = asyncio.create_task(client.connect())
+            await initialize_started.wait()
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=2)
+
+            self.assertEqual(transports[0].exit_count, 1)
+            self.assertIs(transports[0].entered_by, transports[0].closed_by)
+            self.assertFalse(client.is_connected)
+            await client.connect()
+            await client.close()
+
+        self.assertTrue(all(item.exit_count == 1 for item in transports))
 
     async def test_http_client_can_reconnect_after_close(self) -> None:
         """An HTTP client must get a new transport after close()."""

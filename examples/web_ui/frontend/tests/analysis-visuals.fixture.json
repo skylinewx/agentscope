@@ -1,0 +1,444 @@
+{
+  "actions": [],
+  "activeColumnKey": "column_e648d7102a86d08332741cee",
+  "analysisRef": "ana_8d3155fbb11d40a1a4f52f5fe64ff3d9:1",
+  "chartUnavailable": null,
+  "chartsRequested": true,
+  "claims": [],
+  "claimsCollapsed": false,
+  "claimsScopeLabel": "",
+  "columns": [
+    {
+      "key": "column_e648d7102a86d08332741cee",
+      "label": "结果",
+      "unit": ""
+    },
+    {
+      "key": "column_2b2313fa7449e6bb9e97f1fc",
+      "label": "收入",
+      "unit": ""
+    },
+    {
+      "key": "column_e8ac02ae93dc36c973a955d1",
+      "label": "成本",
+      "unit": ""
+    }
+  ],
+  "dataDigest": "446db7531066688ea5b3e482205f668a17e4838e357d3428db02fd9455e9d3d3",
+  "engineVersion": "1.5.0",
+  "findings": [],
+  "findingsScopeLabel": "原发布范围的发现与建议",
+  "isFiltered": false,
+  "limitations": [],
+  "memberKeys": [
+    "member_e125d0cbc9d494b91d388faa",
+    "member_a9c93e95164623f7f3113647",
+    "member_547c813d0f1d5da3bfcac7b1"
+  ],
+  "metrics": [
+    {
+      "display": "-5",
+      "label": "集团预算中心（合成） / 结果",
+      "scopeId": "scope_2f6eba9592bce077e718b53d",
+      "unit": "",
+      "valueRef": "value_3b5ff93302859d96db34be39",
+      "viewId": "metrics"
+    },
+    {
+      "display": "20",
+      "label": "华东业务部（合成） / 结果",
+      "scopeId": "scope_2f6eba9592bce077e718b53d",
+      "unit": "",
+      "valueRef": "value_92fa4bba20ce520e4fdc2b3a",
+      "viewId": "metrics"
+    },
+    {
+      "display": "-5",
+      "label": "华南业务部（合成） / 结果",
+      "scopeId": "scope_2f6eba9592bce077e718b53d",
+      "unit": "",
+      "valueRef": "value_ef1a3c2b79a495ba0301c9ab",
+      "viewId": "metrics"
+    }
+  ],
+  "objectCount": 3,
+  "originalObjectCount": 3,
+  "originalTotal": 5,
+  "publishedAt": "2026-10-12T16:22:43.163653+00:00",
+  "rendererVersion": "1.11.1",
+  "rows": [
+    {
+      "display": "-5",
+      "exact": "-5",
+      "label": "集团预算中心（合成）",
+      "measure": "结果",
+      "memberKey": "member_e125d0cbc9d494b91d388faa",
+      "rowKey": "row_9e9c1fc38cdaf8017fe201bb",
+      "state": "已取得",
+      "unit": "",
+      "valueRef": "value_9e9c1fc38cdaf8017fe201bb"
+    },
+    {
+      "display": "10",
+      "exact": "10",
+      "label": "集团预算中心（合成）",
+      "measure": "收入",
+      "memberKey": "member_e125d0cbc9d494b91d388faa",
+      "rowKey": "row_bb0f3a84b6e00ca472b9e68d",
+      "state": "已取得",
+      "unit": "",
+      "valueRef": "value_bb0f3a84b6e00ca472b9e68d"
+    },
+    {
+      "display": "15",
+      "exact": "15",
+      "label": "集团预算中心（合成）",
+      "measure": "成本",
+      "memberKey": "member_e125d0cbc9d494b91d388faa",
+      "rowKey": "row_c37886d5cccf423b80f594e6",
+      "state": "已取得",
+      "unit": "",
+      "valueRef": "value_c37886d5cccf423b80f594e6"
+    },
+    {
+      "display": "20",
+      "exact": "20",
+      "label": "华东业务部（合成）",
+      "measure": "结果",
+      "memberKey": "member_a9c93e95164623f7f3113647",
+      "rowKey": "row_9ac0875d65f702df708864c1",
+      "state": "已取得",
+      "unit": "",
+      "valueRef": "value_9ac0875d65f702df708864c1"
+    },
+    {
+      "display": "-5",
+      "exact": "-5",
+      "label": "华南业务部（合成）",
+      "measure": "结果",
+      "memberKey": "member_547c813d0f1d5da3bfcac7b1",
+      "rowKey": "row_87d97a2a847f073a4fb6eba1",
+      "state": "已取得",
+      "unit": "",
+      "valueRef": "value_87d97a2a847f073a4fb6eba1"
+    }
+  ],
+  "schemaVersion": 1,
+  "scopeId": "scope_2f6eba9592bce077e718b53d",
+  "scopeLabel": "2026 年预算 · 计算与一级层级（合成演示数据）",
+  "sections": [
+    {
+      "blocks": [
+        {
+          "description": "",
+          "metricIndexes": [
+            0,
+            1,
+            2
+          ],
+          "sceneIndexes": [],
+          "tableIndexes": [],
+          "title": "",
+          "viewId": "metrics"
+        }
+      ],
+      "description": "",
+      "groupId": "view:metrics",
+      "title": "",
+      "width": "full",
+      "claimsPosition": "after",
+      "claimIndexes": []
+    },
+    {
+      "blocks": [
+        {
+          "description": "",
+          "metricIndexes": [],
+          "sceneIndexes": [
+            0
+          ],
+          "tableIndexes": [],
+          "title": "各单位预算结果",
+          "viewId": "comparison"
+        }
+      ],
+      "description": "",
+      "groupId": "view:comparison",
+      "title": "",
+      "width": "full",
+      "claimsPosition": "after",
+      "claimIndexes": []
+    },
+    {
+      "blocks": [
+        {
+          "description": "",
+          "metricIndexes": [],
+          "sceneIndexes": [
+            1
+          ],
+          "tableIndexes": [],
+          "title": "集团预算中心 · 结果如何计算",
+          "viewId": "formula"
+        }
+      ],
+      "description": "",
+      "groupId": "view:formula",
+      "title": "",
+      "width": "full",
+      "claimsPosition": "after",
+      "claimIndexes": []
+    },
+    {
+      "blocks": [
+        {
+          "description": "一级上下级关系",
+          "metricIndexes": [],
+          "sceneIndexes": [
+            2
+          ],
+          "tableIndexes": [],
+          "title": "集团预算中心与直接下级",
+          "viewId": "hierarchy"
+        }
+      ],
+      "description": "",
+      "groupId": "view:hierarchy",
+      "title": "",
+      "width": "full",
+      "claimsPosition": "after",
+      "claimIndexes": []
+    }
+  ],
+  "sources": [],
+  "statuses": {
+    "calculationValidation": "PASS",
+    "comparability": "UNCONFIRMED",
+    "coverage": "COMPLETE",
+    "publicationState": "PUBLISHED",
+    "receiptVerification": "UNVERIFIED"
+  },
+  "tables": [],
+  "technicalDetails": false,
+  "total": 5,
+  "verificationRecordedAt": "2026-10-12T16:22:43.104889+00:00",
+  "viewDerivedValues": [],
+  "viewId": "view_5b4972775ee7334aa603fe00",
+  "viewParameters": {
+    "columnKey": null,
+    "filter": "all",
+    "sort": "published",
+    "topN": null
+  },
+  "page": {
+    "offset": 0,
+    "limit": 12,
+    "total": 3,
+    "nextOffset": null
+  },
+  "capabilities": {
+    "cards": true,
+    "generateReports": true,
+    "followUp": false
+  },
+  "actionRuns": [],
+  "reports": [],
+  "scenes": [
+    {
+      "collapsed": false,
+      "description": "",
+      "height": 182,
+      "primitives": [
+        {
+          "kind": "line",
+          "tone": "axis",
+          "x1": 134.4,
+          "x2": 134.4,
+          "y1": 8,
+          "y2": 174
+        },
+        {
+          "kind": "text",
+          "text": "集团预算中心（合成）",
+          "tone": "label",
+          "x": 24,
+          "y": 20
+        },
+        {
+          "kind": "text",
+          "text": "-5",
+          "tone": "value",
+          "x": 360,
+          "y": 20
+        },
+        {
+          "height": 10,
+          "kind": "rect",
+          "rowKey": "row_9e9c1fc38cdaf8017fe201bb",
+          "tone": "negative",
+          "width": 110.4,
+          "x": 24.0,
+          "y": 40
+        },
+        {
+          "kind": "text",
+          "text": "华东业务部（合成）",
+          "tone": "label",
+          "x": 24,
+          "y": 78
+        },
+        {
+          "kind": "text",
+          "text": "20",
+          "tone": "value",
+          "x": 360,
+          "y": 78
+        },
+        {
+          "height": 10,
+          "kind": "rect",
+          "rowKey": "row_9ac0875d65f702df708864c1",
+          "tone": "positive",
+          "width": 441.6,
+          "x": 134.4,
+          "y": 98
+        },
+        {
+          "kind": "text",
+          "text": "华南业务部（合成）",
+          "tone": "label",
+          "x": 24,
+          "y": 136
+        },
+        {
+          "kind": "text",
+          "text": "-5",
+          "tone": "value",
+          "x": 360,
+          "y": 136
+        },
+        {
+          "height": 10,
+          "kind": "rect",
+          "rowKey": "row_87d97a2a847f073a4fb6eba1",
+          "tone": "negative",
+          "width": 110.4,
+          "x": 24.0,
+          "y": 156
+        }
+      ],
+      "rowKeys": [
+        "row_9e9c1fc38cdaf8017fe201bb",
+        "row_9ac0875d65f702df708864c1",
+        "row_87d97a2a847f073a4fb6eba1"
+      ],
+      "title": "各单位预算结果",
+      "type": "BAR_VALUES",
+      "viewId": "comparison",
+      "width": 600,
+      "zeroBaseline": 134.4
+    },
+    {
+      "collapsed": false,
+      "description": "",
+      "height": 0,
+      "primary": true,
+      "primitives": [],
+      "relationship": {
+        "checks": [
+          {
+            "display": "-5",
+            "label": "按本层公式计算"
+          },
+          {
+            "display": "0",
+            "label": "差额（来源 − 计算）"
+          }
+        ],
+        "equation": "收入 − 成本 = 结果",
+        "inputs": [
+          {
+            "display": "10",
+            "key": "node_71ae9801157d5a3e2ddb6d97",
+            "label": "收入",
+            "note": "",
+            "tone": "positive"
+          },
+          {
+            "display": "15",
+            "key": "node_abf5f56d8a2d6e3725660f67",
+            "label": "成本",
+            "note": "",
+            "tone": "positive"
+          }
+        ],
+        "note": "",
+        "result": {
+          "display": "-5",
+          "key": "node_7bdce1f3a4e5b5b798f15cea",
+          "label": "结果",
+          "note": "",
+          "tone": "negative"
+        }
+      },
+      "rowKeys": [
+        "node_71ae9801157d5a3e2ddb6d97",
+        "node_abf5f56d8a2d6e3725660f67",
+        "node_7bdce1f3a4e5b5b798f15cea"
+      ],
+      "title": "集团预算中心 · 结果如何计算 · 结果",
+      "type": "FORMULA",
+      "viewId": "formula",
+      "width": 600,
+      "zeroBaseline": 0
+    },
+    {
+      "collapsed": false,
+      "description": "",
+      "height": 0,
+      "primitives": [],
+      "relationship": {
+        "checks": [],
+        "equation": "",
+        "inputs": [
+          {
+            "display": "20",
+            "key": "node_8a4b004de2c315e58332b106",
+            "label": "华东业务部（合成）",
+            "note": "",
+            "tone": "positive"
+          },
+          {
+            "display": "-5",
+            "key": "node_2ca9685113b339df0e5c8f76",
+            "label": "华南业务部（合成）",
+            "note": "",
+            "tone": "negative"
+          }
+        ],
+        "note": "",
+        "result": {
+          "display": "-5",
+          "key": "node_7bdce1f3a4e5b5b798f15cea",
+          "label": "集团预算中心（合成）",
+          "note": "",
+          "tone": "negative"
+        }
+      },
+      "rowKeys": [
+        "node_8a4b004de2c315e58332b106",
+        "node_2ca9685113b339df0e5c8f76",
+        "node_7bdce1f3a4e5b5b798f15cea"
+      ],
+      "title": "集团预算中心与直接下级",
+      "type": "HIERARCHY",
+      "viewId": "hierarchy",
+      "width": 600,
+      "zeroBaseline": 0
+    }
+  ],
+  "summaryPosition": "end",
+  "summaryTitle": "分析总结",
+  "reportTitle": "",
+  "summaryClaimIndexes": []
+}

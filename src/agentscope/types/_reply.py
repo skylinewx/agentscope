@@ -2,7 +2,9 @@
 """Reply-termination vocabulary shared by the ``message`` and ``event``
 modules. Lives in ``types`` (a leaf) so both can depend on it downward
 without an import cycle."""
+
 from enum import StrEnum
+from typing import Any
 
 from pydantic import BaseModel
 
@@ -30,6 +32,8 @@ class ErrorType(StrEnum):
     """429 — rate/quota exceeded."""
     INVALID_REQUEST = "invalid_request"
     """400 / 422 — malformed request."""
+    CONTEXT_LENGTH = "context_length"
+    """The model rejected input that exceeds its context capacity."""
     UPSTREAM = "upstream"
     """5xx — an upstream service failed."""
     CONNECTION = "connection"
@@ -50,3 +54,5 @@ class ErrorInfo(BaseModel):
     """Stable classification key; the frontend localizes off it."""
     message: str
     """Short, sanitized, human-readable description."""
+    diagnostics: dict[str, Any] | None = None
+    """Safe model-call correlation and phase information; never request bodies."""

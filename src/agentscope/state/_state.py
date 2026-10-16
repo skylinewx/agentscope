@@ -282,6 +282,9 @@ class AgentState(BaseModel):
     # =================================================================
     tool_context: ToolContext = Field(default_factory=ToolContext)
 
+    skill_read_refs: list[dict[str, Any]] = Field(default_factory=list)
+    """Pointers to skill sections displaced by compression; not copied instructions."""
+
     # =================================================================
     # The tasks context
     # =================================================================

@@ -1,0 +1,15 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>对话过程折叠回归</title></head>
+<body class="p-6">
+  <h1 class="text-xl">对话过程折叠回归</h1>
+  <p>使用真实 React 消息组件和固定测试数据，不发送对话。</p>
+  <button id="run" class="my-4 rounded border px-3 py-2">运行测试</button>
+  <button id="preview-running" class="my-4 rounded border px-3 py-2">预览运行中</button>
+  <button id="preview-completed" class="my-4 rounded border px-3 py-2">模拟查询完成</button>
+  <p id="summary" role="status">准备就绪</p>
+  <div id="harness" class="mt-6 max-w-3xl border p-4"></div>
+  <ol id="results" class="mt-4 space-y-1"></ol>
+  <script type="module" src="./reply-process.browser.tsx"></script>
+</body>
+</html>

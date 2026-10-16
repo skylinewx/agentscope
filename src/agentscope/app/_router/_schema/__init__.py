@@ -14,8 +14,19 @@ from ._channel import (
 from ._chat import ChatRequest, ChatTriggerResponse
 from ._health import ComponentStatus, HealthResponse
 from ._hub import HubInfo
-from ._hub_mcp import InstallMCPRequest, MCPView, UpdateMCPRequest
-from ._hub_skill import SkillView
+from ._hub_mcp import (
+    CreateMCPRequest,
+    InstallMCPRequest,
+    MCPDetail,
+    MCPView,
+    UpdateMCPRequest,
+)
+from ._hub_skill import (
+    SaveSkillFilesRequest,
+    SkillFileView,
+    SkillView,
+    SkillDetail,
+)
 from ._workspace import (
     AddFromLibraryRequest,
     AddFromLibraryResponse,
@@ -25,6 +36,7 @@ from ._workspace import (
     DirectoryListing,
     DownloadTokenResponse,
     MCPClientStatus,
+    WorkspaceSkillView,
     ToolInfo,
 )
 from ._embedding_model import (
@@ -113,9 +125,14 @@ __all__ = [
     # Hub
     "HubInfo",
     "InstallMCPRequest",
+    "CreateMCPRequest",
+    "MCPDetail",
     "MCPView",
     "UpdateMCPRequest",
     "SkillView",
+    "SkillDetail",
+    "SaveSkillFilesRequest",
+    "SkillFileView",
     # Workspace
     "AddFromLibraryRequest",
     "AddFromLibraryResponse",
@@ -125,6 +142,7 @@ __all__ = [
     "DirectoryListing",
     "DownloadTokenResponse",
     "MCPClientStatus",
+    "WorkspaceSkillView",
     "ToolInfo",
     # Agent
     "CreateSOPRequest",

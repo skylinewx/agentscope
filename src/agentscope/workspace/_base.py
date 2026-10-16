@@ -143,7 +143,7 @@ _MIGRATE_SKILLS_SHIM = (
 #: what makes it safe against a concurrent first touch: the loser
 #: fails and drops its copy. Argv: seed dir, partition dir.
 _EQUIP_PARTITION_SHIM = (
-    "import os, shutil, sys\n"
+    "import os, shutil, sys, time\n"
     "seed, partition = sys.argv[1], sys.argv[2]\n"
     "if os.path.isdir(partition):\n"
     "    sys.exit(0)\n"
@@ -154,8 +154,18 @@ _EQUIP_PARTITION_SHIM = (
     "else:\n"
     "    os.makedirs(staging)\n"
     "try:\n"
-    "    os.rename(staging, partition)\n"
-    "except OSError:\n"
+    "    for attempt in range(6):\n"
+    "        try:\n"
+    "            os.rename(staging, partition)\n"
+    "            break\n"
+    "        except OSError as exc:\n"
+    "            if os.path.isdir(partition):\n"
+    "                break\n"
+    "            if (getattr(exc, 'winerror', None) not in (5, 32, 33)\n"
+    "                    or attempt == 5):\n"
+    "                raise\n"
+    "            time.sleep(0.025 * 2**attempt)\n"
+    "finally:\n"
     "    shutil.rmtree(staging, ignore_errors=True)\n"
     "print('equipped')\n"
 )
@@ -283,6 +293,9 @@ class WorkspaceBase:
     _skill_lock: asyncio.Lock
     """Guards mutation of the ``skills/`` directory."""
 
+    _resource_lock: asyncio.Lock
+    """Serializes service binding-file updates across MCP and Skill scopes."""
+
     @property
     def _glob_helper_path(self) -> str | None:
         """Optional path (backend-side) to the ``Glob`` helper script.
@@ -344,6 +357,7 @@ class WorkspaceBase:
         self._equipped_partitions = set()
         self._mcp_lock = asyncio.Lock()
         self._skill_lock = asyncio.Lock()
+        self._resource_lock = asyncio.Lock()
 
     # ── derived paths ──────────────────────────────────────────────
 
@@ -657,6 +671,46 @@ class WorkspaceBase:
             # Declaration order: an MCP rebuilt after eviction must
             # not jump to the end.
             return [live[s.name] for s in specs if s.name in live]
+
+    def list_mcp_specs(
+        self,
+        *,
+        agent_id: str,
+        session_id: str,
+    ) -> list[MCPClient]:
+        """List declarations without connecting any MCP server."""
+        return self._declared_specs(agent_id, session_id)
+
+    def has_mcp_configuration(self, agent_id: str, session_id: str) -> bool:
+        """Whether a scope has an explicit selection, including none."""
+        return (agent_id, session_id) in self._mcp_specs
+
+    async def set_mcp_specs(
+        self,
+        specs: list[MCPClient],
+        *,
+        agent_id: str,
+        session_id: str,
+    ) -> None:
+        """Persist selection without starting or closing live clients.
+
+        The service owns leased runtime clients separately so management
+        edits cannot interrupt an in-flight tool call.
+        """
+        async with self._mcp_lock:
+            self._mcp_specs[(agent_id, session_id)] = list(specs)
+            await self._save_mcp_file()
+
+    def create_mcp_client(
+        self,
+        spec: MCPClient,
+        *,
+        agent_id: str,
+        session_id: str,
+        instance_id: str,
+    ) -> MCPClient:
+        """Create an unconnected client for one service runtime generation."""
+        return MCPClient.model_validate(spec.model_dump(mode="json"))
 
     # ── for User: dynamic MCP management ───────────────────────────
 

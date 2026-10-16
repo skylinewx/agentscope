@@ -16,6 +16,7 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 import { sessionApi, takeFreshlyCreated } from '@/api';
 import { chatApi } from '@/api';
 import { useAudioManager } from '@/context/AudioContext';
+import { applyReplyPresentation, pendingCalls } from '@/lib/reply-presentation';
 
 /**
  * One pending subagent HITL request, projected from a team *member*
@@ -43,13 +44,7 @@ export type SubagentHitlEntry = {
  * card once the paired tool_result lands.
  */
 const hasPendingToolCall = (msg: Msg | undefined): boolean => {
-	if (!msg || msg.role !== 'assistant') return false;
-	for (const block of msg.content) {
-		if (block.type !== 'tool_call') continue;
-		const state = (block as ToolCallBlock).state;
-		if (state === 'asking' || state === 'submitted') return true;
-	}
-	return false;
+	return !!msg && msg.role === 'assistant' && pendingCalls(msg).length > 0;
 };
 
 const hitlKey = (e: { worker_session_id: string; reply_id: string }) =>
@@ -147,6 +142,13 @@ export function useMessages(
 	const [loadedKey, setLoadedKey] = useState<string | null>(null);
 	const [phase, setPhase] = useState<ReplyPhase>('idle');
 	const [error, setError] = useState<Error | null>(null);
+	// A failed history read is distinct from an empty conversation or a stream error.
+	const [historyError, setHistoryError] = useState<Error | null>(null);
+	const [historyAttempt, setHistoryAttempt] = useState(0);
+	const reloadHistory = useCallback(() => {
+		setLoadedKey(null);
+		setHistoryAttempt((attempt) => attempt + 1);
+	}, []);
 	// Pending subagent HITL cards projected onto this (leader) session.
 	const [subagentHitl, setSubagentHitl] = useState<SubagentHitlEntry[]>([]);
 
@@ -243,6 +245,7 @@ export function useMessages(
 					: currentReplyRef.current;
 				if (reply) {
 					appendEvent(reply, event);
+					applyReplyPresentation(reply, event);
 					// ``appendEvent`` mutates in place, which would leave
 					// every Msg identical across renders and force the whole
 					// list to re-render on each delta. Republish just the
@@ -304,6 +307,7 @@ export function useMessages(
 		currentReplyRef.current = null;
 		setMsgs([]);
 		setError(null);
+		setHistoryError(null);
 		clearInterruptTimer();
 		setPhase('idle');
 		setSubagentHitl([]);
@@ -356,11 +360,14 @@ export function useMessages(
 					// Both setters now land in the same React batch.
 					setMsgs([...msgsRef.current]);
 				} catch (e) {
-					if (!cancelled) setError(e as Error);
+					if (!cancelled) {
+						setError(e as Error);
+						setHistoryError(e as Error);
+					}
 					return;
 				} finally {
 					// Marks the load done whether it succeeded or threw —
-					// an error surfaces through `error`, and leaving
+					// an error surfaces through `historyError`, and leaving
 					// `loading` stuck on would hide it behind a spinner
 					// forever.
 					if (!cancelled) setLoadedKey(`${agentId}:${sessionId}`);
@@ -391,7 +398,7 @@ export function useMessages(
 			abortRef.current = null;
 			clearInterruptTimer();
 		};
-	}, [agentId, sessionId, scheduleUpdate, processEvent, audioManager, clearInterruptTimer]);
+	}, [agentId, sessionId, historyAttempt, scheduleUpdate, processEvent, audioManager, clearInterruptTimer]);
 
 	/**
 	 * Send a user message. Appends the message to the local list
@@ -594,6 +601,8 @@ export function useMessages(
 		loading,
 		phase: ownsConversation ? phase : ('idle' as ReplyPhase),
 		error: ownsConversation ? error : null,
+		historyError: ownsConversation ? historyError : null,
+		reloadHistory,
 		send,
 		onUserConfirm,
 		onSubagentConfirm,

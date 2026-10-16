@@ -13,6 +13,7 @@ import mime from 'mime';
 import React, {
 	useState,
 	useRef,
+	useId,
 	useMemo,
 	useLayoutEffect,
 	type KeyboardEvent,
@@ -35,6 +36,7 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
 import type { ReplyPhase } from '@/hooks/useMessages';
 import { useTranslation } from '@/i18n/useI18n.ts';
+import { insertDraft, readDraft, writeDraft } from '@/lib/analysis-draft';
 import type { RealtimeConnectionState } from '@/lib/browserWebRTCTransport';
 import { cn } from '@/lib/utils';
 
@@ -51,6 +53,7 @@ interface ProcessedFile {
 }
 
 interface TextInputProps {
+	draftScope?: string;
 	onSend: (blocks: ContentBlock[]) => void;
 	placeholder?: string;
 	autoComplete?: (input: string) => string | null;
@@ -108,6 +111,7 @@ interface TextInputProps {
 
 export interface TextInputRef {
 	focus: () => void;
+	insertDraft: (text: string, expectedScope: string) => void;
 }
 
 /** One line box of textarea text: ``text-sm`` (14px) at a 1.5 line-height. */
@@ -151,12 +155,17 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 			onVoiceToggle,
 			voiceDisabled = false,
 			headerSlot,
+			draftScope: suppliedScope,
 		},
 		ref,
 	) => {
 		const { t } = useTranslation();
+		const instanceScope = useId();
+		const draftScope = suppliedScope ?? instanceScope;
 		const defaultPlaceholder = placeholder || t('chat.inputPlaceholder');
-		const [value, setValue] = useState('');
+		const [value, setValueState] = useState(() => readDraft(draftScope));
+		const [pendingDraft, setPendingDraft] = useState<string | null>(null);
+		const setValue = (next: string) => { writeDraft(draftScope, next); setValueState(next); };
 		const [files, setFiles] = useState<ProcessedFile[]>([]);
 		const [isFocused, setIsFocused] = useState(false);
 		const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -180,6 +189,12 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 
 		useImperativeHandle(ref, () => ({
 			focus: () => textareaRef.current?.focus(),
+			insertDraft: (text, expectedScope) => {
+				if (disabled) return;
+				const result = insertDraft(draftScope, expectedScope, text);
+				if (result.kind === 'confirm') setPendingDraft(text);
+				if (result.kind === 'inserted') { setValueState(result.value); setPendingDraft(null); textareaRef.current?.focus(); }
+			},
 		}));
 
 		// Grow the textarea with its content. The ``auto`` reset is what lets it
@@ -429,6 +444,15 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 						</AttachmentGroup>
 					)}
 
+					{pendingDraft && <div role="status" className="mx-2 mb-2 rounded-lg border p-3 text-sm">
+						<p>{t('analysis.draftPreserved')}</p><p className="my-2 max-h-32 overflow-auto whitespace-pre-wrap break-words">{pendingDraft}</p>
+						<Button type="button" size="sm" variant="outline" disabled={disabled} onClick={() => {
+							const result = insertDraft(draftScope, draftScope, pendingDraft, true);
+							if (result.kind === 'inserted') setValueState(result.value);
+							setPendingDraft(null); textareaRef.current?.focus();
+						}}>{t('analysis.appendDraft')}</Button>
+						<Button type="button" size="sm" variant="ghost" onClick={() => setPendingDraft(null)}>{t('analysis.cancelInsert')}</Button>
+					</div>}
 					{/* ``items-end`` in both layouts: the buttons are then already at the
 					    bottom before stacking moves them there, so nothing jumps. */}
 					<div className="relative flex flex-wrap items-end justify-end">

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """The message class in agentscope."""
 import base64
+from copy import deepcopy
 from typing import Literal, List, overload, Sequence, Self, TYPE_CHECKING, Any
 
 from pydantic import BaseModel, Field, model_validator
@@ -280,6 +281,13 @@ class Msg(BaseModel):
                     event.finished_reason,
                 )
                 self.error = event.error
+                # Preserve the server's final-output selection in history.
+                # The same metadata travels with REPLY_END over SSE.
+                presentation = event.metadata.get("presentation")
+                if isinstance(presentation, dict) and isinstance(
+                    presentation.get("answer_block_ids"), list,
+                ):
+                    self.metadata["presentation"] = deepcopy(presentation)
 
             case EventType.MODEL_CALL_END:
                 self.append_usage(

@@ -11,6 +11,7 @@ Events produced by the agent are not exposed back through this method
 that wants them subscribes through the
 ``GET /sessions/{sid}/stream`` SSE endpoint.
 """
+
 import asyncio
 import inspect
 import json
@@ -62,6 +63,7 @@ from ._access import ResourceAccessService
 from ._model import get_model
 from ._tts_model import get_tts_model
 from ._toolkit import get_toolkit
+from ._resources import ResourceService, resource_toolkit_scope
 from ._session_projection import SessionProjection
 from ._sop import SOPService
 from ._projectors import SubagentHitlProjector
@@ -167,6 +169,7 @@ class ChatService:
         custom_agent_cls: type[Agent] | None = None,
         extra_projectors: list[EventProjector] | None = None,
         channel_clients: "ChannelClients | None" = None,
+        resource_service: ResourceService | None = None,
     ) -> None:
         """Initialize chat service.
 
@@ -240,6 +243,7 @@ class ChatService:
         self._background_task_manager = background_task_manager
         self._message_bus = message_bus
         self._access = resource_access_service
+        self._resources = resource_service
         self._knowledge_base_manager = knowledge_base_manager
         self._extra_agent_middlewares = extra_agent_middlewares
         # Probed once (the service is built once per lifespan) so legacy
@@ -274,12 +278,14 @@ class ChatService:
         user_id: str,
         session_id: str,
         agent_id: str,
-        input_msg: Msg
-        | list[Msg]
-        | UserConfirmResultEvent
-        | ExternalExecutionResultEvent
-        | UserInterruptEvent
-        | None = None,
+        input_msg: (
+            Msg
+            | list[Msg]
+            | UserConfirmResultEvent
+            | ExternalExecutionResultEvent
+            | UserInterruptEvent
+            | None
+        ) = None,
         sop_dispatch: str | None = None,
     ) -> None:
         """Drive a chat run to completion.
@@ -325,13 +331,14 @@ class ChatService:
                 this turn, which gives it a submit tool.
         """
         try:
-            await self._run_impl(
-                user_id,
-                session_id,
-                agent_id,
-                input_msg,
-                sop_dispatch,
-            )
+            async with resource_toolkit_scope():
+                await self._run_impl(
+                    user_id,
+                    session_id,
+                    agent_id,
+                    input_msg,
+                    sop_dispatch,
+                )
         except Exception as e:
             logger.exception(
                 "ChatService.run failed for user_id=%s session_id=%s "
@@ -411,13 +418,17 @@ class ChatService:
             )
 
         try:
-            await self._storage.upsert_session(
-                user_id=user_id,
-                agent_id=agent_id,
-                config=session_record.config.model_copy(
-                    update={"name": name, "naming": SessionNaming(auto=False)},
-                ),
-                session_id=session_record.id,
+
+            def apply_name(latest):
+                if latest.config.naming.auto:
+                    latest.config.name = name
+                    latest.config.naming = SessionNaming(auto=False)
+
+            await self._storage.mutate_session(
+                user_id,
+                agent_id,
+                session_record.id,
+                apply_name,
             )
             await publish_session_event(
                 self._message_bus,
@@ -789,12 +800,14 @@ class ChatService:
         user_id: str,
         session_id: str,
         agent_id: str,
-        input_msg: Msg
-        | list[Msg]
-        | UserConfirmResultEvent
-        | ExternalExecutionResultEvent
-        | UserInterruptEvent
-        | None,
+        input_msg: (
+            Msg
+            | list[Msg]
+            | UserConfirmResultEvent
+            | ExternalExecutionResultEvent
+            | UserInterruptEvent
+            | None
+        ),
         sop_dispatch: str | None = None,
     ) -> None:
         """The actual chat-run body; wrapped by :meth:`run` for error
@@ -930,11 +943,11 @@ class ChatService:
                     session_record.state.permission_context.working_directories
                 )
                 if workspace.workdir not in working_dirs:
-                    working_dirs[
-                        workspace.workdir
-                    ] = AdditionalWorkingDirectory(
-                        path=workspace.workdir,
-                        source="session",
+                    working_dirs[workspace.workdir] = (
+                        AdditionalWorkingDirectory(
+                            path=workspace.workdir,
+                            source="session",
+                        )
                     )
 
                 # -------------------------------------------------------------
@@ -966,9 +979,11 @@ class ChatService:
                 channel_tools = (
                     await channel.list_tools(
                         workspace,
-                        channel_origin.channel_user_id
-                        if chat_kind is ChatKind.PRIVATE
-                        else None,
+                        (
+                            channel_origin.channel_user_id
+                            if chat_kind is ChatKind.PRIVATE
+                            else None
+                        ),
                     )
                     if channel is not None and channel_origin is not None
                     else []
@@ -1089,6 +1104,7 @@ class ChatService:
                 # schedule + team + extras + skills + mcps).
                 # -------------------------------------------------------------
                 toolkit = await get_toolkit(
+                    resource_service=self._resources,
                     storage=self._storage,
                     workspace=workspace,
                     workspace_manager=self._workspace_manager,
@@ -1165,6 +1181,25 @@ class ChatService:
                             f"tools available: {tools}. Pass this chat's id "
                             f"as their target to act on this chat."
                         )
+
+                if channel_origin is None:
+                    attachment += (
+                        " AgentScope Web UI supports HTML report cards. "
+                        "When delivering an HTML report, save a UTF-8 "
+                        "self-contained .html file under the workspace root "
+                        f"{workspace.workdir!r}, then return a standalone "
+                        "Markdown link [Report title](./path/to/report.html). "
+                        "The ./ path is relative to that workspace root, "
+                        "not the browser URL or a tool's current directory. "
+                        "URL-encode special characters in path segments. "
+                        "The UI verifies the file and supplies its card, "
+                        "click-to-preview, and download actions. Keep styles, "
+                        "charts and scripts inline: preview is isolated and "
+                        "does not load network or sibling-file resources. "
+                        "Never invent a file URL, download endpoint, size, "
+                        "or token. Do not launch a browser or preview unless "
+                        "the user explicitly asks to open it."
+                    )
 
                 attachment = (
                     f"<system-notification>{attachment}</system-notification>"
@@ -1530,10 +1565,12 @@ class ChatService:
                                     team_ctx,
                                     worker_name,
                                     msg.finished_reason,
-                                    msg.error.message
-                                    if msg.error
-                                    else "The turn stopped before it "
-                                    "finished.",
+                                    (
+                                        msg.error.message
+                                        if msg.error
+                                        else "The turn stopped before it "
+                                        "finished."
+                                    ),
                                 )
 
                 persist_task = asyncio.create_task(_persist())

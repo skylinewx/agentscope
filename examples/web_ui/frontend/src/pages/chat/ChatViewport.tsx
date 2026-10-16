@@ -1,5 +1,6 @@
 import type { PermissionContext } from '@agentscope-ai/agentscope/permission';
 import type { TaskContext } from '@agentscope-ai/agentscope/state';
+import { useQueryClient } from '@tanstack/react-query';
 import {
 	BookText,
 	ChevronDown,
@@ -178,6 +179,7 @@ function closePanelInLayout(layout: PanelKey[][], key: PanelKey): PanelKey[][] {
  */
 export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatViewportProps) {
 	const { t } = useTranslation();
+	const analysisQueries = useQueryClient();
 	const { sessions, refetch: refetchSessions } = useSessions(agentId);
 	const { groups } = useAvailableModels();
 	const { groups: realtimeGroups } = useAvailableRealtimeModels();
@@ -263,6 +265,8 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 	const {
 		msgs,
 		loading: messagesLoading,
+		historyError,
+		reloadHistory,
 		phase,
 		send,
 		onUserConfirm,
@@ -287,7 +291,13 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 		uploadSkill,
 		addSkillsFromLibrary,
 		removeSkill,
-	} = useWorkspace(agentId, sessionId);
+		upgradeSkill,
+		changeMcp,
+		changeSkill,
+	} = useWorkspace(agentId, sessionId, {
+		isRunning: phase !== 'idle' || voiceBusy,
+		mcpPanelOpen: panelLayout.some((column) => column.includes('mcp')),
+	});
 	const { knowledgeBases, loading: knowledgeBasesLoading } = useKnowledgeBases();
 	const { schema: kbMiddlewareSchema } = useKnowledgeBaseMiddlewareSchema();
 
@@ -384,8 +394,11 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 	useEffect(() => {
 		const wasRunning = prevPhaseRef.current !== 'idle';
 		prevPhaseRef.current = phase;
-		if (wasRunning && phase === 'idle') void refetchWorkspaceStatus();
-	}, [phase, refetchWorkspaceStatus]);
+		if (wasRunning && phase === 'idle') {
+			void refetchWorkspaceStatus();
+			void analysisQueries.invalidateQueries({ queryKey: ['workspace-analysis'] });
+		}
+	}, [phase, refetchWorkspaceStatus, analysisQueries]);
 
 	// Build the panel descriptors with live data. Rebuilt on every
 	// data change so the dock always renders the latest state — the
@@ -407,6 +420,7 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 						onAdd={addMcps}
 						onAddFromLibrary={addMcpsFromLibrary}
 						onRemove={removeMcp}
+						onChange={changeMcp}
 					/>
 				),
 			},
@@ -420,6 +434,8 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 						onUpload={uploadSkill}
 						onAddFromLibrary={addSkillsFromLibrary}
 						onRemove={removeSkill}
+						onChange={changeSkill}
+						onUpgrade={upgradeSkill}
 					/>
 				),
 			},
@@ -493,6 +509,9 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 			uploadSkill,
 			addSkillsFromLibrary,
 			removeSkill,
+			upgradeSkill,
+			changeMcp,
+			changeSkill,
 			permissionContext,
 			knowledgeBases,
 			knowledgeBasesLoading,
@@ -907,6 +926,8 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 									className={'max-w-[var(--chat-content-w)] w-full'}
 									msgs={msgs}
 									loading={messagesLoading}
+									historyError={historyError}
+									onReloadHistory={reloadHistory}
 									agentId={agentId}
 									sessionId={sessionId}
 									cwd={view?.session.config.cwd ?? null}
@@ -914,13 +935,24 @@ export function ChatViewport({ agentId, sessionId, onSessionsChanged }: ChatView
 									git={workspaceStatus?.git ?? null}
 									onRefreshGit={refetchWorkspaceStatus}
 									phase={phase}
-									disabled={selectedModel === null || voiceBusy}
+									disabled={
+										selectedModel === null ||
+										voiceBusy ||
+										messagesLoading ||
+										historyError !== null
+									}
 									onSend={send}
 									onUserConfirm={onUserConfirm}
 									onInterrupt={interrupt}
 									voiceState={realtimeVoice.state}
 									onVoiceToggle={() => void realtimeVoice.toggle()}
-									voiceDisabled={!selectedRealtimeModel || !agentId || !sessionId}
+									voiceDisabled={
+										!selectedRealtimeModel ||
+										!agentId ||
+										!sessionId ||
+										messagesLoading ||
+										historyError !== null
+									}
 									// cwd={
 									// 	{cwd: view?.session.config.cwd, git: {
 									// 		branch: 'main',

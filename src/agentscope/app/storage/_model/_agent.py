@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """The agent storage class."""
+
 import warnings
 from typing import Any, Literal, Self
 
@@ -8,6 +9,7 @@ from pydantic.json_schema import SkipJsonSchema
 
 from ...._utils._common import _generate_id
 from ._base import _RecordBase
+from ._resource_config import AgentResourceConfig
 from ....agent import ContextConfig, ReActConfig
 
 
@@ -125,6 +127,12 @@ class AgentData(BaseModel):
         default_factory=AgentChatConfig,
         description="The settings for the agent's text conversations.",
         title="Chat Config",
+    )
+
+    resource_config: AgentResourceConfig = Field(
+        default_factory=AgentResourceConfig,
+        description="Default MCP and Skill bindings for all conversations.",
+        title="Resources",
     )
 
     @property

@@ -2,6 +2,7 @@ import { CircleAlert, Loader2, PlusCircle } from 'lucide-react';
 import { useEffect, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
 
+import type { AgentResourceConfig } from '@/api';
 import type { ContextConfig, InviteConfig, ReActConfig } from '@/api';
 import {
 	AgentFormFields,
@@ -9,6 +10,7 @@ import {
 	type AgentFormValues,
 	type AgentSection,
 } from '@/components/form/AgentFormFields';
+import { AgentResources } from '@/components/form/AgentResources';
 import type { SchemaFormValue } from '@/components/form/SchemaForm';
 import { Alert, AlertDescription } from '@/components/ui/alert.tsx';
 import { Button } from '@/components/ui/button';
@@ -38,10 +40,12 @@ export function AgentDialog({ onCreated, children }: Props) {
 	const [submitting, setSubmitting] = useState(false);
 	const [values, setValues] = useState<AgentFormValues | null>(null);
 	const [errorMsg, setErrorMsg] = useState('');
+	const [resources, setResources] = useState<AgentResourceConfig>({ mcps: {}, skills: {} });
 
 	useEffect(() => {
 		if (open && schema && !values) {
 			setValues(defaultAgentFormValues(schema));
+			setResources({ mcps: {}, skills: {} });
 		}
 		if (!open) {
 			setValues(null);
@@ -66,6 +70,7 @@ export function AgentDialog({ onCreated, children }: Props) {
 			await create(
 				{
 					name,
+					resource_config: resources,
 					system_prompt: values.identity.system_prompt as string | undefined,
 					chat_config: {
 						context_config: values.context_config as unknown as ContextConfig,
@@ -98,7 +103,18 @@ export function AgentDialog({ onCreated, children }: Props) {
 				</DialogHeader>
 				<div className="no-scrollbar -mx-4 max-h-[75vh] overflow-y-auto px-4">
 					{schema && values ? (
-						<AgentFormFields schema={schema} values={values} onChange={handleChange} />
+						<>
+							<AgentFormFields
+								schema={schema}
+								values={values}
+								onChange={handleChange}
+							/>
+							<AgentResources
+								value={resources}
+								onChange={setResources}
+								disabled={submitting}
+							/>
+						</>
 					) : (
 						<p className="text-muted-foreground text-sm">{t('common.loading')}</p>
 					)}

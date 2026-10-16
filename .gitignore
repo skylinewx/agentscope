@@ -156,6 +156,7 @@ package-lock.json
 uv.lock
 
 # JS/Node frontend (examples/web_ui)
+.test-tmp/
 *.local
 .eslintcache
 .vite/
@@ -166,3 +167,9 @@ yarn-error.log*
 lerna-debug.log*
 
 **/workspaces/
+**/resource-artifacts/
+
+# Local analysis identities and captured business data
+/examples/agent_service/analysis-data/
+/examples/agent_service/analysis-config.local.json
+/examples/agent_service/service-config.local.json

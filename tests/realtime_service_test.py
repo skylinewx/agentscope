@@ -153,6 +153,7 @@ class RealtimeServiceTest(unittest.IsolatedAsyncioTestCase):
         channel.chat_kind.assert_awaited_once_with("chat-1")
         channel.chat_name.assert_awaited_once_with("chat-1")
         get_toolkit_mock.assert_awaited_once_with(
+            resource_service=None,
             storage=storage,
             workspace=workspace,
             workspace_manager=workspace_manager,

@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 """Request / response schemas for the agent router."""
+
 import warnings
 
 from pydantic import BaseModel, Field
 
 from ....agent import ContextConfig, ReActConfig
-from ...storage import AgentChatConfig, InviteConfig
+from ...storage import AgentChatConfig, InviteConfig, AgentResourceConfig
 from ..._service import AgentView
 
 
@@ -18,6 +19,9 @@ class CreateAgentRequest(BaseModel):
     :class:`AgentData`; sending both puts the flat one on top.
     """
 
+    resource_config: AgentResourceConfig = Field(
+        default_factory=AgentResourceConfig
+    )
     name: str = Field(description="Display name of the agent.")
     system_prompt: str = Field(
         default="You're a helpful assistant.",
@@ -56,6 +60,7 @@ class UpdateAgentRequest(BaseModel):
     Omit any field to keep its current value.
     """
 
+    resource_config: AgentResourceConfig | None = None
     name: str | None = Field(default=None, description="New display name.")
     system_prompt: str | None = Field(
         default=None,

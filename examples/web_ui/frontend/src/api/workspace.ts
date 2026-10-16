@@ -9,6 +9,7 @@ import type {
 	MCPClientStatus,
 	Skill,
 } from './types';
+import { REPORT_PREVIEW_MAX_BYTES } from '@/lib/workspace-reports';
 
 export interface UploadOptions {
 	/** Fired with byte-level progress while the body is streamed. */
@@ -99,7 +100,100 @@ function uploadSkillXhr(
 	});
 }
 
+export interface WorkspaceFileInfo {
+	name: string;
+	path: string;
+	media_type: string;
+	size_bytes: number | null;
+}
+
+const fileParams = (agentId: string, sessionId: string, path: string) => ({
+	agent_id: agentId,
+	session_id: sessionId,
+	path,
+});
+
+const files = {
+	info: (agentId: string, sessionId: string, path: string) =>
+		client.get<WorkspaceFileInfo>(
+			'/workspace/files/info',
+			fileParams(agentId, sessionId, path),
+			{ silent: true },
+		),
+	async preview(
+		agentId: string,
+		sessionId: string,
+		path: string,
+		signal: AbortSignal,
+	): Promise<string> {
+		const response = await client.stream('/workspace/files', {
+			params: fileParams(agentId, sessionId, path),
+			signal,
+			silent: true,
+		});
+		const type = response.headers.get('content-type')?.split(';')[0].trim();
+		if (type !== 'text/html' && type !== 'application/xhtml+xml') {
+			await response.body?.cancel();
+			throw new ApiError(415, 'HTML preview requires an HTML file.');
+		}
+		if (Number(response.headers.get('content-length')) > REPORT_PREVIEW_MAX_BYTES) {
+			await response.body?.cancel();
+			throw new ApiError(413, 'Report is too large to preview.');
+		}
+		const reader = response.body?.getReader();
+		if (!reader) return '';
+		const decoder = new TextDecoder('utf-8');
+		let size = 0;
+		let content = '';
+		try {
+			while (true) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				size += value.byteLength;
+				if (size > REPORT_PREVIEW_MAX_BYTES) {
+					await reader.cancel();
+					throw new ApiError(413, 'Report is too large to preview.');
+				}
+				content += decoder.decode(value, { stream: true });
+			}
+			return content + decoder.decode();
+		} finally {
+			reader.releaseLock();
+		}
+	},
+	async downloadUrl(agentId: string, sessionId: string, path: string): Promise<string> {
+		const params = fileParams(agentId, sessionId, path);
+		// Validate before navigation so a missing report stays an inline error.
+		await files.info(agentId, sessionId, path);
+		const result = await client.post<{ token: string }>(
+			'/workspace/files/download-token',
+			undefined,
+			params,
+			{ silent: true },
+		);
+		const url = new URL('/workspace/files', getBaseUrl());
+		Object.entries({ ...params, token: result.token, download: 'true' }).forEach(
+			([key, value]) => url.searchParams.set(key, value),
+		);
+		return url.toString();
+	},
+};
+
 export const workspaceApi = {
+	setResourceEnabled: (
+		kind: 'mcp' | 'skill',
+		resourceId: string,
+		agentId: string,
+		sessionId: string,
+		enabled: boolean | null,
+	) =>
+		client.patch<void>(
+			`/workspace/${kind}/${encodeURIComponent(resourceId)}`,
+			{ enabled },
+			{ agent_id: agentId, session_id: sessionId },
+			{ silent: true },
+		),
+	files,
 	/**
 	 * List one directory level inside the session's workspace.
 	 *
@@ -160,6 +254,12 @@ export const workspaceApi = {
 	},
 
 	skill: {
+		upgrade: (skillName: string, agentId: string, sessionId: string) =>
+			client.post<void>(
+				`/workspace/skill/${encodeURIComponent(skillName)}/upgrade`,
+				undefined,
+				{ agent_id: agentId, session_id: sessionId },
+			),
 		list: (agentId: string, sessionId: string) =>
 			client.get<Skill[]>('/workspace/skill', { agent_id: agentId, session_id: sessionId }),
 

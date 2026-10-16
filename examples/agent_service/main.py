@@ -18,39 +18,16 @@ from agentscope.app.message_bus import InMemoryMessageBus
 from agentscope.app.rag.knowledge_base_manager import CollectionPerKbManager
 from agentscope.app.storage import RedisStorage
 from agentscope.app.workspace_manager import LocalWorkspaceManager
-from agentscope.mcp import MCPClient, StdioMCPConfig, HttpMCPConfig
+from agentscope.app.resources import LocalSkillStore
 from agentscope.middleware import AgenticMemoryMiddleware, MiddlewareBase
 from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.rag import ApproxTokenChunker, QdrantStore
 from agentscope.workspace import WorkspaceBase
 
-default_mcps = [
-    MCPClient(
-        name="playwright",
-        mcp_config=StdioMCPConfig(
-            command="npx",
-            args=["@playwright/mcp@latest"],
-        ),
-        is_stateful=True,
-    ),
-]
+from service_config import redis_settings
 
-if os.getenv("AMAP_API_KEY"):
-    default_mcps.append(
-        MCPClient(
-            name="amap",
-            mcp_config=HttpMCPConfig(
-                url=f"https://mcp.amap.com/mcp?key="
-                f"{os.environ['AMAP_API_KEY']}",
-            ),
-            is_stateful=False,
-        ),
-    )
-
-storage = RedisStorage(
-    host="localhost",
-    port=6379,
-)
+service_dir = os.path.dirname(os.path.abspath(__file__))
+storage = RedisStorage(**redis_settings(os.path.join(service_dir, "service-config.local.json")))
 
 vector_store = QdrantStore(location=":memory:")
 
@@ -63,11 +40,18 @@ async def longterm_memory_factory(
 ) -> list[MiddlewareBase]:
     """Attach Markdown-file long-term memory, stored under the session's
     workspace so it is reachable through whichever backend is bound."""
-    del user_id, agent_id, session_id
+    from analysis_extension.bootstrap import create_analysis_middlewares
+    from numeric_tools import NumericToolsMiddleware
+
     return [
+        NumericToolsMiddleware(),
         AgenticMemoryMiddleware(
             workdir=workspace.workdir,
             backend=workspace.get_backend(),
+        ),
+        *await create_analysis_middlewares(
+            app, user_id, agent_id, session_id, workspace,
+            os.path.join(service_dir, "analysis-config.local.json"),
         ),
     ]
 
@@ -89,8 +73,12 @@ app = create_app(
             os.path.dirname(os.path.abspath(__file__)),
             "workspaces",
         ),
-        # The default MCP servers that will be added into the workspace
-        default_mcps=default_mcps,
+    ),
+    skill_store=LocalSkillStore(
+        os.getenv(
+            "AGENTSCOPE_SKILL_ARTIFACT_DIR",
+            os.path.join(service_dir, "resource-artifacts"),
+        ),
     ),
     # Knowledge base feature — backed by an in-memory Qdrant store. The
     # CollectionPerKbManager allocates one collection per knowledge base,
@@ -163,6 +151,11 @@ so anything you want them to see MUST be sent through `TeamSay`.""",
         FeishuChannel,
     ],
 )
+
+
+from analysis_extension.router import create_analysis_router
+
+app.include_router(create_analysis_router(os.path.join(service_dir, "analysis-config.local.json")))
 
 
 if __name__ == "__main__":

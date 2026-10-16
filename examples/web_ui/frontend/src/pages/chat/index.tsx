@@ -100,7 +100,11 @@ const ChatPageInner = () => {
 		sessionId?: string;
 		memberId?: string;
 	}>();
-	const { t } = useTranslation();
+	const { t, i18n } = useTranslation();
+	const sessionDateFormatter = new Intl.DateTimeFormat(i18n.resolvedLanguage || i18n.language, {
+		month: 'short',
+		day: '2-digit',
+	});
 	const { agents, refetch: refetchAgents, remove: removeAgent } = useAgents();
 	const {
 		sessions,
@@ -456,11 +460,10 @@ const ChatPageInner = () => {
 																	</span>
 																</SidebarMenuButton>
 																<SidebarMenuBadge className="max-md:hidden group-hover/menu-item:hidden group-has-focus-visible/menu-item:hidden group-has-data-[state=open]/menu-item:hidden text-text-tertiary! font-mono">
-																	{format(
+																	{sessionDateFormatter.format(
 																		new Date(
 																			view.session.created_at,
 																		),
-																		'MMM dd',
 																	)}
 																</SidebarMenuBadge>
 																<DropdownMenu>

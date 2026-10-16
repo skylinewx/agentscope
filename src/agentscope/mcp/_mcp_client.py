@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Unified MCP client implementation for AgentScope."""
-import asyncio
+
 import re
 from contextlib import (
     AbstractAsyncContextManager,
@@ -10,6 +10,7 @@ from contextlib import (
 from typing import Any, AsyncGenerator, ClassVar, TYPE_CHECKING
 from urllib.parse import urlsplit
 
+import anyio
 import httpx
 import mcp.types
 from mcp import ClientSession, stdio_client, StdioServerParameters
@@ -126,6 +127,7 @@ class MCPClient(BaseModel):
     _client: Any = PrivateAttr(default=None)
     _session: ClientSession | None = PrivateAttr(default=None)
     _stack: AsyncExitStack | None = PrivateAttr(default=None)
+    _cleanup_scope: anyio.CancelScope | None = PrivateAttr(default=None)
     _is_connected: bool = PrivateAttr(default=False)
     _cached_tools: list[mcp.types.Tool] | None = PrivateAttr(default=None)
     _http_client: httpx.AsyncClient | None = PrivateAttr(default=None)
@@ -348,6 +350,9 @@ class MCPClient(BaseModel):
         assert self._client is not None
         stack = AsyncExitStack()
         self._stack = stack
+        # Enter before the transport's task groups so shielding cleanup does
+        # not change their task or violate the cancel-scope nesting order.
+        self._cleanup_scope = stack.enter_context(anyio.CancelScope())
 
         try:
             context = await stack.enter_async_context(self._client)
@@ -360,15 +365,16 @@ class MCPClient(BaseModel):
             logger.info("MCP connected: %s", self.name)
         except BaseException:
             # asyncio.CancelledError inherits BaseException, so a cancelled
-            # initialization must close every context entered so far. The
-            # close is shielded because an anyio cancel scope (a cancelled
-            # FastAPI request, for one) keeps cancelling every await inside
-            # it, which would otherwise abandon a live stdio subprocess.
+            # initialization must close every context entered so far. AnyIO
+            # task groups must exit in the task that entered them, so shield
+            # their enclosing scope instead of spawning an asyncio task.
+            self._cleanup_scope.shield = True
             try:
-                await asyncio.shield(stack.aclose())
+                await stack.aclose()
             finally:
                 self._client = None
                 self._stack = None
+                self._cleanup_scope = None
                 self._session = None
                 self._is_connected = False
             raise
@@ -398,6 +404,8 @@ class MCPClient(BaseModel):
             )
 
         try:
+            if self._cleanup_scope is not None:
+                self._cleanup_scope.shield = True
             await self._stack.aclose()
         except Exception as e:
             if not ignore_errors:
@@ -410,6 +418,7 @@ class MCPClient(BaseModel):
         finally:
             self._client = None
             self._stack = None
+            self._cleanup_scope = None
             self._session = None
             self._is_connected = False
             logger.info("MCP closed: %s", self.name)

@@ -3,7 +3,7 @@ import { QueryClient } from '@tanstack/react-query';
 /**
  * The app-wide query cache.
  *
- * Nothing here is polled. A cached entry is only re-fetched when a
+ * No polling is enabled by default. A cached entry is re-fetched when a
  * component that needs it mounts again after `staleTime` has passed, and
  * anything the user changes is re-fetched explicitly by the hook that
  * changed it — so this window is not a correctness mechanism, it only
@@ -14,7 +14,9 @@ import { QueryClient } from '@tanstack/react-query';
  * Data that cannot change while the server is up — the hub lists, the
  * agent form schema — overrides this with `staleTime: Infinity` at the
  * hook. Anything that must always be fresh (session messages, workspace
- * and git status, index polling) stays off this cache entirely.
+ * and git status, index polling) uses dedicated fetching or per-hook
+ * overrides. Workspace MCP health refreshes at run boundaries and polls
+ * only while an open panel is awaiting initialization.
  */
 export const queryClient = new QueryClient({
 	defaultOptions: {

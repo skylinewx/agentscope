@@ -217,11 +217,17 @@ class ChannelDeliveryFromTheRunTest(IsolatedAsyncioTestCase):
             type_registry=ChannelTypeRegistry([_RecordingChannel]),
         )
 
+        prompts: list[str] = []
+        self.prompts = prompts
+
         class _Agent:
             """Reply with nothing; the run's own events are enough."""
 
-            def __init__(self, *, state: object = None, **_: object) -> None:
+            def __init__(
+                self, *, state: object = None, system_prompt: str, **_: object
+            ) -> None:
                 self.state = state
+                prompts.append(system_prompt)
 
             async def reply_stream(
                 self,
@@ -360,5 +366,29 @@ class ChannelDeliveryFromTheRunTest(IsolatedAsyncioTestCase):
         )
         try:
             self.assertListEqual(_RecordingChannel.tool_user_ids, [None])
+        finally:
+            await clients.__aexit__(None, None, None)
+
+    async def test_web_report_contract_uses_the_workspace_root(self) -> None:
+        """The model receives the same stable file reference the UI reads."""
+        clients = await self._run(UserOrigin())
+        try:
+            self.assertEqual(len(self.prompts), 1)
+            prompt = self.prompts[0]
+            self.assertIn("[Report title](./path/to/report.html)", prompt)
+            self.assertIn("/tmp/agentscope-delivery-test", prompt)
+            self.assertIn("Do not launch a browser or preview", prompt)
+            self.assertIn("self-contained .html", prompt)
+        finally:
+            await clients.__aexit__(None, None, None)
+
+    async def test_channel_does_not_advertise_web_only_report_cards(self) -> None:
+        """An external channel keeps its own attachment capabilities."""
+        clients = await self._run(
+            ChannelOrigin(channel_id="chan-1", chat_id="chat-1"),
+        )
+        try:
+            self.assertEqual(len(self.prompts), 1)
+            self.assertNotIn("HTML report cards", self.prompts[0])
         finally:
             await clients.__aexit__(None, None, None)

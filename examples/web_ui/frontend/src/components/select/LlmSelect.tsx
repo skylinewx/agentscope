@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { useTranslation } from '@/i18n/useI18n.ts';
+import { selectChatModel } from '@/lib/model-selection';
 import { cn } from '@/lib/utils';
 import { credentialLabel } from '@/utils/common';
 
@@ -59,7 +60,12 @@ export function LlmSelect({
 	const hasOptions = groupEntries.length > 0;
 
 	const handleSelect = (type: string, credentialId: string, model: string) => {
-		onChange?.({ type, credential_id: credentialId, model, parameters: {} });
+		const next = selectChatModel(
+			value,
+			{ type, credential_id: credentialId, model },
+			groups[type]?.flatMap((item) => item.models) ?? [],
+		);
+		if (next !== value) onChange?.(next);
 	};
 
 	const displayLabel = value?.model

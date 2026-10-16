@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Shared FastAPI dependencies for the agentscope app."""
-from fastapi import Header, HTTPException, Request, status
+
+from fastapi import Depends, Header, HTTPException, Request, status
 
 from .workspace_manager import WorkspaceManagerBase
 from .channel import (
@@ -20,6 +21,7 @@ from ._service import (
     KnowledgeBaseService,
     RealtimeService,
     ResourceAccessService,
+    ResourceService,
     SessionService,
     WorkspaceService,
 )
@@ -67,6 +69,18 @@ async def get_storage(request: Request) -> StorageBase:
         `StorageBase`: The storage instance stored in ``app.state``.
     """
     return request.app.state.storage
+
+
+async def get_resource_service(
+    request: Request,
+    storage: StorageBase = Depends(get_storage),
+) -> ResourceService:
+    """Return resource policy, also supporting standalone mounted routers."""
+    service = getattr(request.app.state, "resource_service", None)
+    if service is None:
+        service = ResourceService(storage)
+        request.app.state.resource_service = service
+    return service
 
 
 async def get_message_bus(request: Request) -> MessageBus:

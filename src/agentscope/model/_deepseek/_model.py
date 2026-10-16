@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """The DeepSeek chat model implementation."""
+
 from collections import OrderedDict
 from datetime import datetime
 from typing import Literal, Any, AsyncGenerator, TYPE_CHECKING, List, Type
@@ -25,6 +26,13 @@ else:
 
 class DeepSeekChatModel(ChatModelBase):
     """The DeepSeek chat model."""
+
+    # JSON, numeric identifiers and hashes tokenize much more densely than
+    # ordinary prose. Four bytes/token underestimated a real tool-heavy
+    # request by about 40%, bypassing compression until the provider rejected
+    # it. Use a conservative text estimate, including tool arguments, results
+    # and schemas. Multimodal estimates retain the base class's flat allowance.
+    _text_bytes_per_token = 2
 
     class Parameters(BaseModel):
         """The parameters for the DeepSeek chat model."""

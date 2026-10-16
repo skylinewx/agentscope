@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Service layer for the AgentScope app."""
+
 from ._access import (
     AgentView,
     CredentialView,
@@ -29,6 +30,7 @@ from ._sop import SessionSOPStep, SOPService
 from ._toolkit import get_toolkit
 from ._download_token import sign_download_token, verify_download_token
 from ._workspace import GitStatus, WorkspaceService, WorkspaceStatus
+from ._resources import ResourceService
 
 __all__ = [
     "AgentView",
@@ -46,6 +48,7 @@ __all__ = [
     "KnowledgeBaseView",
     "MCPRenderError",
     "ResourceAccessService",
+    "ResourceService",
     "RealtimeService",
     "SessionSOPStep",
     "SOPService",

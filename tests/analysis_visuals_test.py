@@ -22,13 +22,13 @@ def visual_capture(store):
     rows = receipt['data']['stepResults'][0]['rows']
     names = ['集团预算中心（合成）', '华东业务部（合成）', '华南业务部（合成）']
     for i, row in enumerate(rows):
-        row.update(resourceIri=f'urn:fixture:member/{i}', label=names[i])
+        row.update(resourceRef=f'urn:fixture:member/{i}', label=names[i])
     capture['request']['plan']['steps'] += [
-        {'id':'parent', 'operation':'RESOLVE_ENTITY', 'resourceIris':['urn:fixture:member/0']},
+        {'id':'parent', 'operation':'RESOLVE_ENTITY', 'resourceRefs':['urn:fixture:member/0']},
         {'id':'children', 'operation':'TRAVERSE_RELATION', 'inputs':['parent'],
          'traversalScope':'DIRECT', 'maximumDepth':1, 'capabilityId':'fixture:direct-children'}]
     receipt['data']['stepResults'].append({'stepId':'children', 'operation':'TRAVERSE_RELATION', 'exactness':'EXACT',
-        'rows':[{**r,'rootResourceIri':'urn:fixture:member/0','depth':1} for r in rows[1:]]})
+        'rows':[{**r,'rootResourceRef':'urn:fixture:member/0','depth':1} for r in rows[1:]]})
     capture['response']['content'][0]['text']=json.dumps(receipt,ensure_ascii=False)
     ref=store.capture(OWNER,capture)
     for selector in selectors: selector['captureRef']=ref
@@ -148,7 +148,7 @@ class VisualTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(captured_relations({ref:capture}),[])
         relation['maximumDepth']=1
         receipt=json.loads(capture['response']['content'][0]['text'])
-        receipt['data']['stepResults'][0]['rows'][0].pop('resourceIri')
+        receipt['data']['stepResults'][0]['rows'][0].pop('resourceRef')
         capture['response']['content'][0]['text']=json.dumps(receipt)
         self.assertEqual(captured_relations({ref:capture}),[])
 

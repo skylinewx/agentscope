@@ -21,6 +21,10 @@ def resolved_form_query(query, receipt, step_id):
         elif resolved.get(key) != value:
             raise AnalysisError('GRID_TARGET_REFERENCE_MISMATCH', '已选目标改变了原查询参数。')
     for key, value in resolved.items():
+        if (key == 'periodCode' and key not in query and not query.get('periodRequest')
+                and value == resolved.get('targetDimensions', {}).get('DATATIME')
+                and re.fullmatch(r'[0-9]{4}N0001', str(value))):
+            continue
         if key not in query and key not in {'targetDimensions', 'measureCode', 'headerText'} and value not in (None, False, {}, []):
             raise AnalysisError('GRID_TARGET_REFERENCE_MISMATCH', '目标解析添加了无关运行条件。')
     if not any(resolved.get(key) for key in ('targetDimensions', 'measureCode', 'headerText')):
@@ -41,16 +45,27 @@ def validate_selection(form, query=None, upgraded=False):
             or not re.fullmatch('[0-9a-f]{64}', str(selection.get('contentDigest', '')))):
         raise AnalysisError('GRID_SELECTION_INVALID', '裁剪范围计数或摘要不完整。')
     if query is not None:
-        expected = {key: query.get(key) for key in ('measureCode', 'expression', 'headerText', 'cellKey')}
+        actual = selection['filter']
+        exp_key = 'cellExp' if 'cellExp' in actual else 'expression'
+        expected = {key: query.get(key) for key in ('measureCode', 'headerText', 'cellKey')}
+        expected[exp_key] = query.get('cellExp', query.get('expression'))
         expected.update(targetDimensions=query.get('targetDimensions') or {},
                         includeFormulaDependencies=query.get('includeFormulaDependencies', False))
-        if query.get('modelCode') is not None or 'modelCode' in selection['filter']:
+        if query.get('modelCode') is not None or 'modelCode' in actual:
             expected['modelCode'] = query.get('modelCode')
+        if query.get('targetRefs'):
+            expected['targetRefs'] = query['targetRefs']
+            # 同一组已确认引用可以派生多个表头。下载直接使用这份有摘要的完整筛选条件。
+            if 'headerTexts' in actual:
+                headers = actual['headerTexts']
+                if not isinstance(headers, list) or not headers or not all(isinstance(h, str) and h for h in headers):
+                    raise AnalysisError('GRID_SELECTION_INVALID', '已选目标的表头条件不完整。')
+                expected['headerTexts'] = headers
         # FOR_GRID 升级到 INPUT_VO 时，来源服务用旧坐标的表达式重新定位，不能复用旧坐标。
-        if upgraded and expected['cellKey'] and form.get('matchedExpression'):
+        if upgraded and expected['cellKey'] and form.get('matchedCellExp'):
             expected['cellKey'] = None
-            expected['expression'] = form['matchedExpression']
-        if expected != selection['filter']:
+            expected[exp_key] = form['matchedCellExp']
+        if expected != actual:
             raise AnalysisError('GRID_SELECTION_MISMATCH', '裁剪条件与本次查询的已确认目标不一致。')
     page, file = form.get('page'), form.get('file')
     if file:

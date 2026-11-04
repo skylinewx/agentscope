@@ -35,7 +35,7 @@ def period_fixture():
         data['evidence'][0]['fact'] = deepcopy(form['runtime'])
         step['periodExecution'] = {'planId': 'period-plan', 'resolution': deepcopy(resolution), 'periodIndex': index,
                                    'executionPeriod': period, 'periodCount': 2, 'workIndex': 0, 'workCount': 1,
-                                   'periodFinished': True, 'planFinished': index == 1, 'bindingIris': ['binding-A'],
+                                   'periodFinished': True, 'planFinished': index == 1, 'bindingRefs': ['binding-A'],
                                    'periodRequest': deepcopy(intent)}
         data.update(executionId='period-execution-' + str(index), status='SUCCEEDED' if index else 'PARTIAL')
         data['completeness']['enumerationExhausted'] = index == 1
@@ -197,13 +197,13 @@ class BudgetPeriodTest(TestCase):
     def test_equivalent_expression_requires_source_match_receipt(self):
         capture, selected, scope = fixture(values=('100',), page=False)
         expression = 'M_N[AMOUNT,-0N,ACCOUNT="profit",SCENE="budget"]'
-        capture['request']['plan']['steps'][1]['formQuery']['expression'] = expression
+        capture['request']['plan']['steps'][1]['formQuery']['cellExp'] = expression
         data = json.loads(capture['response']['content'][0]['text'])
         form = data['data']['stepResults'][1]['formResults'][0]
-        form['cells'][0]['expression'] = 'M_N[AMOUNT,DATATIME="2026N0001",ACCOUNT="profit",SCENE="budget"]'
+        form['cells'][0]['cellExp'] = 'M_N[AMOUNT,DATATIME="2026N0001",ACCOUNT="profit",SCENE="budget"]'
         capture['response']['content'][0]['text'] = json.dumps(data)
         with self.assertRaisesRegex(AnalysisError, '目标匹配证明'):
             adapt({'replace': capture}, selected, scope, 50000)
-        form['matchedExpression'] = expression
+        form['matchedCellExp'] = expression
         capture['response']['content'][0]['text'] = json.dumps(data)
         self.assertEqual(adapt({'replace': capture}, selected, scope, 50000)['facts'][0]['value'], '100')

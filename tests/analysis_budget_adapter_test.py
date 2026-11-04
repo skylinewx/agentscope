@@ -27,7 +27,7 @@ class BudgetAdapterTest(TestCase):
 
     def test_wrong_binding_rejected(self):
         capture, selections, scope = fixture()
-        capture["request"]["plan"]["steps"][0]["resourceIris"] = ["different-binding"]
+        capture["request"]["plan"]["steps"][0]["resourceRefs"] = ["different-binding"]
         with self.assertRaises(AnalysisError):
             adapt({"replace": capture}, selections, scope, 50000)
 

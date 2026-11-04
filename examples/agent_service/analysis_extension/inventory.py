@@ -116,7 +116,7 @@ def entities(captures, offset, limit, max_page, max_items, object_id=None, searc
             scanned += 1
             if scanned > max_items:
                 raise AnalysisError('INVENTORY_LIMIT', '实体索引超过容量，请按 captureRef 定位。')
-            item = {k: row.get(k) for k in ('key', 'label', 'resourceIri', 'modelCode')}
+            item = {k: row.get(k) for k in ('key', 'label', 'resourceRef', 'modelCode')}
             identity = digest(item)
             if identity in seen: continue
             seen.add(identity)

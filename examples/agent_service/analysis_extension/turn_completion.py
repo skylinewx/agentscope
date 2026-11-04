@@ -227,6 +227,9 @@ class TurnCompletion:
                         or any(not isinstance(value, str) or len(value) > 1024 for value in intent.values())):
                     raise AnalysisError('INVALID_QUERY_INTENT', 'intent 使用用户语义记录指标、完整任务限定、时期、情景、范围、分组及排序；不猜系统编码。')
             intent = {key: value.strip() for key, value in (intent or {}).items() if value.strip()}
+            form_year = intent.get('formExecutionYear')
+            if form_year is not None and not re.fullmatch(r'[1-9][0-9]{3}', form_year):
+                raise AnalysisError('INVALID_QUERY_INTENT', 'formExecutionYear 只能填写用户明确的四位开表年份。')
             if requiredEvidence is not None and requiredEvidence not in ('VALUES', 'FORMULAS'):
                 raise AnalysisError('INVALID_EVIDENCE_REQUIREMENT', 'requiredEvidence 使用 VALUES 或 FORMULAS。')
             if self.state.get('requiredEvidence') == 'FORMULAS' and requiredEvidence == 'VALUES':
@@ -288,7 +291,7 @@ class TurnCompletion:
                         or receipt.get('status') != 'SUCCEEDED' or data.get('resolutionKind') != 'GROUPING'
                         or not (data.get('status') == 'UNSUPPORTED' and data.get('metadataComplete') is True
                                 or data.get('status') == 'INCOMPLETE' and data.get('diagnostics'))
-                        or data.get('bindingIri') != capture.get('request', {}).get('bindingIri')):
+                        or data.get('bindingRef') != capture.get('request', {}).get('bindingRef')):
                     valid_receipts = False
                     break
             if (not isinstance(reason, str) or not reason.strip()
@@ -743,7 +746,7 @@ def query_evidence(turn):
     turn = evidence_turn(turn)
     captures, sources = {}, []
     registry = turn.service.sources
-    fields = ('factId', 'sourceContextId', 'objectId', 'objectLabel', 'sourceObjectId',
+    fields = ('factId', 'sourceContextId', 'objectId', 'objectLabel', 'sourceObjectId', 'selectionExecutionPeriod', 'selectionDataPeriod',
               'headers', 'measureCode', 'period', 'executionPeriod', 'dimensions',
               'effectiveDimensions', 'value', 'valueState', 'unit', 'scale', 'formula',
               'taskName', 'formName', 'cellAddress', 'observationExhausted', 'dimensionNames', 'formulaStatus', 'entryType')
@@ -754,7 +757,7 @@ def query_evidence(turn):
             if not adapter.is_data(capture):
                 continue
             contexts, facts = {}, []
-            context_fields = ('sourceContextId', 'period', 'executionPeriod', 'effectiveDimensions',
+            context_fields = ('sourceContextId', 'period', 'executionPeriod', 'selectionExecutionPeriod', 'selectionDataPeriod', 'effectiveDimensions',
                               'taskName', 'formName', 'observationExhausted')
             for value in registry.catalog(capture):
                 context = {k: value[k] for k in context_fields if k in value}
@@ -766,7 +769,7 @@ def query_evidence(turn):
             # evidence IDs and row IDs add no semantic information here.
             entities = []
             for row in adapter.entities(capture):
-                entity = {k: row[k] for k in ('key', 'label', 'modelCode', 'resourceIri', 'rootResourceIri', 'depth') if k in row}
+                entity = {k: row[k] for k in ('key', 'label', 'modelCode', 'resourceRef', 'rootResourceRef', 'depth') if k in row}
                 if row.get('fields'):
                     entity['fields'] = [{k: field[k] for k in ('capabilityId', 'label', 'valueType', 'valueStatus', 'values') if k in field}
                                         for field in row['fields']]
@@ -839,7 +842,7 @@ def _compact_query_entities(evidence):
 
     def pack_identity(identity):
         # IRI 的公共命名空间很长，但不是业务语义。只编码公共前缀，完整路径可逆恢复。
-        for field in ('resourceIri', 'rootResourceIri'):
+        for field in ('resourceRef', 'rootResourceRef'):
             value = identity.get(field)
             if not isinstance(value, str) or '/' not in value:
                 continue
@@ -883,7 +886,7 @@ sourceData.columnDictionaries 只为重复字段提供无损值字典：该字�
 followupScope.selectedContexts 标明本轮选择的历史结果或未完成任务，inheritedSubject 是该锚点的真实来源范围；resultSubject 若存在，以其实际交付子集为承接对象，不能恢复成来源全集。普通追问不悄然扩大层级、过滤或成员。context 是模型声明，不是用户授权；NEW、SYNTHESIZE、改选历史锚点或 changedFields 须与本轮原话相符。明确回到旧主题时不要求沿用最近另一主题；继续失败任务可复用该任务已取得资料，不能冒称已完成。参考数据不扩大主体。
 facts 的 contextRef 指向同一来源项 contexts 中的真实共同背景（时期、表名、任务及有效维度等），这是去重保存而非缺失；按此关联核对。captureRef 指向完整原始回执。
 entityRows 每行是 [entityRef, [[fieldRef, values], ...]]；只有身份的行是 [entityRef]。entityDefinitions[entityRef] 保存身份，fieldDefinitions[fieldRef] 保存字段名称、类型和取值状态，values 保留原值。缺少 values 与空集合、null 不同。definitionProjection 明确标识按已选运行对象省略的无关发现定义，原回执仍可追溯；这不是遗漏事实或业务成员。共享字典按引用展开后核对，不能把字典下标当业务代码。
-身份中的 resourceIri/rootResourceIri 若为 [prefixRef, suffix]，完整标识为 identityPrefixes[prefixRef] + suffix；这是无损前缀编码，不改变业务 key。
+身份中的 resourceRef/rootResourceRef 若为 [prefixRef, suffix]，完整标识为 identityPrefixes[prefixRef] + suffix；这是无损前缀编码，不改变业务 key。
 metadataPartition 存在时，仅元数据身份按段提供；全部查询事实、实际范围、失败诊断及关系在每段中保持完整。核对当前段提供的身份与完整数据和答复是否矛盾，未出现在当前段的身份不能当成缺失；不要要求重新枚举或取数。所有段都由宿主核对，任一段失败则整体不通过。完整事实上的数值、排序、计算和范围检查仍必须执行。
 sourceConnection 是实际调用的 MCP 资源、服务名与原始工具名，source 中的 sourceAdapter 只是解析该来源的宿主适配器，不是另一个数据来源；不得因两者名称不同而误报来源错误。缺少某描述的证据不等于证实它为假，不要求答复暴露这些技术标识。
 只检查用户要求的范围、数值、名称、时期、口径、排序方向和简单计算是否符合真实来源回执。检查正数、零、负数混合时的真实数值顺序；有排序或算术错误时要求使用 SortRecords 或 Calculate 复核并沿用结果。
@@ -898,6 +901,7 @@ batchQueries 的 requestedScope 表示用户条件，results 表示预算服务�
 
 QUERY_REVIEW_PROMPT += '\n来源含 factColumns/factRows 时逐行按列名恢复事实，并合并 fixedFactFields；missingFactFields 按行号标明实际缺少的字段，真实 null 保持 null。此为无损结构压缩，不是省略记录。'
 QUERY_REVIEW_PROMPT += '\n只报告数值、计算、范围、口径、关键遗漏、编造来源事实和实质矛盾。文字解释言之有理即可，不因缺少逐句证明、可润色或存在另一种合理解释提出问题。'
+QUERY_REVIEW_PROMPT += '\n用户明确要求某一开表年度的表内数值时，批量事实的 selectionExecutionPeriod（实际打开的表）与 selectionDataPeriod（该表中定位格的数据期）须同时符合问题。period 是结果数据期。其他执行年度的金额或跨期切片不能证明本张表有该格。完整展开没有对应格时可回答未匹配，已匹配格的 null 则是空值。'
 QUERY_REVIEW_PROMPT += '\nverifiedDependencyUnitRefs 表示宿主已核对相同代码、完整实际输入/读集和输出的依赖单元；本次不重复附这些明细。executionScopes 仍是运行级范围，不是逐产物血缘。FINAL 阶段继续核对本轮问题、实际选定结果、范围及新答复，不能把计算通过当成新问题已回答。DEPENDENCY 阶段不接收本轮问题或 candidateAnswer，只核对不可变代码、实际输入/完整读集与所列输出的对应关系和计算，不以缺少问题、答复或其他探索输出作为缺口。'
 from .review_encoding import ENCODING_GUIDE
 QUERY_REVIEW_PROMPT += '\n' + ENCODING_GUIDE
@@ -1074,7 +1078,7 @@ def _metadata_query_payloads(envelope, evidence):
         definitions = {ref: evidence['entityDefinitions'][ref] for ref in sorted(entity_refs)}
         prefixes = {value[0] for definition in definitions.values()
                     for field, value in definition.items()
-                    if field in ('resourceIri', 'rootResourceIri') and isinstance(value, list)}
+                    if field in ('resourceRef', 'rootResourceRef') and isinstance(value, list)}
         return {**evidence, 'sources': sources, 'entityDefinitions': definitions,
                 'fieldDefinitions': {ref: evidence['fieldDefinitions'][ref] for ref in sorted(field_refs)},
                 'identityPrefixes': {ref: evidence.get('identityPrefixes', {})[ref] for ref in sorted(prefixes)}}

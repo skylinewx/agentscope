@@ -19,7 +19,7 @@ class ReliabilityTests(PresentationCase):
     def source(self):
         capture, selections, scope=fixture(('10','4','5'),unit=None)
         receipt=receipt_from_capture(capture)
-        for row in receipt['data']['stepResults'][0]['rows']: row['resourceIri']='iri:'+row['key']
+        for row in receipt['data']['stepResults'][0]['rows']: row['resourceRef']='iri:'+row['key']
         ref=self.store.capture(OWNER,reply(capture,receipt))
         for s in selections: s['captureRef']=ref
         scope['population']['captureRef']=ref
@@ -29,13 +29,13 @@ class ReliabilityTests(PresentationCase):
         capture,_,_=fixture()
         capture['originalToolName']='traverse_relation'
         capture['request']={'contractVersion':'2.0','contextId':CONTEXT['contextId'],'querySessionId':'query-A',
-                            'resourceIri':'iri:object-0','capabilityId':'child-cap','traversalScope':'DIRECT',
+                            'resourceRef':'iri:object-0','capabilityId':'child-cap','traversalScope':'DIRECT',
                             'traversalMaximumDepth':1,'traversalPageSize':20}
         if cursor: capture['request']['traversalCursor']=cursor
         receipt={'contractVersion':'2.0','status':'SUCCEEDED','context':deepcopy(CONTEXT),'querySessionId':'query-A',
                  'completeness':{'enumerationExhausted':not next_cursor},'data':{
-                 'rootResourceIri':'iri:object-0','capabilityId':'child-cap','scope':'DIRECT','maximumDepth':1,
-                 'rows':[{'key':k,'label':'名称'+k,'resourceIri':'iri:'+k,'rootResourceIri':'iri:object-0','depth':1} for k in keys],
+                 'rootResourceRef':'iri:object-0','capabilityId':'child-cap','scope':'DIRECT','maximumDepth':1,
+                 'rows':[{'key':k,'label':'名称'+k,'resourceRef':'iri:'+k,'rootResourceRef':'iri:object-0','depth':1} for k in keys],
                  'page':{'enumerationExhausted':not next_cursor,'nextCursor':next_cursor,'stopReasons':[]}}}
         return self.store.capture(OWNER,reply(capture,receipt))
 
@@ -82,11 +82,11 @@ class ReliabilityTests(PresentationCase):
              'capabilityId': 'category-members', 'traversalScope': 'DIRECT'}], 'outputStepIds': ['children']}
         receipt['data']['stepResults'] = [
             {'stepId': 'roots', 'exactness': 'EXACT', 'rows': [
-                {'resourceIri': 'iri:one', 'key': 'one', 'modelCode': 'category'},
-                {'resourceIri': 'iri:two', 'key': 'two', 'modelCode': 'category'}]},
+                {'resourceRef': 'iri:one', 'key': 'one', 'modelCode': 'category'},
+                {'resourceRef': 'iri:two', 'key': 'two', 'modelCode': 'category'}]},
             {'stepId': 'children', 'exactness': 'EXACT', 'rows': [
-                {'resourceIri': 'iri:member', 'key': 'member', 'modelCode': 'unit',
-                 'rootResourceIri': 'iri:one', 'depth': 1}]}]
+                {'resourceRef': 'iri:member', 'key': 'member', 'modelCode': 'unit',
+                 'rootResourceRef': 'iri:one', 'depth': 1}]}]
         ref = self.store.capture(OWNER, reply(capture, receipt))
         relations = captured_relations({ref: self.store.get_capture(OWNER, ref)})
         self.assertEqual({item['parentId']: item['childIds'] for item in relations}, {'one': ['member'], 'two': []})
@@ -116,7 +116,7 @@ class ReliabilityTests(PresentationCase):
         for s in selections:s['captureRef']=source
         scope.pop('population',None)
         names=deepcopy(capture);names['originalToolName']='search_entities'
-        candidate={'key':'object-0','label':'来源正式名称','resourceIri':'iri:object-0',
+        candidate={'key':'object-0','label':'来源正式名称','resourceRef':'iri:object-0',
                    'modelCode':'MODEL_A','kind':'RESOURCE','matchedBy':['RESOURCE_RDF_VERIFIED']}
         names_ref=self.store.capture(OWNER,reply(names,{**receipt,'data':{'candidates':[candidate]}}))
         found=await self.service.inspect(section='inventory',memberDimension='MD_ORG')

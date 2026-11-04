@@ -15,7 +15,7 @@ CONTEXT = {"contextId": "context-A", "sourceId": "source-A", "snapshotId": "snap
 def fixture(values=("100", "-1033.14", "-8300"), unit="元", page=True):
     members = [f"object-{i}" for i in range(len(values))]
     request = {"contractVersion": "2.0", "contextId": CONTEXT["contextId"], "querySessionId": "query-A", "requestId": "request-A", "mode": "execute",
-               "plan": {"steps": [{"id": "binding", "operation": "RESOLVE_ENTITY", "resourceIris": ["binding-A"]}], "outputStepIds": []}}
+               "plan": {"steps": [{"id": "binding", "operation": "RESOLVE_ENTITY", "resourceRefs": ["binding-A"]}], "outputStepIds": []}}
     receipt = {"contractVersion": "2.0", "executionId": "execution-A", "querySessionId": "query-A", "context": deepcopy(CONTEXT), "requestFingerprint": "request-digest",
                "status": "SUCCEEDED", "data": {"stepResults": [{"stepId": "population", "rows": [{"id": x, "key": x, "label": f"合成成员 {i}"} for i, x in enumerate(members)], "exactness": "EXACT"}]},
                "evidence": [], "branches": [], "completeness": {"enumerationExhausted": True, "semanticCompleteness": "UNVERIFIED"}}

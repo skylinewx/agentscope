@@ -1,10 +1,11 @@
 """从已交付的来源范围承接追问；不靠业务关键词猜测用户是否换题。"""
 from copy import deepcopy
+from datetime import date
 
 from .models import AnalysisError, digest
 
 
-INTENT_FIELDS = ('metric', 'task', 'period', 'scenario', 'population', 'grouping',
+INTENT_FIELDS = ('metric', 'task', 'period', 'formExecutionYear', 'scenario', 'population', 'grouping',
                  'order', 'analysisFocus', 'referencePopulation')
 # 意图与变化字段共用同一契约；分组、排序变化不解除主体或时期边界。
 CHANGE_FIELDS = INTENT_FIELDS
@@ -66,10 +67,11 @@ def _query(capture, step_id):
 
 
 def _bindings(capture, step_id):
-    from .adapters.budget_v2 import _step_request, _bindings as bindings
+    from .adapters.budget_v2 import _step_request, _bindings as bindings, receipt_from_capture
     step, steps = _step_request(capture, step_id)
-    result = bindings(step, steps)
-    result.update(metric['bindingIri'] for metric in step.get('batchQuery', {}).get('metrics', []) if metric.get('bindingIri'))
+    results = receipt_from_capture(capture).get('data', {}).get('stepResults', []) if capture.get('response') else ()
+    result = bindings(step, steps, results=results)
+    result.update(metric['bindingRef'] for metric in step.get('batchQuery', {}).get('metrics', []) if metric.get('bindingRef'))
     return result
 
 
@@ -122,7 +124,7 @@ def _metric_period(previous_metrics, metric):
     selection = metric.get('selection', {})
     identity = {key: value for key, value in selection.items() if key != 'periodCode'}
     same_binding = [old for old in previous_metrics
-                    if old.get('bindingIri') == metric.get('bindingIri')]
+                    if old.get('bindingRef') == metric.get('bindingRef')]
     matches = [old for old in same_binding if identity == {
         key: value for key, value in old.get('selection', {}).items() if key != 'periodCode'}]
     # 未知新指标只可继承同一绑定内明确共同的时期，不能跨绑定借值。
@@ -161,7 +163,68 @@ def _inherit_query(previous, proposed, changes, period_dimensions=()):
     return result
 
 
+def _single_annual_code(period_request):
+    if not isinstance(period_request, dict) or period_request.get('kind') != 'PERIOD':
+        return None
+    start = period_request.get('start') or {}
+    if not isinstance(start, dict) or start.get('type') != 'N':
+        return None
+    if type(start.get('year')) is int:
+        return f"{start['year']:04d}N0001"
+    if isinstance(start.get('date'), str):
+        try:
+            return f"{date.fromisoformat(start['date']).year:04d}N0001"
+        except ValueError:
+            pass
+    return None
+
+
+def _apply_form_year(request, year):
+    """限定年度表内查询：表外执行期与批量结果的数据期各自约束，实际维值由预算展开核对。"""
+    expected = year + 'N0001'
+    result = deepcopy(request)
+    for step in result.get('plan', {}).get('steps', []):
+        batch = step.get('batchQuery') or {}
+        selections = [metric['selection'] for metric in batch.get('metrics', [])
+                      if isinstance(metric, dict) and isinstance(metric.get('selection'), dict)]
+        if isinstance(step.get('formQuery'), dict):
+            selections.append(step['formQuery'])
+        axis = next((dim for dim in batch.get('batchDimensions', []) if dim.get('dimCode') == 'DATATIME'), None)
+        data_period = None
+        if axis is not None:
+            values = axis.get('values', [])
+            data_period = values[0] if isinstance(values, list) and len(values) == 1 else _single_annual_code(axis.get('periodRequest'))
+            if not data_period:
+                raise AnalysisError('FORM_GRID_PERIOD_SCOPE',
+                    f'用户限定了 {year} 年度表内的值。请用 FORM_VIEW_QUERY 在同一张表中读取各数据期；批量取数时按已确认的格内时期分别查询。')
+        for selection in selections:
+            code = selection.get('periodCode')
+            dimension = (selection.get('dimensions') or {}).get('DATATIME')
+            structured = selection.get('periodRequest')
+            if (any(value is not None and value != expected for value in (code, dimension))
+                    or (structured is not None and _single_annual_code(structured) != expected)
+                    or selection.get('periodText')):
+                raise AnalysisError('FORM_EXECUTION_PERIOD_CONFLICT',
+                    f'本轮已确定按 {year} 年度开表，请在该执行期展开，并按实际格内时期筛选。')
+            if code is None and dimension is None and structured is None:
+                selection['periodCode'] = expected
+            if data_period is not None:
+                target = selection.setdefault('targetDimensions', {})
+                if target.get('DATATIME', data_period) != data_period:
+                    raise AnalysisError('FORM_GRID_PERIOD_SCOPE', '批量数据期与所选格的数据期不同，请使用该年度的展开结果。')
+                target['DATATIME'] = data_period
+    return result
+
+
 def prepare_request(turn, origin, request):
+    result = _inherit_request(turn, origin, request)
+    year = turn.state.get('queryIntent', {}).get('formExecutionYear')
+    if year and origin.get('originalToolName') == 'execute_semantic_plan':
+        return _apply_form_year(result, year)
+    return result
+
+
+def _inherit_request(turn, origin, request):
     """在同来源、同绑定下补齐遗漏条件；不增加工具或模型往返。"""
     selectors = _selectors(turn)
     if not selectors or origin.get('originalToolName') not in ('execute_semantic_plan', 'discover_query_targets'):
@@ -199,17 +262,21 @@ def query_anchors(turn):
     """返回已成功查询的完整身份；分组追问不靠模型重写长标识。"""
     if 'task' in _changes(turn):
         return []
+    from .adapters.budget_v2 import task_form_endpoints
     result = []
     for selection, capture, _, _ in _inherited_tables(turn, _selectors(turn)):
         request = capture.get('request', {})
         for binding in sorted(_bindings(capture, selection['stepId'])):
-            anchor = {'captureRef': selection['captureRef'], 'resourceId': capture['resourceId'], 'bindingIri': binding,
+            anchor = {'captureRef': selection['captureRef'], 'resourceId': capture['resourceId'], 'bindingRef': binding,
                       'contextId': request.get('contextId'), 'querySessionId': request.get('querySessionId')}
+            endpoints = task_form_endpoints(binding)
+            if endpoints:
+                anchor['taskRef'], anchor['formRef'] = endpoints
             grouping = turn.state.get('queryIntent', {}).get('grouping')
             if grouping and 'task' not in _changes(turn):
                 anchor['discoverGroupingArguments'] = {
                     'contractVersion': '2.0', 'contextId': request.get('contextId'),
-                    'querySessionId': request.get('querySessionId'), 'bindingIri': binding,
+                    'querySessionId': request.get('querySessionId'), 'bindingRef': binding,
                     'groupingKeyword': grouping, 'requestId': 'grouping-' + digest([binding, grouping])[:24]}
             if anchor not in result:
                 result.append(anchor)
@@ -226,6 +293,9 @@ def _check_anchor_identifiers(turn, origin, request, anchors):
                 and capture.get('request', {}).get('contextId') == request.get('contextId')
                 and capture.get('request', {}).get('querySessionId') == request.get('querySessionId')):
             known.update(_bindings(capture, selection['stepId']))
+    from .adapters.budget_v2 import task_form_endpoints
+    for reference in tuple(known):
+        known.update(task_form_endpoints(reference) or ())
     if not known:
         return
     corrected, replacements = deepcopy(request), []
@@ -234,9 +304,9 @@ def _check_anchor_identifiers(turn, origin, request, anchors):
         if isinstance(value, dict):
             for key, child in value.items():
                 child_path = path + '/' + key
-                if key in ('bindingIri', 'resourceIri') and isinstance(child, str):
+                if key in ('bindingRef', 'resourceRef') and isinstance(child, str):
                     value[key] = match(child, child_path)
-                elif key == 'resourceIris' and isinstance(child, list):
+                elif key == 'resourceRefs' and isinstance(child, list):
                     value[key] = [match(item, child_path + '/' + str(index)) if isinstance(item, str) else item
                                   for index, item in enumerate(child)]
                 else:

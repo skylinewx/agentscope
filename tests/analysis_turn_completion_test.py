@@ -41,7 +41,7 @@ def expanded_entities(evidence, source):
     entities = []
     for row in source['entityRows']:
         entity = deepcopy(evidence['entityDefinitions'][row[0]])
-        for field in ('resourceIri', 'rootResourceIri'):
+        for field in ('resourceRef', 'rootResourceRef'):
             value = entity.get(field)
             if isinstance(value, list):
                 entity[field] = evidence['identityPrefixes'][value[0]] + value[1]
@@ -305,7 +305,7 @@ class TurnCompletionTests(PresentationCase):
                         'valueType': 'http://www.w3.org/2001/XMLSchema#string', 'valueStatus': 'PRESENT'}
                        for index in range(7)]
         rows = [{'key': f'task-{index}', 'label': f'合成年度任务{index}', 'modelCode': 'TASK',
-                 'resourceIri': f'urn:fixture:task:{index}', 'rootResourceIri': f'urn:fixture:task:{index}',
+                 'resourceRef': f'urn:fixture:task:{index}', 'rootResourceRef': f'urn:fixture:task:{index}',
                  'depth': 0, 'fields': [{**definition, 'values': [f'value-{index}-{field_index}']}
                                       for field_index, definition in enumerate(definitions)]}
                 for index in range(100)]
@@ -373,8 +373,8 @@ class TurnCompletionTests(PresentationCase):
 
     def test_iri_prefix_packing_is_lossless_and_keeps_different_namespaces(self):
         rows = [{'key': str(index), 'label': '成员', 'modelCode': 'synthetic',
-                 'resourceIri': f'urn:example:source/{namespace}/resource/object/{index}',
-                 'rootResourceIri': f'urn:example:source/{namespace}/resource/object/root'}
+                 'resourceRef': f'urn:example:source/{namespace}/resource/object/{index}',
+                 'rootResourceRef': f'urn:example:source/{namespace}/resource/object/root'}
                 for namespace in ('first', 'second') for index in range(20)]
         evidence = {'sources': [{'entities': deepcopy(rows)}]}
         _compact_query_entities(evidence)
@@ -611,9 +611,9 @@ class TurnCompletionTests(PresentationCase):
                 turn = self.turn()
                 capture, _, _, receipt = batch_fixture()
                 capture.update(originalToolName='discover_query_targets', toolCallId=f'discovery-{next(IDS)}')
-                capture['request'] = {'bindingIri': 'binding-A'}
+                capture['request'] = {'bindingRef': 'binding-A'}
                 receipt['data'] = {'resolutionKind': 'GROUPING', 'status': status, 'metadataComplete': complete,
-                                   'bindingIri': 'binding-A' if same_binding else 'binding-B'}
+                                   'bindingRef': 'binding-A' if same_binding else 'binding-B'}
                 update(capture, receipt)
                 ref = self.store.capture(OWNER, capture)
                 turn.state['queryCaptureRefs'] = [ref] if current else []

@@ -12,7 +12,7 @@ from jsonschema import Draft202012Validator
 
 
 def metric(account, period=None, binding='binding-A', name=None):
-    value = {'bindingIri': binding, 'selection': {'measureCode': 'amount',
+    value = {'bindingRef': binding, 'selection': {'measureCode': 'amount',
              'targetDimensions': {'ACCOUNT': account}}}
     if period is not None:
         value['selection']['periodCode'] = period

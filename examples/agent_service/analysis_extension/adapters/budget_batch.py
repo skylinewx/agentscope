@@ -21,10 +21,10 @@ def validate(capture, receipt, step_id, table):
     metrics, origins = request.get('metrics', []), table.get('metrics', [])
     if not metrics or len(metrics) != len(origins) or len(metrics) != len(query.get('metrics', [])):
         raise AnalysisError('REQUEST_MISMATCH', '批量查询项与原请求不一致。')
-    bindings = _bindings(step, steps)
+    bindings = _bindings(step, steps, results=receipt.get("data", {}).get("stepResults", []))
     for previous in receipt.get('data', {}).get('stepResults', []):
-        if previous.get('stepId') in step.get('inputs', []):
-            bindings.update(row['resourceIri'] for row in previous.get('rows', []) if row.get('resourceIri'))
+        if len(step.get('inputs', [])) == 1 and previous.get('stepId') in step['inputs']:
+            bindings.update(row['resourceRef'] for row in previous.get('rows', []) if row.get('resourceRef'))
     categories = set()
     for index, (metric, origin, requested) in enumerate(zip(metrics, origins, query['metrics'])):
         context, selection = origin.get('context', {}), requested.get('selection', {})
@@ -34,7 +34,7 @@ def validate(capture, receipt, step_id, table):
         name = 'metric' + str(index + 1)
         binding = target.get('formBindingKey')
         if (metric.get('name') != name or origin.get('name') != name or binding not in bindings
-                or requested.get('bindingIri', binding) != binding or metric.get('viewId') != target.get('viewId')
+                or requested.get('bindingRef', binding) != binding or metric.get('viewId') != target.get('viewId')
                 or request.get('budTaskId') != target.get('mainTaskId')
                 or metric.get('cellExp') != origin.get('cellExp')
                 or metric.get('dimValMap') != context.get('effectiveDimensions')):
@@ -50,7 +50,7 @@ def validate(capture, receipt, step_id, table):
         if (selection.get('measureCode', origin.get('measureCode')) != origin.get('measureCode')
                 or selection.get('cellKey', origin.get('selectionCellKey')) != origin.get('selectionCellKey')
                 or selection.get('observationId', origin.get('selectionObservationId')) != origin.get('selectionObservationId')
-                or selection.get('expression') != origin.get('requestedExpression')
+                or selection.get('cellExp') != origin.get('requestedCellExp')
                 or selection.get('headerText') and selection['headerText'] not in origin.get('headers', [])):
             raise AnalysisError('REQUEST_MISMATCH', '批量定位目标与原请求不一致。')
         categories.add(target.get('organizationCategory'))
@@ -180,7 +180,10 @@ def catalog(capture, selections=None, max_facts=Limits().max_facts):
                                'dimensionModels': origin.get('dimensionModels', {}), 'dimensions': effective,
                                'propertyDimensions': property_dimensions,
                                'dimensionNames': names, 'effectiveDimensions': {},
-                               'period': effective.get('DATATIME'), 'executionPeriod': effective.get('DATATIME'),
+                               'period': effective.get('DATATIME'),
+                               'executionPeriod': (origin['context'].get('period') if origin.get('periodBinding') in ('OFFSET', 'CELL') else effective.get('DATATIME')),
+                               'selectionExecutionPeriod': origin['context'].get('period'),
+                               'selectionDataPeriod': origin.get('selectedDimensions', {}).get('DATATIME'),
                                'value': value, 'valueState': 'NO_VALUE' if raw is None else 'PRESENT',
                                'precision': 'decimal_string', 'unit': column.get('unit'),
                                'calcType': column.get('calcType'), 'aggregation': table['request'].get('aggregation'),

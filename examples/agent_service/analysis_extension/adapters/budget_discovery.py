@@ -21,7 +21,7 @@ def entity_rows(receipt):
     for _, output in row_sets(receipt):
         yield from output['rows']
     for candidate in (receipt.get('data') or {}).get('candidates', []):
-        if (candidate.get('kind') == 'RESOURCE' and candidate.get('resourceIri')
+        if (candidate.get('kind') == 'RESOURCE' and candidate.get('resourceRef')
                 and 'RESOURCE_RDF_VERIFIED' in candidate.get('matchedBy', [])):
             yield candidate
 

@@ -17,12 +17,12 @@ def remember_grouping(turn, capture):
     data = receipt.get('data') or {}
     if receipt.get('status') != 'SUCCEEDED' or data.get('resolutionKind') != 'GROUPING':
         return
-    if data.get('bindingIri') != capture.get('request', {}).get('bindingIri'):
+    if data.get('bindingRef') != capture.get('request', {}).get('bindingRef'):
         return
     from .actions import source_identity
     from .adapters.budget_v2 import data_context
     boundary = {'source': list(source_identity(capture)), 'context': data_context(receipt.get('context')),
-                'bindingIri': data['bindingIri']}
+                'bindingRef': data['bindingRef']}
     key = digest([boundary, capture['request'].get('groupingKeyword')])
     turn.state.setdefault('groupingRequirements', {})[key] = {
         **boundary, 'captureRef': capture['captureRef'], 'keyword': capture['request'].get('groupingKeyword'),
@@ -67,13 +67,13 @@ def grouping_requirements(turn):
                 if not groups:
                     continue
                 target, steps = _step_request(capture, step['id'])
-                bindings = _bindings(target, steps)
-                bindings.update(metric['bindingIri'] for metric in step.get('batchQuery', {}).get('metrics', [])
-                                if metric.get('bindingIri'))
+                bindings = _bindings(target, steps, results=receipt.get("data", {}).get("stepResults", []))
+                bindings.update(metric['bindingRef'] for metric in step.get('batchQuery', {}).get('metrics', [])
+                                if metric.get('bindingRef'))
                 for item in candidates:
                     if (list(item['source']) == list(source_identity(capture))
                             and item['context'] == data_context(receipt.get('context'))
-                            and item['bindingIri'] in bindings
+                            and item['bindingRef'] in bindings
                             and any(group in groups for group in item['candidates'])):
                         selected.add(item['captureRef'])
     return [{**item, 'required': item['captureRef'] in selected} for item in candidates]
@@ -106,11 +106,11 @@ def grouping_issues(turn, artifact=None):
                 # 会话经 JSON 保存后 tuple 会成为 list；按规范化后的值比较来源身份。
                 if (list(requirement['source']) == list(source_identity(capture))
                         and requirement['context'] == data_context(receipt.get('context'))
-                        and requirement['bindingIri'] in bindings
+                        and requirement['bindingRef'] in bindings
                         and any(group in groups for group in requirement['candidates'])):
                     matched.add(index)
     return [{'code': 'GROUPING_RESULT_REQUIRED',
              'message': '当前任务表样的分组口径尚无成功的预算聚合结果；复用原定位和范围执行批量聚合，不能用手工加总、父级属性继承或 Python 替代。',
-             'discoveryCaptureRef': item['captureRef'], 'bindingIri': item['bindingIri'],
+             'discoveryCaptureRef': item['captureRef'], 'bindingRef': item['bindingRef'],
              'organizationType': item['organizationType'], 'groupByCandidates': item['candidates']}
             for index, item in enumerate(requirements) if index not in matched and item['status'] == 'SUPPORTED']

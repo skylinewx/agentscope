@@ -30,8 +30,8 @@ class GroupingRecoveryTests(PresentationCase):
 
     def discovery(self, turn, keyword, field, binding='binding-A'):
         capture, _, _, receipt = batch_fixture()
-        capture.update(originalToolName='discover_query_targets', request={'bindingIri': binding, 'groupingKeyword': keyword})
-        receipt['data'] = {'resolutionKind': 'GROUPING', 'bindingIri': binding, 'status': 'SUPPORTED',
+        capture.update(originalToolName='discover_query_targets', request={'bindingRef': binding, 'groupingKeyword': keyword})
+        receipt['data'] = {'resolutionKind': 'GROUPING', 'bindingRef': binding, 'status': 'SUPPORTED',
                            'metadataComplete': True, 'organizationType': 'category-A',
                            'candidates': [{'supported': True, 'groupBy': {'dimCode': 'MD_ORG', 'field': field}}]}
         capture['response']['content'][0]['text'] = json.dumps(receipt)
@@ -82,8 +82,8 @@ class GroupingRecoveryTests(PresentationCase):
         turn = self.turn()
         capture, selection, scope, receipt = batch_fixture()
         discovery = deepcopy(capture)
-        discovery.update(originalToolName='discover_query_targets', request={'bindingIri': 'binding-A', 'groupingKeyword': '类别'})
-        data = {'resolutionKind': 'GROUPING', 'bindingIri': 'binding-A', 'status': 'SUPPORTED', 'metadataComplete': True,
+        discovery.update(originalToolName='discover_query_targets', request={'bindingRef': 'binding-A', 'groupingKeyword': '类别'})
+        data = {'resolutionKind': 'GROUPING', 'bindingRef': 'binding-A', 'status': 'SUPPORTED', 'metadataComplete': True,
                 'organizationType': 'category-A', 'candidates': [{'supported': True, 'groupBy': {'dimCode': 'MD_ORG', 'field': 'MD_YWBK'}}]}
         discovery['response']['content'][0]['text'] = json.dumps({**receipt, 'data': data})
         discovery_ref = self.store.capture(OWNER, discovery)
@@ -106,8 +106,8 @@ class GroupingRecoveryTests(PresentationCase):
     async def test_metadata_incomplete_can_finish_with_evidence_but_not_fake_success(self):
         turn = self.turn()
         capture, _, _, receipt = batch_fixture()
-        capture.update(originalToolName='discover_query_targets', request={'bindingIri': 'binding-A', 'groupingKeyword': '类别'})
-        receipt['data'] = {'resolutionKind': 'GROUPING', 'bindingIri': 'binding-A', 'status': 'INCOMPLETE',
+        capture.update(originalToolName='discover_query_targets', request={'bindingRef': 'binding-A', 'groupingKeyword': '类别'})
+        receipt['data'] = {'resolutionKind': 'GROUPING', 'bindingRef': 'binding-A', 'status': 'INCOMPLETE',
                            'metadataComplete': False, 'diagnostics': ['当前表样结构缺失'], 'candidates': []}
         capture['response']['content'][0]['text'] = json.dumps(receipt)
         ref = self.store.capture(OWNER, capture)

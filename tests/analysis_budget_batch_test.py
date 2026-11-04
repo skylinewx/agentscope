@@ -57,7 +57,7 @@ def batch_fixture(aggregate=True, null_value=False):
         data['aggregationSummary'] = {'leafTargetCombinationCount': 5, 'groupCountBeforeHaving': 2, 'filteredOutGroupCount': 0}
     table = {'resultType': 'BATCH_RESULT', 'batchId': 'batch-A', 'disposition': 'SUCCEEDED', 'message': '批量查询成功',
              'readAt': '2026-01-01T00:00:01Z', 'request': request, 'metrics': origins, 'columnRoles': roles, 'data': data}
-    plan = {'steps': [{'id': 'binding', 'operation': 'RESOLVE_ENTITY', 'resourceIris': ['binding-A']},
+    plan = {'steps': [{'id': 'binding', 'operation': 'RESOLVE_ENTITY', 'resourceRefs': ['binding-A']},
                       {'id': 'batch', 'operation': 'BATCH_DATA_QUERY', 'inputs': ['binding'], 'batchQuery': query}]}
     receipt = {'contractVersion': '2.0', 'status': 'SUCCEEDED', 'context': context, 'querySessionId': 'session-A', 'executionId': 'execution-A',
                'data': {'stepResults': [{'stepId': 'batch', 'operation': 'BATCH_DATA_QUERY', 'batchResults': [table], 'rows': [], 'formResults': [], 'exactness': 'EXACT'}]},
@@ -77,6 +77,38 @@ def update(capture, receipt):
 
 
 class BudgetBatchTest(TestCase):
+    def test_offset_metric_separates_grid_opening_year_from_result_data_year(self):
+        capture, _, _, receipt = batch_fixture(False)
+        table = receipt['data']['stepResults'][0]['batchResults'][0]
+        origin = table['metrics'][0]
+        origin['periodBinding'] = 'OFFSET'
+        origin['selectedDimensions']['DATATIME'] = '2025N0001'
+        table['data'].setdefault('fixedDimValMap', {})['DATATIME'] = '2025N0001'
+        update(capture, receipt)
+        fact = next(fact for fact in catalog(capture) if fact.get('queryMetricName') == 'metric1')
+        self.assertEqual(fact['selectionExecutionPeriod'], '2026N0001')
+        self.assertEqual(fact['executionPeriod'], '2026N0001')
+        self.assertEqual(fact['selectionDataPeriod'], '2025N0001')
+        self.assertEqual(fact['period'], '2025N0001')
+
+    def test_batch_receipt_must_match_the_two_selected_path_endpoints(self):
+        from analysis_extension.adapters import budget_batch
+        from analysis_extension.adapters.budget_v2 import task_form_reference
+        capture, _, _, receipt = batch_fixture()
+        task, form = 'BUDTASK/A', 'BUDVIEW/shared'
+        plan = capture['request']['plan']
+        batch = next(s for s in plan['steps'] if s['operation'] == 'BATCH_DATA_QUERY')
+        plan['steps'] = [{'id': 'task', 'operation': 'RESOLVE_ENTITY', 'resourceRefs': [task]},
+                         {'id': 'template', 'operation': 'RESOLVE_ENTITY', 'resourceRefs': [form]}, batch]
+        batch['inputs'] = ['task', 'template']
+        table = next(iter(budget_batch.tables(receipt)))[1]
+        for metric in table['metrics']:
+            metric['context']['target']['formBindingKey'] = task_form_reference(task, form)
+        budget_batch.validate(capture, receipt, batch['id'], table)
+        plan['steps'][0]['resourceRefs'] = ['BUDTASK/B']
+        with self.assertRaises(AnalysisError):
+            budget_batch.validate(capture, receipt, batch['id'], table)
+
     def test_partial_metric_selection_is_not_hidden_by_union_of_rows(self):
         capture, selection, scope, _ = batch_fixture()
         scope.pop('members')

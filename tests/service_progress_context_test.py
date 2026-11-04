@@ -33,7 +33,7 @@ class PublicContextTests(TestCase):
 
     def test_candidate_names_and_scope_remain_candidates(self):
         result = public_observations({'data': {'candidates': [{
-            'taskName': '预算二上', 'formName': '利润表', 'bindingIri': 'binding',
+            'taskName': '预算二上', 'formName': '利润表', 'bindingRef': 'binding',
             'matches': [{'label': '净利润', 'targetDimensions': {'MD_BUDACCOUNT': 'np'}},
                         {'label': '归母净利润', 'targetDimensions': {'MD_BUDACCOUNT': 'parent'}}],
         }]}}, 'capture', 'discover_query_targets', {'keyword': '净利润'})

@@ -21,9 +21,9 @@ def direct_outputs(captures, receipts, diagnostics=None):
             roots = set()
             for source in inputs:
                 output = returned.get(source.get('id'), {})
-                roots.update(row['resourceIri'] for row in output.get('rows', []) if row.get('resourceIri'))
+                roots.update(row['resourceRef'] for row in output.get('rows', []) if row.get('resourceRef'))
                 if source.get('operation') == 'RESOLVE_ENTITY':
-                    roots.update(source.get('resourceIris', []))
+                    roots.update(source.get('resourceRefs', []))
             yield ref, sid, step['capabilityId'], roots, returned[sid]['rows'], (
                 receipt.get('completeness', {}).get('enumerationExhausted') is True and returned[sid].get('exactness') == 'EXACT'), [ref]
         if capture.get('originalToolName') != 'traverse_relation': continue
@@ -31,7 +31,7 @@ def direct_outputs(captures, receipts, diagnostics=None):
         if request.get('traversalScope') != 'DIRECT': continue
         if (request.get('traversalMaximumDepth', 1) != 1
                 or data.get('scope') != 'DIRECT' or data.get('maximumDepth') != 1
-                or not request.get('resourceIri') or request['resourceIri'] != data.get('rootResourceIri')
+                or not request.get('resourceRef') or request['resourceRef'] != data.get('rootResourceRef')
                 or not request.get('capabilityId') or request['capabilityId'] != data.get('capabilityId')):
             if diagnostics is not None:
                 diagnostics.append({'captureRef': ref, 'code': 'RELATION_CONTRACT_MISMATCH',
@@ -58,7 +58,7 @@ def direct_outputs(captures, receipts, diagnostics=None):
                 candidates = [p for p in group if p[1].get('traversalCursor') == cursor]
                 # Ambiguous continuations must not silently select one result.
                 current = candidates[0] if len(candidates) == 1 else None
-            yield first[0], None, first[1]['capabilityId'], {first[1]['resourceIri']}, [r for p in chain for r in p[2].get('rows', [])], complete, [p[0] for p in chain]
+            yield first[0], None, first[1]['capabilityId'], {first[1]['resourceRef']}, [r for p in chain for r in p[2].get('rows', [])], complete, [p[0] for p in chain]
 
 
 def captured_relations(captures, diagnostics=None):
@@ -67,16 +67,16 @@ def captured_relations(captures, diagnostics=None):
     for ref, receipt in receipts.items():
         origin = digest({'source': source_identity(captures[ref]), 'context': data_context(receipt['context'])})
         for row in entity_rows(receipt):
-            if row.get('resourceIri') and row.get('key'):
-                identities.setdefault((origin, row['resourceIri']), set()).add((row['key'], row.get('modelCode')))
+            if row.get('resourceRef') and row.get('key'):
+                identities.setdefault((origin, row['resourceRef']), set()).add((row['key'], row.get('modelCode')))
     result = []
     for ref, sid, capability, roots, rows, complete, source_refs in direct_outputs(captures, receipts, diagnostics):
         capture = captures[ref]
         receipt = receipts[ref]
         origin = digest(source_identity(capture))
         identity = digest({'source': source_identity(capture), 'context': data_context(receipt['context'])})
-        if not roots or any(r.get('rootResourceIri') not in roots or r.get('depth') != 1
-                            or not r.get('resourceIri') or not r.get('key') for r in rows):
+        if not roots or any(r.get('rootResourceRef') not in roots or r.get('depth') != 1
+                            or not r.get('resourceRef') or not r.get('key') for r in rows):
             if diagnostics is not None:
                 diagnostics.append({'captureRef': ref, 'code': 'RELATION_ROWS_INVALID', 'message': '关系行缺少身份或不属于请求的直接根集合。'})
             continue
@@ -84,13 +84,13 @@ def captured_relations(captures, diagnostics=None):
             parent = identities.get((identity, root), set())
             if len(parent) != 1:
                 if diagnostics is not None:
-                    diagnostics.append({'captureRef': ref, 'code': 'RELATION_ROOT_UNRESOLVED', 'resourceIri': root,
+                    diagnostics.append({'captureRef': ref, 'code': 'RELATION_ROOT_UNRESOLVED', 'resourceRef': root,
                                         'message': '关系根节点缺少唯一的来源身份，请读取根实体信息。'})
                 continue
-            children = [r['key'] for r in rows if r['rootResourceIri'] == root]
+            children = [r['key'] for r in rows if r['rootResourceRef'] == root]
             parent_id, parent_model = next(iter(parent))
             self_link = any(row['key'] == parent_id and row.get('modelCode') == parent_model
-                            for row in rows if row['rootResourceIri'] == root)
+                            for row in rows if row['rootResourceRef'] == root)
             if len(children) != len(set(children)) or self_link:
                 if diagnostics is not None:
                     diagnostics.append({'captureRef': ref, 'code': 'RELATION_IDENTITY_CONFLICT',
@@ -99,7 +99,7 @@ def captured_relations(captures, diagnostics=None):
             item = {'captureRef': ref, 'captureRefs': source_refs, 'stepId': sid, 'sourceOrigin': origin,
                     'context': receipt.get('context'), 'capabilityId': capability,
                     'parentId': parent_id, 'parentModelCode': parent_model, 'childIds': children,
-                    'childModelCodes': {r['key']: r.get('modelCode') for r in rows if r['rootResourceIri'] == root}, 'complete': complete}
+                    'childModelCodes': {r['key']: r.get('modelCode') for r in rows if r['rootResourceRef'] == root}, 'complete': complete}
             item['relationRef'] = 'relation_' + digest(item)[:24]
             item['dataContext'] = data_context(receipt['context'])
             result.append(item)

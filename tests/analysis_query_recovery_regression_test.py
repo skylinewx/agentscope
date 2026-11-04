@@ -41,8 +41,8 @@ class QueryReferenceRecoveryTests(PresentationCase):
     def test_task_returns_complete_source_grouping_arguments_without_rewriting_identifier(self):
         anchor = self.task['queryAnchors'][0]
         arguments = anchor['discoverGroupingArguments']
-        self.assertEqual(anchor['bindingIri'], BINDING)
-        self.assertEqual(arguments['bindingIri'], BINDING)
+        self.assertEqual(anchor['bindingRef'], BINDING)
+        self.assertEqual(arguments['bindingRef'], BINDING)
         self.assertEqual(arguments['groupingKeyword'], '板块')
         self.assertEqual(arguments['contextId'], self.capture['request']['contextId'])
         self.assertEqual(arguments['querySessionId'], self.capture['request']['querySessionId'])
@@ -50,8 +50,8 @@ class QueryReferenceRecoveryTests(PresentationCase):
 
     def test_mistyped_known_reference_has_exact_retry_arguments_not_grouping_guesses(self):
         request = deepcopy(self.capture['request'])
-        request['plan']['steps'][0]['resourceIris'] = [MISTYPED]
-        request['plan']['steps'][1]['batchQuery']['metrics'][0]['bindingIri'] = MISTYPED
+        request['plan']['steps'][0]['resourceRefs'] = [MISTYPED]
+        request['plan']['steps'][1]['batchQuery']['metrics'][0]['bindingRef'] = MISTYPED
         before = deepcopy(request)
         with self.assertRaises(AnalysisError) as caught:
             prepare_request(self.turn, self.capture, request)
@@ -64,11 +64,11 @@ class QueryReferenceRecoveryTests(PresentationCase):
 
     def test_reference_suggestions_do_not_cross_source_context_session_or_task(self):
         arguments = deepcopy(self.task['queryAnchors'][0]['discoverGroupingArguments'])
-        arguments['bindingIri'] = MISTYPED
+        arguments['bindingRef'] = MISTYPED
         origin = {**self.capture, 'originalToolName': 'discover_query_targets'}
         for changed_origin, changed_request in [({**origin, 'resourceId': 'other'}, arguments),
             (origin, {**arguments, 'contextId': 'other'}), (origin, {**arguments, 'querySessionId': 'other'}),
-            (origin, {**arguments, 'bindingIri': MISTYPED + '-different-resource'})]:
+            (origin, {**arguments, 'bindingRef': MISTYPED + '-different-resource'})]:
             with self.subTest(request=changed_request, origin=changed_origin.get('resourceId')):
                 self.assertEqual(prepare_request(self.turn, changed_origin, changed_request), changed_request)
         self.turn.state['followupContext'] = {'mode': 'CONTINUE', 'changedFields': ['task']}
@@ -82,7 +82,7 @@ class QueryReferenceRecoveryTests(PresentationCase):
         capture = ReceiptCapture(self.store, OWNER, frozenset({'registered-budget'}), AsyncMock())
         capture.turn_key_provider = lambda: 'next'
         def reject(origin, request):
-            raise AnalysisError('QUERY_REFERENCE_MISMATCH', '修复标识', {'retryArguments': {'bindingIri': BINDING}})
+            raise AnalysisError('QUERY_REFERENCE_MISMATCH', '修复标识', {'retryArguments': {'bindingRef': BINDING}})
         capture.request_preparer = reject
         executed = []
         async def execute(**kwargs):
@@ -93,7 +93,7 @@ class QueryReferenceRecoveryTests(PresentationCase):
         self.assertEqual(executed, [])
         self.assertEqual(responses[0].state, ToolResultState.ERROR)
         self.assertEqual(responses[0].metadata['analysisTurnKey'], 'next')
-        self.assertEqual(json.loads(responses[0].content[0].text)['error']['details']['retryArguments']['bindingIri'], BINDING)
+        self.assertEqual(json.loads(responses[0].content[0].text)['error']['details']['retryArguments']['bindingRef'], BINDING)
 
 
 class CapturedVerificationRecoveryTests(PresentationCase):
@@ -227,8 +227,8 @@ class CapturedVerificationRecoveryTests(PresentationCase):
     async def test_missing_native_grouping_returns_query_gap_before_model_review(self):
         built = await self.setup_draft()
         capture = deepcopy(self.data_capture)
-        capture.update(originalToolName='discover_query_targets', request={'bindingIri': 'binding-A', 'groupingKeyword': '类别'})
-        receipt = {**self.data_receipt, 'data': {'resolutionKind': 'GROUPING', 'bindingIri': 'binding-A',
+        capture.update(originalToolName='discover_query_targets', request={'bindingRef': 'binding-A', 'groupingKeyword': '类别'})
+        receipt = {**self.data_receipt, 'data': {'resolutionKind': 'GROUPING', 'bindingRef': 'binding-A',
             'status': 'SUPPORTED', 'metadataComplete': True, 'organizationType': 'category-A',
             'candidates': [{'supported': True, 'groupBy': {'dimCode': 'MD_ORG', 'field': 'category'}}]}}
         capture['response']['content'][0]['text'] = json.dumps(receipt)

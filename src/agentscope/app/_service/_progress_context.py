@@ -251,10 +251,10 @@ def public_observations(receipt, source_id, name='', request=None):
             task, form = _label(candidate.get('taskName')), _label(candidate.get('formName'))
             matches = [m for m in _items(candidate.get('matches')) if isinstance(m, dict) and _label(m.get('label'))]
             for match in matches:
-                bind(match.get('resourceIri'), match['label'])
+                bind(match.get('resourceRef'), match['label'])
                 for model, value in object_value(match.get('targetDimensions')).items():
                     bind(f'{model}:{value}', match['label'])
-            bind(candidate.get('bindingIri'), f'{task}的{form}' if task and form else form)
+            bind(candidate.get('bindingRef'), f'{task}的{form}' if task and form else form)
             if i == 0 and task and form and matches:
                 names = _quoted([m['label'] for m in matches], 2)
                 caveat = '这些名称是候选匹配，尚未读取对应金额。'
@@ -269,7 +269,7 @@ def public_observations(receipt, source_id, name='', request=None):
             '/data/candidates', len(candidates), kind='candidate', unit='个')
         for candidate in candidates:
             if isinstance(candidate, dict):
-                bind(candidate.get('resourceIri'), candidate.get('label'))
+                bind(candidate.get('resourceRef'), candidate.get('label'))
                 bind(f'{candidate.get("modelCode")}:{candidate.get("key")}', candidate.get('label'))
     elif key == 'searchschema' and isinstance(data.get('definitions'), list):
         count = len(data['definitions'])
@@ -294,7 +294,7 @@ def public_observations(receipt, source_id, name='', request=None):
         category = _MODELS.get(model)
         for row in rows:
             if isinstance(row, dict):
-                bind(row.get('resourceIri'), row.get('label'))
+                bind(row.get('resourceRef'), row.get('label'))
                 bind(f'{row.get("modelCode")}:{row.get("key")}', row.get('label'))
         if category:
             row_labels = [r.get('label') for r in rows if isinstance(r, dict)]

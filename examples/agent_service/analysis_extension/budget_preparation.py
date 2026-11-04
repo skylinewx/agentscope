@@ -7,7 +7,7 @@ import logging
 
 from .actions import source_identity
 from .adapters import budget_batch
-from .adapters.budget_v2 import receipt_from_capture, stored_form_request
+from .adapters.budget_v2 import receipt_from_capture, stored_form_request, task_form_endpoints
 from .models import AnalysisError, digest
 from .prepared_inputs import prepared_forms
 
@@ -33,16 +33,19 @@ def remember_capability(turn, capture):
     if receipt.get('status') != 'SUCCEEDED':
         return
     data = receipt.get('data') or {}
-    capability = data.get('formCapabilityId')
-    if not capability:
-        choices = {item.get('capabilityId') for item in data.get('capabilities', [])
-                   if item.get('operation') == 'FORM_VIEW_QUERY' and item.get('modelCode') == 'BUDGET_TASK_FORM_BINDING'}
-        capability = choices.pop() if len(choices) == 1 else None
-    if isinstance(capability, str) and capability:
-        cache = turn.state.setdefault('budgetFormCapabilities', {})
-        cache[boundary(capture, receipt)] = capability
-        while len(cache) > 32:
-            del cache[next(iter(cache))]
+    cache = turn.state.setdefault('budgetFormCapabilities', {})
+    key = boundary(capture, receipt)
+    if data.get('formCapabilityId') and data.get('candidates'):
+        direct = any(candidate.get('taskRef') and candidate.get('formRef') for candidate in data.get('candidates', []))
+        cache[key + ':task-form' if direct else key] = data['formCapabilityId']
+    for item in data.get('capabilities', []):
+        if item.get('operation') == 'FORM_VIEW_QUERY' and item.get('capabilityId'):
+            if item.get('modelCode') == 'BUDGET_FORM_TEMPLATE':
+                cache[key + ':task-form'] = item['capabilityId']
+            elif item.get('modelCode') == 'BUDGET_TASK_FORM_BINDING':
+                cache[key] = item['capabilityId']
+    while len(cache) > 32:
+        del cache[next(iter(cache))]
 
 
 def metric_target(capture, receipt, metric, subject=None):
@@ -327,9 +330,10 @@ class BudgetPreparation:
                 else:
                     groups[(target['boundary'], target['binding'])].append(target)
         for group in groups.values():
-            for offset in range(0, len(group), 11):
-                # 计划最多十二步：一次解析绑定，其余步骤对应不同的实际运行条件。
-                part = group[offset:offset + 11]
+            # 每个计划最多十二步，为主任务和表样各保留一个解析步骤。
+            capacity = 10 if task_form_endpoints(group[0]['binding']) else 11
+            for offset in range(0, len(group), capacity):
+                part = group[offset:offset + capacity]
                 try:
                     refs, diagnostic = await self._fetch(turn, part)
                     saved = [self.service.store.get_capture(self.service.owner, ref) for ref in refs]
@@ -368,14 +372,16 @@ class BudgetPreparation:
         base = {'contractVersion': '2.0', 'contextId': receipt['context']['contextId'], 'querySessionId': receipt['querySessionId']}
         if not self.runner:
             raise AnalysisError('FORM_PREPARATION_UNAVAILABLE', '本轮没有已授权的表展开执行入口。')
-        capability = turn.state.get('budgetFormCapabilities', {}).get(first['boundary'])
+        endpoints = task_form_endpoints(first['binding'])
+        cache_key = first['boundary'] + ':task-form' if endpoints else first['boundary']
+        capability = turn.state.get('budgetFormCapabilities', {}).get(cache_key)
         if not capability:
-            request = {**base, 'modelCodes': ['BUDGET_TASK_FORM_BINDING'], 'capabilityDiscoveryPageSize': 50}
+            request = {**base, 'modelCodes': ['BUDGET_FORM_TEMPLATE' if endpoints else 'BUDGET_TASK_FORM_BINDING'], 'capabilityDiscoveryPageSize': 50}
             for _ in range(12):
                 refs, error = await self.runner(turn, capture, 'list_capabilities', request)
                 if error:
                     return [], error
-                capability = turn.state.get('budgetFormCapabilities', {}).get(first['boundary'])
+                capability = turn.state.get('budgetFormCapabilities', {}).get(cache_key)
                 if capability or not refs:
                     break
                 page = receipt_from_capture(self.service.store.get_capture(self.service.owner, refs[-1]))['data'].get('page') or {}
@@ -385,13 +391,16 @@ class BudgetPreparation:
                 request = {**request, 'capabilityDiscoveryCursor': cursor}
         if not capability:
             raise AnalysisError('FORM_CAPABILITY_UNAVAILABLE', '当前绑定上下文没有取得可验证的表展开能力标识。')
-        steps = [{'id': 'binding', 'operation': 'RESOLVE_ENTITY', 'modelCode': 'BUDGET_TASK_FORM_BINDING',
-                  'resourceIris': [first['binding']], 'inputs': []}]
+        roots = [('task', 'BUDGET_TASK', endpoints[0]), ('template', 'BUDGET_FORM_TEMPLATE', endpoints[1])] if endpoints else [
+            ('binding', 'BUDGET_TASK_FORM_BINDING', first['binding'])]
+        steps = [{'id': name, 'operation': 'RESOLVE_ENTITY', 'modelCode': model, 'resourceRefs': [iri], 'inputs': []}
+                 for name, model, iri in roots]
+        input_ids = [step['id'] for step in steps]
         for index, target in enumerate(part, 1):
-            steps.append({'id': 'form' + str(index), 'operation': 'FORM_VIEW_QUERY', 'inputs': ['binding'],
+            steps.append({'id': 'form' + str(index), 'operation': 'FORM_VIEW_QUERY', 'inputs': input_ids,
                           'capabilityId': capability, 'formQuery': target['query']})
         return await self.runner(turn, capture, 'execute_semantic_plan',
-                                 {**base, 'plan': {'dslVersion': '1.0', 'steps': steps, 'outputStepIds': [step['id'] for step in steps[1:]]}})
+                                 {**base, 'plan': {'dslVersion': '1.0', 'steps': steps, 'outputStepIds': [step['id'] for step in steps[len(input_ids):]]}})
 
     async def after_query(self, turn, capture):
         """聚合回执先保存，金额完整时在同一轮准备结构。子查询有独立回执和权限校验。"""

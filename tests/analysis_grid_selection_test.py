@@ -39,6 +39,9 @@ class GridSelectionTest(PresentationCase):
             refs = ['ft1.execution.' + 'a'*64 + '.0']
             step['formQuery']['targetRefs'] = refs
             normalized['steps'][index+1]['formQuery']['targetRefs'] = refs
+            filter_ = receipt['data']['stepResults'][index+1]['formResults'][0]['selection']['filter']
+            filter_['cellExp'] = filter_.pop('expression')
+            filter_.update(targetRefs=refs, headerTexts=['收入', '预计数'])
         receipt['data']['normalizedPlan'] = normalized
         capture['response']['content'][0]['text'] = json.dumps(receipt)
         ref = self.store.capture(OWNER, capture)
@@ -63,6 +66,15 @@ class GridSelectionTest(PresentationCase):
             mutate(wrong['data']['normalizedPlan']['steps'][0]['formQuery'])
             with self.assertRaises(AnalysisError):
                 resolved_form_query(query, wrong, 'form')
+
+    async def test_reference_only_year_must_agree_with_normalized_target(self):
+        query = {'targetRefs':['target']}
+        resolved = dict(query, periodCode='2025N0001', targetDimensions={'DATATIME':'2025N0001'})
+        receipt = {'data':{'normalizedPlan':{'steps':[{'id':'form','formQuery':resolved}]}}}
+        self.assertEqual(resolved_form_query(query, receipt, 'form'), resolved)
+        resolved['periodCode'] = '2026N0001'
+        with self.assertRaises(AnalysisError):
+            resolved_form_query(query, receipt, 'form')
 
     async def test_scoped_pages_keep_source_identity_and_exact_values(self):
         capture, selectors, scope, _ = cropped_fixture()
@@ -95,6 +107,19 @@ class GridSelectionTest(PresentationCase):
         receipt['data']['stepResults'] = receipt['data']['stepResults'][:2]
         form = receipt['data']['stepResults'][1]['formResults'][0]
         content = b''.join((json.dumps(cell, ensure_ascii=False)+'\n').encode() for cell in form['page']['cells'])
+        target = ['ft1.execution.' + 'a'*64 + '.0']
+        query = capture['request']['plan']['steps'][1]['formQuery']
+        query['targetRefs'] = target
+        receipt['data']['normalizedPlan'] = deepcopy(capture['request']['plan'])
+        filter_ = form['selection']['filter']
+        filter_['cellExp'] = filter_.pop('expression')
+        filter_.update(targetRefs=target, headerTexts=['收入', '预计数'])
+        validate_selection(form, query)
+        for key, bad_value in [('targetRefs', ['unrelated']), ('headerTexts', '收入')]:
+            wrong = deepcopy(form)
+            wrong['selection']['filter'][key] = bad_value
+            with self.assertRaises(AnalysisError):
+                validate_selection(wrong, query)
         sha = hashlib.sha256(content).hexdigest()
         form['selection']['contentDigest'] = sha
         path = '/api/v1/ontology/sources/source-A/snapshots/snapshot-A/forms/observations/observation-0/cells'

@@ -33,8 +33,8 @@ def period_execution(capture, receipt, step_id, context=None):
                      ('resolutionId', 'ruleVersion', 'referenceDate', 'referenceInstant', 'timeZone'))
              and isinstance(progress.get('planId'), str) and bool(progress['planId'])
              and type(progress.get('periodFinished')) is bool and type(progress.get('planFinished')) is bool
-             and isinstance(progress.get('bindingIris'), list) and 1 <= len(progress['bindingIris']) <= 32
-             and all(isinstance(b, str) and b for b in progress['bindingIris'])
+             and isinstance(progress.get('bindingRefs'), list) and 1 <= len(progress['bindingRefs']) <= 32
+             and all(isinstance(b, str) and b for b in progress['bindingRefs'])
              and _clean(progress.get('periodRequest')) == _clean(query.get('periodRequest')))
     if not valid:
         raise AnalysisError('PERIOD_RECEIPT_CONFLICT', '时期进度、原请求与服务端解析清单不一致。')
@@ -46,7 +46,7 @@ def period_execution(capture, receipt, step_id, context=None):
             or query.get('periodCode') and codes != [query['periodCode']]):
         raise AnalysisError('PERIOD_REFERENCE_CONFLICT', '时期参照必须来自明确指定的参照或预算服务器系统时间。')
     if context is not None and (context.get('period') != codes[index] or context.get('periodResolution') != resolution
-                               or context.get('target', {}).get('formBindingKey') not in progress['bindingIris']):
+                               or context.get('target', {}).get('formBindingKey') not in progress['bindingRefs']):
         raise AnalysisError('PERIOD_RECEIPT_CONFLICT', '观察的执行时期、绑定或冻结参照与进度不一致。')
     return progress
 

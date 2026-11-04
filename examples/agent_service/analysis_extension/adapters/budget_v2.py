@@ -173,13 +173,39 @@ def _step_request(capture, step_id):
     return selected[0], {s["id"]: s for s in steps}
 
 
-def _bindings(step, steps, visited=None):
+def task_form_reference(task_ref, form_ref):
+    if not (task_ref.startswith("BUDTASK/") and form_ref.startswith("BUDVIEW/")) or "|" in task_ref + form_ref:
+        raise AnalysisError("BINDING_UNPROVEN", "所选资源需要任务和表样业务短码。")
+    return task_ref + "|" + form_ref
+
+
+def task_form_endpoints(reference):
+    """读取当前来源上下文中的任务和表样端点。"""
+    if "|" not in reference:
+        return None
+    task, form = reference.split("|", 1)
+    task_form_reference(task, form)
+    return task, form
+
+
+def _bindings(step, steps, visited=None, *, results=()):
+    inputs = step.get("inputs", [])
+    if len(inputs) == 2 and step.get("operation") in ("FORM_VIEW_QUERY", "CELL_VALUE_QUERY", "BATCH_DATA_QUERY"):
+        def endpoints(step_id):
+            for result in results:
+                if result.get("stepId") == step_id:
+                    return {row["resourceRef"] for row in result.get("rows", []) if row.get("resourceRef")}
+            source = steps.get(step_id, {})
+            return set(source.get("resourceRefs", [])) if source.get("operation") == "RESOLVE_ENTITY" else set()
+        tasks, forms = (endpoints(step_id) for step_id in inputs)
+        return {task_form_reference(task, form) for task in tasks for form in forms} if len(tasks) == 1 else set()
+
     visited = set() if visited is None else visited
     sid = step.get("id")
     if sid in visited:
         raise AnalysisError("CYCLIC_PLAN", "原请求步骤存在循环。")
     visited = visited | {sid}
-    result = set(step.get("resourceIris", []))
+    result = set(step.get("resourceRefs", []))
     for sid in step.get("inputs", []):
         if sid in steps:
             result.update(_bindings(steps[sid], steps, visited))
@@ -194,7 +220,8 @@ def validate_form_request(capture, receipt, step_id, form):
         if not receipt.get("context", {}).get(field) or base.get(field) != receipt["context"][field]:
             raise AnalysisError("CONTEXT_CONFLICT", "表观察与预算回执不属于同一固定上下文。")
     step, steps = _step_request(capture, step_id)
-    query = step.get("formQuery", {})
+    from ..grid_selection import resolved_form_query, validate_selection
+    query = resolved_form_query(step.get("formQuery", {}), receipt, step_id)
     progress = period_execution(capture, receipt, step_id, context)
     if query.get("periodCode") and query["periodCode"] != context.get("period"):
         raise AnalysisError("REQUEST_MISMATCH", "表观察时期与原请求不一致。")
@@ -202,14 +229,14 @@ def validate_form_request(capture, receipt, step_id, form):
         if context.get("effectiveDimensions", {}).get(key) != value:
             raise AnalysisError("REQUEST_MISMATCH", "表观察维度与原请求不一致。")
     binding = context.get("target", {}).get("formBindingKey")
-    bindings = _bindings(step, steps)
-    if not bindings:
+    bindings = _bindings(step, steps, results=receipt.get("data", {}).get("stepResults", []))
+    if not bindings and len(step.get("inputs", [])) == 1:
         # Dynamic inputs may resolve a binding in earlier, returned plan rows.
         for previous in receipt.get("data", {}).get("stepResults", []):
             if previous.get("stepId") in step.get("inputs", []):
-                bindings.update(row["resourceIri"] for row in previous.get("rows", []) if row.get("resourceIri"))
-        if progress:
-            bindings.update(progress['bindingIris'])
+                bindings.update(row["resourceRef"] for row in previous.get("rows", []) if row.get("resourceRef"))
+    if not bindings and progress:
+        bindings.update(progress['bindingRefs'])
     if not binding or binding not in bindings:
         raise AnalysisError("BINDING_UNPROVEN", "表结果绑定未由原请求或已返回的上游步骤证明。")
     observation = runtime.get("observation") or {}
@@ -222,8 +249,6 @@ def validate_form_request(capture, receipt, step_id, form):
     page = form.get("page")
     if page and (page.get("observationId") != observation.get("observationId") or page.get("contentDigest") != observation.get("contentDigest")):
         raise AnalysisError("OBSERVATION_CONFLICT", "数据页与已声明观察不一致。")
-    from ..grid_selection import resolved_form_query, validate_selection
-    query = resolved_form_query(query, receipt, step_id)
     validate_selection(form, query, upgraded=upgraded)
     return context, observation
 
@@ -521,9 +546,9 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
             for request_field, cell_field in (("cellKey", "key"), ("measureCode", "measureCode"), ("modelCode", "modelCode")):
                 if query.get(request_field) is not None and cell.get(cell_field) != query[request_field]:
                     raise AnalysisError("REQUEST_TARGET_MISMATCH", "定位单元格与原请求的指标或坐标不一致。")
-            if query.get('expression') is not None and cell.get('expression') != query['expression']:
+            if query.get('cellExp') is not None and cell.get('cellExp') != query['cellExp']:
                 # Native offset resolution is attested by the source; do not reproduce that engine in Python.
-                if (form.get('matchedExpression') != query['expression'] or form.get('status') not in ('VALUE_FOUND', 'CELL_HAS_NO_VALUE')
+                if (form.get('matchedCellExp') != query['cellExp'] or form.get('status') not in ('VALUE_FOUND', 'CELL_HAS_NO_VALUE')
                         or cell not in form.get('cells', []) or cell.get('issue')):
                     raise AnalysisError('REQUEST_TARGET_MISMATCH', '表达式变化缺少服务端完成时期偏移后的目标匹配证明。')
             for dimension, expected in query.get("targetDimensions", {}).items():
@@ -578,7 +603,7 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
                     "formula": cell.get("formula"), "formulaStructure": cell.get("formulaStructure"),
                     "formulaTarget": key in graph.get('targetKeys', []), "readAt": form.get("readAt"),
                     "entryType": observation.get("entryType"),
-                    "expression": cell.get("expression"),
+                    "expression": cell.get("cellExp"),
                     "formulaStatus": ('CAPTURED' if cell.get('formula') else 'NOT_CONFIGURED'
                                       if observation.get('entryType') == 'INPUT_VO' else 'NOT_CAPTURED'),
                     "evidenceIds": [e["evidenceId"] for e in receipt.get("evidence", []) if e.get("kind") == "FORM_RUNTIME" and e.get("fact", {}).get("observation", {}).get("observationId") == oid]}

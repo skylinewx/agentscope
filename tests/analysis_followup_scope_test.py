@@ -21,6 +21,36 @@ from agentscope.tool import ToolResponse
 
 
 class FollowupScopeTest(PresentationCase):
+    def test_explicit_annual_form_anchors_raw_metrics_and_intersects_a_single_data_period(self):
+        turn = SimpleNamespace(state={'queryIntent': {'formExecutionYear': '2025'}})
+        origin = {'originalToolName':'execute_semantic_plan'}
+        request = {'plan':{'steps':[{'operation':'BATCH_DATA_QUERY','batchQuery':{
+            'metrics':[{'selection':{'measureCode':'AMT','targetDimensions':{'SCENE':'FORECAST'}}}],
+            'batchDimensions':[{'dimCode':'DATATIME','periodRequest':{'kind':'PERIOD','start':{'type':'N','year':2024}}}]}}]}}
+        metric = prepare_request(turn,origin,request)['plan']['steps'][0]['batchQuery']['metrics'][0]['selection']
+        self.assertEqual(metric,{'periodCode':'2025N0001','measureCode':'AMT','targetDimensions':{'SCENE':'FORECAST','DATATIME':'2024N0001'}})
+        self.assertNotIn('periodCode', request['plan']['steps'][0]['batchQuery']['metrics'][0]['selection'])
+        request['plan']['steps'][0]['batchQuery']['batchDimensions'][0] = {'dimCode':'DATATIME','values':['2024N0001','2025N0001']}
+        with self.assertRaises(AnalysisError) as error:
+            prepare_request(turn,origin,request)
+        self.assertEqual(error.exception.code,'FORM_GRID_PERIOD_SCOPE')
+        self.assertIs(prepare_request(SimpleNamespace(state={}),origin,request),request)
+
+    def test_fixed_form_year_accepts_the_same_date_or_observation_and_rejects_a_different_opening_year(self):
+        turn = SimpleNamespace(state={'queryIntent':{'formExecutionYear':'2025'}})
+        origin = {'originalToolName':'execute_semantic_plan'}
+        def prepare(query):
+            request = {'plan':{'steps':[{'operation':'FORM_VIEW_QUERY','formQuery':query}]}}
+            return prepare_request(turn,origin,request)['plan']['steps'][0]['formQuery']
+        dated = {'periodRequest':{'kind':'PERIOD','start':{'type':'N','date':'2025-12-31'}},'targetDimensions':{'DATATIME':'2024N0001'}}
+        self.assertEqual(prepare(dated),dated)
+        self.assertEqual(prepare({'observationId':'prev'}),{'observationId':'prev','periodCode':'2025N0001'})
+        for wrong in ({'periodCode':'2026N0001'},{'dimensions':{'DATATIME':'2024N0001'}},
+                      {'periodRequest':{'kind':'PERIOD','start':{'type':'N','date':'2026-01-01'}}}):
+            with self.assertRaises(AnalysisError) as error:
+                prepare(wrong)
+            self.assertEqual(error.exception.code,'FORM_EXECUTION_PERIOD_CONFLICT')
+
     def setUp(self):
         super().setUp()
         self.capture, self.selection, _, self.receipt = batch_fixtures.batch_fixture(False)

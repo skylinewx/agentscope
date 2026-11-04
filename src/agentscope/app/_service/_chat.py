@@ -71,6 +71,7 @@ from ._sop import SOPService
 from ._projectors import SubagentHitlProjector
 from ._reply_progress import apply_progress, with_reply_progress
 
+from ..._io_log import io_context
 from ..._logging import logger
 from ...agent import Agent, ModelConfig
 from ...model import ChatModelBase
@@ -340,16 +341,17 @@ class ChatService:
                 this turn, which gives it a submit tool.
         """
         try:
-            async with resource_toolkit_scope():
-                await self._run_impl(
-                    user_id,
-                    session_id,
-                    agent_id,
-                    input_msg,
-                    sop_dispatch,
-                    consume_queue,
-                    submission,
-                )
+            with io_context(sessionId=session_id, agentId=agent_id):
+                async with resource_toolkit_scope():
+                    await self._run_impl(
+                        user_id,
+                        session_id,
+                        agent_id,
+                        input_msg,
+                        sop_dispatch,
+                        consume_queue,
+                        submission,
+                    )
         except Exception as e:
             logger.exception(
                 "ChatService.run failed for user_id=%s session_id=%s "

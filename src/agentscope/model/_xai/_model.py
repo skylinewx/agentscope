@@ -6,6 +6,7 @@ from typing import Any, AsyncGenerator, List, Literal, TYPE_CHECKING, Type
 from pydantic import BaseModel, Field
 
 from ..._utils._common import _generate_id
+from ..._io_log import model_request
 from .._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from .._model_response import ChatResponse
 from .._model_usage import ChatUsage
@@ -220,6 +221,7 @@ class XAIChatModel(ChatModelBase):
 
         create_kwargs.update(generate_kwargs)
 
+        model_request({**create_kwargs, "messages": xai_messages})
         chat = client.chat.create(**create_kwargs)
         for xai_msg in xai_messages:
             chat.append(xai_msg)

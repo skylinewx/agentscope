@@ -16,6 +16,7 @@ from ._model_response import StructuredResponse, ChatResponse, FinishedReason
 from ._model_card import ModelCard
 from ._utils import _StreamAccumulator
 from ._diagnostics import ModelCallDiagnostic
+from .._io_log import CallIO, model_response
 from .._logging import logger
 from .._utils._common import _json_loads_with_repair
 from ..credential import CredentialBase
@@ -235,14 +236,21 @@ class ChatModelBase:
         last_error: Exception | None = None
         for attempt in range(self.max_retries + 1):
             # The accumulated chat response
+            io = CallIO(
+                "LLM", self.model,
+                {"messages": messages, "tools": tools, "tool_choice": tool_choice, **kwargs},
+                call_id=diagnostic.call_id, provider=type(self).__name__,
+                attempt=attempt + 1,
+            )
             try:
-                res = await self._call_api(
-                    self.model,
-                    messages=messages,
-                    tools=tools,
-                    tool_choice=tool_choice,
-                    **kwargs,
-                )
+                with io.model_attempt():
+                    res = await self._call_api(
+                        self.model,
+                        messages=messages,
+                        tools=tools,
+                        tool_choice=tool_choice,
+                        **kwargs,
+                    )
                 break
             except asyncio.CancelledError:
                 return ChatResponse(
@@ -284,6 +292,7 @@ class ChatModelBase:
         # Consume the model calling result
         # =====================================================================
         if isinstance(res, ChatResponse):
+            io.output(res, res.finished_reason)
             return res
 
         async def _stream() -> AsyncGenerator[ChatResponse, None]:
@@ -310,11 +319,16 @@ class ChatModelBase:
                             continue
                     else:
                         yield_acc_res = False
+                        io.output(chunk, chunk.finished_reason)
                     yield chunk
+            except GeneratorExit as error:
+                io.failed(error, acc_res.build)
+                raise
             except asyncio.CancelledError:
                 acc_res.finished_reason = FinishedReason.INTERRUPTED
                 yield_acc_res = True
             except Exception as error:
+                io.failed(error, acc_res.build)
                 diagnostic.failed(error, 'stream', attempt + 1, chunks=received_chunks)
                 raise
             finally:
@@ -322,12 +336,18 @@ class ChatModelBase:
                 # Wait for provider cleanup before ``aclose`` returns.
                 aclose = getattr(res, "aclose", None)
                 if aclose is not None:
-                    maybe_awaitable = aclose()
-                    if inspect.isawaitable(maybe_awaitable):
-                        await maybe_awaitable
+                    try:
+                        maybe_awaitable = aclose()
+                        if inspect.isawaitable(maybe_awaitable):
+                            await maybe_awaitable
+                    except BaseException as error:
+                        io.failed(error, acc_res.build)
+                        raise
 
             if yield_acc_res:
-                yield acc_res.build()
+                final = acc_res.build()
+                io.output(final, final.finished_reason)
+                yield final
 
         return _stream()
 
@@ -567,14 +587,22 @@ class ChatModelBase:
                     merged[key] = {**kwargs[key], **val}
 
             for attempt in range(self.max_retries + 1):
+                io = CallIO(
+                    "LLM", self.model,
+                    {"messages": messages, "tool_choice": tool_choice, **merged},
+                    call_id=diagnostic.call_id, provider=type(self).__name__,
+                    strategy=name, attempt=attempt + 1,
+                )
                 try:
-                    result = await self._call_api_with_structured_output(
-                        self.model,
-                        messages=messages,
-                        structured_model=structured_model,
-                        tool_choice=tool_choice,
-                        **merged,
-                    )
+                    with io.model_attempt():
+                        result = await self._call_api_with_structured_output(
+                            self.model,
+                            messages=messages,
+                            structured_model=structured_model,
+                            tool_choice=tool_choice,
+                            **merged,
+                        )
+                    io.output(io.model_result if io.model_result is not None else result)
                     if strategy_index > 0:
                         logger.info(
                             "Structured output for %s: using fallback "
@@ -726,6 +754,7 @@ class ChatModelBase:
         else:
             completed_response = res
 
+        model_response(completed_response)
         if completed_response is None or not completed_response.content:
             raise StructuredOutputError(
                 f"Failed to get the completed response from model "

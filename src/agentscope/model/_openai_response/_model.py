@@ -8,6 +8,7 @@ import openai
 from pydantic import BaseModel, Field
 
 from ..._utils._common import _generate_id
+from ..._io_log import model_request
 from .._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from .._model_response import ChatResponse
 from .._model_usage import ChatUsage
@@ -245,6 +246,7 @@ class OpenAIResponseModel(ChatModelBase):
         if fmt_tool_choice is not None:
             api_kwargs["tool_choice"] = fmt_tool_choice
 
+        model_request(api_kwargs)
         start_datetime = datetime.now()
         response = await self.client.responses.create(**api_kwargs)
 

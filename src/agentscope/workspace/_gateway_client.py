@@ -33,6 +33,7 @@ from urllib.parse import urlencode
 import mcp.types
 from pydantic import PrivateAttr
 
+from .._io_log import CallIO
 from .._logging import logger
 from ..mcp import MCPClient
 from ..message import ToolResultState
@@ -144,27 +145,35 @@ class GatewayMCPTool(ToolBase):
         :class:`RuntimeError` only if the gateway returns 2xx with no
         ``chunk`` payload (protocol violation).
         """
-        status, body = await self._gateway.exec_request(
-            "POST",
-            f"/mcps/{self.mcp_name}/tools/{self._tool.name}",
-            params={
-                "agent_id": self._agent_id,
-                "session_id": self._session_id,
-            },
-            body={"arguments": kwargs},
-        )
-        if status >= 400:
-            return ToolChunk(
-                content=[{"type": "text", "text": _safe_detail(status, body)}],
-                state=ToolResultState.ERROR,
+        with CallIO(
+            "MCP", self._tool.name, kwargs,
+            server=self.mcp_name, transport="gateway",
+        ) as io:
+            status, body = await self._gateway.exec_request(
+                "POST",
+                f"/mcps/{self.mcp_name}/tools/{self._tool.name}",
+                params={
+                    "agent_id": self._agent_id,
+                    "session_id": self._session_id,
+                },
+                body={"arguments": kwargs},
             )
-        payload = json.loads(body)
-        chunk_dict = payload.get("chunk")
-        if chunk_dict is None:
-            raise RuntimeError(
-                f"gateway returned no chunk for {self.name!r}",
-            )
-        return ToolChunk.model_validate(chunk_dict)
+            if status >= 400:
+                detail = _safe_detail(status, body)
+                io.output({"httpStatus": status, "detail": detail}, "error")
+                return ToolChunk(
+                    content=[{"type": "text", "text": detail}],
+                    state=ToolResultState.ERROR,
+                )
+            payload = json.loads(body)
+            chunk_dict = payload.get("chunk")
+            if chunk_dict is None:
+                raise RuntimeError(
+                    f"gateway returned no chunk for {self.name!r}",
+                )
+            chunk = ToolChunk.model_validate(chunk_dict)
+            io.output(payload, "error" if chunk.state == ToolResultState.ERROR else "ok")
+            return chunk
 
 
 # ── pseudo MCP client ──────────────────────────────────────────────

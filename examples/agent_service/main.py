@@ -2,9 +2,11 @@
 """The example script to start the agent service."""
 import os
 import sys
+from pathlib import Path
 
 import uvicorn
 
+from agentscope._io_log import setup_io_file
 from agentscope.app import create_app, SubAgentTemplate
 from agentscope.app.auth import AuthService, RedisAuthStore
 from agentscope.app.channel import (
@@ -27,6 +29,7 @@ from service_config import auth_settings, redis_settings
 from business_instructions import WORKSPACE_INSTRUCTIONS
 
 service_dir = os.path.dirname(os.path.abspath(__file__))
+setup_io_file(Path(__file__).resolve().parents[2] / ".cache" / "agentscope")
 config_path = os.path.join(service_dir, "service-config.local.json")
 redis_config = redis_settings(config_path)
 auth = AuthService(RedisAuthStore(**redis_config), auth_settings(config_path))

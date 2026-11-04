@@ -29,6 +29,7 @@ from ._reply_presentation import ReplyPresentationTracker
 from ..state import AgentState
 from ..state._state import ReplyContext
 from ._utils import _ToolCallBatch, Acting, Exit, Reasoning, _resolve_timezone
+from .._io_log import CallIO
 from .._logging import logger
 from .._utils._common import (
     _generate_id,
@@ -2021,8 +2022,17 @@ class Agent:
                 # breaks it is their bug to fix, and the reply stays
                 # parked so they can send it again.
                 tool = await self.toolkit.get_tool(tool_result.name)
-                if tool is not None:
-                    await tool.check_external_result(tool_result)
+                io = CallIO(
+                    "TOOL", tool_result.name, None,
+                    call_id=tool_result.id, execution="external",
+                )
+                try:
+                    if tool is not None:
+                        await tool.check_external_result(tool_result)
+                except Exception:
+                    io.output(tool_result, "invalid", resumed=True)
+                    raise
+                io.output(tool_result, tool_result.state, resumed=True)
 
                 async for evt in self._convert_tool_chunk_to_event(
                     tool_result.id,
@@ -2683,6 +2693,10 @@ class Agent:
                     tool_call.id,
                     ToolCallState.SUBMITTED,
                 )
+                CallIO(
+                    "TOOL", tool_call.name, tool_call.input,
+                    call_id=tool_call.id, execution="external",
+                ).input()
                 yield RequireExternalExecutionEvent(
                     reply_id=self.state.reply_id,
                     tool_calls=[tool_call],
@@ -2913,6 +2927,10 @@ class Agent:
             content=[TextBlock(text=message)],
             state=state,
         )
+        CallIO(
+            "TOOL", tool_call.name, tool_call.input,
+            call_id=tool_call.id, execution="rejected",
+        ).output(result, state)
 
         # Return the result directly to the agent
         self._save_to_context(

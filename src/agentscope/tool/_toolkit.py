@@ -37,6 +37,7 @@ from ..message import (
     ToolResultState,
 )
 from ._tool_group import ToolGroup
+from .._io_log import CallIO, io_context, tool_chunks
 from .._logging import logger
 from ..state import AgentState
 
@@ -249,6 +250,7 @@ class Toolkit:
                 the complete tool result in a ToolResponse object.
         """
         tool_response = ToolResponse(id=tool_call.id)
+        io = CallIO("TOOL", tool_call.name, tool_call.input, call_id=tool_call.id)
 
         # Check
         available_tools = await self._get_available_tools(
@@ -256,6 +258,7 @@ class Toolkit:
         )
 
         if tool_call.name not in available_tools:
+            io.input()
             all_tools = await self._get_available_tools(
                 groups=[_.name for _ in self.tool_groups],
             )
@@ -277,7 +280,9 @@ class Toolkit:
                     state=ToolResultState.ERROR,
                 )
                 yield chunk
-                yield tool_response.append_chunk(chunk)
+                tool_response.append_chunk(chunk)
+                io.output(tool_response, tool_response.state)
+                yield tool_response
                 return
 
             # Not exist
@@ -291,13 +296,16 @@ class Toolkit:
                 state=ToolResultState.ERROR,
             )
             yield chunk
-            yield tool_response.append_chunk(chunk)
+            tool_response.append_chunk(chunk)
+            io.output(tool_response, tool_response.state)
+            yield tool_response
             return
 
         # Obtain the tool function
         tool_func = available_tools[tool_call.name].tool
 
         # Async function
+        closing = False
         try:
             # Prepare keyword arguments, repairing the argument types
             # against the tool schema when the model got them wrong.
@@ -305,6 +313,7 @@ class Toolkit:
                 tool_call.input,
                 tool_func.input_schema,
             )
+            io.input(kwargs)
 
             # State injection
             if (
@@ -314,12 +323,11 @@ class Toolkit:
             ):
                 kwargs["_agent_state"] = state
 
-            if inspect.iscoroutinefunction(tool_func.__call__):
-                res = await tool_func(**kwargs)
-            else:
-                # When `tool_func.original_func` is Async generator function or
-                # Sync function
-                res = tool_func(**kwargs)
+            with io_context(toolCallId=tool_call.id):
+                if inspect.iscoroutinefunction(tool_func.__call__):
+                    res = await tool_func(**kwargs)
+                else:
+                    res = tool_func(**kwargs)
 
             if isinstance(res, ToolChunk):
                 yield res
@@ -327,7 +335,8 @@ class Toolkit:
 
             # If return an async generator
             elif isinstance(res, AsyncGenerator):
-                async for chunk in res:
+                chunks = tool_chunks(res, tool_call.id) if io.enabled else res
+                async for chunk in chunks:
                     yield chunk
                     tool_response.append_chunk(chunk)
 
@@ -362,6 +371,7 @@ class Toolkit:
         except Exception as e:
             # Raise the developer-oriented exception
             if isinstance(e, DeveloperOrientedException):
+                io.failed(e)
                 raise e from None
 
             # The exceptions should be handled by the agent
@@ -395,9 +405,15 @@ class Toolkit:
             yield chunk
             tool_response.append_chunk(chunk)
 
+        except GeneratorExit as error:
+            closing = True
+            io.failed(error, tool_response)
+            raise
+
         finally:
-            # Finally, yield the complete tool response
-            yield tool_response
+            if not closing:
+                io.output(tool_response, tool_response.state)
+                yield tool_response
 
     async def _get_available_skills(
         self,

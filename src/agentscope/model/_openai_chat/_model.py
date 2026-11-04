@@ -12,6 +12,7 @@ from ..._utils._audio import (
     _build_wav_header,
 )
 from ..._utils._common import _generate_id, _flatten_json_schema
+from ..._io_log import model_request
 from .._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from .._model_response import ChatResponse
 from .._model_usage import ChatUsage
@@ -276,6 +277,7 @@ class OpenAIChatModel(ChatModelBase):
         if self.stream:
             kwargs["stream_options"] = {"include_usage": True}
 
+        model_request(kwargs)
         start_datetime = datetime.now()
         response = await self.client.chat.completions.create(**kwargs)
 

@@ -76,6 +76,29 @@ forwards to `http://127.0.0.1:8000`; deployment operators can override the targe
 with `AGENTSCOPE_BACKEND_URL` in the frontend `.env.local` or environment.
 Users sign in with their username and password, without entering an address.
 
+## 调试模型、工具和 MCP 调用
+
+在 PyCharm 的后端 Run/Debug Configuration 中添加环境变量
+`AGENTSCOPE_LOG_IO=1`，重新启动服务。在 PowerShell 启动时也可以先执行
+`$env:AGENTSCOPE_LOG_IO = '1'`。详细日志默认关闭，移除变量并重启即可关闭。
+
+在后端控制台搜索 `CALL_IO`。启动日志会给出 UTF-8 文件的绝对路径，
+位于仓库的 `.cache/agentscope/calls-<进程号>.jsonl`。每行一个 JSON 事件，
+按进程写入，达到约 32 MiB 时轮转，保留两份备份。消息、提示词和业务回执
+会保留在日志中，适合在本地排查。常见凭据字段会遮盖，二进制附件和模型
+思考块只保留标记。
+
+| `kind` | `direction=input` | `direction=output` |
+| --- | --- | --- |
+| `LLM` | 内置模型适配器传给供应商 SDK 的最终参数，包含提示词、对话和工具选择 | 模型返回的正文、工具调用及可用的用量信息。流式调用合并后记录一次，失败可查看已接收的部分 |
+| `TOOL` | 工具名与实际参数 | 工具的完整结果和执行状态。被拒绝和外部执行的调用会标明 `execution` |
+| `MCP` | MCP 服务名、原始工具名与请求参数 | 本地 MCP 连接返回的原始回执，包括 `isError`、`content` 和可用的 `structuredContent`。经网关调用时记录网关回包 |
+
+查某个会话时，先筛选 `sessionId`，用 `callId` 配对输入和输出。
+模型重试还要对照 `attempt`，结构化输出回退再看 `strategy`。例如排查净利润时，
+找到 `name=execute_semantic_plan` 的 MCP 输入，检查实际的科目、期间和组织；
+配对输出就是进入分析扩展之前的回执。`toolCallId` 可关联发起它的工具调用。
+
 ## 用户登录与管理
 
 启动前，在 `service-config.local.json` 中保留现有 `redis` 段并增加：

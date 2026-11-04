@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 
 from ..._utils._audio import _build_streaming_wav_header
 from ..._utils._common import _generate_id
+from ..._io_log import model_request
 from .._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from .._model_response import ChatResponse
 from .._model_usage import ChatUsage
@@ -271,6 +272,7 @@ class DashScopeChatModel(ChatModelBase):
         if self.stream:
             request_kwargs["stream_options"] = {"include_usage": True}
 
+        model_request(request_kwargs)
         start_datetime = datetime.now()
         response = await self.client.chat.completions.create(**request_kwargs)
 

@@ -23,6 +23,7 @@ from ._utils import (
     _extract_input_schema,
     _remove_title_field,
 )
+from .._io_log import CallIO
 from .._logging import logger
 from ..message import (
     TextBlock,
@@ -326,25 +327,26 @@ class MCPTool(ToolBase):
             `ToolChunk`: The converted tool execution result.
         """
 
-        # Call the MCP tool
-        if self._client_gen:
-            # Stateless client: create temporary session
-            async with self._client_gen() as cli:
-                read_stream, write_stream = cli[0], cli[1]
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    result = await session.call_tool(
-                        self._tool.name,
-                        arguments=kwargs,
-                        read_timeout_seconds=self._timeout,
-                    )
-        else:
-            # Stateful client: use existing session
-            result = await self._session.call_tool(
-                self._tool.name,
-                arguments=kwargs,
-                read_timeout_seconds=self._timeout,
-            )
+        with CallIO("MCP", self._tool.name, kwargs, server=self.mcp_name) as io:
+            if self._client_gen:
+                # Stateless client: create temporary session
+                async with self._client_gen() as cli:
+                    read_stream, write_stream = cli[0], cli[1]
+                    async with ClientSession(read_stream, write_stream) as session:
+                        await session.initialize()
+                        result = await session.call_tool(
+                            self._tool.name,
+                            arguments=kwargs,
+                            read_timeout_seconds=self._timeout,
+                        )
+            else:
+                # Stateful client: use existing session
+                result = await self._session.call_tool(
+                    self._tool.name,
+                    arguments=kwargs,
+                    read_timeout_seconds=self._timeout,
+                )
+            io.output(result, "error" if result.isError else "ok")
 
         # Convert MCP result to AgentScope blocks
         return ToolChunk(

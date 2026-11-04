@@ -7,6 +7,7 @@ from typing import Literal, Any, AsyncGenerator, TYPE_CHECKING, List, Type
 
 from pydantic import BaseModel, Field
 
+from ..._io_log import model_request
 from .._base import ChatModelBase, _TOOL_CHOICE_LITERAL_MODES
 from .._model_response import ChatResponse
 from .._model_usage import ChatUsage
@@ -286,6 +287,7 @@ class AnthropicChatModel(ChatModelBase):
 
         kwargs["messages"] = formatted_messages
 
+        model_request(kwargs)
         start_datetime = datetime.now()
 
         response = await self.client.messages.create(**kwargs)

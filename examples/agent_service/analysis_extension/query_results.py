@@ -162,6 +162,8 @@ def project(value, pointer, omitted, width=20, depth=0, defer=False):
 
 
 def compact_receipt(receipt, capture_ref, source_chars, max_chars=MODEL_CHARS):
+    if isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT':
+        return budget_query_view(receipt, capture_ref, source_chars, max_chars)
     if source_chars < COMPACT_AT:
         return None
     for width in (20, 5, 1):
@@ -169,18 +171,37 @@ def compact_receipt(receipt, capture_ref, source_chars, max_chars=MODEL_CHARS):
         result = {'viewType': 'captured_query_result', 'captureRef': capture_ref,
                   'receipt': project(receipt, '', omitted, width, defer=True), 'omitted': omitted,
                   'stepReads': step_reads(receipt, capture_ref),
-                  'analysisRead': {'section': 'inventory', 'captureRef': capture_ref},
+                  'analysisRead': {'tool': 'AnalysisInspect', 'arguments': {'section': 'inventory', 'captureRef': capture_ref}},
                   'sourceChars': source_chars, 'readTool': 'QueryResultRead',
                   'note': '完整原回执已保存。分析所需的值、公式与选择器可用 analysisRead 调用 AnalysisInspect 定向读取，不必先通读原报文。原始字段按 readOptions.read 调用 QueryResultRead；fields 是导航投影，不能当作已读取全部字段。stepReads 不代表步骤全集，未列步骤从 /data/stepResults 分页读取；stepId 不是下标。展示省略不代表来源完整，不要因此重新查询。'}
         if len(encode(result)) <= max_chars:
             return result
-    # Unusual shapes stay intact instead of concealing metadata or errors.
-    return None
+    # An unusually wide protocol must not put megabytes back in the conversation.
+    # State and all omitted details stay accessible by the same persisted reference.
+    return {'viewType': 'captured_query_result', 'captureRef': capture_ref,
+            'status': receipt.get('status'), 'sourceChars': source_chars, 'allFieldsIncluded': False,
+            'readTool': 'QueryResultRead', 'read': {'captureRef': capture_ref, 'pointer': '', 'limit': 10},
+            'errorRead': {'captureRef': capture_ref, 'pointer': '/error'},
+            'analysisRead': {'tool': 'AnalysisInspect', 'arguments': {'section': 'materials', 'captureRef': capture_ref}},
+            'note': '完整回执已保存；这是导航摘要，失败原因和执行详情沿同一引用读取，不重新查询。'}
 
 
-def read_receipt(receipt, capture_ref, pointer='', offset=0, limit=20, search=None, fields=None):
+def budget_query_view(receipt, capture_ref, source_chars, max_chars=MODEL_CHARS):
+    from .business_tables import business_view
+    return business_view(receipt, capture_ref, max_chars=max_chars)
+
+
+def read_receipt(receipt, capture_ref, pointer='', offset=0, limit=20, search=None, fields=None,
+                 tableRef=None, columns=None, filters=None, cursor=None):
     """原回执不变；错误恢复参数同样从该回执生成，不猜字段别名。"""
     try:
+        business = isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT'
+        explicit = any(v is not None for v in (tableRef, columns, filters, cursor))
+        if explicit or (business and not pointer and search is None and fields is None):
+            if not business or pointer or offset or search is not None or fields is not None:
+                raise AnalysisError('INVALID_BUSINESS_READ', '业务表格读取与原始路径读取分开，使用返回的 nextRead。')
+            from .business_tables import business_view
+            return business_view(receipt, capture_ref, tableRef=tableRef, columns=columns, filters=filters, cursor=cursor, limit=limit)
         return _read_receipt(receipt, capture_ref, pointer, offset, limit, search, fields)
     except AnalysisError as error:
         details = dict(error.details or {})
@@ -217,6 +238,34 @@ def _read_receipt(receipt, capture_ref, pointer='', offset=0, limit=20, search=N
     result = {'captureRef': capture_ref, 'pointer': pointer,
               'sourceState': state, 'stateOmitted': state_omitted,
               'offset': offset, 'nextOffset': None}
+    if isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT':
+        result['sourceState']['budgetQuery'] = {key: receipt['data'].get(key) for key in ('complete', 'purpose', 'selection', 'summary', 'failureSummary')}
+        fact_match = re.match(r'(/data/resultSets/[0-9]+)/rows(?:/|$)', pointer)
+        if fact_match:
+            result_set = at_pointer(receipt, fact_match.group(1))
+            result['resultSetContext'] = {key: result_set.get(key) for key in
+                                          ('resultSetId', 'targetId', 'interpretationId', 'context', 'resolvedTerms', 'grain')}
+            # Context is navigation metadata, not part of the selected row. A large
+            # period-selection proof must not make even one projected value unreadable.
+            context_omitted = []
+            def bounded_context(value, path):
+                if len(encode(value)) <= 2000:
+                    return value
+                if isinstance(value, dict):
+                    return {key: bounded_context(child, child_pointer(path, key)) for key, child in value.items()}
+                context_omitted.append(path)
+                return {'readAt': path, 'size': len(value) if isinstance(value, (list, str)) else None}
+            result['resultSetContext'] = {key: bounded_context(value, child_pointer(fact_match.group(1), key))
+                                         for key, value in result['resultSetContext'].items()}
+            if len(encode(result['resultSetContext'])) > 8000:
+                result['resultSetContext'] = {key: value if len(encode(value)) <= 1200 else
+                    {'readAt': child_pointer(fact_match.group(1), key)}
+                    for key, value in result['resultSetContext'].items()}
+                context_omitted = [fact_match.group(1)]
+            if context_omitted:
+                result['resultSetContextRead'] = {'captureRef': capture_ref, 'pointer': fact_match.group(1),
+                    'fields': ['context', 'resolvedTerms', 'grain']}
+                result['contextProjection'] = 'Large background fields are referenced; selected values are unchanged.'
     if isinstance(value, dict):
         result['availableFields'] = available_fields(value)
         result['readOptions'] = read_options(value, pointer, capture_ref)

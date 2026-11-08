@@ -2,6 +2,111 @@
 from copy import deepcopy
 
 
+def business_query_projection(capture, receipt, source):
+    """Use every verified business row once; native requests remain in the immutable capture.
+
+    Call only after adapter validation. Do not apply to ANALYZE, whose formula evidence
+    and calculation dependency graph require the original fact projection.
+    """
+    from .models import digest
+    data = receipt['data']
+    contexts, facts = {}, []
+    fallback_origins = {origin.get('originId') for origin in data.get('origins', [])
+                        if (origin.get('scenarioFallback') or {}).get('kind') == 'BUDGET_CELL_SCENARIO_OVERRIDE'
+                        and origin['scenarioFallback'].get('formulaStatus') == 'NO_TARGET_CELL'}
+    def target(value):
+        return {key: deepcopy(value[key]) for key in
+                ('taskCode', 'formCode', 'organizationCategory') if key in value}
+    for result in data.get('resultSets', []):
+        actual = result.get('context', {})
+        context = {key: deepcopy(actual[key]) for key in
+                   ('taskName', 'formName', 'period', 'periodResolution', 'effectiveDimensions', 'dataPeriodSelection') if key in actual}
+        context['target'] = target(actual.get('target', {}))
+        context.update({key: deepcopy(result[key]) for key in
+                        ('targetId', 'interpretationId', 'resolvedTerms', 'resolvedTitleTerms', 'grain') if key in result})
+        context_ref = digest(context)[:24]
+        contexts[context_ref] = context
+        for row in result.get('rows', []):
+            fact = {key: deepcopy(row[key]) for key in
+                    ('factId', 'title', 'measureCode', 'dimensions', 'dimensionNames', 'dataPeriod',
+                     'value', 'valueType', 'valueState', 'unit', 'unitBasis', 'originRefs') if key in row}
+            if row.get('originRefs') and set(row['originRefs']) <= fallback_origins:
+                fact['formulaStatus'] = 'NO_TARGET_CELL'
+            facts.append({**fact, 'contextRef': context_ref})
+    source = deepcopy(source)
+    business = source.get('businessQuery', {})
+    # The contexts and facts above cover these two duplicated projections, including NULL/NOT_LOADED.
+    business.pop('presentValueGroups', None)
+    business.pop('resultSetCatalog', None)
+    business['requestedTargets'] = deepcopy(data.get('targets', []))
+    if data.get('presentation'):
+        business['verifiedPresentation'] = deepcopy(data['presentation'])
+    runtime_contexts = {}
+    for query in source.get('batchQueries', []):
+        scope = query.get('requestedScope', {})
+        query['metricCount'] = len(scope.pop('metrics', []))
+        for result in query.get('results', []):
+            metrics = result.pop('metricContexts', [])
+            # Keep each metric's selected conditions, task and period. Omit transport/session
+            # identifiers and reusable tool selectors, which do not change the answer's scope.
+            result['metricContexts'] = []
+            for metric in metrics:
+                actual = metric.get('context', {})
+                runtime_context = {key: deepcopy(actual.get(key)) for key in ('period', 'effectiveDimensions')}
+                runtime_context['target'] = target(actual.get('target', {}))
+                runtime_context.update({key: metric.get(key) for key in ('taskName', 'formName')})
+                context_ref = digest(runtime_context)[:24]
+                runtime_contexts[context_ref] = runtime_context
+                result['metricContexts'].append({**{key: deepcopy(metric[key]) for key in
+                    ('name', 'measureCode', 'selectedDimensions', 'selectionCellKey') if key in metric},
+                    'runtimeContextRef': context_ref})
+    source['runtimeContexts'] = runtime_contexts
+    source['projection'] = {'kind': 'VERIFIED_BUSINESS_ROWS', 'rowCount': len(facts),
+                            'readTool': 'QueryResultRead',
+                            'nativeRead': {'captureRef': capture['captureRef'], 'pointer': '/data'},
+                            'boundary': '全部业务行、类型、空值状态和执行失败均保留；原生数据及定位参数已校验并完整保存。'}
+    from .business_tables import build_tables, state_markdown, catalog
+    tables = build_tables(receipt)
+    locations = {}
+    for table in tables:
+        for fact, places in table.locations.items():
+            locations.setdefault(fact, []).extend(places)
+    source['businessTableView'] = {
+        'markdown': state_markdown(receipt) + '\n\n' + '\n\n'.join(t.markdown() for t in tables),
+        'tables': catalog(tables), 'factLocations': locations,
+        'allFactsIncluded': sum(len(t.facts) for t in tables) == len(facts)}
+    return contexts, facts, source
+
+
+def markdown_review_material(value):
+    """Only the model wire changes; validation, hashes and follow-up use full facts."""
+    value = deepcopy(value)
+    evidence = value.get('evidence', {})
+    for item in evidence.get('sources', []):
+        source = item.get('source', {})
+        view = source.get('businessTableView')
+        if not view or not view.get('allFactsIncluded'):
+            continue
+        item['businessTables'] = view['markdown']
+        item['factReferences'] = [[fact, ';'.join(f"{p['tableRef']}.{p['rowRef']}.{p['columnRef']}" for p in places)]
+                                  for fact, places in view['factLocations'].items()]
+        item['tableDefinitions'] = view['tables']
+        item['factCount'] = len(view['factLocations'])
+        item['executionScopes'] = [{key: deepcopy(context[key]) for key in
+            ('taskName', 'formName', 'period', 'targetId', 'interpretationId') if key in context}
+            for context in item.get('contexts', {}).values()]
+        for field in ('facts', 'factRows', 'factFields', 'contexts'):
+            item.pop(field, None)
+        item['source'] = {key: source[key] for key in ('status', 'error', 'completeness', 'resumeRef', 'projection') if key in source}
+        # The original requested semantics and period selection are review inputs,
+        # not expendable transport detail. Keep them once, without native rows.
+        business = source.get('businessQuery', {})
+        item['source']['businessQuery'] = {key: deepcopy(business[key]) for key in
+            ('question', 'purpose', 'selection', 'complete', 'requestedTargets', 'verifiedPresentation', 'failureSummary', 'unresolvedGroups') if key in business}
+        item['source']['verification'] = '原生请求、结果、来源及范围已通过现有程序校验；本表保留全部业务事实。审查仍核对原问题、答复、口径、异常及计算。'
+    return value
+
+
 def _strings(value):
     if isinstance(value, str):
         yield value

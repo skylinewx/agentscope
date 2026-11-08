@@ -13,7 +13,7 @@ def row_sets(receipt):
 
 
 def entity_rows(receipt):
-    """Actual identities from row results and RDF-verified search candidates.
+    """Source-verified member identities and schema definitions, with distinct evidence kinds.
 
     Search candidates are labels, never proof of a complete population.
     Similarity scores and matching phrases are not identity mappings.
@@ -22,8 +22,24 @@ def entity_rows(receipt):
         yield from output['rows']
     for candidate in (receipt.get('data') or {}).get('candidates', []):
         if (candidate.get('kind') == 'RESOURCE' and candidate.get('resourceRef')
-                and 'RESOURCE_RDF_VERIFIED' in candidate.get('matchedBy', [])):
-            yield candidate
+                and {'RESOURCE_RDF_VERIFIED', 'RESOURCE_MEMBER_INDEX_VERIFIED'}.intersection(candidate.get('matchedBy', []))):
+            yield {**candidate, 'entityKind': 'MEMBER', 'identityBasis': list(candidate['matchedBy'])}
+    data = receipt.get('data') or {}
+    definitions = list(data.get('definitions') or []) + list(data.get('members') or [])
+    if isinstance(data.get('definition'), dict):
+        definitions.append(data['definition'])
+    proofs = {item.get('evidenceId'): item for item in receipt.get('evidence', []) if item.get('kind') == 'SCHEMA'}
+    seen = set()
+    for definition in definitions:
+        if not isinstance(definition, dict) or not definition.get('schemaRef') or definition['schemaRef'] in seen:
+            continue
+        evidence = [proofs[ref] for ref in definition.get('evidenceIds', []) if ref in proofs]
+        fact = {key: value for key, value in definition.items() if key != 'evidenceIds'}
+        if not any(proof.get('fact') == fact for proof in evidence):
+            continue
+        seen.add(definition['schemaRef'])
+        yield {**definition, 'key': definition.get('modelCode', definition['schemaRef']),
+               'entityKind': 'SCHEMA', 'definitionKind': definition.get('kind'), 'identityBasis': ['SCHEMA_VERIFIED']}
 
 
 def selected_rows(receipt, step_id=None):

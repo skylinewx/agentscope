@@ -3,7 +3,7 @@ from .models import AnalysisError, digest
 
 
 def remember_grouping(turn, capture):
-    if capture.get('originalToolName') != 'discover_query_targets':
+    if capture.get('originalToolName') not in ('discover_query_targets', 'execute_budget_query'):
         return
     adapter = turn.service.sources.for_capture(capture)
     if adapter.adapter_id != 'budget-v2':
@@ -11,25 +11,54 @@ def remember_grouping(turn, capture):
     try:
         receipt = adapter.raw_receipt(capture['response'])
     except AnalysisError as error:
-        # 调用失败也要保留回执；无法解析分组元数据不能反过来中断证据登记。
         turn.state.setdefault('groupingDiagnostics', {})[capture['captureRef']] = error.as_dict()
         return
     data = receipt.get('data') or {}
-    if receipt.get('status') != 'SUCCEEDED' or data.get('resolutionKind') != 'GROUPING':
-        return
-    if data.get('bindingRef') != capture.get('request', {}).get('bindingRef'):
-        return
+    findings = data.get('grouping', []) if capture.get('originalToolName') == 'execute_budget_query' else [data]
     from .actions import source_identity
     from .adapters.budget_v2 import data_context
-    boundary = {'source': list(source_identity(capture)), 'context': data_context(receipt.get('context')),
-                'bindingRef': data['bindingRef']}
-    key = digest([boundary, capture['request'].get('groupingKeyword')])
-    turn.state.setdefault('groupingRequirements', {})[key] = {
-        **boundary, 'captureRef': capture['captureRef'], 'keyword': capture['request'].get('groupingKeyword'),
-        'status': data.get('status'),
-        'metadataComplete': data.get('metadataComplete'), 'message': data.get('message'),
-        'organizationType': data.get('organizationType'), 'diagnostics': data.get('diagnostics', []),
-        'candidates': [candidate['groupBy'] for candidate in data.get('candidates', []) if candidate.get('supported')]}
+    requirements = turn.state.setdefault('groupingRequirements', {})
+    matched_bindings = {item.get('context', {}).get('target', {}).get('formBindingKey')
+                        for item in data.get('resultSets', [])}
+    requested = capture.get('request', {}).get('groupBy', [])
+    # Failure to resolve is still an outstanding user requirement. Do not turn
+    # a prior unit distribution into successful sector analysis by dropping it.
+    for keyword in requested:
+        if not isinstance(keyword, str):
+            continue
+        matching = [item for item in findings if item.get('groupingKeyword') == keyword]
+        if matching:
+            for key, item in list(requirements.items()):
+                if item.get('keyword') == keyword and item.get('bindingRef') is None:
+                    del requirements[key]
+            continue
+        boundary = {'source': list(source_identity(capture)), 'context': data_context(receipt.get('context')), 'bindingRef': None}
+        requirements[digest([boundary, keyword])] = {**boundary, 'captureRef': capture['captureRef'],
+            'keyword': keyword, 'requested': True, 'status': 'UNRESOLVED', 'metadataComplete': False,
+            'message': '本轮分组尚未取得成功的原生分组结果', 'organizationType': None,
+            'diagnostics': [receipt.get('error')] if receipt.get('error') else [], 'candidates': []}
+    for finding in findings:
+        binding = finding.get('bindingRef') or finding.get('bindingIri') or finding.get('binding')
+        if not binding:
+            continue
+        if (capture.get('originalToolName') == 'execute_budget_query' and receipt.get('status') == 'SUCCEEDED'
+                and data.get('complete') is True and not data.get('unresolvedGroups')
+                and not data.get('failureSummary', {}).get('issueCount') and finding.get('status') == 'SUPPORTED'
+                and matched_bindings and binding not in matched_bindings):
+            # Design candidates with no matching runtime cell are exploration,
+            # not eight independent grouping obligations for two actual tables.
+            continue
+        boundary = {'source': list(source_identity(capture)), 'context': data_context(receipt.get('context')),
+                    'bindingRef': binding}
+        keyword = finding.get('groupingKeyword') or capture.get('request', {}).get('groupingKeyword')
+        key = digest([boundary, keyword])
+        turn.state.setdefault('groupingRequirements', {})[key] = {
+            **boundary, 'captureRef': capture['captureRef'], 'keyword': keyword,
+            'requested': capture.get('originalToolName') == 'execute_budget_query' and keyword in capture['request'].get('groupBy', []),
+            'status': finding.get('status'), 'metadataComplete': finding.get('metadataComplete'), 'message': finding.get('message'),
+            'organizationType': finding.get('organizationType'), 'diagnostics': finding.get('diagnostics', []),
+            'candidates': ([finding['groupBy']] if finding.get('groupBy') else
+                           [candidate['groupBy'] for candidate in finding.get('candidates', []) if candidate.get('supported')])}
 
 
 def validate_grouping_selection(turn, capture_refs):
@@ -56,13 +85,13 @@ def grouping_requirements(turn):
     else:
         # 这里只做已声明概念的精确对应，不从用户原话猜业务字段或机构类型。
         intent = turn.state.get('queryIntent', {}).get('grouping')
-        selected = {item['captureRef'] for item in candidates if intent and item.get('keyword') == intent}
+        selected = {item['captureRef'] for item in candidates if item.get('requested') or intent and item.get('keyword') == intent}
         for ref in turn.state.get('queryCaptureRefs', []):
             capture = turn.service.store.get_capture(turn.service.owner, ref)
-            if capture.get('originalToolName') != 'execute_semantic_plan':
+            if capture.get('originalToolName') not in ('execute_semantic_plan', 'execute_budget_query'):
                 continue
             receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
-            for step in capture.get('request', {}).get('plan', {}).get('steps', []):
+            for step in (receipt.get('data', {}).get('runtimeRequests', []) if capture.get('originalToolName') == 'execute_budget_query' else capture.get('request', {}).get('plan', {}).get('steps', [])):
                 groups = step.get('batchQuery', {}).get('aggregation', {}).get('groupBy', [])
                 if not groups:
                     continue
@@ -91,10 +120,10 @@ def grouping_issues(turn, artifact=None):
     refs = artifact['captureRefs'] if artifact is not None else turn.state.get('queryCaptureRefs', [])
     for ref in refs:
         capture = turn.service.store.get_capture(turn.service.owner, ref)
-        if capture.get('originalToolName') != 'execute_semantic_plan':
+        if capture.get('originalToolName') not in ('execute_semantic_plan', 'execute_budget_query'):
             continue
         receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
-        if receipt.get('status') != 'SUCCEEDED':
+        if receipt.get('status') not in ('SUCCEEDED', 'PARTIAL'):
             continue
         for step_id, table, _ in budget_batch.tables(receipt):
             if table.get('disposition') != 'SUCCEEDED' or not table.get('request', {}).get('aggregation'):
@@ -109,8 +138,11 @@ def grouping_issues(turn, artifact=None):
                         and requirement['bindingRef'] in bindings
                         and any(group in groups for group in requirement['candidates'])):
                     matched.add(index)
+    completed_keywords = {requirements[index]['keyword'] for index in matched}
     return [{'code': 'GROUPING_RESULT_REQUIRED',
-             'message': '当前任务表样的分组口径尚无成功的预算聚合结果；复用原定位和范围执行批量聚合，不能用手工加总、父级属性继承或 Python 替代。',
+             'message': '本轮要求的分组尚未完成。已有单位明细只能作为参考，不能标记分组分析成功；未识别、元数据不完整与明确不支持须分别说明。',
+             'groupingStatus': item['status'], 'groupingKeyword': item['keyword'],
              'discoveryCaptureRef': item['captureRef'], 'bindingRef': item['bindingRef'],
              'organizationType': item['organizationType'], 'groupByCandidates': item['candidates']}
-            for index, item in enumerate(requirements) if index not in matched and item['status'] == 'SUPPORTED']
+            for index, item in enumerate(requirements) if index not in matched
+            and (item['status'] == 'SUPPORTED' or item['keyword'] not in completed_keywords)]

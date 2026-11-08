@@ -531,6 +531,17 @@ class MCPClient(BaseModel):
                 f"Tool '{name}' not found in MCP server " f"'{self.name}'",
             )
 
+        # A durable query may return after a longer server wait window. Respect
+        # an explicit, bounded hint while retaining any larger user timeout.
+        wait = (target_tool.meta or {}).get('recommendedWaitSeconds')
+        tool_timeout = self.execution_timeout
+        if isinstance(wait, (int, float)) and not isinstance(wait, bool) and 0 < wait <= 3600:
+            tool_timeout = max(tool_timeout or 0, wait)
+            if isinstance(self.mcp_config, HttpMCPConfig) and self.mcp_config.timeout is not None:
+                self.mcp_config.timeout = max(self.mcp_config.timeout, wait)
+                if self._http_client is not None:
+                    self._http_client.timeout = httpx.Timeout(self.mcp_config.timeout)
+
         # Create MCPTool based on stateful/stateless
         if not self.is_stateful:
             # Stateless: pass client generator
@@ -538,7 +549,7 @@ class MCPClient(BaseModel):
                 mcp_name=self.name,
                 tool=target_tool,
                 client_gen=self._get_client_gen,
-                timeout=self.execution_timeout,
+                timeout=tool_timeout,
             )
         else:
             # Stateful: pass session
@@ -547,7 +558,7 @@ class MCPClient(BaseModel):
                 mcp_name=self.name,
                 tool=target_tool,
                 session=self._session,
-                timeout=self.execution_timeout,
+                timeout=tool_timeout,
             )
 
     def _validate_connection(self) -> None:

@@ -57,6 +57,8 @@ def formula_review_trace(trace):
         'externalBoundaries', 'meaning', 'boundaryMeaning', 'applicability',
         'executionStatus', 'completionReason') if key in trace}
     result['recursiveStatus'] = trace.get('status')
+    from .formula_check_summary import summarize
+    result['checkSummary'] = summarize(trace)
     result['nodes'] = [{
         'factRef': node['factRef'], 'observed': node.get('observed'),
         'localCheck': deepcopy(node.get('localCheck')),

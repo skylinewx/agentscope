@@ -1,5 +1,5 @@
 from unittest import TestCase, IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock, patch
 from decimal import Decimal
 import tempfile
 
@@ -10,6 +10,28 @@ from analysis_extension.service import AnalysisService
 
 
 class QueryReadTests(TestCase):
+    def test_generic_list_and_null_data_survive_compaction_and_reading(self):
+        for data in (None, [{'value': '0'}, {'value': None}]):
+            with self.subTest(data=data):
+                receipt = {'contractVersion': '2.0', 'data': data, 'evidence': ['x' * 20000]}
+                original = encode(receipt)
+                compact = compact_receipt(receipt, 'cap', len(original))
+                self.assertIsNotNone(compact)
+                page = read_receipt(receipt, 'cap', '/data')
+                self.assertEqual(page.get('items') if isinstance(data, list) else page.get('value'), data)
+                self.assertEqual(encode(receipt), original)
+
+    def test_capture_projection_does_not_dispatch_generic_data_as_a_budget_result(self):
+        from analysis_extension.capture import ReceiptCapture
+        capture = ReceiptCapture(None, None, frozenset(), None)
+        for data in (None, [{'value': '0'}]):
+            receipt = {'data': data}
+            adapter = Mock(adapter_id='generic')
+            adapter.compact.return_value = receipt
+            with patch('analysis_extension.analysis_materials.response_materials', return_value=None):
+                self.assertEqual(capture._model_projection(adapter, receipt, {'captureRef': 'cap'}, 100), receipt)
+            adapter.compact.assert_called_once_with(receipt, 'cap', 100)
+
     def test_step_index_uses_real_array_positions_and_can_recover_unknown_step_pointer(self):
         receipt = {'data':{'stepResults':[
             {'stepId':'s4','rows':[{'value':'8'}]},
@@ -88,6 +110,22 @@ class QueryReadTests(TestCase):
         self.assertEqual(page['sourceState']['error'], {'readAt': '/error'})
         self.assertEqual(page['nextOffset'], 500)
         self.assertEqual(page['value'], 'x' * 500)
+
+    def test_small_rows_remain_readable_with_large_period_selection_context(self):
+        groups = [{'factId': str(index), 'period': '2026J0001', 'proof': 'x' * 500} for index in range(100)]
+        receipt = {'data': {'resultType': 'BUDGET_QUERY_RESULT', 'complete': True, 'purpose': 'QUERY',
+            'resultSets': [{'context': {'period': '2026N0001', 'dataPeriodSelection': {
+                'mode': 'CONTAINED_PREFERRED_GRAIN', 'groups': groups}},
+                'rows': [{'value': '0', 'valueState': 'PRESENT'}, {'value': None, 'valueState': 'NULL'}]}]}}
+        original = encode(receipt)
+        page = read_receipt(receipt, 'cap', '/data/resultSets/0/rows', fields=['value', 'valueState'])
+        self.assertEqual(page['items'], receipt['data']['resultSets'][0]['rows'])
+        context = page['resultSetContext']['context']
+        self.assertEqual(context['period'], '2026N0001')
+        path = context['dataPeriodSelection']['groups']['readAt']
+        self.assertEqual(at_pointer(receipt, path), groups)
+        self.assertLess(len(encode(page)), 24000)
+        self.assertEqual(encode(receipt), original)
 
 
 class QueryReadAuthorizationTests(IsolatedAsyncioTestCase):

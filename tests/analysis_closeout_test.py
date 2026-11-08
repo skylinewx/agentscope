@@ -113,6 +113,9 @@ class CloseoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(derived['sourceFactIds']), 3)
         inspected = await self.service.inspect('formulas', analysisRef=self.ref, factRef=self.artifact['facts'][0]['factId'])
         self.assertEqual(inspected['status'], 'MATCH')
+        self.assertEqual(inspected['viewType'], 'source_formula_tables')
+        self.assertIn('目标单元格', inspected['markdown'])
+        inspected = await self.service.inspect('formulas', analysisRef=self.ref, factRef=self.artifact['facts'][0]['factId'], detail='full')
         self.assertEqual(inspected['nodes']['total'], 3)
         self.assertEqual(self.artifact['facts'][0]['cellAddress'], 'A1')
 

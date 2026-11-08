@@ -27,6 +27,9 @@ def summaries(capture):
         preparation = form['preparation']
         selector = {'captureRef': capture['captureRef'], 'stepId': step,
                     'observationId': observation['observationId'], 'preparedTargets': True, 'role': 'PRIMARY'}
+        grain = _confirmed_grain(capture, form, context)
+        if grain:
+            selector['grain'] = grain
         summary = {key: deepcopy(value) for key, value in preparation.items() if key != 'targetKeys'}
         summary.update(stepId=step, observationId=observation['observationId'],
                        formulaRequested=bool(form.get('formulaGraph')),
@@ -44,6 +47,72 @@ def summaries(capture):
                                           'headers': cell.get('headers', [])}
                                          for cell in captured_cells(capture, form) if cell.get('key') in keys]
         result.append(summary)
+    return result
+
+
+def _confirmed_grain(capture, form, context, requested=None):
+    """Use the executed dimension scope, or resolve names against its own catalog."""
+    if capture.get('originalToolName') != 'execute_budget_query':
+        return requested
+    from .adapters.budget_v2 import receipt_from_capture
+    from .grid_files import captured_cells
+    data = receipt_from_capture(capture).get('data', {})
+    keys = set(form['preparation']['targetKeys'])
+    roots = [cell for cell in captured_cells(capture, form) if cell.get('key') in keys]
+    if not roots:
+        return requested
+    coordinates = [{**context.get('effectiveDimensions', {}), **cell.get('dimensions', {})} for cell in roots]
+    available = set.intersection(*(set(row) for row in coordinates))
+    models = {cell['modelCode'] for cell in roots if isinstance(cell.get('modelCode'), str)}
+    aliases = {code: {code} for code in available}
+    for entry in data.get('dimensionCatalog', []):
+        code, model = entry.get('dimCode'), entry.get('modelCode')
+        if code not in available or not model or not any(value == model or value.rsplit('_', 1)[0] == model for value in models):
+            continue
+        for name in [entry.get('label'), *entry.get('names', [])]:
+            if isinstance(name, str) and name:
+                aliases.setdefault(name, set()).add(code)
+    if requested is not None:
+        if not isinstance(requested, list) or not requested or any(not isinstance(name, str) or not name for name in requested):
+            raise AnalysisError('INVALID_GRAIN', '分析粒度使用非空维度名称数组。')
+        result = []
+        for name in requested:
+            codes = {name} if name in available else aliases.get(name, set())
+            if len(codes) != 1:
+                raise AnalysisError('ANALYSIS_GRAIN_UNRESOLVED', '分析维度名称未在当前目标中唯一确认。',
+                                    {'dimension': name, 'candidates': sorted(codes), 'availableDimensions': sorted(available)})
+            result.append(next(iter(codes)))
+        if len(set(result)) != len(result):
+            raise AnalysisError('INVALID_GRAIN', '分析粒度不能重复指定同一维度。')
+        return result
+    binding = context.get('target', {}).get('formBindingKey')
+    scopes = [item for item in data.get('scopeResolution', [])
+              if item.get('status') == 'RESOLVED' and item.get('binding') == binding]
+    # A source-confirmed range identifies subjects even when only one value matched
+    # the predicate. Fixed scenario/currency values do not become subject dimensions.
+    ranged = {item['dimCode'] for item in scopes if item.get('dimCode') in available
+              and (any((item.get('condition') or {}).get(key) for key in ('all', 'hierarchy', 'where'))
+                   or len((item.get('condition') or {}).get('values', [])) > 1)}
+    return sorted(ranged) or None
+
+
+def normalize_prepared_grains(captures, selections, scope):
+    result = deepcopy(selections)
+    for item in result:
+        capture = captures.get(item.get('captureRef'), {})
+        if capture.get('originalToolName') != 'execute_budget_query' or not item.get('preparedTargets'):
+            continue
+        matches = [(form, context) for step, form, context, observation in prepared_forms(capture)
+                   if step == item['stepId'] and (not item.get('observationId')
+                       or item['observationId'] == observation['observationId'])]
+        if len(matches) != 1:
+            continue  # The normal selection validator reports missing/ambiguous observations.
+        requested = item.get('grain')
+        if requested is None and scope.get('memberDimension'):
+            requested = [scope['memberDimension']]
+        grain = _confirmed_grain(capture, *matches[0], requested)
+        if grain:
+            item['grain'] = grain
     return result
 
 
@@ -143,7 +212,8 @@ def infer_selections(service, captures, scope, declared=()):
             if len(prior) == 1:
                 batches.append({**deepcopy(prior[0]), 'role': prior[0].get('role', 'PRIMARY')})
             elif item['disposition'] == 'SUCCEEDED' and len(item['columnNames']) == 1 and not prior:
-                batches.append({key: item[key] for key in ('captureRef', 'stepId', 'batchId', 'columnNames')} | {'role': 'PRIMARY'})
+                batches.append({key: item[key] for key in ('captureRef', 'stepId', 'batchId', 'columnNames', 'rowIndices', 'selectionReason')
+                                if key in item} | {'role': 'PRIMARY'})
             else:
                 raise AnalysisError('PREPARATION_NEEDS_SELECTION', '请在候选指标或已有子集之间明确选择。', {'selectionRead': {'section': 'selectors', 'captureRef': ref}})
         # 一个计划有多个对象时逐分支核对到达情况；不同计划允许使用相同的 stepId。
@@ -166,8 +236,12 @@ def infer_selections(service, captures, scope, declared=()):
                 raise AnalysisError('PREPARATION_NEEDS_SELECTION', '多个目标或目录未齐，请只补已确认的区别条件。', {
                     'varyingDimensions': preparation.get('varyingDimensions', []), 'targetCount': preparation['targetCount'],
                     'read': {'section': 'materials', 'captureRef': ref}})
-            chosen.append({'captureRef': ref, 'stepId': step, 'observationId': observation['observationId'],
-                           'preparedTargets': True, 'role': 'PRIMARY'})
+            selected = {'captureRef': ref, 'stepId': step, 'observationId': observation['observationId'],
+                        'preparedTargets': True, 'role': 'PRIMARY'}
+            grain = _confirmed_grain(capture, form, context)
+            if grain:
+                selected['grain'] = grain
+            chosen.append(selected)
             form_contexts[position] = context, form
     missing = sorted(step for plan_id, step in form_steps - observed_steps)
     if missing:
@@ -198,10 +272,10 @@ def infer_selections(service, captures, scope, declared=()):
             coordinates = {**context['effectiveDimensions'], **(root.get('dimensions') or {})}
             subject = {key: coordinates.get(key) for key in grain}
             if tuple(subject.values()) not in population or form_selector(capture, receipt_from_capture(capture),
-                    metric_target(batch_capture, receipt, metrics[0], subject)) != {key: value for key, value in item.items() if key != 'role'}:
+                    metric_target(batch_capture, receipt, metrics[0], subject)) != {key: value for key, value in item.items() if key not in ('role', 'grain')}:
                 raise AnalysisError('PREPARATION_NEEDS_SELECTION', '此表展开不能证明对应所选总体的实际成员与同一指标。')
             item['grain'] = selection.get('grain', list(grain))
-    elif chosen and not scope.get('memberDimension'):
+    elif chosen and not scope.get('memberDimension') and not all(item.get('grain') for item in chosen):
         raise AnalysisError('PREPARATION_NEEDS_SELECTION', '请按已确认的分析对象提供 scope.memberDimension 或显式 grain。')
     if not chosen and not batches and not declared_inputs:
         raise AnalysisError('PREPARATION_INCOMPLETE', '所选回执没有准备完成的数据目标。')

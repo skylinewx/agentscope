@@ -162,7 +162,7 @@ class PublicationFlowTests(PresentationCase):
 
     async def test_frozen_draft_can_be_refreshed_from_workspace_file_without_resending_bindings(self):
         request = await self.request()
-        self.delivery.root.mkdir(parents=True)
+        self.delivery.root.mkdir(parents=True, exist_ok=True)
         path = self.delivery.root / 'report.html'
         path.write_text(request['document'].pop('html'), encoding='utf-8')
         request['document']['path'] = 'report.html'

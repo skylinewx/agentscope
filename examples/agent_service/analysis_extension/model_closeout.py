@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+from collections import Counter, defaultdict, deque
 from copy import deepcopy
 from time import perf_counter
 from uuid import uuid4
@@ -31,6 +32,27 @@ usedRefs 必须列出实际使用的 facts.factId 或 computed.derivedId。没�
 """
 CLOSEOUT_PROMPT += '\n' + ENCODING_GUIDE
 CLOSEOUT_PROMPT += '\n有 omittedCount 或材料裁剪时，只能说该部分未包含在本次整理材料中，不能断言系统未查到；构成关系只能依据来源公式，不能按相邻行标题或行业通用公式自行推定。'
+CLOSEOUT_PROMPT += '\nfactCoverage 是宿主按完整已取得事实计算的各 contextRef 状态数量，关联 contexts 读取任务、时期等条件。它不合计金额。includedCount 是本次整理实际提供的事实数量；不能以展示样本推断整表或其他任务无值。PRESENT 表示有数值，NO_VALUE/NULL 表示空值；不同任务和时期分别解释。'
+CLOSEOUT_PROMPT += '\nFORMULA_CHECK.checkSummary 和 formulaTrace.nodes.localCheck 是程序核对结果。targetLocalCheck=MATCH 只表示目标本层相符；capturedChainStatus=INCOMPLETE/MISMATCH 时，不能把营业利润或整条链说成已经复算相符。BLOCKED 不是差额为零，不能把空值忽略后自称复算通过。来源数值仍可列示；计算不符时不能用已知项目解释全部差额。'
+CLOSEOUT_PROMPT += '\nformulaStatus=NO_TARGET_CELL 表示通过对应预算格定位并仅替换情景后取得目标情景数值；没有该情景运行格及其公式。可解释已有数值，不能套用预算公式，也不应反复要求展开同一表补取不存在的目标格。'
+
+
+def artifact_closeout_records(artifact):
+    """Keep all business facts and local checks; omit repeated transport/provenance details."""
+    from .review_revision import formula_review_trace
+    from .formula_check_summary import summarize
+    fields = ('factId', 'sourceContextId', 'objectId', 'objectLabel', 'objectLabelState', 'sourceObjectId',
+              'objectModelCode', 'inputRole', 'headers', 'measureCode', 'period', 'dataPeriod', 'executionPeriod',
+              'dimensions', 'effectiveDimensions', 'dimensionNames', 'value', 'valueType', 'valueState',
+              'unit', 'unitBasis', 'scale', 'scaleBasis', 'precision', 'formula', 'formulaStatus', 'expression',
+              'taskName', 'formName', 'cellAddress')
+    facts = [{key: deepcopy(fact[key]) for key in fields if key in fact} for fact in artifact.get('facts', [])]
+    computed = deepcopy(artifact.get('derivedValues', []))
+    for value in computed:
+        if value.get('operator') == 'FORMULA_CHECK' and value.get('formulaTrace'):
+            value['checkSummary'] = summarize(value['formulaTrace'])
+            value['formulaTrace'] = formula_review_trace(value['formulaTrace'])
+    return facts, computed
 
 
 def closeout_material(turn, evidence=None, artifact=None):
@@ -41,7 +63,9 @@ def closeout_material(turn, evidence=None, artifact=None):
                 'reviewIssues': [item for review in turn.state.get('reviews', [])[-1:] for item in review.get('issues', [])]}
     if artifact:
         material.update(scope=artifact.get('scope'), checks=artifact.get('checks'), partialReason=artifact.get('partialReason'))
-        facts, computed = artifact.get('facts', []), artifact.get('derivedValues', [])
+        facts, computed = artifact_closeout_records(artifact)
+        material['projection'] = 'All business facts and per-layer checks retained; repeated transport metadata omitted.'
+        material['reviewIssues'].extend(deepcopy(progress(turn).get('lastContentReview', {}).get('issues', [])))
     else:
         evidence = evidence or {}
         facts = [fact for source in evidence.get('sources', []) if not source.get('diagnostic')
@@ -59,9 +83,29 @@ def closeout_material(turn, evidence=None, artifact=None):
     full = json_values({**material, 'facts': facts, 'computed': computed})
     if len(json.dumps(pack_review_records(full), ensure_ascii=False, separators=(',', ':'))) <= 60000:
         return full
-    # 真正超限时保留明确裁剪量；不按金额筛选，空值组也保留。
+    # Truly oversized material must represent every context and value state,
+    # rather than filling the budget with the first (possibly empty) task.
+    # Counts are from the full captured set; the rows remain an explicit sample.
+    groups, coverage = defaultdict(deque), {}
+    for fact in facts:
+        context_ref = fact.get('contextRef', fact.get('sourceContextId', ''))
+        state = fact.get('valueState', 'UNSPECIFIED')
+        groups[(context_ref, state)].append(fact)
+        group = coverage.setdefault(context_ref, {'contextRef': context_ref, 'availableCount': 0,
+                                                  'includedCount': 0, 'valueStates': Counter()})
+        group['availableCount'] += 1
+        group['valueStates'][state] += 1
+    material['factCoverage'] = list(coverage.values())
     material_size = len(json.dumps(json_values(material), ensure_ascii=False))
-    for field, records in (('computed', computed), ('facts', facts)):
+    def round_robin():
+        pending = deque(groups.values())
+        while pending:
+            group = pending.popleft()
+            yield group.popleft()
+            if group:
+                pending.append(group)
+
+    for field, records in (('computed', computed), ('facts', round_robin())):
         for record in records:
             value = json_values(record)
             size = len(json.dumps(value, ensure_ascii=False)) + 2
@@ -70,6 +114,8 @@ def closeout_material(turn, evidence=None, artifact=None):
             else:
                 material[field].append(value)
                 material_size += size
+                if field == 'facts':
+                    coverage[record.get('contextRef', record.get('sourceContextId', ''))]['includedCount'] += 1
     if not material['facts'] and not material['computed']:
         raise AnalysisError('NO_AVAILABLE_FACTS', '当前尚无足够的已取得数据用于解释本题。')
     if len(json.dumps(material, ensure_ascii=False)) > 65000:

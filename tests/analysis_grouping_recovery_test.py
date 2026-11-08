@@ -16,6 +16,41 @@ from agentscope.state import AgentState
 
 
 class GroupingRecoveryTests(PresentationCase):
+    def test_completed_query_does_not_require_unmatched_design_candidates(self):
+        from analysis_extension.grouping_policy import remember_grouping, grouping_requirements
+        turn = self.turn()
+        capture, _, _, receipt = batch_fixture()
+        capture.update(originalToolName='execute_budget_query', request={'groupBy': ['版块']}, captureRef='native')
+        receipt['status'] = 'SUCCEEDED'
+        receipt['data'] = {'complete': True, 'resultSets': [
+            {'context': {'target': {'formBindingKey': 'binding-A'}}}],
+            'grouping': [{'bindingRef': binding, 'groupingKeyword': '版块', 'status': 'SUPPORTED',
+                          'metadataComplete': True, 'groupBy': {'dimCode': 'MD_ORG', 'field': 'MD_YWBK'}}
+                         for binding in ('binding-A', 'binding-no-match')]}
+        capture['response']['content'][0]['text'] = json.dumps(receipt)
+        remember_grouping(turn, capture)
+        self.assertEqual([item['bindingRef'] for item in grouping_requirements(turn)], ['binding-A'])
+        # A failed or incomplete candidate is not excused merely because another table returned rows.
+        receipt['status'] = 'PARTIAL'
+        receipt['data']['failureSummary'] = {'issueCount': 1}
+        capture['response']['content'][0]['text'] = json.dumps(receipt)
+        remember_grouping(turn, capture)
+        self.assertEqual({item['bindingRef'] for item in grouping_requirements(turn)}, {'binding-A', 'binding-no-match'})
+
+    def test_failed_grouping_keeps_unfulfilled_requirement(self):
+        from analysis_extension.grouping_policy import remember_grouping, grouping_requirements
+        turn = self.turn()
+        capture, _, _, receipt = batch_fixture()
+        capture.update(originalToolName='execute_budget_query', request={'groupBy': ['版块']}, captureRef='failed')
+        receipt.update(status='FAILED', error={'code': 'DIMENSION_MEMBER_UNRESOLVED'})
+        receipt['data'] = {}
+        capture['response']['content'][0]['text'] = json.dumps(receipt)
+        remember_grouping(turn, capture)
+        requirement, = grouping_requirements(turn)
+        self.assertTrue(requirement['required'])
+        self.assertEqual(requirement['status'], 'UNRESOLVED')
+        issue, = grouping_issues(turn)
+        self.assertEqual(issue['groupingKeyword'], '版块')
     def test_no_grouping_does_not_load_unrelated_source_receipts(self):
         turn = self.turn()
         turn.state['queryCaptureRefs'] = ['unrelated-source']

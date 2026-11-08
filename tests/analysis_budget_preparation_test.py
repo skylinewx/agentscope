@@ -1,7 +1,7 @@
 """预算分析的宿主准备入口，按来源绑定、目标、权限和用途核对。"""
 from copy import deepcopy
 import json
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from analysis_fixtures import OWNER
 from analysis_budget_batch_test import batch_fixture, update
@@ -185,6 +185,11 @@ class BudgetPreparationTests(PresentationCase):
         scope = {'memberDimension': 'MD_ORG'}
         selectors = infer_selections(self.service, captures, scope)
         self.assertEqual(selectors[1]['grain'], ['MD_ORG'])
+        # Business-query forms may already carry a source-confirmed grain. It
+        # describes subjects, and must not change the observation identity.
+        with patch('analysis_extension.prepared_inputs._confirmed_grain', return_value=['MD_ORG']):
+            confirmed = infer_selections(self.service, captures, scope)
+        self.assertEqual(confirmed, selectors)
         self.turn.state['inheritedScope']['selections'][0]['rowIndices'] = [0]
         with self.assertRaises(AnalysisError) as unselected:
             infer_selections(self.service, captures, scope)

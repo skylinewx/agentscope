@@ -1,4 +1,5 @@
 """执行同一只读计划的明确续页；不替模型选择任务、扩展范围或重试业务失败。"""
+from .business_tables import model_text
 from .query_results import encode
 
 MAX_PAGES = 4
@@ -71,6 +72,21 @@ def combined_response(capture, adapter, events, started, stopped_reason):
         receipt = adapter.raw_receipt(saved['response'])
         # 页面独立分配额度；最后一页的状态不能掩盖前页的缺数、错误和公式边界。
         budget = max(2500, (MODEL_CHARS - 1500) // len(events))
+        source_chars = sum(len(block.get('text', '')) for block in saved['response']['content'])
+        if isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT':
+            from .business_tables import business_view
+            try:
+                if receipt.get('status') in ('SUCCEEDED', 'PARTIAL'):
+                    from .analysis_materials import material_capture
+                    receipt = adapter.receipt(material_capture(saved, capture.sources, capture.store, capture.owner))
+                projected = business_view(receipt, reference, max_chars=budget - 500)
+                if receipt['data'].get('purpose') == 'ANALYZE':
+                    projected['analysisRead'] = {'tool': 'AnalysisInspect', 'arguments': {'section': 'materials', 'captureRef': reference}}
+            except AnalysisError as error:
+                projected = {**diagnostic_navigation(receipt, reference), 'projectionDiagnostic': error.as_dict()}
+            pages.append({'captureRef': reference, 'receipt': projected})
+            refs.append(reference); total_source_chars += source_chars
+            continue
         try:
             material = materials(saved, capture.sources, max_chars=max(1500, budget - 1500), store=capture.store, owner=capture.owner)
         except AnalysisError as error:
@@ -78,7 +94,6 @@ def combined_response(capture, adapter, events, started, stopped_reason):
             # 让前页 PARTIAL 被误读为整次调用结果。原始失败页仍可定向读取。
             material = {'status': 'UNAVAILABLE', 'diagnostic': error.as_dict(),
                         'nextRead': {'section': 'receipt', 'captureRef': reference}}
-        source_chars = sum(len(block.get('text', '')) for block in saved['response']['content'])
         projected = compact_receipt(receipt, reference, max(source_chars, COMPACT_AT),
                                     max_chars=max(1000, budget - len(encode(material))))
         page = {'captureRef': reference, 'analysisMaterials': material}
@@ -100,7 +115,7 @@ def combined_response(capture, adapter, events, started, stopped_reason):
                'scope': 'SAME_READ_ONLY_PLAN', 'allPagesCaptured': True},
                'captureRefs': refs, 'pages': pages,
                'note': '这些是同一计划的连续回执，使用全部相关 captureRefs 构建分析。顶层 status/resumeRef 是最新状态；前页的 PAGE_BOUNDARY 已继续执行，不再恢复历史游标。每页原值、缺数和公式边界分别保留。'})
-    last.content = [TextBlock(text=encode(payload))]
+    last.content = [TextBlock(text=model_text(payload))]
     last.metadata['analysisCaptureRefs'] = refs
     performance = last.metadata['queryPerformance'] = {
         'elapsedMs': round((perf_counter() - started) * 1000, 2), 'pageCount': len(events),

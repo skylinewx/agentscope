@@ -12,6 +12,12 @@ def _clean(value):
 
 
 def period_execution(capture, receipt, step_id, context=None):
+    if capture.get('originalToolName') == 'execute_budget_query':
+        # Business execution has no AI DSL plan or twelve-work-item limit.
+        # Its complete server plan and the period receipt are validated against the original scope.
+        from .budget_query import validate
+        validate(capture, receipt)
+        return None
     steps = [s for s in receipt.get('data', {}).get('stepResults', []) if s.get('stepId') == step_id]
     requests = [s for s in capture['request'].get('plan', {}).get('steps', []) if s.get('id') == step_id]
     query = requests[0].get('formQuery', {}) if len(requests) == 1 else {}

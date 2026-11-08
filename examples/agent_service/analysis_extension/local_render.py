@@ -5,8 +5,9 @@ from .models import AnalysisError
 
 
 class LocalRenderChecker:
-    def __init__(self, widths=(420, 900)):
+    def __init__(self, widths=(420, 900), channel=None):
         self.widths = list(widths)
+        self.channel = channel
 
     async def check(self, document):
         try:
@@ -18,7 +19,7 @@ class LocalRenderChecker:
         try:
             async with async_playwright() as playwright:
                 async with asyncio.timeout(35):
-                    browser = await playwright.chromium.launch(headless=True)
+                    browser = await playwright.chromium.launch(headless=True, **({'channel': self.channel} if self.channel else {}))
                     try:
                         samples = []
                         for width in self.widths:

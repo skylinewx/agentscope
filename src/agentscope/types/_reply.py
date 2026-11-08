@@ -33,6 +33,7 @@ class ErrorType(StrEnum):
     INVALID_REQUEST = "invalid_request"
     """400 / 422 — malformed request."""
     CONTEXT_LENGTH = "context_length"
+    STORAGE_CAPACITY = "storage_capacity"
     """The model rejected input that exceeds its context capacity."""
     UPSTREAM = "upstream"
     """5xx — an upstream service failed."""

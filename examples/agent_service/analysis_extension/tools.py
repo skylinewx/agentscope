@@ -149,6 +149,7 @@ class _AnalysisTool(ToolBase):
             delivery = value.get("delivery", value)
             metadata = {}
             if self.method == 'build' and value.get('calculationSummary'):
+                metadata['analysisNativeResult'] = {'analysisRef': value.get('analysisRef')}
                 metadata['calculationPerformance'] = value['calculationSummary']
                 logging.getLogger(__name__).info('分析运算汇总 总数=%s 已完成=%s 受阻=%s 重复失败=%s',
                     value['calculationSummary']['operationCount'], value['calculationSummary']['completedCount'],
@@ -160,7 +161,8 @@ class _AnalysisTool(ToolBase):
                     'partialRequestCount': sum(item.get('status') == 'PARTIAL' for item in value['results'])}
             if isinstance(delivery, dict) and delivery.get("registered") is True and isinstance(delivery.get("processSummary"), dict):
                 metadata["process_summary"] = delivery["processSummary"]
-            return ToolChunk(content=[TextBlock(text=json.dumps(json_values(value), ensure_ascii=False, allow_nan=False))], metadata=metadata)
+            from .business_tables import model_text
+            return ToolChunk(content=[TextBlock(text=model_text(value))], metadata=metadata)
         except AnalysisError as exc:
             if self.method == 'build' and exc.code in ('UNKNOWN_MEMBER_REFERENCE', 'SCOPE_MISMATCH', 'BATCH_GRAIN_MISMATCH', 'UNDECLARED_SCOPE_EXCLUSION'):
                 failures[input_key] = {'code': exc.code, 'message': str(exc), 'details': exc.details or {}}
@@ -188,6 +190,7 @@ class AnalysisTask(_AnalysisTool):
                                         'contextRefs': {**array(TEXT, 20), 'description': 'CONTINUE 可指定一个历史结果或未完成任务的 contextRef；SYNTHESIZE 指定相关多个，NEW 不带引用。来自宿主业务上下文目录，不是本体 contextId。'},
                                         'changedFields': {**array({'enum': list(CHANGE_FIELDS)}, len(CHANGE_FIELDS)),
                                                           'uniqueItems': True, 'description': '只列本轮实际改变的 intent 字段；grouping/order 等变化不解除 population、task、period 边界。'},
+                                        'changedDimensions': array({**TEXT, 'description': '本轮改变范围的业务维度名称，如部门、项目、组织机构。只替换这些维度，其他已确认范围继续保留。'}, 32),
                                         'userQuote': {**TEXT, 'description': '换题、综合或改变既定范围时，引用本轮用户表达该意图的原话；只改变时期不放开对象范围。'}}, ['mode']),
                         'intent': obj({**{key: {**TEXT, 'minLength': 0, 'description': '保留用户原始业务限定，追问沿用已确认条件；未指定可省略，空字符串按未提供处理；不猜系统编码。'}
                                          for key in INTENT_FIELDS},
@@ -196,6 +199,7 @@ class AnalysisTask(_AnalysisTool):
                         'requiredEvidence': {'enum': ['VALUES', 'FORMULAS'], 'description': '预算指标构成、负值原因、公式分析使用 FORMULAS；须取得分析对象的表展开和适用公式，不能用批量金额代替。'},
                         'formulaSubjects': {**array(STRING_MAP, 100, 1), 'uniqueItems': True,
                             'description': '解释上一轮已确定的明细对象时，在本次 declare 中直接提供需解释的主体维值映射列表。须唯一命中已选批量表的真实维值行，宿主一次取得各对象 INPUT_VO 并准备目标；总体分析仍可沿用原明细。不填写本体能力标识或单元格坐标。'},
+                        'subjectFilter': obj({'operator': {'enum': ['LT', 'LE', 'GT', 'GE', 'EQ', 'NE']}, 'value': TEXT}, ['operator', 'value']),
                         'groupingCaptureRefs': {**array(TEXT, 20), 'uniqueItems': True,
                             'description': '可选：当前采用的分组发现 captureRef 全集。省略时沿用明确意图及原生聚合请求；仅探索未选用的候选不必取数。不能借此省略用户要求的口径。'},
                         'goal': {**TEXT, 'description': '登记用户实际要求的目标与范围。自行选用的例子、图表或附加明细属于展示选择。'},
@@ -203,22 +207,31 @@ class AnalysisTask(_AnalysisTool):
                         'delivery': {'enum': ['TEXT', 'DOCUMENT'], 'description': '分析、数据构成查询及报告使用 DOCUMENT，首次提供适用图形、解读和明细；普通单值、筛选、排序及简单统计可用 TEXT。'}}, ['action'])
     input_schema['allOf'] = [{'if': {'properties': {'action': {'const': 'declare'}}},
                               'then': {'required': ['mode', 'goal']}}]
+    description += ' 解释上一轮结果的数值子集时，优先用 subjectFilter（例如亏损为 {operator:LT,value:"0"}）代替转抄主体编码；与 formulaSubjects 二选一。程序按唯一已选指标筛选真实结果并准备各主体公式，返回 populationSelection 用于构建。'
 
 
 class QueryResultRead(_AnalysisTool):
     name = 'QueryResultRead'
     method = 'read_query_result'
     is_read_only = True
-    description = '只读当前会话已保存的完整查询回执，不触发查询或分析。优先复制 readOptions.read 的调用参数、nextRead 的续页参数；fields 只是导航投影，未选字段按本题需要另读。分析已知 capture 时可直接用 analysisRead 调用 AnalysisInspect，无需先通读原回执。pointer 原样复制 stepReads/readOptions/omitted 返回的 JSON Pointer，根为空字符串；stepId 不是数组下标。没有已知路径时先读根获得实际子路径；预算 v2 可读 /data/stepResults 的 stepId 字段以获得 itemPointers，其他来源使用其实际 JSON 结构，不能从 s2 推导下标 2。数组用 offset/limit 分页；容量不足自动减少完整返回项，严格沿 nextOffset 继续，不自行加 limit。search 按原文片段筛选，fields 选择直接字段。单个对象内部内容不受 limit 限制；过大时按错误 readOptions 的实际子路径或 availableFields 读取，不重复减 limit。itemPointers 指向原回执位置。文本 offset 为字符位置，limit 每单位 100 字符。来源完整性仍看 sourceState 及分支 completeness/resumeRef；读取分页不等于来源分页。'
+    description = '读取当前会话已保存结果，不重新查询。预算查询默认返回业务 Markdown 表格；按返回的 tableRef、C列标识选择 columns，用 filters 对变化维度做 EQ/IN 过滤，严格复制 nextRead 游标续页。行号在同一 captureRef 内稳定。完整数据已返回时不要重复读取。执行覆盖 complete 与本次展示 readComplete 分开。显式排错才使用 pointer/fields 读取原始 JSON 片段；不读取整个 resultSet 对象。其他来源沿其实际 readOptions 读取。'
     input_schema = obj({'captureRef': TEXT, 'pointer': {'type': 'string', 'maxLength': 2048},
                         'offset': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
-                        'search': {'type': 'string', 'minLength': 1, 'maxLength': 200}, 'fields': array(TEXT, 30, 1)}, ['captureRef'])
+                        'search': {'type': 'string', 'minLength': 1, 'maxLength': 200}, 'fields': array(TEXT, 30, 1),
+                        'tableRef': TEXT, 'columns': array(TEXT, 100, 1), 'cursor': {'type': 'string', 'maxLength': 2048},
+                        'filters': array(obj({'column': TEXT, 'operator': {'enum': ['EQ', 'IN']},
+                            'value': {'oneOf': [TEXT, array(TEXT, 100, 1)]}}, ['column', 'operator', 'value']), 20)}, ['captureRef'])
     description += ' 多个已知对象或片段用 requests:[单次参数,...] 一次读取；allPages=true 由宿主在输出额度内续页。每项独立返回状态、pages、readComplete 和 nextRead，局部失败不丢失其他结果。资料已在 analysisMaterials 中给出时直接使用，不重复读取。'
     single_read_schema = deepcopy(input_schema)
-    input_schema = obj({**single_read_schema['properties'], 'requests': array(single_read_schema, 12, 1),
-                        'allPages': {'type': 'boolean', 'description': '仅用于 requests；在同一明确范围内自动读取后续页，超出模型额度时保留准确续读入口。'}})
-    input_schema['oneOf'] = [{'required': ['captureRef'], 'not': {'anyOf': [{'required': ['requests']}, {'required': ['allPages']}]}},
-                            {'required': ['requests'], 'not': {'anyOf': [{'required': [key]} for key in single_read_schema['properties']]}}]
+    shared_read_schema = deepcopy(single_read_schema)
+    shared_read_schema.pop('required', None)
+    input_schema = obj({**single_read_schema['properties'], 'requests': array(shared_read_schema, 12, 1),
+                        'allPages': {'type': 'boolean', 'description': '单次或批量读取均支持。按明确范围续页；受输出额度约束，未读完时返回准确 nextRead。'}})
+    input_schema['oneOf'] = [{'required': ['captureRef'], 'not': {'required': ['requests']}},
+                            {'required': ['requests'], 'not': {'anyOf': [{'required': [key]} for key in single_read_schema['properties'] if key != 'captureRef']}}]
+    input_schema['allOf'] = [{'if': {'required': ['requests'], 'not': {'required': ['captureRef']}},
+                             'then': {'properties': {'requests': array(single_read_schema, 12, 1)}}}]
+    description += ' 同一回执的批量读取可以在顶层给 captureRef；项内显式引用优先。单次读取也可 allPages=true，统一返回逐项 pages/readComplete/nextRead，不触发来源查询。'
 
 
 WORK_ITEM = obj({'taskId': TEXT, 'title': TEXT, 'kind': {'enum': ['VALUES', 'COMPUTATION', 'RELATION']},
@@ -336,10 +349,11 @@ class AnalysisInspect(_AnalysisTool):
     description += ' queryContexts 按最新优先读取本会话已捕获的查询条件、绑定、指标定位和任务机构类型，每页最多 10 个回执；追问只增加分组等条件时先复用仍适用的上下文，不重新发现任务和指标。未命中当前页时沿 nextOffset 继续；失败回执保留失败原因。'
     input_schema = obj({"section": {"enum": ["materials", "gridFiles", "inventory", "inventoryIssues", "entities", "results", "selectors", "captures", "queryContexts", "capture", "receipt", "rows", "protocol", "facts", "derived", "formulas", "summary", "claims", "verificationRecords", "relations", "order", "delivery", "findings", "actions", "preview", "python", "products"]},
                         'pythonRunRef': {**TEXT, 'description': 'section=python 读取成功、失败、取消或超时的执行记录；或用 analysisRef 列出该分析已登记的 Python 计算。'},
+                        'pythonPath': {**TEXT, 'description': 'section=python 的完整记录 JSON Pointer，沿返回的 readOptions/read/nextRead 读取代码、输入和输出；支持 offset/limit/fields 分页，默认仅摘要。'},
                         "previewRef": {**TEXT, 'description': '仅 section=preview，传成功预览返回的 repairRef；读取当前文档的页面检查记录，不会代替浏览器运行检查。'},
                         "analysisRef": TEXT, "captureRef": TEXT,
                         "derivedId": {**TEXT, "description": "section=order 使用 SORT/RANK 派生引用。section=formulas 使用 factRef，不能填这里；section=derived 列出当前版本已完成计算。"}, "stepId": TEXT, "search": TEXT,
-                        "detail": {"enum": ["compact", "full"]}, "fields": {**array(TEXT, 30, 1), 'description': '仅 section=facts 可用；inventory 不传 fields，用 detail=compact 和对象/单元格筛选。'}, "cellKey": TEXT, "factRef": {**TEXT, "description": "section=formulas 必填目标来源 factId；section=facts 可按实际 factId 定位。公式计算结果的 derivedId 不放这里。"}, "memberDimension": TEXT, "objectId": TEXT, "bindingRef": TEXT, "period": TEXT, "measureCode": TEXT,
+                        "detail": {"enum": ["compact", "full"]}, "fields": {**array(TEXT, 30, 1), 'description': 'section=facts 或 python 可用；inventory 不传 fields，用 detail=compact 和对象/单元格筛选。'}, "cellKey": TEXT, "factRef": {**TEXT, "description": "section=formulas 必填目标来源 factId；section=facts 可按实际 factId 定位。公式计算结果的 derivedId 不放这里。"}, "memberDimension": TEXT, "objectId": TEXT, "bindingRef": TEXT, "period": TEXT, "measureCode": TEXT,
                         "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                         "findingPlan": array(FINDING_CHECK, 100), "thresholds": array(THRESHOLD, 20)})
     description += ' 查询返回的 analysisMaterials 已含值、公式、上下文和真实选择器；材料足够时直接 Build/Python。section=materials 按 captureRef 补读同一份资料。多个目标或部分用 requests:[单次参数,...] 一次读取，allPages=true 自动续页；每项必须明确 captureRef/analysisRef/pythonRunRef，不扫描其他历史，不发出源查询。'

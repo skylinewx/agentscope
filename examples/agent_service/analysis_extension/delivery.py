@@ -99,6 +99,13 @@ class AnalysisDelivery:
         self._write(relative, content)
         return {'path': relative, 'purpose': '当前冻结页面的编辑源，后续整页修改以此为准；不是成品交付链接。'}
 
+    def document_draft(self, analysis_ref):
+        from .models import digest
+        relative = 'analysis/drafts/' + digest(self.owner.session_id)[:24] + '/' + digest(analysis_ref)[:24] + '/report.html'
+        self._path(relative).parent.mkdir(parents=True, exist_ok=True)
+        self._path(relative)
+        return {'path': relative, 'purpose': '本会话本分析版本的报告编辑路径；沿用现有报告模板，发布仍使用 document.path。'}
+
     def _artifact(self, ref):
         manifest_path(ref)
         artifact = self.store.get_analysis(self.owner, ref)

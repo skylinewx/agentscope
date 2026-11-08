@@ -71,6 +71,28 @@ class FollowupRouteTests(ActionCase):
 
 
 class MiddlewareFollowupTests(ActionCase):
+    async def test_current_business_query_contract_is_available_to_host_preparation_and_checks_permission(self):
+        from agentscope.permission import PermissionBehavior
+        definition = mcp.types.Tool(name='execute_budget_query', inputSchema={'properties': {'contractVersion': {'const': '2.0'}}},
+            annotations=mcp.types.ToolAnnotations(readOnlyHint=False),
+            _meta={'version': '2.0', 'exactContractResource': 'semantic://contracts/external-query', 'risk': 'READ_ONLY',
+                   'dataBoundary': 'PINNED_SOURCE_SNAPSHOT_ASOF', 'evidencePolicy': 'EVIDENCE_REQUIRED'})
+        tool = _LeasedTool(MCPTool('budget', definition, session=SimpleNamespace()),
+                           SimpleNamespace(resource_id='fixture-resource', fingerprint='fixture-connection'))
+        origin = leased_mcp_origin(tool, frozenset({'fixture-resource'}))
+        self.assertEqual(readonly_capability(tool, origin)['roles'], ['query'])
+        middleware = AnalysisMiddleware(self.store, OWNER, ['fixture-resource'], self.service.authorize)
+        agent = SimpleNamespace(toolkit=SimpleNamespace(_get_available_tools=AsyncMock(return_value={tool.name: SimpleNamespace(tool=tool)})),
+            state=SimpleNamespace(tool_context=SimpleNamespace(activated_groups=[])),
+            _check_permission=AsyncMock(return_value=SimpleNamespace(behavior=PermissionBehavior.DENY, updated_input=None)))
+        turn = SimpleNamespace(state={'turnKey': 'readonly-query'})
+        with self.assertRaises(AnalysisError) as failure:
+            await middleware._call_readonly_source(agent, turn, origin, 'execute_budget_query', {'purpose': 'ANALYZE'})
+        self.assertEqual(failure.exception.code, 'PREPARATION_PERMISSION_REQUIRED')
+        agent._check_permission.assert_awaited_once()
+        definition.meta['risk'] = 'WRITE'
+        self.assertIsNone(readonly_capability(tool, origin))
+
     async def test_real_mcp_business_readonly_metadata_without_overriding_permission(self):
         definition = mcp.types.Tool(name="execute_semantic_plan", inputSchema={"properties": {"contractVersion": {"const": "2.0"}}},
             annotations=mcp.types.ToolAnnotations(readOnlyHint=False),

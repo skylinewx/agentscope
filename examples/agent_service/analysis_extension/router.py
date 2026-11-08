@@ -15,6 +15,7 @@ from .models import AnalysisError, Limits, Owner, canonical
 from .store import AnalysisStore
 from .actions import resolve, followup_text
 from .activation import load_config, resolve_activation
+from .maintenance import maintenance_lifespan
 
 log = logging.getLogger(__name__)
 
@@ -41,8 +42,8 @@ async def _body(request, allowed):
 
 
 def create_analysis_router(config_path):
-    router = APIRouter(prefix="/workspace/analyses", tags=["analysis"])
     path = Path(config_path).resolve()
+    router = APIRouter(prefix="/workspace/analyses", tags=["analysis"], lifespan=maintenance_lifespan(path))
 
     async def context(request, user_id, agent_id, session_id):
         app = request.app

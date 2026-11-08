@@ -6,7 +6,60 @@ import json
 ENCODING_GUIDE = ('仅当材料顶层 recordTableEncoding=1 时，_recordTable 表示原本有序的对象列表：每个 rows 行按 columns 还原字段，再合并 fixedFields；'
                   '若有 recordKeys，则按对应行的 key 还原为对象映射而非列表。valueSets 按列名存放重复值字典，该列行值为零起始索引，先展开字典再解释；'
                   'missingFields 按零基行号列出不存在的字段，必须删除，不能当成 null。'
+                  'valueSets 中的字典本身也可用 _recordTable 保存，先递归还原字典再按下标取值。'
                   '未列为缺失的 null 是显式空值，0/false 保持原类型；列表顺序、数值、引用和依赖均未删减。')
+
+ENCODING_GUIDE += ('顶层 sharedValueEncoding=1 时，先将仅含 _sharedValueRef 的对象替换为 reviewSharedValues 对应零基下标的完整值，'
+                   '再按 recordTableEncoding 规则还原。共享值保持原类型；这是相同背景或标识的重复引用，不省略任何事实或失败。')
+
+
+def pack_shared_review_values(material):
+    """Share identical large backgrounds across singleton metric batches, without trimming any fields."""
+    if len(_encode(material)) < 50000:
+        return material
+    reserved = {'_sharedValueRef', 'reviewSharedValues', 'sharedValueEncoding'}
+    counts = {}
+
+    def count(value):
+        if isinstance(value, dict):
+            if reserved.intersection(value):
+                raise ValueError('source uses shared-value marker')
+            for child in value.values():
+                count(child)
+        elif isinstance(value, list):
+            for child in value:
+                count(child)
+        if isinstance(value, (dict, list, str)):
+            encoded = _encode(value)
+            if len(encoded) >= 100:
+                counts[encoded] = counts.get(encoded, 0) + 1
+
+    try:
+        count(material)
+    except ValueError:
+        return material
+    shared, refs = [], {}
+
+    def visit(value):
+        if isinstance(value, (dict, list, str)):
+            encoded = _encode(value)
+            if counts.get(encoded, 0) >= 2:
+                if encoded not in refs:
+                    refs[encoded] = len(shared)
+                    shared.append(deepcopy(value))
+                return {'_sharedValueRef': refs[encoded]}
+        if isinstance(value, dict):
+            return {key: visit(child) for key, child in value.items()}
+        if isinstance(value, list):
+            return [visit(child) for child in value]
+        return value
+
+    result = visit(material)
+    if not shared or not isinstance(result, dict):
+        return material
+    result['sharedValueEncoding'] = 1
+    result['reviewSharedValues'] = shared
+    return result if len(_encode(result)) < len(_encode(material)) * .9 else material
 
 
 # 宿主公式核对结果须可直接阅读，不能再用字典索引掩盖本层/逐层差别。
@@ -66,13 +119,18 @@ def pack_review_records(material):
                 for row, index in zip(table['rows'], indices):
                     row[column_index] = index
         if value_sets:
-            table['valueSets'] = value_sets
+            # Whole-form dimension combinations differ in one or two fields.
+            # Share those fields inside the value dictionary as well; otherwise
+            # hundreds of near-identical objects can still exceed review capacity.
+            table['valueSets'] = {key: visit(values) for key, values in value_sets.items()}
         packed = {'_recordTable': table}
         original = rows if record_keys is None else dict(zip(record_keys, rows))
         return packed if len(_encode(packed)) < len(_encode(original)) * .9 else None
 
     def visit(value):
         if isinstance(value, dict):
+            if set(value) == {'_recordTable'}:
+                return value
             mapped = {key: deepcopy(child) if key == 'formulaTrace' else visit(child)
                       for key, child in value.items()}
             return pack_rows(list(mapped.values()), list(mapped)) or mapped
@@ -101,9 +159,10 @@ def _unpack(material):
         return material
     if set(material) == {'_recordTable'}:
         table = material['_recordTable']
+        dictionaries = {key: _unpack(value) for key, value in table.get('valueSets', {}).items()}
         result = []
         for index, row in enumerate(table['rows']):
-            fields = {key: table['valueSets'][key][value] if key in table.get('valueSets', {}) else value
+            fields = {key: dictionaries[key][value] if key in dictionaries else value
                       for key, value in zip(table['columns'], row)}
             restored = {**table.get('fixedFields', {}), **fields}
             for key in table.get('missingFields', {}).get(str(index), []):

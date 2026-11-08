@@ -113,22 +113,39 @@ class AnalysisService:
         if self.turn is None:
             raise AnalysisError('NO_ACTIVE_USER_TURN', '当前没有可登记的真实用户轮。')
         subjects = kwargs.pop('formulaSubjects', None)
-        if subjects is not None and (kwargs.get('action', 'declare') != 'declare' or kwargs.get('requiredEvidence') != 'FORMULAS'
+        subject_filter = kwargs.pop('subjectFilter', None)
+        if subjects is not None and subject_filter is not None:
+            raise AnalysisError('INVALID_SUBJECT_FILTER', 'subjectFilter 和 formulaSubjects 二选一。')
+        if (subjects is not None or subject_filter is not None) and (kwargs.get('action', 'declare') != 'declare' or kwargs.get('requiredEvidence') != 'FORMULAS'
                                      or kwargs.get('mode') not in ('ANALYSIS', 'REPORT')):
             raise AnalysisError('INVALID_FORMULA_SUBJECTS', '按主体准备表展开适用于声明 FORMULAS 的数据分析。')
         turn = self.turn
+        if subject_filter is not None:
+            from .budget_preparation import validate_subject_filter
+            validate_subject_filter(subject_filter)
         result = turn.task(**kwargs)
+        population_selection = None
+        if subject_filter is not None:
+            # Resolve the population and filter values in the application before
+            # opening formula grids. An old group total is not a subject population.
+            turn.state['budgetValueFilter'] = deepcopy(subject_filter)
+            result['valueFilter'] = deepcopy(subject_filter)
+            result['next'] = '提交一次 execute_budget_query；宿主附加数值条件，应用服务确认本轮范围、筛选并仅展开命中的分析目标。'
+            return result
         if subjects is not None:
             from .budget_preparation import formula_subjects
-            targets = formula_subjects(turn, subjects)
+            targets = formula_subjects(turn, subjects, [population_selection] if population_selection else None)
             previous = turn.state.get('budgetFormulaPreparation', [])
             if previous and {item['targetKey'] for item in previous} != {item['key'] for item in targets}:
                 raise AnalysisError('PREPARATION_SCOPE_CONFLICT', '本轮已登记的预期主体与此次声明不一致，请沿用原目标。')
             records = await self.budget_preparation.ensure(turn, targets, 'PRIMARY')
             turn.state['budgetFormulaTargets'] = targets
             turn.state['budgetFormulaPreparation'] = records
+            if population_selection is not None:
+                turn.state['selectedResultScope'] = {'selections': [population_selection], 'subjectFilter': subject_filter}
             result['preparedFormulaInputs'] = {
                 'populationCaptureRef': targets[0]['source'], 'expected': len(targets),
+                **({'populationSelection': population_selection} if population_selection else {}),
                 'targets': [{'subject': item['subject'], **({'captureRef': item['selection']['captureRef']} if 'selection' in item else {'error': item['error']})}
                             for item in records],
                 'next': ('构建时选择本题的总体数据或已准备目标回执，宿主自动附上各对象的公式材料；额外统计放在 operations。'
@@ -141,27 +158,53 @@ class AnalysisService:
         return await analyze(self, **kwargs)
 
     async def read_query_result(self, captureRef=None, pointer='', offset=0, limit=20, search=None, fields=None,
-                                requests=None, allPages=False):
+                                requests=None, allPages=False, tableRef=None, columns=None, filters=None, cursor=None):
         from .query_results import read_receipt
         await self.authorize()
+        if requests is None and allPages:
+            requests = [{'captureRef': captureRef, 'pointer': pointer, 'offset': offset, 'limit': limit,
+                         **({'search': search} if search is not None else {}),
+                         **({'fields': fields} if fields is not None else {}),
+                         **{k: v for k, v in dict(tableRef=tableRef, columns=columns, filters=filters, cursor=cursor).items() if v is not None}}]
+            tableRef, columns, filters, cursor = None, None, None, None
+            pointer, offset, limit, search, fields = '', 0, 20, None, None
         if requests is not None:
-            if captureRef is not None or pointer or offset or limit != 20 or search is not None or fields is not None:
-                raise AnalysisError('INVALID_READ_BATCH', 'requests 与顶层单次读取条件不能混用。')
+            if pointer or offset or limit != 20 or search is not None or fields is not None or any(v is not None for v in (tableRef, columns, filters, cursor)):
+                raise AnalysisError('INVALID_READ_BATCH', '批量读取可共享 captureRef，具体路径、字段和分页条件放在每个 requests 项内。')
+            if not isinstance(requests, list) or any(not isinstance(item, dict) for item in requests):
+                raise AnalysisError('INVALID_READ_BATCH', 'requests 必须是读取条件对象的列表。')
+            requests = [{**({'captureRef': captureRef} if captureRef else {}), **item} for item in requests]
             from .batch_reads import read_batch
-            receipts = {}
+            receipts, saved_captures, validated = {}, {}, set()
             async def read_page(**request):
                 reference = request.get('captureRef')
                 if reference not in receipts:
                     capture = self.store.get_capture(self.owner, reference)
-                    receipts[reference] = self.sources.for_capture(capture).raw_receipt(capture['response'])
+                    saved_captures[reference] = capture
+                    adapter = self.sources.for_capture(capture)
+                    receipt = adapter.raw_receipt(capture['response'])
+                    receipts[reference] = receipt
+                # A preceding diagnostic read of this same capture must not bypass
+                # validation when another batch item requests business tables.
+                if not request.get('pointer') and reference not in validated:
+                    capture = saved_captures[reference]
+                    adapter = self.sources.for_capture(capture)
+                    receipt = receipts[reference]
+                    if (getattr(adapter, 'adapter_id', None) == 'budget-v2' and receipt.get('status') in ('SUCCEEDED', 'PARTIAL')
+                            and isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT'):
+                        receipts[reference] = adapter.receipt(capture)
+                    validated.add(reference)
                 return read_receipt(receipts[reference], reference,
                                     **{key: value for key, value in request.items() if key != 'captureRef'})
             return await read_batch(requests, allPages, read_page,
-                                    allowed_fields={'captureRef', 'pointer', 'offset', 'limit', 'search', 'fields'})
-        if allPages:
-            raise AnalysisError('INVALID_READ_BATCH', 'allPages 仅用于 requests 批量读取。')
+                                    allowed_fields={'captureRef', 'pointer', 'offset', 'limit', 'search', 'fields', 'tableRef', 'columns', 'filters', 'cursor'})
         capture = self.store.get_capture(self.owner, captureRef)
-        return read_receipt(self.sources.for_capture(capture).raw_receipt(capture['response']), captureRef, pointer, offset, limit, search, fields)
+        adapter = self.sources.for_capture(capture)
+        receipt = adapter.raw_receipt(capture['response'])
+        if (not pointer and getattr(adapter, 'adapter_id', None) == 'budget-v2' and receipt.get('status') in ('SUCCEEDED', 'PARTIAL')
+                and isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT'):
+            receipt = adapter.receipt(capture)
+        return read_receipt(receipt, captureRef, pointer, offset, limit, search, fields, tableRef, columns, filters, cursor)
 
     async def build(self, captureRefs=None, selections=None, scope=None, operations=None, requestKey=None,
                     baseAnalysisRef=None, actionRunRef=None, workPlan=None):
@@ -381,7 +424,7 @@ class AnalysisService:
         previous = self.store.get_analysis(self.owner, artifact['baseAnalysisRef']) if artifact.get('baseAnalysisRef') else None
         values, changes, calculation_summary = project_results(
             artifact['derivedValues'], compact_derived(artifact['derivedValues'], analysis_ref=artifact['analysisRef']),
-            artifact['analysisRef'], previous.get('derivedValues', []) if previous else [])
+            artifact['analysisRef'], previous.get('derivedValues', []) if previous else [], artifact['facts'])
         verification_tasks = self.pending_verifications(artifact)
         scope = {key: value for key, value in artifact['scope'].items() if key != 'sourceScopes'}
         omitted_lists = []
@@ -397,6 +440,7 @@ class AnalysisService:
                                                   'rangeSummary', 'aggregationSummary')}
                                       for item in artifact['scope'].get('sourceScopes', [])]
         return {"schemaVersion": SCHEMA_VERSION, "analysisRef": artifact["analysisRef"],
+                **({'documentDraft': self.delivery.document_draft(artifact['analysisRef'])} if self.delivery else {}),
                 **({'inputPreparation': artifact['inputPreparation']} if artifact.get('inputPreparation') else {}),
                 "revision": artifact["revision"], "scope": scope, **public_states(artifact),
                 "factCount": len(artifact["facts"]), "derivedValues": values,
@@ -612,7 +656,7 @@ class AnalysisService:
                 result = candidate
         return result
 
-    async def _inspect(self, section="captures", analysisRef=None, captureRef=None, offset=0, limit=50, derivedId=None, stepId=None, search=None, findingPlan=None, thresholds=None, factRef=None, memberDimension=None, objectId=None, bindingRef=None, period=None, measureCode=None, cellKey=None, detail="compact", fields=None, previewRef=None, pythonRunRef=None):
+    async def _inspect(self, section="captures", analysisRef=None, captureRef=None, offset=0, limit=50, derivedId=None, stepId=None, search=None, findingPlan=None, thresholds=None, factRef=None, memberDimension=None, objectId=None, bindingRef=None, period=None, measureCode=None, cellKey=None, detail="compact", fields=None, previewRef=None, pythonRunRef=None, pythonPath=''):
         await self.authorize()
         bounded_page([], offset, limit, self.store.limits.page_size)
         if section == 'materials':
@@ -635,11 +679,15 @@ class AnalysisService:
                     'reader': 'grid_rows(ref, where)', 'previewIsCompleteData': False}
         if section == 'python':
             if pythonRunRef:
-                return self.store.get_python_run(self.owner, pythonRunRef)
+                from .python_reads import inspect_run
+                return inspect_run(self.store.get_python_run(self.owner, pythonRunRef), pythonRunRef,
+                                   pythonPath, offset, limit, search, fields)
             artifact = self.store.get_analysis(self.owner, analysisRef)
             return bounded_page(artifact.get('pythonRuns', []), offset, limit)
         if pythonRunRef is not None:
             raise AnalysisError('INVALID_SECTION', 'pythonRunRef 仅用于 section=python。')
+        if pythonPath:
+            raise AnalysisError('INVALID_SECTION', 'pythonPath 仅用于 section=python。')
         if fields is not None and (section != "facts" or not isinstance(fields, list) or not 1 <= len(fields) <= 30 or any(not isinstance(k, str) for k in fields)):
             raise AnalysisError("INVALID_FIELDS", "fields 仅用于 facts，选择最多 30 个实际字段。",
                                 {'path': '/fields', 'nextAction': 'REMOVE_FIELDS' if section != 'facts' else 'SELECT_FACT_FIELDS',
@@ -873,9 +921,14 @@ class AnalysisService:
             from .formulas import trace_formula
             trace = trace_formula(artifact["facts"], factRef)
             self._annotate_formula_dependencies(artifact, trace)
-            return {**{k: v for k, v in trace.items() if k not in ("nodes", "pendingDependencies")},
-                    "nodes": bounded_page(trace["nodes"], offset, limit, self.store.limits.page_size),
-                    "pendingDependencies": bounded_page(trace["pendingDependencies"], offset, limit, self.store.limits.page_size)}
+            if detail == 'full':
+                return {**{k: v for k, v in trace.items() if k not in ('nodes', 'pendingDependencies')},
+                        'nodes': bounded_page(trace['nodes'], offset, limit, self.store.limits.page_size),
+                        'pendingDependencies': bounded_page(trace['pendingDependencies'], offset, limit, self.store.limits.page_size)}
+            from .formula_tables import formula_view
+            result = formula_view(trace, artifact['facts'], analysisRef, offset=offset, limit=limit)
+            result['pendingDependencies'] = bounded_page(trace['pendingDependencies'], offset, limit, self.store.limits.page_size)
+            return result
         if section == "order":
             if derivedId is None:
                 raise AnalysisError('INVALID_INSPECT_ARGUMENT', 'section=order 必须指定 SORT/RANK 的 derivedId。',

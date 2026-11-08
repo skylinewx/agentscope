@@ -25,7 +25,7 @@ class FreeDocumentTests(PresentationCase):
         req = await self.request()
         req['renderCheckUnavailableReason'] = '离线冻结与导出契约测试未启动浏览器，实际视觉效果未验证。'
         original = self.store.get_analysis(OWNER, self.ref)
-        self.delivery.root.mkdir(parents=True)
+        self.delivery.root.mkdir(parents=True, exist_ok=True)
         source = self.delivery.root/'draft.html'
         source.write_text(req['document'].pop('html'),'utf-8')
         req['document']['path']='./draft.html'

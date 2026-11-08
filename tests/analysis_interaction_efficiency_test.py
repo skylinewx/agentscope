@@ -16,6 +16,7 @@ import analysis_turn_completion_test as turn_fixture
 from analysis_presentation_fixtures import PresentationCase
 from analysis_fixtures import OWNER
 from analysis_extension.capture import ReceiptCapture
+from analysis_extension.adapters import default_sources
 from analysis_extension.models import AnalysisError
 from analysis_extension.query_continuation import continuation_request
 from analysis_extension.tools import AnalysisPublish
@@ -44,7 +45,7 @@ class ContinuationTests(IsolatedAsyncioTestCase):
         request = {'contractVersion': '2.0', 'contextId': 'context', 'querySessionId': 'query',
                    'requestId': 'first', 'plan': {'steps': []}}
         call = ToolCallBlock(id='one-call', name=tool.name, input=json.dumps(request))
-        responses = [event async for event in capture.run(agent, {'tool_call': call}, execute)]
+        responses = [event async for event in capture.run(agent, {'tool_call': call}, execute) if isinstance(event, ToolResponse)]
         return responses, sent
 
     async def test_two_pages_one_response_and_all_evidence_survives_background_restore(self):
@@ -64,7 +65,7 @@ class ContinuationTests(IsolatedAsyncioTestCase):
         self.assertEqual(payload['status'], 'SUCCEEDED')
         self.assertIsNone(payload['resumeRef'])
         from analysis_extension.turn_completion import TurnCompletion
-        turn = TurnCompletion(SimpleNamespace(store=self.store, owner=self.owner), {'turnKey': 'one'})
+        turn = TurnCompletion(SimpleNamespace(store=self.store, owner=self.owner, sources=default_sources()), {'turnKey': 'one'})
         turn.observe_background({'backgroundToolCallId': 'one-call', 'toolResponseMetadata': response.metadata})
         self.assertEqual(turn.state['queryCaptureRefs'], refs)
         self.assertFalse(turn.state.get('backgroundEvidenceErrors'))
@@ -139,7 +140,7 @@ class FinalizeTests(PresentationCase):
 
     async def test_file_repair_reuses_all_bindings_and_can_finalize_in_same_call(self):
         request = await self.request()
-        self.delivery.root.mkdir(parents=True)
+        self.delivery.root.mkdir(parents=True, exist_ok=True)
         path = self.delivery.root / 'report.html'
         path.write_text(request['document'].pop('html'), 'utf-8')
         request['document']['path'] = 'report.html'

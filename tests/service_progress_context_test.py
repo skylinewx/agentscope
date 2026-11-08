@@ -6,6 +6,18 @@ from agentscope.app._service._progress_facts import result_facts
 
 
 class PublicContextTests(TestCase):
+    def test_business_query_progress_uses_whole_receipt_counts_and_preserves_partial_scope(self):
+        receipt = {'status': 'PARTIAL', 'data': {'resultType': 'BUDGET_QUERY_RESULT', 'complete': False,
+            'summary': {'rowCount': 129, 'resultSetCount': 68},
+            'stepResults': [{'batchResults': [{'data': {'rowCount': 1, 'rows': [[999]]}}]}]}}
+        result = public_observations(receipt, 'capture', 'execute_budget_query')
+        self.assertEqual([fact['value'] for fact in result['facts']], [129, 68, False])
+        self.assertEqual(result['facts'][0]['pointer'], '/data/summary/rowCount')
+        text = ''.join(fact['text'] for fact in result['facts'])
+        self.assertIn('部分完成', text)
+        self.assertNotIn('本次返回 1 条', text)
+        self.assertNotIn('999', text)
+
     def test_calculation_is_attributed_without_inventing_unit_or_business_total(self):
         request = {'expression': 'a+b', 'variables': {'a': '1.00', 'b': '2.00'}}
         fact = public_observations({'value': '3.00'}, 'call', 'Calculate', request)['facts'][0]

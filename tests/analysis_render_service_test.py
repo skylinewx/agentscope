@@ -142,11 +142,14 @@ class RenderProtocolTests(IsolatedAsyncioTestCase):
         from analysis_extension.local_render import LocalRenderChecker
         checker = configured_checker({'mode': 'local', 'widths': [420, 900], 'webUiUrl': 'http://localhost:5173'})
         self.assertIsInstance(checker, LocalRenderChecker)
+        self.assertIsNone(checker.channel)
+        self.assertEqual(configured_checker({'mode': 'local', 'channel': 'msedge'}).channel, 'msedge')
         with patch.dict('os.environ', {'ANALYSIS_RENDER_URL': 'http://renderer:8932', 'ANALYSIS_RENDER_TOKEN': 'fixture-token'}):
             self.assertEqual(configured_checker({'mode': 'external', 'widths': [480, 1200]}).widths, [480, 1200])
         for config in ({'mode': 'guess'}, {'widths': [420]}, {'webUiUrl': 'file:///tmp/page'},
                        {'webUiUrl': 'http://user:secret@localhost'}, {'webUiUrl': 'http://localhost/path'},
-                       {'webUiUrl': 42}):
+                       {'webUiUrl': 42}, {'mode': 'local', 'channel': 'C:/unknown.exe'},
+                       {'mode': 'external', 'channel': 'msedge'}):
             with self.assertRaises(AnalysisError):
                 validate_rendering(config)
     async def test_response_identity_and_widths_are_verified(self):

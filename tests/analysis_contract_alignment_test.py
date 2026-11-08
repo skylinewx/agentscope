@@ -34,6 +34,21 @@ class RequestAttemptTests(PresentationCase):
     def attempt(self, request=None, turn='turn'):
         return prepare(self.store, OWNER, turn, self.origin, request or self.request)
 
+    def test_equivalent_failed_business_draft_does_not_create_a_replacement_execution(self):
+        from analysis_extension.models import AnalysisError
+        origin = {**self.origin, 'originalToolName': 'execute_budget_query'}
+        request = {'contractVersion': '2.0', 'requestId': 'one', 'purpose': 'ANALYZE', 'question': '分析亏损原因',
+                   'intentDraft': {'sharedConditions': [], 'targets': [{'id': 'one', 'businessPhrases': [{'text': '净利润', 'sourceText': '净利润'}]}]}}
+        _, attempt = prepare(self.store, OWNER, 'turn', origin, request)
+        self.finish(attempt, retryable=False, action='CORRECT_REQUEST')
+        changed = deepcopy(request)
+        changed['intentDraft']['targets'][0]['id'] = 'renamed'
+        with self.assertRaises(AnalysisError) as error:
+            prepare(self.store, OWNER, 'turn', origin, changed)
+        self.assertEqual(error.exception.code, 'QUERY_EQUIVALENT_FAILURE')
+        changed['intentDraft']['targets'][0]['businessPhrases'][0]['text'] = '营业收入'
+        self.assertNotEqual(prepare(self.store, OWNER, 'turn', origin, changed)[1]['logicalKey'], attempt['logicalKey'])
+
     def finish(self, attempt, status='FAILED', retryable=True, action='RETRY'):
         record(self.store, OWNER, 'turn', attempt, {'contractVersion': '2.0', 'executionId': 'execution',
             'status': status, 'error': {'code': 'QUERY_CONCURRENCY_LIMIT', 'retryable': retryable,
@@ -65,6 +80,40 @@ class RequestAttemptTests(PresentationCase):
         self.assertEqual(acquired[0][0], self.attempt()[0])
         self.assertNotEqual(first['requestId'], self.attempt(turn='another-turn')[0]['requestId'])
 
+    def test_wait_timeout_does_not_freeze_attempt_as_terminal_failure(self):
+        first, attempt = self.attempt()
+        record(self.store, OWNER, 'turn', attempt, {'contractVersion': '2.0', 'executionId': 'physical-one',
+            'status': 'FAILED', 'executionState': 'UNKNOWN',
+            'error': {'code': 'QUERY_WAIT_TIMEOUT', 'retryable': False, 'recoveryAction': 'READ_STATUS'}})
+        self.assertEqual(self.attempt()[0], first)
+        self.assertEqual(self.attempt()[1]['status'], 'IN_PROGRESS')
+        record(self.store, OWNER, 'turn', attempt, {'contractVersion': '2.0', 'executionId': 'physical-one',
+            'status': 'SUCCEEDED', 'error': None})
+        self.assertEqual(self.attempt()[1]['status'], 'SUCCEEDED')
+
+    async def test_host_reads_waiting_execution_without_model_loop_or_replacement_identity(self):
+        tool = capture_fixture.CaptureTest.make_tool(self, '{}')
+        agent = SimpleNamespace(toolkit=SimpleNamespace(get_tool=AsyncMock(return_value=tool)))
+        capture = ReceiptCapture(self.store, OWNER, frozenset({'registered-budget'}), AsyncMock())
+        capture.turn_key_provider = lambda: 'waiting-turn'
+        sent = []
+        async def execute(**kwargs):
+            sent.append(json.loads(kwargs['tool_call'].input))
+            receipt = {'contractVersion': '2.0', 'executionId': 'physical-one', 'data': {}, 'error': None,
+                       'status': 'SUCCEEDED' if len(sent) == 3 else 'IN_PROGRESS'}
+            if len(sent) == 1:
+                receipt.update(status='FAILED', executionState='UNKNOWN', error={
+                    'code': 'QUERY_WAIT_TIMEOUT', 'retryable': False, 'recoveryAction': 'READ_STATUS'})
+            yield ToolResponse(content=[TextBlock(text=json.dumps(receipt))])
+        call = ToolCallBlock(id='one-model-call', name=tool.name, input=json.dumps(self.request))
+        with patch('analysis_extension.capture.asyncio.sleep', new=AsyncMock()):
+            events = [event async for event in capture.run(agent, {'tool_call': call}, execute) if isinstance(event, ToolResponse)]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[0], sent[1])
+        self.assertEqual(sent[1], sent[2])
+        self.assertEqual(len(events[0].metadata['queryStatusReads']), 2)
+
     def test_non_retryable_failure_and_unconfirmed_error_do_not_change_identity(self):
         for retryable, action in ((False, 'RETRY'), (True, 'NONE'), ('true', 'RETRY')):
             request = {**self.request, 'querySessionId': str((retryable, action))}
@@ -90,7 +139,7 @@ class RequestAttemptTests(PresentationCase):
             yield ToolResponse(state=ToolResultState.ERROR if failed else ToolResultState.SUCCESS,
                                content=[TextBlock(text=json.dumps(receipt))])
         call = ToolCallBlock(id='one-model-call', name=tool.name, input=json.dumps(self.request))
-        events = [event async for event in capture.run(agent, {'tool_call': call}, execute)]
+        events = [event async for event in capture.run(agent, {'tool_call': call}, execute) if isinstance(event, ToolResponse)]
         self.assertEqual(len(sent), 2)
         self.assertNotEqual(sent[0]['requestId'], sent[1]['requestId'])
         self.assertEqual({k: v for k, v in sent[0].items() if k != 'requestId'},

@@ -11,6 +11,18 @@ from analysis_extension.turn_completion import TurnCompletion, query_evidence, r
 
 
 class QuerySubjectTests(FollowupScopeTest):
+    def test_successful_batch_in_partial_receipt_remains_an_answer_subject(self):
+        receipt = deepcopy(self.receipt)
+        receipt['status'] = 'PARTIAL'
+        ref = self.save_capture(deepcopy(self.capture), receipt)
+        state = deepcopy(self.previous)
+        state['queryCaptureRefs'] = [ref]
+        turn = TurnCompletion(self.service, state)
+        self.assertEqual([item['captureRef'] for item in candidates(turn)], [ref])
+        receipt['data']['stepResults'][0]['batchResults'][0]['disposition'] = 'FAILED'
+        state['queryCaptureRefs'] = [self.save_capture(deepcopy(self.capture), receipt)]
+        self.assertEqual(candidates(turn), [])
+
     def make_later_exploration(self):
         capture, receipt = deepcopy(self.capture), deepcopy(self.receipt)
         condition = [{'dimCode': 'MD_ORG', 'hierarchy': {'rootCode': 'GT00', 'level': 3}}]

@@ -79,7 +79,11 @@ def inventory(store, owner, offset, limit, member_dimension=None, search=None, d
                     'resolvedDimensions': dimensions,
                     'sourceGroup': origin, 'capturedAt': capture.get('capturedAt')}
             contexts.add(origin)
-            if any(expected is not None and item.get(key) != expected for key, expected in filters.items()): continue
+            # Batch metric names are transport selectors; callers also know the
+            # source measure code returned by the budget query (e.g. XSSR).
+            if any(expected is not None and (
+                    expected not in (item.get('measureCode'), item.get('sourceMeasureCode')) if key == 'measureCode'
+                    else item.get(key) != expected) for key, expected in filters.items()): continue
             if search and search not in json.dumps(item, ensure_ascii=False): continue
             rows.append(item)
     from .inspect_pages import character_page

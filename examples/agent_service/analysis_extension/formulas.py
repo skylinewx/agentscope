@@ -338,7 +338,7 @@ def trace_formula(facts, target_ref):
                              for item in blockers))
     recovery = None
     formula_status = target.get('formulaStatus', 'NOT_CAPTURED')
-    if state == 'NO_FORMULA' and formula_status != 'NOT_CONFIGURED':
+    if state == 'NO_FORMULA' and formula_status not in ('NOT_CONFIGURED', 'NO_TARGET_CELL'):
         # 批量定位时的表外机构可能只是探测用机构；补公式必须改用当前结果行的实际机构。
         dimensions = dict(target.get('formContext', {}).get('effectiveDimensions', target.get('effectiveDimensions', {})))
         dimensions.update({key: value for key, value in target.get('dimensions', {}).items() if key in dimensions})
@@ -363,7 +363,8 @@ def trace_formula(facts, target_ref):
             'executionStatus': 'BLOCKED' if state == 'BLOCKED' and not null_boundary else 'COMPLETED',
             **({'completionReason': 'SOURCE_VALUE_MISSING'} if null_boundary else {}),
             'sourceConsistency': state if state in ('MATCH', 'MISMATCH') else 'NOT_CHECKED',
-            'applicabilityStatus': ('FORMULA_NOT_CONFIGURED' if state == 'NO_FORMULA' and formula_status == 'NOT_CONFIGURED'
+            'applicabilityStatus': ('NO_TARGET_SCENARIO_CELL' if state == 'NO_FORMULA' and formula_status == 'NO_TARGET_CELL'
+                                    else 'FORMULA_NOT_CONFIGURED' if state == 'NO_FORMULA' and formula_status == 'NOT_CONFIGURED'
                                     else 'NO_CAPTURED_FORMULA' if state == 'NO_FORMULA'
                                     else 'CAPTURED_FORMULA' if nodes[0]['expression']
                                     else 'UNDETERMINED'),

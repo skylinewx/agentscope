@@ -18,6 +18,11 @@ from .protocol import validate_artifact
 HOST_ID = uuid.uuid4().hex  # Single-process host lifetime, never a model parameter.
 
 
+class BlobConnection(sqlite3.Connection):
+    quota_ready = False
+    blob_write_marker = None
+
+
 class AnalysisStore:
     def __init__(self, root: str | Path, limits: Limits | None = None):
         self.root = Path(root).resolve()
@@ -63,26 +68,33 @@ class AnalysisStore:
                 CREATE TABLE IF NOT EXISTS action_events(id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run TEXT NOT NULL, owner TEXT NOT NULL, status TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS maintenance_runs(name TEXT PRIMARY KEY, completed REAL NOT NULL);
+                CREATE TABLE IF NOT EXISTS blob_usage(id INTEGER PRIMARY KEY CHECK(id=1), bytes INTEGER NOT NULL);
             """)
 
     def _connect(self):
-        db = sqlite3.connect(self.database, timeout=30)
+        db = sqlite3.connect(self.database, timeout=30, factory=BlobConnection)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys=ON")
         return db
 
     @contextmanager
-    def _transaction(self):
-        db = self._connect()
+    def _transaction(self, *, connection=None):
+        db = connection if connection is not None else self._connect()
         try:
             db.execute("BEGIN IMMEDIATE")
+            db.quota_ready = False
+            db.blob_write_marker = None
             yield db
             db.commit()
+            # Use a transaction-specific marker: another process may acquire the DB lock immediately after commit.
+            if db.blob_write_marker is not None:
+                db.blob_write_marker.unlink(missing_ok=True)
         except BaseException:
             db.rollback()
             raise
         finally:
-            db.close()
+            if connection is None:
+                db.close()
 
     def _blob_path(self, content_digest: str) -> Path:
         if len(content_digest) != 64 or any(c not in "0123456789abcdef" for c in content_digest):
@@ -92,20 +104,47 @@ class AnalysisStore:
             raise AnalysisError("UNSAFE_PATH", "分析内容路径不属于存储目录。")
         return path
 
+    def _blob_usage(self, db, reconcile=False):
+        """O(1) quota reads; a crash/rollback marker requests one physical reconciliation under the DB lock."""
+        row = db.execute("SELECT bytes FROM blob_usage WHERE id=1").fetchone()
+        if not db.quota_ready or reconcile:
+            markers = list(self.root.glob('blob-write-*.pending'))
+            stale = [path for path in markers if path != db.blob_write_marker]
+            if row is None or stale or reconcile:
+                used = sum(path.stat().st_size for path in self.blobs.iterdir() if path.is_file())
+                db.execute("INSERT INTO blob_usage VALUES(1,?) ON CONFLICT(id) DO UPDATE SET bytes=excluded.bytes", (used,))
+                # Retain markers until commit; rollback must request reconciliation again.
+                if stale:
+                    self._mark_blob_write(db)
+                    for path in stale:
+                        path.unlink(missing_ok=True)
+                row = (used,)
+            db.quota_ready = True
+        return row[0]
+
+    def _mark_blob_write(self, db):
+        if db.blob_write_marker is None:
+            path = self.root / ('blob-write-' + uuid.uuid4().hex + '.pending')
+            with path.open('xb') as stream:
+                stream.write(b'filesystem mutation may outlive the sqlite transaction')
+                stream.flush()
+                os.fsync(stream.fileno())
+            db.blob_write_marker = path
+
     def _put(self, db, data: dict) -> str:
         content = canonical(data)
         if len(content) > self.limits.max_receipt_bytes:
             raise AnalysisError("INPUT_TOO_LARGE", "分析输入超过配置上限；未保存截断内容。")
         content_digest = hashlib.sha256(content).hexdigest()
         path = self._blob_path(content_digest)
+        used = self._blob_usage(db)
         if path.exists():
             if path.read_bytes() != content:
                 raise AnalysisError("DIGEST_MISMATCH", "已保存的分析内容被修改。")
         else:
-            # Include unregistered files left by a crash in quota accounting.
-            used = sum(p.stat().st_size for p in self.blobs.iterdir() if p.is_file())
             if used + len(content) > self.limits.max_store_bytes:
                 raise AnalysisError("STORE_FULL", "分析存储达到配额，已发布依据仍保留。")
+            self._mark_blob_write(db)
             fd, temporary = tempfile.mkstemp(prefix="pending-", dir=self.blobs)
             try:
                 with os.fdopen(fd, "wb") as stream:
@@ -113,6 +152,7 @@ class AnalysisStore:
                     stream.flush()
                     os.fsync(stream.fileno())
                 os.replace(temporary, path)
+                db.execute("UPDATE blob_usage SET bytes=bytes+? WHERE id=1", (len(content),))
             finally:
                 if os.path.exists(temporary):
                     os.unlink(temporary)
@@ -605,48 +645,38 @@ class AnalysisStore:
 
     def collect_expired(self, timestamp: float | None = None) -> dict:
         """Remove only old, unpinned extension objects; never published inputs."""
+        from .store_cleanup import maintenance_lock
         cutoff = (time.time() if timestamp is None else timestamp) - self.limits.retention_seconds
-        with self._transaction() as db:
-            return self._collect_expired(db, cutoff)
+        with maintenance_lock(self.root) as acquired:
+            if not acquired:
+                return {'performed': False, 'reason': 'IN_PROGRESS'}
+            with closing(self._connect()) as db:
+                return self._collect_expired(db, cutoff)
 
-    def collect_expired_if_due(self, interval_seconds=300, timestamp=None):
+    def collect_expired_if_due(self, interval_seconds=300, timestamp=None, *, stop=None):
         """同一存储按间隔维护，跨会话和进程共享完成时间，恢复执行不重复扫描。"""
+        from .store_cleanup import maintenance_lock, MaintenanceStopped, check_stopped
         current = time.time() if timestamp is None else timestamp
-        with self._transaction() as db:
-            row = db.execute("SELECT completed FROM maintenance_runs WHERE name='expiry'").fetchone()
-            if row and 0 <= current - row['completed'] < interval_seconds:
-                return {'performed': False, 'reason': 'NOT_DUE', 'lastCompletedAt': row['completed']}
-            # 与清理共用事务；失败回滚，不把失败登记成已完成或无限延后重试。
-            result = self._collect_expired(db, current - self.limits.retention_seconds)
-            completed = time.time() if timestamp is None else timestamp
-            db.execute("INSERT INTO maintenance_runs VALUES('expiry',?) "
-                       "ON CONFLICT(name) DO UPDATE SET completed=excluded.completed", (completed,))
-            return {'performed': True, 'completedAt': completed, **result}
+        with maintenance_lock(self.root) as acquired:
+            if not acquired:
+                return {'performed': False, 'reason': 'IN_PROGRESS'}
+            with closing(self._connect()) as db:
+                row = db.execute("SELECT completed FROM maintenance_runs WHERE name='expiry'").fetchone()
+                if row and 0 <= current - row['completed'] < interval_seconds:
+                    return {'performed': False, 'reason': 'NOT_DUE', 'lastCompletedAt': row['completed']}
+                try:
+                    result = self._collect_expired(db, current - self.limits.retention_seconds, stop)
+                    if result.get('deferred'):
+                        return {'performed': True, **result}
+                    with self._transaction(connection=db):
+                        check_stopped(stop)
+                        completed = time.time() if timestamp is None else timestamp
+                        db.execute("INSERT INTO maintenance_runs VALUES('expiry',?) "
+                                   "ON CONFLICT(name) DO UPDATE SET completed=excluded.completed", (completed,))
+                    return {'performed': True, 'completedAt': completed, **result}
+                except MaintenanceStopped:
+                    return {'performed': False, 'reason': 'STOPPING'}
 
-    def _collect_expired(self, db, cutoff):
-        """调用者持有事务，避免清理与新建引用之间出现删除竞态。"""
-        deleted = db.execute("DELETE FROM captures WHERE created<? AND ref NOT IN (SELECT capture FROM pins)", (cutoff,)).rowcount
-        db.execute("DELETE FROM semantic_reviews WHERE created<?", (cutoff,))
-        db.execute('DELETE FROM native_results WHERE created<?', (cutoff,))
-        db.execute('DELETE FROM turn_progress WHERE updated<?', (cutoff,))
-        retained = {r[0] for r in db.execute("SELECT digest FROM captures UNION SELECT digest FROM analyses UNION SELECT digest FROM presentations UNION SELECT digest FROM publication_proposals UNION SELECT digest FROM document_checks UNION SELECT digest FROM python_runs UNION SELECT digest FROM semantic_reviews UNION SELECT digest FROM native_results")}
-        removed = 0
-        blob_root = self.blobs.resolve()
-        for path in self.blobs.iterdir():
-            # 仍被引用的对象不能删除，先跳过可避免每轮对全部历史文件重复做文件系统检查。
-            if path.stem in retained:
-                continue
-            owned_file = ((path.suffix == '.json' and len(path.stem) == 64
-                           and all(char in '0123456789abcdef' for char in path.stem))
-                          or path.name.startswith('pending-'))
-            if not owned_file:
-                continue
-            if path.is_symlink() or path.resolve().parent != blob_root:
-                continue
-            if path.is_file() and path.stat().st_mtime < cutoff:
-                path.unlink()
-                db.execute("DELETE FROM blobs WHERE digest=?", (path.stem,))
-                removed += 1
-        from .grid_files import collect_expired_files
-        grid_removed = collect_expired_files(self, db, cutoff)
-        return {"capturesRemoved": deleted, "blobsRemoved": removed, "gridFilesRemoved": grid_removed}
+    def _collect_expired(self, db, cutoff, stop=None):
+        from .store_cleanup import collect_expired
+        return collect_expired(self, db, cutoff, stop)

@@ -122,7 +122,12 @@ async def receive_files(receipt, tool, store, owner):
                     or type(manifest.get('cellCount')) is not int or not 0 <= manifest['cellCount'] <= 1_000_000):
                 raise AnalysisError('GRID_FILE_MANIFEST', '网格文件描述与已捕获的来源观察不一致。')
             destination = root / (manifest['sha256'] + '.jsonl')
-            if not destination.exists():
+            # 复用旧文件与后台清理共享短事务。先续期，防止尚未登记新回执时被当作孤儿回收。
+            with store._transaction():
+                present = destination.exists()
+                if present:
+                    os.utime(destination, None)
+            if not present:
                 handle, temporary = tempfile.mkstemp(prefix='grid-', suffix='.tmp', dir=root)
                 try:
                     url = urlunsplit((source_url.scheme, source_url.netloc, expected_path, '', ''))
@@ -203,29 +208,3 @@ def captured_cells(capture, form):
         raise AnalysisError('GRID_FILE_NOT_FOUND', '完整网格文件尚未落盘，不能将空 cells 解释为无数据。')
     _verify_file(Path(values[0]['_path']), values[0])
     return records(values[0])
-
-
-def collect_expired_files(store, db, cutoff):
-    """沿用输入保留策略，只回收专用目录中无人引用的旧文件；运行记录钉住所用回执。"""
-    root = store.root / 'grid-files'
-    if not root.is_dir() or root.is_symlink() or root.resolve() != store.root.resolve() / 'grid-files':
-        return 0
-    retained = set()
-    for row in db.execute('SELECT owner,digest FROM captures'):
-        capture = store._read(row['digest'])
-        retained.update((digest(row['owner']), value['sha256']) for value in capture.get('gridFiles', []))
-    removed = 0
-    for owner_root in root.iterdir():
-        if not owner_root.is_dir() or owner_root.is_symlink() or owner_root.resolve().parent != root.resolve():
-            continue
-        for path in owner_root.iterdir():
-            if path.is_symlink() or path.resolve().parent != owner_root.resolve() or not path.is_file():
-                continue
-            if path.stat().st_mtime >= cutoff:
-                continue
-            hashed = path.suffix == '.jsonl' and len(path.stem) == 64 and all(char in '0123456789abcdef' for char in path.stem)
-            temporary = path.name.startswith('grid-') and path.suffix == '.tmp'
-            if temporary or hashed and (owner_root.name, path.stem) not in retained:
-                path.unlink()
-                removed += 1
-    return removed

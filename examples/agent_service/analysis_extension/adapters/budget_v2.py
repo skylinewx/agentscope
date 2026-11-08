@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 import re
 
+from ..business_tables import actual_headers
 from ..models import AnalysisError, decimal_text, decimal_value, digest, exact_loads, json_values
 from ..sources import SourceAdapter, source_context, combined_context
 from .budget_periods import period_execution, period_coverage
@@ -22,7 +23,8 @@ def budget_receipt(response: dict) -> dict:
             candidates.append(value)
     if len(candidates) != 1:
         raise AnalysisError("RECEIPT_UNAVAILABLE", "该输入不包含唯一、完整的预算 v2 回执。")
-    return candidates[0]
+    from ..receipt_references import expand_receipt
+    return expand_receipt(candidates[0])
 
 
 def declares_v2(schema):
@@ -63,7 +65,8 @@ def batch_query_context(capture, receipt):
     data = mapping(receipt.get('data'))
     results = {step.get('stepId'): step for step in objects(data.get('stepResults')) if isinstance(step.get('stepId'), str)}
     queries = []
-    for step in objects(mapping(mapping(capture.get('request')).get('plan')).get('steps')):
+    planned = data.get('runtimeRequests') if capture.get('originalToolName') == 'execute_budget_query' else mapping(mapping(capture.get('request')).get('plan')).get('steps')
+    for step in objects(planned):
         if step.get('operation') != 'BATCH_DATA_QUERY':
             continue
         query = {key: value for key, value in mapping(step.get('batchQuery')).items()
@@ -140,12 +143,17 @@ def receipt_from_capture(capture: dict) -> dict:
             raise AnalysisError("REQUEST_MISMATCH", "回执的查询上下文与原请求不一致。")
     if request.get("querySessionId") and request["querySessionId"] != receipt.get("querySessionId"):
         raise AnalysisError("REQUEST_MISMATCH", "回执的查询会话与原请求不一致。")
+    if capture.get('originalToolName') == 'execute_budget_query':
+        from .budget_query import validate
+        validate(capture, receipt)
     return receipt
 
 
 def form_rows(receipt: dict):
     data = receipt.get("data") or {}
     for step in data.get("stepResults", []):
+        if step.get('evidenceRole') == 'FILTER_POPULATION':
+            continue
         for form in step.get("formResults", []):
             yield step.get("stepId"), form
     for form in data.get("formResults", []):
@@ -166,7 +174,11 @@ def pointer(value, path: str):
 
 
 def _step_request(capture, step_id):
-    steps = capture["request"].get("plan", {}).get("steps", [])
+    if capture.get('originalToolName') == 'execute_budget_query':
+        from .budget_query import server_steps
+        steps = server_steps(capture, budget_receipt(capture['response']))
+    else:
+        steps = capture["request"].get("plan", {}).get("steps", [])
     selected = [s for s in steps if s.get("id") == step_id]
     if len(selected) != 1:
         raise AnalysisError("REQUEST_TARGET_UNPROVEN", "无法把表结果对应到唯一的原请求步骤。")
@@ -253,7 +265,7 @@ def validate_form_request(capture, receipt, step_id, form):
     return context, observation
 
 
-def cell_value(cell, number_format=None):
+def cell_value(cell, number_format=None, value_type=None):
     if cell.get("issue"):
         return None, "FAILED", "unavailable"
     raw = cell.get("rawValueJson")
@@ -269,6 +281,13 @@ def cell_value(cell, number_format=None):
         value = exact_loads(raw) if isinstance(raw, str) else raw
         if value is None:
             return None, "NO_VALUE", "raw_json"
+        if value_type in ('STRING', 'BOOLEAN', 'DATE', 'DATETIME', 'UNKNOWN'):
+            expected = (str, bool) if value_type == 'UNKNOWN' else (bool,) if value_type == 'BOOLEAN' else (str,)
+            if type(value) not in expected:
+                if value_type == 'UNKNOWN' and not isinstance(value, (dict, list)):
+                    return str(value), 'PRESENT', 'source_typed'
+                return None, 'FAILED', 'source_type_mismatch'
+            return value, 'PRESENT', 'source_typed'
         if isinstance(value, str) and number_format == "grouped-dot" and re.fullmatch(r"-?[1-9]\d{0,2}(?:,\d{3})+(?:\.\d+)?", value):
             value = value.replace(",", "")
         return decimal_text(decimal_value(value)), "PRESENT", "raw_json" if isinstance(raw, str) else "typed_value"
@@ -278,8 +297,14 @@ def cell_value(cell, number_format=None):
 
 def catalog(capture, *, grid_selection=None):
     receipt = receipt_from_capture(capture)
+    from .budget_query import runtime_value_types, runtime_dimension_names
+    value_types = runtime_value_types(receipt)
+    dimension_names = runtime_dimension_names(receipt)
     from ..identity import dimension_models
     items = []
+    full_form_query = (capture.get('originalToolName') == 'execute_budget_query'
+                       and receipt.get('data', {}).get('selection') == 'FULL_FORM'
+                       and receipt.get('data', {}).get('purpose') == 'QUERY')
     for step_id, form in form_rows(receipt):
         # 文件有独立读取入口。目录和最终核对不展开全部文件内容。
         if form.get('file') and grid_selection is None:
@@ -298,8 +323,15 @@ def catalog(capture, *, grid_selection=None):
                 wanted.update((form.get('formulaGraph') or {}).get('cellKeys', []))
             cells = [cell for cell in captured_cells(capture, form) if cell.get('key') in wanted]
         for cell in cells:
-            value, state, precision = cell_value(cell, capture.get("numberFormat"))
+            # The native full-form receipt also contains headers and index cells.
+            # They remain available in the grid and in each data cell's headers;
+            # they are not additional numeric facts in the business query.
+            if full_form_query and not (cell.get('row', 0) > 0 and cell.get('column', 0) > 0
+                                        and (cell.get('mapType') == 'ZB' or cell.get('formula') is not None)):
+                continue
             oid = (form.get("runtime") or {}).get("observation", {}).get("observationId")
+            value_type = value_types.get((oid, cell.get('key')))
+            value, state, precision = cell_value(cell, capture.get("numberFormat"), value_type)
             source = budget_source_context(capture, receipt)
             items.append({"factId": fact_id(source['sourceContextId'], oid, cell.get('key')),
                           "sourceContextId": source['sourceContextId'],
@@ -315,9 +347,11 @@ def catalog(capture, *, grid_selection=None):
                           "period": cell.get('dimensions', {}).get('DATATIME', context.get('period')),
                           "executionPeriod": context.get('period'), "periodResolution": context.get('periodResolution'),
                           "cellKey": cell.get("key"), "row": cell.get("row"), "column": cell.get("column"),
-                          "headers": cell.get("headers", []), "modelCode": cell.get("modelCode"), "measureCode": cell.get("measureCode"),
+                          "headers": actual_headers(cell, context.get("period")), "modelCode": cell.get("modelCode"), "measureCode": cell.get("measureCode"),
                           "dimensions": cell.get("dimensions", {}), "displayValue": cell.get("displayValue"),
-                          "unit": cell.get("unit"), "value": value, "valueState": state, "precision": precision,
+                          "dimensionNames": dimension_names.get((oid, cell.get('key')), {}),
+                          "unit": cell.get("unit") if value_type in (None, 'DECIMAL_STRING') else None,
+                          "value": value, "valueState": state, "precision": precision, "valueType": value_type,
                           "formula": cell.get("formula"), "cellAddress": source_address(cell, cells),
                           "formulaStructure": cell.get("formulaStructure"),
                           "formulaTarget": cell.get('key') in (form.get('formulaGraph') or {}).get('targetKeys', [])})
@@ -444,6 +478,9 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
     if not selections:
         raise AnalysisError("EMPTY_SELECTION", "需要选择实际捕获的对象和单元格。")
     receipts = {ref: receipt_from_capture(value) for ref, value in captures.items()}
+    from .budget_query import runtime_value_types, runtime_dimension_names
+    value_types = {ref: runtime_value_types(receipt) for ref, receipt in receipts.items()}
+    dimension_names = {ref: runtime_dimension_names(receipt) for ref, receipt in receipts.items()}
     captures = resolve_form_requests(captures, receipts)
     from ..identity import dimension_models, names_for
     from ..actions import source_identity
@@ -569,6 +606,9 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
                              'captureRef': ref, 'stepId': sid, 'cellKey': key, 'nextSection': 'inventory'})
             if outside_scope:
                 continue
+            value_type = value_types[ref].get((oid, key))
+            if value_type not in (None, 'DECIMAL_STRING'):
+                raise AnalysisError('NON_NUMERIC_MEASURE', '文本、日期和布尔指标可直接查询展示，不能作为金额参与数值分析。')
             value, state, precision = cell_value(cell, capture.get("numberFormat"))
             model = dimension_models(form).get(member_dimension)
             if member in member_models and member_models[member] != model:
@@ -588,8 +628,9 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
                     "sourceContextId": source_contexts[ref]['sourceContextId'], "querySessionId": receipt['querySessionId'],
                     "cellKey": key, "row": cell.get("row"), "column": cell.get("column"),
                     "cellAddress": source_address(cell, cells),
-                    "measureCode": cell.get("measureCode"), "headers": cell.get("headers") or [c["displayValue"] for c in cells if c.get("row") == cell.get("row") and c.get("displayValue") and cell_value(c, capture.get("numberFormat"))[1] == "NOT_APPLICABLE"],
+                    "measureCode": cell.get("measureCode"), "headers": actual_headers(cell, context.get("period")) or [c["displayValue"] for c in cells if c.get("row") == cell.get("row") and c.get("displayValue") and cell_value(c, capture.get("numberFormat"))[1] == "NOT_APPLICABLE"],
                     "dimensions": effective, "dimensionModels": dimension_models(form),
+                    "dimensionNames": dimension_names[ref].get((oid, key), {}),
                     "formContext": json_values(context),
                     "period": effective.get("DATATIME", context.get("period")),
                     "executionPeriod": context.get('period'), "periodResolution": context.get('periodResolution'),
@@ -841,12 +882,22 @@ class BudgetV2Adapter(SourceAdapter):
     def receipt_info(self, capture):
         receipt = receipt_from_capture(capture)
         from ..grid_files import file_summary
+        business = {}
+        if capture.get('originalToolName') == 'execute_budget_query':
+            from .budget_query import result_set_summaries, present_value_groups
+            data = receipt['data']
+            business['businessQuery'] = {**{key: data.get(key) for key in
+                ('question', 'purpose', 'selection', 'complete', 'summary', 'failureSummary', 'unresolvedGroups')},
+                'resultSetCatalog': result_set_summaries(data), 'presentValueGroups': present_value_groups(data)}
+            if data.get('valueFilter'):
+                business['businessQuery']['valueFilter'] = {key: value for key, value in data['valueFilter'].items()
+                                                            if key != 'evaluatedFacts'}
         return {'context': receipt.get('context'), 'querySessionId': receipt.get('querySessionId'),
                 'status': receipt.get('status'), 'error': receipt.get('error'),
                 'branches': receipt.get('branches', []), 'completeness': receipt.get('completeness'),
                 'evidenceIds': [e.get('evidenceId') for e in receipt.get('evidence', [])], 'resumeRef': receipt.get('resumeRef'),
                 'batchQueries': batch_query_context(capture, receipt), 'gridFiles': file_summary(capture),
-                'gridFileErrors': capture.get('gridFileErrors', [])}
+                'gridFileErrors': capture.get('gridFileErrors', []), **business}
 
     def member_namespace(self, capture, dimension):
         if capture.get('originalToolName') == 'validate_evidence':
@@ -858,15 +909,15 @@ class BudgetV2Adapter(SourceAdapter):
         if tool.is_read_only:
             return 'mcp-readonly-annotation'
         metadata = tool._tool._tool.meta or {}
-        if (origin['originalToolName'] in {'execute_semantic_plan', 'validate_evidence'}
-                and self.matches(tool, origin) and metadata.get('risk') == 'L1'
+        if (origin['originalToolName'] in {'execute_semantic_plan', 'execute_budget_query', 'validate_evidence'}
+                and self.matches(tool, origin) and metadata.get('risk') in {'L1', 'READ_ONLY'}
                 and metadata.get('dataBoundary') == 'PINNED_SOURCE_SNAPSHOT_ASOF'
                 and metadata.get('evidencePolicy') == 'EVIDENCE_REQUIRED'):
             return 'budget-v2-business-readonly-contract'
         return None
 
     def roles(self, tool, origin):
-        return {'execute_semantic_plan': ['query'], 'validate_evidence': ['verify']}.get(origin['originalToolName'], [])
+        return {'execute_semantic_plan': ['query'], 'execute_budget_query': ['query'], 'validate_evidence': ['verify']}.get(origin['originalToolName'], [])
 
     def verification_task(self, fact, capture):
         receipt = receipt_from_capture(capture)

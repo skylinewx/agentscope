@@ -11,9 +11,11 @@ from .models import AnalysisError
 
 def validate_rendering(config):
     """渲染入口由宿主配置，模型只能提交已经冻结的页面。"""
-    if (not isinstance(config, dict) or set(config) - {'mode', 'widths', 'webUiUrl'}
+    if (not isinstance(config, dict) or set(config) - {'mode', 'widths', 'webUiUrl', 'channel'}
             or config.get('mode', 'external') not in ('external', 'local')):
-        raise AnalysisError('INVALID_RENDER_CONFIG', 'rendering 使用 mode、widths、webUiUrl；mode 为 local 或 external。')
+        raise AnalysisError('INVALID_RENDER_CONFIG', 'rendering 使用 mode、widths、webUiUrl、channel；mode 为 local 或 external。')
+    if 'channel' in config and (config.get('mode') != 'local' or config['channel'] not in ('chromium', 'chrome', 'msedge')):
+        raise AnalysisError('INVALID_RENDER_CONFIG', 'channel 仅用于 local 模式，使用 chromium、chrome 或 msedge。')
     widths = config.get('widths', [420, 900])
     if (not isinstance(widths, list) or not 2 <= len(widths) <= 4
             or any(type(width) is not int or not 320 <= width <= 2400 for width in widths)
@@ -37,7 +39,7 @@ def configured_checker(config):
     validate_rendering(config)
     if config.get('mode') == 'local':
         from .local_render import LocalRenderChecker
-        return LocalRenderChecker(config.get('widths', [420, 900]))
+        return LocalRenderChecker(config.get('widths', [420, 900]), config.get('channel'))
     return RenderChecker.from_environment(config.get('widths'))
 
 

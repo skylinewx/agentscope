@@ -116,7 +116,7 @@ class AnalysisMiddleware(MiddlewareBase):
                 if isinstance(event, ReplyEndEvent) and self.service.turn is not None:
                     if event.finished_reason == ReplyFinishedReason.COMPLETED:
                         status = await self._check_end(agent)
-                        if self.service.turn.state.get('hostCloseout') and status['status'] in ('READY', 'PARTIAL'):
+                        if self.service.turn.state.get('hostCloseout') and status['status'] in ('DIRECT', 'READY', 'PARTIAL'):
                             # 完成检查发生在模型正文之后；事实摘要使用宿主文本替换未经确认的候选。
                             block = TextBlock(text=self.service.turn.state['hostCloseout']['answer'])
                             candidate_events = [TextBlockStartEvent(reply_id=event.reply_id, block_id=block.id),
@@ -270,6 +270,13 @@ class AnalysisMiddleware(MiddlewareBase):
                         'issues': [issue(exc.code, str(exc))], 'recoveryAction': 'REVIEW_SAVED_EVIDENCE'}
             if artifact is None:
                 return status
+            from .query_empty_result import empty_query_answer
+            empty = empty_query_answer(artifact)
+            if empty:
+                from .review_control import progress
+                progress(turn, lambda saved: saved.update(closeout=empty))
+                turn.state['hostCloseout'] = empty
+                return {key: value for key, value in empty.items() if key != 'answer'}
             from .query_result_evidence import focused_review_context
             focus_context = focused_review_context(turn, artifact)
             if focus_context:
@@ -391,7 +398,7 @@ class AnalysisMiddleware(MiddlewareBase):
                                    usage=agent._get_reply_usage(), finished_reason=ReplyFinishedReason.COMPLETED)
                 return
             if not agent.state.middle_context.get('background_tools_v1'):
-                answer = self._approved_delivery()
+                answer = self._empty_scenario_analysis() or self._approved_delivery()
                 if answer is not None:
                     block = TextBlock(text=answer)
                     yield TextBlockStartEvent(reply_id=agent.state.reply_id, block_id=block.id)
@@ -461,6 +468,60 @@ class AnalysisMiddleware(MiddlewareBase):
                     stats['elapsedMs'] = round(stats['elapsedMs'] + elapsed_ms, 2)
                 saved = progress(turn, record_reasoning)
                 turn.state['reasoningPerformance'] = saved['reasoning']
+
+    def _empty_scenario_analysis(self):
+        """Finish a proven empty fallback before another model call can change its scenario."""
+        turn = self.service.turn
+        if (turn.state.get('mode') not in ('ANALYSIS', 'REPORT') or turn.state.get('analysisRef')
+                or turn.state.get('backgroundEvidenceErrors')):
+            return None
+        if turn.state.get('hostCloseout'):
+            return turn.state['hostCloseout'].get('answer')
+        from .query_empty_result import empty_scenario_analysis_answer
+        try:
+            current = turn
+            inherited = not turn.state.get('queryCaptureRefs')
+            if inherited:
+                from .dimension_scopes import changed_fields
+                if (turn.state.get('followupContext', {}).get('mode', 'CONTINUE') != 'CONTINUE'
+                        or changed_fields(turn.state) & {'task', 'period', 'formExecutionYear', 'scenario', 'population', 'metric', 'grouping', 'referencePopulation'}
+                        or turn.state.get('followupContext', {}).get('changedDimensions')):
+                    return None
+                from .conversation_context import evidence_turn
+                current = evidence_turn(turn)
+            # An earlier rejected draft is audit history, not a second unresolved data
+            # result after a complete request for the same user question succeeded.
+            # Keep partial/running executions and every valid fact; never erase receipts.
+            refs = []
+            for ref in current.state.get('queryCaptureRefs', []):
+                capture = turn.service.store.get_capture(turn.service.owner, ref)
+                adapter = turn.service.sources.for_capture(capture)
+                if capture.get('originalToolName') == 'execute_budget_query':
+                    receipt = adapter.raw_receipt(capture['response'])
+                    if receipt.get('status') == 'FAILED' and capture.get('request', {}).get('question') == turn.state.get('request'):
+                        continue
+                    data = receipt.get('data') or {}
+                    if (receipt.get('status') != 'SUCCEEDED' or data.get('complete') is not True
+                            or data.get('failureSummary', {}).get('outcome') != 'NO_DATA'):
+                        return None  # Avoid rebuilding large ordinary analysis evidence on every model turn.
+                    refs.append(ref)
+                elif adapter.is_data(capture):
+                    return None
+            if not refs:
+                return None
+            from types import SimpleNamespace
+            current = SimpleNamespace(service=turn.service, state={**current.state, 'queryCaptureRefs': refs})
+            result = empty_scenario_analysis_answer(query_evidence(current))
+        except AnalysisError:
+            return None  # An unverified receipt is not evidence of missing business data.
+        if result is None:
+            return None
+        if inherited:
+            result['answer'] = '沿用上一轮已确认的查询结果，本轮未重复取数。\n\n' + result['answer'].replace('本次已按', '已按', 1)
+        from .review_control import progress
+        progress(turn, lambda saved: saved.update(closeout=result))
+        turn.state['hostCloseout'] = result
+        return result['answer']
 
     async def _closeout(self, reason, agent=None):
         """宿主完成有限补做后的交付，不再请求模型决定是否继续循环。"""
@@ -647,7 +708,8 @@ class AnalysisMiddleware(MiddlewareBase):
             except (ValueError, TypeError):
                 pass  # 参数错误仍由工具按原契约返回，不影响其他独立工作。
         from .timing import tool_timing_context
-        with tool_timing_context(call.id, call.name):
+        from .value_references import reference_context
+        with tool_timing_context(call.id, call.name), reference_context(self.service, turn):
             async for event in self.capture.run(agent, input_kwargs, next_handler):
                 if turn is not None:
                     if isinstance(event, ToolResponse):

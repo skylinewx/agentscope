@@ -67,6 +67,9 @@ def operation(name, arguments, labels=None):
         plan = ('接下来检查当前可查询的数据源，确认本次请求可以从哪里读取数据。'
                 if request.get('action') == 'discover' else
                 '接下来连接选定的数据源并建立查询上下文，让后续的对象查找和数据读取使用明确的数据范围。')
+    elif key == 'executebudgetquery':
+        topic, title = 'query', '查询预算数据'
+        plan = '应用服务正在识别成员、匹配任务和表样，并核实运行单元格后取数。'
     elif key == 'searchentities':
         mention = _quoted([request.get('entityMention')])
         topic, title = 'entities', f'定位{mention or "查询对象"}'
@@ -178,6 +181,12 @@ def public_observations(receipt, source_id, name='', request=None):
             facts.append({'text': text, 'sourceId': source_id, 'pointer': pointer,
                           'value': value, 'state': 'observed', **extra})
 
+    if (receipt.get('status') == 'IN_PROGRESS' or (receipt.get('executionState') == 'UNKNOWN'
+            and object_value(receipt.get('error')).get('recoveryAction') == 'READ_STATUS')):
+        add('后台查询仍在执行或尚待确认，应用服务将继续读取同一次执行的状态。', '/status',
+            receipt.get('status'), kind='waiting')
+        return {**profile, 'version': 1, 'facts': facts, 'labels': labels}
+
     if receipt.get('status') in ('FAILED', 'ERROR') or receipt.get('error'):
         error = object_value(receipt.get('error'))
         messages = [(f'/error/details/{i}/message', _label(item.get('message')))
@@ -198,6 +207,22 @@ def public_observations(receipt, source_id, name='', request=None):
             '/value', receipt['value'], kind='calculation', state='calculated')
         return {**profile, 'version': 1, 'facts': facts, 'labels': labels}
 
+    if data.get('resultType') == 'BUDGET_QUERY_RESULT':
+        profile.update(topic='query', title='取得预算查询结果')
+        summary = object_value(data.get('summary'))
+        count = summary.get('rowCount')
+        if isinstance(count, int) and not isinstance(count, bool) and count >= 0:
+            add(f'本次返回 {count} 条结果记录；不同任务、表样或解释的记录不能直接累加。',
+                '/data/summary/rowCount', count, kind='scope', unit='条')
+        groups = summary.get('resultSetCount')
+        if isinstance(groups, int) and not isinstance(groups, bool) and groups >= 0:
+            add(f'这些记录按实际查询范围分别列为 {groups} 组结果。',
+                '/data/summary/resultSetCount', groups, kind='scope', unit='组')
+        if data.get('complete') is False:
+            add('本次仅部分完成，未确认或失败的范围保留在查询结果中，不能将已返回数据视为全部范围。',
+                '/data/complete', False, kind='scope')
+        return {**profile, 'version': 1, 'facts': facts, 'labels': labels}
+
     numeric = result_facts(receipt, source_id)
     if numeric:
         profile.update(topic='query', title='取得查询数据')
@@ -214,7 +239,7 @@ def public_observations(receipt, source_id, name='', request=None):
             profile.update(topic='request', title='记录本次查询范围')
             text = f'本次请求已登记为“{subject}”的查询'
             if scope:
-                text += f'，机构范围是“{scope}”'
+                text += f'，问题中的范围描述为“{scope}”'
             if group:
                 text += f'，按“{group}”分组'
             add(text + '。这只是本轮的处理范围，数据来源和可用条件还需通过实际查询确认。',

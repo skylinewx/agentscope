@@ -5,7 +5,7 @@ import json
 from .models import digest
 
 
-def project_results(values, compact_values, analysis_ref, previous_values=()):
+def project_results(values, compact_values, analysis_ref, previous_values=(), facts=()):
     previous = {value['derivedId']: digest(value) for value in previous_values}
     changes = {'new': [], 'changed': [], 'unchanged': []}
     projected = []
@@ -66,8 +66,17 @@ def project_results(values, compact_values, analysis_ref, previous_values=()):
             preview_budget -= preview_size
         item['detailRead'] = {'section': 'derived', 'analysisRef': analysis_ref, 'search': ref}
         if value.get('operator') == 'FORMULA_CHECK' and value.get('formulaTrace'):
+            from .formula_check_summary import summarize
+            item['checkSummary'] = summarize(value['formulaTrace'])
             item['detailRead'] = {'section': 'formulas', 'analysisRef': analysis_ref,
                                   'factRef': value['formulaTrace']['targetFactRef']}
+            if facts and state != 'unchanged' and preview_budget >= 3000:
+                from .formula_tables import formula_view
+                item['formulaPresentation'] = formula_view(value['formulaTrace'], facts, analysis_ref,
+                    limit=4, max_chars=min(12000, preview_budget))
+                preview_budget = max(0, preview_budget - len(json.dumps(item['formulaPresentation'], ensure_ascii=False)))
+                if 'formulaTrace' in item:
+                    item['formulaTrace'].pop('nodes', None)
         elif value.get('operator') in ('SORT', 'RANK'):
             item['detailRead'] = {'section': 'order', 'analysisRef': analysis_ref, 'derivedId': ref}
         elif value.get('outputKind') in ('TABLE', 'CHART_DATA'):

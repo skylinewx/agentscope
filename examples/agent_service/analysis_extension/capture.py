@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from .business_tables import model_text
+
 import asyncio
 import json
 import sqlite3
@@ -9,7 +11,7 @@ import logging
 from time import perf_counter
 
 from agentscope.message import TextBlock, ToolResultState
-from agentscope.tool import ToolResponse
+from agentscope.tool import ToolChunk, ToolResponse
 
 from .models import AnalysisError, Owner, digest, exact_loads, json_values, now
 from .store import AnalysisStore
@@ -50,10 +52,45 @@ class ReceiptCapture:
         self.request_preparer = lambda origin, request: request
 
     def _model_projection(self, adapter, receipt, capture, source_chars):
+        try:
+            return self._material_projection(adapter, receipt, capture, source_chars)
+        except (AnalysisError, ValueError, TypeError, KeyError) as error:
+            logging.getLogger(__name__).exception('资料摘要失败，返回已保存回执的有界导航')
+            # Do not re-enter the failing business projection with the same shape.
+            reference = capture['captureRef']
+            business = isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT'
+            return {'viewType': 'captured_query_result', 'captureRef': reference,
+                    'status': receipt.get('status'), 'sourceChars': source_chars,
+                    'allFieldsIncluded': False, 'readTool': 'QueryResultRead',
+                    'read': {'captureRef': reference, 'pointer': '/data/summary' if business else '', 'limit': 10},
+                    'projectionDiagnostic': {'code': getattr(error, 'code', 'MATERIAL_PROJECTION_FAILED'),
+                                             'requiresSourceQuery': False, 'diagnosticOnly': business},
+                    'note': '摘要生成失败，完整原回执已保存；沿同一引用读取诊断，不重新查询。未通过原生校验的数据不能用于作答。'}
+
+    def _material_projection(self, adapter, receipt, capture, source_chars):
         """资料与原协议导航共享输出额度，完整原回执始终先保存。"""
         from .analysis_materials import response_materials, materials
         from .query_results import compact_receipt, MODEL_CHARS, COMPACT_AT
         reference = capture['captureRef']
+        if isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT':
+            # Validate the native evidence before replacing it with a display view.
+            # A failed execution remains readable as diagnostics, never valid facts.
+            if receipt.get('status') in ('SUCCEEDED', 'PARTIAL'):
+                receipt = adapter.receipt(capture)
+            from .business_tables import business_view
+            navigation = {}
+            if receipt['data'].get('purpose') == 'ANALYZE' and receipt.get('status') in ('SUCCEEDED', 'PARTIAL'):
+                from .prepared_inputs import summaries
+                prepared = summaries(capture)
+                navigation = {'analysisRead': {'tool': 'AnalysisInspect', 'arguments': {
+                    'section': 'materials', 'captureRef': reference}}, 'buildInput': {'captureRefs': [reference]},
+                    'buildInputMeaning': '用本题 scope、operations、requestKey 构建；多个候选需按已确认范围选取。公式使用保存的运行观察，不重复展开。'}
+                if len(encode(prepared)) < 4000:
+                    navigation['preparedTargets'] = prepared
+            # No duplicate JSON fact rows in the analysis preview either.
+            projected = business_view(receipt, reference, max_chars=MODEL_CHARS - len(encode(navigation)) - 100)
+            projected.update(navigation)
+            return projected
         material = response_materials(capture, self.sources, store=self.store, owner=self.owner)
         if material is not None and adapter.adapter_id == 'budget-v2':
             for budget in (14000, 6000):
@@ -63,19 +100,34 @@ class ReceiptCapture:
                 projected = compact_receipt(receipt, reference, max(source_chars, COMPACT_AT), max_chars=remaining)
                 if projected is not None:
                     projected['analysisMaterials'] = material
-                    projected['analysisRead'] = {'section': 'materials', 'captureRef': reference}
+                    projected['analysisRead'] = {'tool': 'AnalysisInspect', 'arguments': {'section': 'materials', 'captureRef': reference}}
                     return projected
         return adapter.compact(receipt, reference, source_chars)
 
     async def run(self, agent, input_kwargs, next_handler):
+        tool = await agent.toolkit.get_tool(input_kwargs['tool_call'].name)
+        adapter = self.sources.for_tool(tool, leased_mcp_origin(tool, self.resource_ids))
+        bounded_stream = adapter is not None and adapter.adapter_id == 'budget-v2'
+        async for event in self._run(agent, input_kwargs, next_handler):
+            if bounded_stream and isinstance(event, ToolChunk):
+                # The full MCP JSON is also emitted as a stream chunk. Sending it
+                # before the bounded final response bloats persisted UI messages.
+                continue
+            if bounded_stream and isinstance(event, ToolResponse):
+                yield ToolChunk(content=[block.model_copy(deep=True) for block in event.content],
+                                state=event.state, metadata=event.metadata.copy())
+            yield event
+
+    async def _run(self, agent, input_kwargs, next_handler):
         from .query_continuation import continuation_request, combined_response, MAX_PAGES, MAX_CONTINUATION_SECONDS
         tool = await agent.toolkit.get_tool(input_kwargs['tool_call'].name)
         origin = leased_mcp_origin(tool, self.resource_ids)
         adapter = self.sources.for_tool(tool, origin)
         enabled = (adapter is not None and adapter.adapter_id == 'budget-v2' and origin
-                   and origin['originalToolName'] == 'execute_semantic_plan' and not self.action_ref_provider())
+                   and origin['originalToolName'] == 'execute_budget_query' and not self.action_ref_provider())
         events, seen, started, stopped = [], set(), perf_counter(), 'SOURCE_STOPPED'
         retries = []
+        status_reads = []
         while True:
             response = None
             async for event in self._run_page(agent, input_kwargs, next_handler):
@@ -95,6 +147,16 @@ class ReceiptCapture:
             try:
                 saved = self.store.get_capture(self.owner, response.metadata['analysisCaptureRef'])
                 receipt = adapter.raw_receipt(saved['response'])
+                from .query_waiting import waiting, wait_limit
+                if waiting(receipt):
+                    status_reads.append(saved['captureRef'])
+                    if perf_counter() - started < wait_limit(saved['request']):
+                        call = input_kwargs['tool_call'].model_copy(update={'input': encode(saved['request'])})
+                        input_kwargs = {**input_kwargs, 'tool_call': call}
+                        await asyncio.sleep(min(5.0, 1.0 + len(status_reads) * 0.5))
+                        continue
+                    response.metadata['queryRecovery'] = {'code': 'QUERY_STILL_RUNNING', 'recoveryAction': 'READ_STATUS',
+                        'message': '后台执行尚未确认结束，保留原请求身份；不能将其视为失败或重新发起等价查询。'}
                 from .query_attempts import can_retry, exhausted
                 if not response.metadata.get('analysisCaptureError') and can_retry(self.store, saved.get('queryAttempt'), receipt):
                     # 来源已明确终态失败且允许重试；保留失败证据，宿主领取下一身份。
@@ -118,6 +180,8 @@ class ReceiptCapture:
             except (AnalysisError, ValueError, TypeError, OSError, sqlite3.Error):
                 request = None
             events.append(response)
+            if status_reads:
+                response.metadata['queryStatusReads'] = status_reads.copy()
             if retries:
                 response.metadata['queryRetries'] = retries.copy()
                 response.metadata.setdefault('queryPerformance', {}).update(
@@ -180,6 +244,11 @@ class ReceiptCapture:
                 from .query_attempts import prepare
                 try:
                     normalized, attempt = prepare(self.store, self.owner, turn_key, origin, normalized)
+                except AnalysisError as error:
+                    yield ToolResponse(id=call.id, state=ToolResultState.ERROR,
+                        content=[TextBlock(text=encode({'error': error.as_dict()}))],
+                        metadata={'analysisTurnKey': turn_key})
+                    return
                 except (OSError, sqlite3.Error):
                     yield ToolResponse(id=call.id, state=ToolResultState.ERROR,
                         content=[TextBlock(text=encode({'error': {'code': 'STORE_UNAVAILABLE',
@@ -205,7 +274,7 @@ class ReceiptCapture:
         cache = self.query_cache_provider()
         cache_key = (digest([origin, request]) if isinstance(cache, dict) and turn_key and not action_run
                      and adapter.adapter_id == 'budget-v2'
-                     and origin['originalToolName'] == 'execute_semantic_plan' else None)
+                     and origin['originalToolName'] in ('execute_budget_query', 'execute_semantic_plan') else None)
         if cache_key and cache_key in cache:
             try:
                 saved = self.store.get_capture(self.owner, cache[cache_key])
@@ -219,7 +288,7 @@ class ReceiptCapture:
                         try:
                             compact = self._model_projection(adapter, receipt, saved, len(content[0].get('text', '')))
                             if compact is not None:
-                                event.content = [TextBlock(text=encode(compact))]
+                                event.content = [TextBlock(text=model_text(compact))]
                         except (AnalysisError, ValueError, TypeError):
                             logging.getLogger(__name__).exception('已保存查询回执投影失败，保留原始返回')
                     from agentscope.app._service._progress_context import public_observations
@@ -307,7 +376,7 @@ class ReceiptCapture:
                             try:
                                 compact = self._model_projection(adapter, receipt, self.store.get_capture(self.owner, saved_ref), source_chars)
                                 if compact is not None:
-                                    event.content = [TextBlock(text=encode(compact))]
+                                    event.content = [TextBlock(text=model_text(compact))]
                                     compacted = True
                             except (AnalysisError, ValueError, TypeError):
                                 logging.getLogger(__name__).exception('查询回执投影失败，保留原始返回')

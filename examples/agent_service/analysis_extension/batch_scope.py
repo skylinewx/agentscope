@@ -22,6 +22,8 @@ def selected_tables(captures, selections):
             raise AnalysisError('UNKNOWN_BATCH', '请使用 selectors 返回的 stepId 与 batchId。')
         step, table, path = matches[0]
         validate(capture, receipt, step, table)
+        from .adapters.budget_exact import view
+        table = view(table)
         columns, rows = selection_scope(selection, table)
         yield selection, table, path, columns, rows
 
@@ -101,6 +103,8 @@ def selection_audit(captures, selections, scope):
                          or column['name'] in record['columns']]
         for row_index, row in enumerate(data['rows']):
             missing_columns = sorted(name for name, selected in record['columnRows'].items() if row_index not in selected)
+            if 'exactRowMetrics' in table:
+                missing_columns = [name for name in missing_columns if name == table['exactRowMetrics'][row_index]]
             if not missing_columns:
                 continue
             raw = row[index] if index is not None else data.get('fixedDimValMap', {}).get(dimension)

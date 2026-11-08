@@ -21,6 +21,27 @@ from agentscope.tool import ToolResponse
 
 
 class FollowupScopeTest(PresentationCase):
+    async def test_business_query_followup_review_and_build_use_server_runtime_requests(self):
+        from analysis_business_query_test import business_fixture
+        from analysis_extension.followup_scope import _query
+        capture, receipt = business_fixture()
+        self.assertNotIn('plan', capture['request'])
+        capture.update(turnKey='first', serverName='source', connectionFingerprint='connection')
+        ref = self.save_capture(capture, receipt)
+        selection = {'captureRef': ref, 'stepId': 'batch', 'batchId': 'batch-A', 'role': 'PRIMARY',
+                     'columnNames': ['metric1', 'metric2']}
+        self.turn.state['inheritedScope'] = {'scopeRef': 'business', 'selections': [selection]}
+        expected = receipt['data']['runtimeRequests'][0]['batchQuery']
+        self.assertEqual(_query(capture, 'batch'), expected)
+        context = review_context(self.turn)
+        self.assertEqual(context['inheritedSubject'][0]['scope']['batchDimensions'], expected['batchDimensions'])
+        result = await self.service.build([ref], [selection],
+            {'label': '沿用服务端业务查询结果', 'selectionReason': '完整保留已查询的两项指标及机构范围'}, [], 'business-followup')
+        artifact = self.store.get_analysis(OWNER, result['analysisRef'])
+        self.assertEqual(len(artifact['facts']), 4)
+        self.assertEqual({fact['dimensions']['MD_ORG'] for fact in artifact['facts']},
+                         {row[0] for row in receipt['data']['stepResults'][0]['batchResults'][0]['data']['rows']})
+
     def test_explicit_annual_form_anchors_raw_metrics_and_intersects_a_single_data_period(self):
         turn = SimpleNamespace(state={'queryIntent': {'formExecutionYear': '2025'}})
         origin = {'originalToolName':'execute_semantic_plan'}
@@ -130,6 +151,58 @@ class FollowupScopeTest(PresentationCase):
             if fact['dimensions']['MD_ORG'] == 'descendant':
                 fact['inputRole'] = 'REFERENCE'
         validate_primary(self.turn, {'facts': facts})
+
+    def formula_subject(self):
+        root = deepcopy(self.facts(self.ref)[0])
+        root.pop('batchId', None)
+        root.update(factId='root', cellAddress='E26', observationId='observed-form',
+                    bindingRef='task/form', sourceContextId='source-context',
+                    formContext={'period': '2026N0001'},
+                    formulaStructure={'status': 'PARSED', 'expression': 'E25', 'references': ['E25']})
+        dependency = deepcopy(root)
+        dependency.update(factId='dependency', cellAddress='E25',
+                          formulaStructure={'status': 'SOURCE_VALUE', 'expression': None, 'references': []})
+        dependency['dimensions']['MD_ORG'] = 'outside-original-row'
+        return root, dependency
+
+    def test_followup_accepts_source_formula_dependencies_but_not_unrelated_rows(self):
+        root, dependency = self.formula_subject()
+        validate_primary(self.turn, {'facts': [root, dependency]})
+        unrelated = deepcopy(dependency)
+        unrelated.update(factId='unrelated', cellAddress='E24')
+        with self.assertRaises(AnalysisError) as caught:
+            validate_primary(self.turn, {'facts': [root, dependency, unrelated]})
+        self.assertEqual(caught.exception.details['invalidFactCount'], 1)
+        self.assertEqual(caught.exception.details['examples'][0]['factRef'], 'unrelated')
+        # The whole dependency closure must start from a subject inside the prior scope.
+        root['dimensions']['MD_ORG'] = 'outside-root'
+        with self.assertRaises(AnalysisError):
+            validate_primary(self.turn, {'facts': [root, dependency]})
+
+    def test_followup_formula_isolates_observations_tasks_and_opening_periods(self):
+        root, dependency = self.formula_subject()
+        variants = [{'observationId': 'another-observation'}, {'bindingRef': 'other-task/form'},
+                    {'sourceContextId': 'other-source'}, {'formContext': {'period': '2025N0001'}},
+                    {'sourceOrigins': ['other-origin']}]
+        for fields in variants:
+            with self.subTest(fields=fields), self.assertRaises(AnalysisError):
+                validate_primary(self.turn, {'facts': [root, {**dependency, **fields}]})
+        # Explicit cross-period references within the same grid remain legal dependencies.
+        dependency['period'] = '2025N0001'
+        validate_primary(self.turn, {'facts': [root, dependency]})
+
+    def test_followup_formula_does_not_resolve_ambiguous_or_unparsed_coordinates(self):
+        root, dependency = self.formula_subject()
+        duplicate = {**deepcopy(dependency), 'factId': 'duplicate'}
+        with self.assertRaises(AnalysisError):
+            validate_primary(self.turn, {'facts': [root, dependency, duplicate]})
+        root['formulaStructure']['expression'] = 'E24'
+        # A stale references array does not override the source expression.
+        with self.assertRaises(AnalysisError):
+            validate_primary(self.turn, {'facts': [root, dependency]})
+        root['formulaStructure'].update(status='EXTERNAL_REFERENCE', expression='Other!E25')
+        with self.assertRaises(AnalysisError):
+            validate_primary(self.turn, {'facts': [root, dependency]})
 
     def test_explicit_population_change_does_not_change_period(self):
         self.state['request'] = '改为全部层级的单位'
@@ -275,7 +348,7 @@ class FollowupScopeTest(PresentationCase):
         self.assertNotIn('rows', context['inheritedSubject'][0])
 
     async def test_capture_sends_inherited_request_and_caches_effective_parameters(self):
-        tool = capture_fixtures.CaptureTest.make_tool(self, '{}')
+        tool = capture_fixtures.CaptureTest.make_tool(self, '{}', tool_name='execute_semantic_plan')
         origin = {'resourceId': 'registered-budget', 'serverName': 'not-a-hardcoded-prefix', 'connectionFingerprint': 'connection-v1'}
         capture = deepcopy(self.capture)
         capture.update(origin)

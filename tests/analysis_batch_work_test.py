@@ -173,7 +173,7 @@ class BatchWorkTests(PresentationCase):
         built = await self.service.build([reference], selections, scope, [], 'base')
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
         targets = [fact['factId'] for fact in artifact['facts'] if fact['cellKey'] == '2:1']
-        requests = [{'section': 'formulas', 'analysisRef': built['analysisRef'], 'factRef': target, 'limit': 1}
+        requests = [{'section': 'formulas', 'analysisRef': built['analysisRef'], 'factRef': target, 'limit': 1, 'detail': 'full'}
                     for target in targets]
         request = {'requests': requests, 'allPages': True}
         Draft202012Validator(AnalysisInspect.input_schema).validate(request)
@@ -202,10 +202,12 @@ class BatchWorkTests(PresentationCase):
 
     def test_schema_does_not_allow_mixed_single_and_batch_inputs(self):
         for tool, request in [(AnalysisInspect, {'requests': [{'section': 'facts', 'analysisRef': 'a'}], 'section': 'facts'}),
-                              (QueryResultRead, {'requests': [{'captureRef': 'c'}], 'captureRef': 'd'})]:
+                              (QueryResultRead, {'requests': [{'captureRef': 'c'}], 'pointer': '/data'})]:
             self.assertTrue(list(Draft202012Validator(tool.input_schema).iter_errors(request)))
         self.assertTrue(list(Draft202012Validator(AnalysisInspect.input_schema).iter_errors(
             {'requests': [{'section': 'inventory'}]})))
+        self.assertFalse(list(Draft202012Validator(QueryResultRead.input_schema).iter_errors(
+            {'captureRef': 'shared', 'requests': [{'pointer': '/data'}, {'captureRef': 'other', 'pointer': '/data'}]})))
 
     async def test_scoped_batch_cannot_hide_global_scan_behind_unused_reference(self):
         for request in ({'section': 'captures', 'captureRef': 'unused'},

@@ -79,11 +79,12 @@ async def read_batch(requests, all_pages, reader, *, allowed_fields):
             pages.append(page)
             following = continuation(page, current)
             if following is None:
-                result['readComplete'] = page.get('catalogComplete') is not False
+                result['readComplete'] = page.get('catalogComplete') is not False and page.get('readComplete') is not False
                 if not result['readComplete'] and page.get('detailRead'):
                     result['nextRead'] = page['detailRead']
                 break
-            if following.get('offset', 0) <= current.get('offset', 0):
+            if ((following.get('cursor') is not None and following.get('cursor') == current.get('cursor'))
+                    or (following.get('cursor') is None and following.get('offset', 0) <= current.get('offset', 0))):
                 raise AnalysisError('READ_CURSOR_INVALID', '读取续页没有前进，已停止而未扩大范围。')
             result.update(status='PARTIAL', nextRead=following)
             if not all_pages:

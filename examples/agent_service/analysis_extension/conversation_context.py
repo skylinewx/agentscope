@@ -16,7 +16,10 @@ def _snapshot(state, status):
     answer = state.get('deliveredAnswer', '') if completed else ''
     captures = state.get('queryCaptureRefs', []) + scope.get('captureRefs', [])
     captures += [selection['captureRef'] for selection in scope.get('selections', [])]
+    from .dimension_scopes import snapshot
+    dimension_scopes = snapshot(state, scope.get('captureRefs', []) + [item['captureRef'] for item in scope.get('selections', [])] or captures) if completed else []
     return {
+        'dimensionScopes': dimension_scopes,
         'contextRef': 'ctx_' + digest(state['turnKey'])[:24],
         'turnKey': state['turnKey'], 'request': state.get('request', ''),
         'goal': state.get('goal', ''), 'intent': deepcopy(state.get('queryIntent', {})),
@@ -29,6 +32,9 @@ def _snapshot(state, status):
         'analysisRef': state.get('analysisRef') or scope.get('analysisRef'),
         'resultRefs': deepcopy(state.get('queryResultRefs', [])),
         'captureRefs': list(dict.fromkeys(captures)),
+        # Frozen calculation proofs stay server-side; the visible context catalog
+        # continues to expose only the answer summary and source references.
+        'referencedCalculations': deepcopy(state.get('referencedCalculations', {})),
         'remainingIssues': deepcopy(state.get('lastCheck', {}).get('issues', [])),
     }
 
@@ -64,7 +70,8 @@ def next_context_state(saved):
     result = {'businessContexts': records, 'activeBusinessContextRef': active['contextRef'] if active else None,
               'selectedContextRefs': [active['contextRef']] if active else [],
               'previousQueryIntent': deepcopy(active['intent']) if active else {},
-              'inheritedScope': deepcopy(active['subjectScope']) if active else {}}
+              'inheritedScope': deepcopy(active['subjectScope']) if active else {},
+              'inheritedDimensionScopes': deepcopy(active.get('dimensionScopes', [])) if active else []}
     if not records:
         # 仅旧状态有可核对的上一轮意图时恢复，不能把失败轮当前意图当成交付意图。
         result['previousQueryIntent'] = deepcopy(saved.get('previousQueryIntent', {}))
@@ -118,6 +125,7 @@ def select_context(turn, context):
     scopes = [item['subjectScope'] for item in selected]
     scope = deepcopy(scopes[0]) if len(scopes) == 1 else {}
     turn.state.update(selectedContextRefs=list(refs), previousQueryIntent=intent, inheritedScope=scope,
+                      inheritedDimensionScopes=deepcopy(selected[0].get('dimensionScopes', [])) if len(selected) == 1 else [],
                       basePendingChanges=deepcopy(selected[0].get('pendingChanges', [])) if len(selected) == 1 else [])
     # 本轮改选依据时清除旧的临时声明，随后由 declare 合并本次显式意图。
     turn.state.pop('queryIntent', None)
@@ -154,6 +162,10 @@ def evidence_turn(turn):
                 raise
             # 产物过期时仍核对尚存的原回执；不伪造已读到产物或重新取数。
     state['queryCaptureRefs'] = list(dict.fromkeys(captures))
+    selected_ids = set(state.get('selectedContextRefs', []))
+    proofs = {key: deepcopy(proof) for item in state.get('businessContexts', []) if item['contextRef'] in selected_ids
+              for key, proof in item.get('referencedCalculations', {}).items()}
+    state['referencedCalculations'] = {**proofs, **state.get('referencedCalculations', {})}
     if not state.get('queryResultRefs'):
         state['queryResultRefs'] = [selection for context in contexts for selection in context.get('resultRefs', []) or []]
     return SimpleNamespace(service=turn.service, state=state)

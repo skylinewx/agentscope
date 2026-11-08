@@ -97,6 +97,32 @@ def calculate(expression, variables=None, decimalPlaces=None):
             "decimalPlaces": decimalPlaces, "rounding": "HALF_UP" if decimalPlaces is not None else None}
 
 
+def calculate_requests(expression=None, variables=None, decimalPlaces=None, requests=None):
+    """Independent exact computations share one tool round; failures never discard other results."""
+    if requests is None:
+        return calculate(expression, variables, decimalPlaces)
+    if expression is not None or variables is not None or decimalPlaces is not None:
+        raise AnalysisError("INVALID_CALCULATION_BATCH", "批量计算把 expression/variables/decimalPlaces 放在各 requests 项中。")
+    if not isinstance(requests, list) or not 1 <= len(requests) <= 32 or len(canonical(requests)) > 128 * 1024:
+        raise AnalysisError("INVALID_CALCULATION_BATCH", "requests 需要 1 至 32 项，输入不超过 128 KiB。")
+    ids, results = set(), []
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict) or set(request) - {'id', 'expression', 'variables', 'decimalPlaces'} or 'expression' not in request:
+            raise AnalysisError("INVALID_CALCULATION_BATCH", "每项仅接受 id、expression、variables 和 decimalPlaces。")
+        key = request.get('id', str(index))
+        if not isinstance(key, str) or not key or len(key) > 128 or key in ids:
+            raise AnalysisError("INVALID_CALCULATION_BATCH", "计算 id 须为不超过 128 字符的唯一文本。")
+        ids.add(key)
+        try:
+            value = calculate(**{name: value for name, value in request.items() if name != 'id'})
+            results.append({'id': key, 'requestIndex': index, 'status': 'SUCCEEDED', **value})
+        except AnalysisError as error:
+            results.append({'id': key, 'requestIndex': index, 'status': 'FAILED', 'error': error.as_dict()})
+    count = sum(item['status'] == 'SUCCEEDED' for item in results)
+    return {'results': results, 'complete': count == len(results), 'succeeded': count,
+            'status': 'SUCCEEDED' if count == len(results) else 'PARTIAL' if count else 'FAILED'}
+
+
 def sort_records(records, keys, offset=0, limit=100):
     if not isinstance(records, list) or not 1 <= len(records) <= 5000 or len(canonical(records)) > 1024 * 1024:
         raise AnalysisError("RECORD_LIMIT", "排序需要 1 至 5000 条记录，总大小不超过 1 MiB。")
@@ -154,7 +180,14 @@ class _NumericTool(ToolBase):
 
     async def call(self, **kwargs):
         try:
-            return ToolChunk(content=[TextBlock(text=json.dumps(self.operation(**kwargs), ensure_ascii=False))])
+            requests = kwargs.get('requests')
+            references = kwargs.get('valueRefs') is not None or (isinstance(requests, list) and any(isinstance(r, dict) and 'valueRefs' in r for r in requests))
+            if self.name == 'Calculate' and references:
+                from analysis_extension.value_references import calculate_references
+                result = await calculate_references(kwargs, self.operation)
+            else:
+                result = self.operation(**kwargs)
+            return ToolChunk(content=[TextBlock(text=json.dumps(result, ensure_ascii=False))])
         except AnalysisError as exc:
             return ToolChunk(content=[TextBlock(text=json.dumps({"error": exc.as_dict()}, ensure_ascii=False))], state=ToolResultState.ERROR)
 
@@ -165,7 +198,23 @@ class Calculate(_NumericTool):
     input_schema = obj({"expression": {"type": "string", "minLength": 1, "maxLength": MAX_EXPRESSION_LENGTH},
                         "variables": {"type": "object", "additionalProperties": DECIMAL, "maxProperties": MAX_ARITHMETIC_INPUTS},
                         "decimalPlaces": {"type": "integer", "minimum": 0, "maximum": 16}}, ['expression'])
-    operation = staticmethod(calculate)
+    single_schema = input_schema
+    reference_schema = obj({'captureRef': TEXT, 'analysisRef': TEXT, 'tableRef': TEXT, 'columnRef': TEXT, 'rowRef': TEXT,
+                            'rowRefs': array(TEXT, 1000, 1), 'aggregation': {'enum': ['SUM', 'COUNT', 'MIN', 'MAX']},
+                            'filters': array(obj({'column': TEXT, 'operator': {'enum': ['EQ', 'IN']},
+                                'value': {'oneOf': [TEXT, array(TEXT, 100, 1)]}}, ['column', 'operator', 'value']), 20)},
+                           ['tableRef', 'columnRef'])
+    reference_schema['oneOf'] = [{'required': ['captureRef'], 'not': {'required': ['analysisRef']}},
+                                 {'required': ['analysisRef'], 'not': {'required': ['captureRef']}}]
+    single_schema['properties']['valueRefs'] = {'type': 'object', 'additionalProperties': reference_schema,
+        'description': '变量到已保存业务表引用的映射。查询表用 captureRef，来源公式表用其 analysisRef，两者不能混用。单格用 rowRef；完整列或筛选范围须显式 aggregation，可用 rowRefs/filters。使用完整保存结果，不受展示分页限制。'}
+    batch_item = obj({'id': {'type': 'string', 'minLength': 1, 'maxLength': 128}, **single_schema['properties']}, ['expression'])
+    input_schema = obj({**single_schema['properties'], 'requests': array(batch_item, 32, 1)})
+    input_schema['oneOf'] = [{'required': ['expression'], 'not': {'required': ['requests']}},
+                            {'required': ['requests'], 'not': {'anyOf': [{'required': [name]} for name in single_schema['properties']]}}]
+    description += ' 多个独立计算用 requests:[{id,expression,variables?,decimalPlaces?},...] 一次完成，最多32项；每项独立返回状态。普通查询不必为计算启动分析。'
+    description += ' 已有业务表格时优先用 valueRefs 绑定变量，避免抄值；查询表引用 captureRef，公式表引用 analysisRef，不把公式表行号套到原查询表。变量名用于 expression。范围聚合必须显式指定，不将合计与明细重复相加。'
+    operation = staticmethod(calculate_requests)
 
 
 class SortRecords(_NumericTool):
@@ -184,4 +233,4 @@ class NumericToolsMiddleware(MiddlewareBase):
         return [Calculate(), SortRecords()]
 
     async def on_system_prompt(self, agent, current_prompt):
-        return current_prompt + "\n\n通用数值工具：首次取数需要排序时使用来源接口的排序参数；已按要求排序的完整结果直接复用。已有完整结果仅调整顺序时使用一次 SortRecords；分析派生结果复用 SORT/DESCRIBE 的顺序。普通查询中的精确计算使用 Calculate，不因此启动分析。已经进入分析或报告时，统计、占比、排序及公式核对优先在同一次 AnalysisBuild 中使用原生算子；已返回的统计及公式结果直接复用，不先抄值逐项 Calculate 再 Build 重算。宿主未提供的必要计算才选择其他可用计算能力。数值按来源原始精度传入，按工具结果组织回答。排序前获取本轮所需完整范围；纯算术结果不等于业务汇总成立。"
+        return current_prompt + "\n\n通用数值工具：首次取数需要排序时使用来源接口的排序参数；已按要求排序的完整结果直接复用。已有完整结果仅调整顺序时使用一次 SortRecords；分析派生结果复用 SORT/DESCRIBE 的顺序。普通查询中的精确计算使用 Calculate；已有业务表时优先用 valueRefs 引用表格所属的 captureRef（查询表）或 analysisRef（公式表），并指定 tableRef、rowRef、columnRef；两类所属引用不可混用，范围聚合明确 filters/rowRefs 与 aggregation，不手抄数值，不混加合计与明细。多个独立表达式合并为一次 requests 批量调用，不因此启动分析。已经进入分析或报告时，统计、占比、排序及公式核对优先在同一次 AnalysisBuild 中使用原生算子；已返回的统计及公式结果直接复用，不先抄值逐项 Calculate 再 Build 重算。宿主未提供的必要计算才选择其他可用计算能力。数值按来源原始精度传入，按工具结果组织回答。排序前获取本轮所需完整范围；纯算术结果不等于业务汇总成立。"

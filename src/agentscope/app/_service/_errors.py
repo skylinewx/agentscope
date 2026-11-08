@@ -64,6 +64,7 @@ _GENERIC_MESSAGE: dict[ErrorType, str] = {
         "tools and knowledge bases."
     ),
     ErrorType.UNKNOWN: "The reply failed with an unknown error.",
+    ErrorType.STORAGE_CAPACITY: "Session storage is full. The reply could not be saved; previously persisted query results remain available. Free storage before resuming, without repeating completed source queries.",
 }
 
 
@@ -180,8 +181,10 @@ def _is_context_length_error(e: BaseException) -> bool:
 
 
 def _classify_type(e: Exception) -> ErrorType:
-    """Map an exception to an :class:`ErrorType` without importing any
-    provider SDK."""
+    """Classify exceptions without requiring any provider SDK."""
+    if any(type(cause).__module__.startswith('redis.') and type(cause).__name__ == 'OutOfMemoryError'
+           for cause in _causes(e)):
+        return ErrorType.STORAGE_CAPACITY
     status = _extract_status(e)
     if status is not None:
         if status in (400, 413, 422) and _is_context_length_error(e):

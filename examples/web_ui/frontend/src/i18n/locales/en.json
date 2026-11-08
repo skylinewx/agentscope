@@ -222,6 +222,7 @@
 			"rate_limit": "Rate limit or quota exceeded — please try again later.",
 			"invalid_request": "The request to the model was rejected as invalid.",
 			"context_length": "The conversation and tool results exceed the model's context capacity. The reply has stopped.",
+			"storage_capacity": "Session storage is full and the reply could not be saved. Persisted results remain available. Free storage before resuming; do not repeat completed queries.",
 			"upstream": "The upstream model service returned an error.",
 			"connection": "Could not reach the model service — network error or timeout.",
 			"connection_timeout": "The model response timed out. This reply has stopped.",

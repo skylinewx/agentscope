@@ -19,7 +19,7 @@ def candidates(turn):
             # 失败或已过期的探查回执不是主体候选，仍由原证据链保留其诊断。
             turn.state.setdefault('querySubjectDiagnostics', {})[ref] = error.code
             continue
-        if receipt.get('status') != 'SUCCEEDED':
+        if receipt.get('status') not in ('SUCCEEDED', 'PARTIAL'):
             continue
         for step, table, _ in tables(receipt):
             if table.get('disposition') != 'SUCCEEDED':

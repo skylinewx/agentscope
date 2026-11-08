@@ -43,13 +43,13 @@ class CaptureTest(IsolatedAsyncioTestCase):
         self.owner = Owner("u", "a", "s")
         self.allowed = AsyncMock()
 
-    def make_tool(self, text, delay=0, resource_id="registered-budget", sent=None):
+    def make_tool(self, text, delay=0, resource_id="registered-budget", sent=None, tool_name="execute_budget_query"):
         async def call_tool(*args, **kwargs):
             if sent is not None:
                 sent.append((args, kwargs))
             await asyncio.sleep(delay)
             return mcp.types.CallToolResult(content=[mcp.types.TextContent(type="text", text=text)])
-        inner = MCPTool("not-a-hardcoded-prefix", mcp.types.Tool(name="execute_semantic_plan", inputSchema={
+        inner = MCPTool("not-a-hardcoded-prefix", mcp.types.Tool(name=tool_name, inputSchema={
             "type": "object", "properties": {"contractVersion": {"const": "2.0"}},
             "required": ["contractVersion"]}, _meta={"version": "2.0", "exactContractResource": "semantic://contracts/external-query"}), session=SimpleNamespace(call_tool=call_tool))
         entry = SimpleNamespace(resource_id=resource_id, fingerprint="connection-v1", users=1, release=AsyncMock())
@@ -114,7 +114,7 @@ class CaptureTest(IsolatedAsyncioTestCase):
         async def query(call_id, year=2026):
             call = ToolCallBlock(id=call_id, name=tool.name,
                                 input=json.dumps({'contractVersion': '2.0', 'requestId': call_id, 'year': year}))
-            return [item async for item in capture.run(agent, {'tool_call': call}, execute)]
+            return [item async for item in capture.run(agent, {'tool_call': call}, execute) if isinstance(item, ToolResponse)]
         first = (await query('first'))[0]
         reused = (await query('second'))[0]
         self.assertEqual(len(sent), 1)
@@ -178,6 +178,10 @@ class CaptureTest(IsolatedAsyncioTestCase):
         self.assertEqual(compact['receipt']['data']['value'], '123456789012345678.123456789')
         self.assertTrue(response.metadata['queryPerformance']['compacted'])
         self.assertLess(len(response.content[0].text), 24000)
+        from agentscope.tool import ToolChunk
+        chunks = [event for event in events if isinstance(event, ToolChunk)]
+        self.assertEqual(len(chunks), 1)
+        self.assertEqual(chunks[0].content[0].text, response.content[0].text)
         from analysis_extension.query_results import read_receipt
         page = read_receipt(exact_loads(text), compact['captureRef'], '/data/padding', offset=1200, limit=10)
         self.assertEqual(page['value'], '预算' * 500)

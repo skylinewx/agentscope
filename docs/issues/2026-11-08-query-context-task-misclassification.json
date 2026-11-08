@@ -1,0 +1,54 @@
+{
+  "id": "QUERY_CONTEXT_TASK_MISCLASSIFICATION",
+  "recordedAt": "2026-11-08T18:07:24+08:00",
+  "title": "指标切换后，从被误分类的任务摘要重新继承旧指标",
+  "status": "FIXED_LIVE_RETEST_PASSED_ONCE",
+  "reportedBy": "真实回归发现，用户要求单独记录",
+  "reproduction": [
+    "看下久其集团26年EVA预算",
+    "水泥的销售预算"
+  ],
+  "observed": {
+    "previousIntentTask": "EVA预算",
+    "declaredChange": "changedFields 包含 metric，用户已明确切换指标",
+    "effectiveContextText": "EVA预算 久其集团 预算 26年 久其集团 预算",
+    "primaryError": "QUERY_DRAFT_INCOMPLETE：领域词典发现未归属目标的业务短语：EVA",
+    "outcome": "模型多次修改请求后才完成水泥查询，不能记为首次通过",
+    "runnerObservedSeconds": 141.11,
+    "successfulApplicationMilliseconds": 20395,
+    "timingNote": "脚本时长包含模型、重试、审查和轮询确认；应用服务耗时不是 SQL 耗时。"
+  },
+  "rootCause": [
+    "模型把 EVA预算 放入上一轮意图的 task 摘要，但它并非已确认的预算任务名称。",
+    "宿主依据 changedFields 释放旧 metric，却继续按 task 字段保留该字符串。",
+    "旧实现只检查该字符串是否出现在历史原文，没有检查它是否得到业务短语解析或显式任务范围的支持。"
+  ],
+  "fix": [
+    "存在已确认查询回执时，task 摘要中的文字只有属于仍保留的已确认业务短语，或显式提交的任务/表样范围，才可继续继承。",
+    "明确切换指标后，不通过误分类的 task 摘要重新引入已经释放的旧指标。",
+    "保留真实显式任务，以及未变化的机构、时期、情景等既有条件。"
+  ],
+  "scopeBoundary": "本项修复处理错误意图字段导致的旧指标回流；不实施用户暂缓的通用历史冗余维度自动清理。",
+  "changedFiles": [
+    "examples/agent_service/analysis_extension/followup_scope.py",
+    "tests/analysis_followup_hierarchy_test.py"
+  ],
+  "verification": {
+    "targetedTests": "63 项通过，包括任务摘要误分类、显式任务保留、机构/时期/情景切换及分析维度解析。",
+    "fullAnalysisTests": "1302 项执行，1285 项通过，17 项按原有条件跳过，无失败。",
+    "liveRetest": "重启 AgentScope 后，原 EVA→水泥→费用对比三轮均首次完成，每轮只调用一次 execute_budget_query，审查均首次通过。水泥及费用对比的 contextText 不含 EVA；机构、预算和 2026 年继续保留。",
+    "liveRetestUrl": "http://localhost:5173/chat/907675559d49564c8edb9b7a16fd2091/4d01b8bd33c54f87a1a1489cbdac7f0e",
+    "liveRetestEvidence": "C:/Users/wx/IdeaProjects/bud-harness/tmp/program-execution-fixes-20261108/run-06/",
+    "waterQuery": {
+      "queryCalls": 1,
+      "applicationMilliseconds": 20200,
+      "runnerObservedSeconds": 80.53,
+      "factCount": 384,
+      "periods": "2026 年第 1—4 季度",
+      "formulaRequested": false
+    },
+    "stabilityClaim": false,
+    "originalEvidence": "C:/Users/wx/IdeaProjects/bud-harness/tmp/program-execution-fixes-20261108/run-04/",
+    "testLog": "C:/Users/wx/IdeaProjects/bud-harness/tmp/program-execution-fixes-20261108/post-vpn-targeted-final2.log"
+  }
+}

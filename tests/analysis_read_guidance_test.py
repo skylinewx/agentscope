@@ -74,8 +74,9 @@ class ReadGuidanceTests(TestCase):
     def test_compact_receipt_points_directly_to_current_capture_analysis(self):
         receipt = {'data': {'stepResults': [{'stepId': 'arbitrary-step', 'rows': [{'key': 'record'}]}]}, 'evidence': ['x' * 20000]}
         compact = compact_receipt(receipt, 'observed-capture', len(encode(receipt)))
-        Draft202012Validator(AnalysisInspect.input_schema).validate(compact['analysisRead'])
-        self.assertEqual(compact['analysisRead']['captureRef'], 'observed-capture')
+        self.assertEqual(compact['analysisRead']['tool'], 'AnalysisInspect')
+        Draft202012Validator(AnalysisInspect.input_schema).validate(compact['analysisRead']['arguments'])
+        self.assertEqual(compact['analysisRead']['arguments']['captureRef'], 'observed-capture')
         self.assertLessEqual(len(encode(compact)), 24000)
 
     def test_skill_calls_are_generated_from_registered_names_and_match_real_schema(self):

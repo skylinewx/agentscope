@@ -194,6 +194,9 @@ class AnalysisTask(_AnalysisTool):
                                         'userQuote': {**TEXT, 'description': '换题、综合或改变既定范围时，引用本轮用户表达该意图的原话；只改变时期不放开对象范围。'}}, ['mode']),
                         'intent': obj({**{key: {**TEXT, 'minLength': 0, 'description': '保留用户原始业务限定，追问沿用已确认条件；未指定可省略，空字符串按未提供处理；不猜系统编码。'}
                                          for key in INTENT_FIELDS},
+                                       'task': {**TEXT, 'description': '仅填用户明确指定的预算任务名称；预算、实际、预计属于情景，不是任务。未指定任务时省略，由应用服务确定适用任务。'},
+                                       'scenario': {**TEXT, 'description': '用户明确指定的情景原文；不要把情景填入 task 或 grouping。'},
+                                       'grouping': {**TEXT, 'description': '仅填用户明确要求分组聚合的字段原文，例如按区域汇总中的区域。单个成员条件、逐成员列表、排序及逐成员构成分析不填。不能根据业务名词猜测分组维度。'},
                                        'formExecutionYear': {'type': 'string', 'pattern': '^[1-9][0-9]{3}$',
                                            'description': '用户明确固定某张年度表的开表年份，例如按2025年末打开利润表填2025。数据归属年份用 period。普通按数据年查询、跨开表年度对比时省略此字段。'}}),
                         'requiredEvidence': {'enum': ['VALUES', 'FORMULAS'], 'description': '预算指标构成、负值原因、公式分析使用 FORMULAS；须取得分析对象的表展开和适用公式，不能用批量金额代替。'},

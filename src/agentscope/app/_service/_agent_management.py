@@ -33,6 +33,20 @@ def revision(record):
 def view(record):
     data = record.model_dump(mode="json")
     data["data"].pop("copy_fingerprint", None)
+    sync = data["data"].pop("template_sync", None)
+    data["template"] = (
+        {
+            key: sync.get(key)
+            for key in (
+                "source_owner_id",
+                "source_agent_id",
+                "source_name",
+                "synced_at",
+            )
+        }
+        if sync
+        else None
+    )
     return {**data, "editable": True, "revision": revision(record)}
 
 
@@ -192,6 +206,7 @@ class AgentManagement:
                 data.id = latest.data.id
                 data.workspace_id = latest.data.workspace_id
                 data.copy_fingerprint = latest.data.copy_fingerprint
+                data.template_sync = latest.data.template_sync
                 latest.data = data
 
             record = await self.storage.mutate_agent(owner, agent_id, mutate)
@@ -370,6 +385,7 @@ class AgentManagement:
     async def _copy(self, record, target, identity, fingerprint, body):
         owner = record.user_id
         data = record.data.model_copy(deep=True)
+        data.template_sync = None
         data.id, data.name = identity, body.name.strip()
         if not data.name:
             raise HTTPException(422, "名称不能为空。")

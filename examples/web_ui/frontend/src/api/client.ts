@@ -1,8 +1,11 @@
 import { toast } from 'sonner';
 
 import { getAuth, getAuthSignal, getCsrfToken, handleUnauthorized } from './auth-state';
+import { withPublicBase } from '@/lib/public-path';
 
-export const getBaseUrl = () => new URL('/api/', window.location.origin).toString();
+
+export const appPath = (path: string) => withPublicBase(path, import.meta.env.BASE_URL || '/');
+export const getBaseUrl = () => new URL(appPath('/api/'), window.location.origin).toString();
 export const getUserId = () => getAuth()?.user.id ?? '';
 export const apiUrl = (path: string) => new URL(path.replace(/^\/+/, ''), getBaseUrl());
 
@@ -36,9 +39,30 @@ interface RequestOptions {
 /** Reported when `timeoutMs` elapses. Real 408s come from a server, so either way the request did not complete in time. */
 export const TIMEOUT_STATUS = 408;
 
-function buildHeaders(hasBody: boolean): Record<string, string> {
+const SSO_SESSION_KEY = 'agentscope_session';
+
+/** Session token for cross-site iframe embeds where cookies are blocked. */
+export function getSsoSessionToken(): string {
+	try {
+		return sessionStorage.getItem(SSO_SESSION_KEY) || '';
+	} catch {
+		return '';
+	}
+}
+
+export function clearSsoSessionToken(): void {
+	try {
+		sessionStorage.removeItem(SSO_SESSION_KEY);
+	} catch {
+		/* ignore */
+	}
+}
+
+export function buildHeaders(hasBody = false): Record<string, string> {
 	const headers: Record<string, string> = { 'X-CSRF-Token': getCsrfToken() };
 	if (hasBody) headers['Content-Type'] = 'application/json';
+	const sso = getSsoSessionToken();
+	if (sso) headers['X-Agentscope-Session'] = sso;
 	return headers;
 }
 

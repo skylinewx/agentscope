@@ -46,6 +46,13 @@ class CopyAgentRequest(BaseModel):
     files: list[str] = Field(default_factory=list, max_length=1000)
 
 
+class TemplateUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    source_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    target_revision: str = Field(pattern=r"^[0-9a-f]{64}$")
+    take_source: list[str] = Field(default_factory=list, max_length=2000)
+
+
 class MemoryWrite(BaseModel):
     model_config = ConfigDict(extra="forbid")
     path: str

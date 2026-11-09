@@ -1,6 +1,8 @@
 import { useOnborda } from 'onborda';
 import { useEffect, useRef } from 'react';
 
+import { isEmbedded } from '@/lib/embed';
+
 import { CHAT_TOUR_NAME } from './chatTourSteps';
 
 interface Props {
@@ -14,13 +16,26 @@ const TOUR_DONE_KEY = 'chat_tour_done';
 const FORCE_TOUR_KEY = 'force_tour';
 
 export const ChatTourController = ({ agentsCount, sessionsCount, onEnsureSidebarOpen }: Props) => {
-	const { currentStep, currentTour, setCurrentStep, startOnborda } = useOnborda();
+	const { currentStep, currentTour, setCurrentStep, startOnborda, closeOnborda } = useOnborda();
 	const startCountsRef = useRef({ agents: agentsCount, sessions: sessionsCount });
 	const startedRef = useRef(false);
 
 	// Auto-start on mount: first-time visitors, or manual trigger via sessionStorage.
 	useEffect(() => {
 		if (startedRef.current) return;
+		// Nuwa FUNCTAB iframe: Onborda's full-screen shield (z-900) blocks all
+		// clicks and the tour card is often off-screen — skip auto tour there.
+		const embedded = isEmbedded();
+		if (embedded) {
+			try {
+				localStorage.setItem(TOUR_DONE_KEY, '1');
+				sessionStorage.removeItem(FORCE_TOUR_KEY);
+			} catch {
+				/* ignore */
+			}
+			closeOnborda();
+			return;
+		}
 		const force = sessionStorage.getItem(FORCE_TOUR_KEY) === '1';
 		const done = localStorage.getItem(TOUR_DONE_KEY) === '1';
 		if (force) sessionStorage.removeItem(FORCE_TOUR_KEY);
@@ -30,7 +45,7 @@ export const ChatTourController = ({ agentsCount, sessionsCount, onEnsureSidebar
 		// Defer one tick so target elements are mounted.
 		const id = window.setTimeout(() => startOnborda(CHAT_TOUR_NAME), 300);
 		return () => window.clearTimeout(id);
-	}, [onEnsureSidebarOpen, startOnborda]);
+	}, [closeOnborda, onEnsureSidebarOpen, startOnborda]);
 
 	// Snapshot the agents/sessions count when entering each step so we can
 	// detect "user just created one" rather than "they already had some."

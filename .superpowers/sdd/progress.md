@@ -1,0 +1,7 @@
+﻿Task 1: complete (1ffa19b..679200a)
+Task 2: complete (679200a..bdfe327)
+Task 3: complete (bdfe327..003d582 + env example)
+Task 4: complete (nginx + runbook in web/harness)
+Task 5: complete (budget-ontology-web 215b633)
+Task 6: complete (harness b1a9145 SSO resolve; conversation user_id still NULL in INSERT — follow-up)
+Task 7: checklist in NVWA_EMBED_RUNBOOK.md (manual)

@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from ._http import NewUser
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 
 class AuthSettings(BaseModel):
@@ -25,6 +25,21 @@ class AuthSettings(BaseModel):
     session_ttl_seconds: int = Field(default=43200, ge=60, le=604800)
     cookie_secure: bool = False
     allowed_origins: list[str] = Field(default_factory=list)
+    cookie_path: str = "/"
+    public_base_path: str = "/"
+
+    @field_validator("cookie_path", "public_base_path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or value.startswith("//")
+            or any(c in value for c in "\\?#;%")
+            or any(ord(c) < 33 for c in value)
+            or any(p in {".", ".."} for p in value.split("/"))
+        ):
+            raise ValueError("Use an absolute, same-origin path.")
+        return value.rstrip("/") or "/"
 
     def validate_password(self) -> None:
         value = self.admin_password.get_secret_value()
@@ -62,12 +77,18 @@ class AuthService:
 
     cookie_name = "agentscope_session"
 
-    def __init__(self, store: RedisAuthStore, settings: AuthSettings) -> None:
+    def __init__(
+        self,
+        store: RedisAuthStore,
+        settings: AuthSettings,
+        nvwa_settings: Any | None = None,
+    ) -> None:
         settings.validate_password()
         from argon2 import PasswordHasher
 
         self.store = store
         self.settings = settings
+        self.nvwa_settings = nvwa_settings
         self.hasher = PasswordHasher(
             time_cost=2, memory_cost=19456, parallelism=1
         )
@@ -206,6 +227,86 @@ class AuthService:
             self.settings.session_ttl_seconds,
         )
         return token, session, user
+
+    async def create_session_for_user(
+        self, user: dict[str, Any]
+    ) -> tuple[str, dict[str, Any], dict[str, Any]]:
+        """Create a session for an already-authenticated account (SSO)."""
+        verified_user = user
+
+        def touch(users: dict[str, dict[str, Any]]) -> dict[str, Any]:
+            latest = users[verified_user["id"]]
+            if (
+                latest["status"] != "active"
+                or latest["auth_version"] != verified_user["auth_version"]
+            ):
+                reject(401, "账号状态已变化，请重新登录。")
+            latest["last_login_at"] = now()
+            return latest
+
+        user = await self.store.mutate(touch)
+        token = secrets.token_urlsafe(32)
+        session = dict(
+            user_id=user["id"],
+            auth_version=user["auth_version"],
+            csrf_token=secrets.token_urlsafe(32),
+            expires_at=time.time() + self.settings.session_ttl_seconds,
+        )
+        await self.store.save_session(
+            token, session, self.settings.session_ttl_seconds
+        )
+        logger.info(
+            "SSO session created: user_id=%s idle_timeout_seconds=%s",
+            user["id"],
+            self.settings.session_ttl_seconds,
+        )
+        return token, session, user
+
+    async def ensure_sso_user(
+        self, username: str, display_name: str = ""
+    ) -> dict[str, Any]:
+        """Atomically match a verified Nuwa username, preserving local passwords."""
+        from ._http import NewUser
+
+        body = NewUser(
+            username=username,
+            password=secrets.token_urlsafe(24),
+            display_name=display_name or username,
+        )
+        if username.casefold() == "admin":
+            reject(403, "内置 admin 请使用用户名密码登录。")
+        encoded = await self.hash_password(body.password.get_secret_value())
+        uid = uuid.uuid4().hex
+
+        def provision(users):
+            existing = next(
+                (
+                    u
+                    for u in users.values()
+                    if u["username"].casefold() == username.casefold()
+                ),
+                None,
+            )
+            if existing is not None:
+                if (
+                    existing["status"] != "active"
+                    or existing["role"] != "user"
+                ):
+                    reject(403, "账号已停用或不允许通过女娲登录。")
+                if display_name:
+                    existing["display_name"] = body.display_name
+                existing.update(sso_provider="nvwa", updated_at=now())
+                return existing
+            user = self.new_user(
+                uid,
+                body.username,
+                body.display_name,
+                encoded,
+            )
+            user["sso_provider"] = "nvwa"
+            return user
+
+        return await self.store.mutate(provision)
 
     async def authenticate(
         self, token: str | None

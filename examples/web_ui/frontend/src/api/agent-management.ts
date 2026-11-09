@@ -30,6 +30,12 @@ export interface MemoryConfig {
 }
 export interface ManagedAgent extends AgentView {
 	revision: string;
+	template?: {
+		source_owner_id: string;
+		source_agent_id: string;
+		source_name: string;
+		synced_at: string;
+	} | null;
 	data: AgentData & {
 		description?: string;
 		defaults?: AgentDefaults | null;
@@ -111,7 +117,35 @@ const scope = (owner: string, extra: Record<string, string> = {}) => ({
 	owner_id: owner,
 	...extra,
 });
+export interface TemplatePreview {
+	source_name: string;
+	synced_at: string;
+	source_revision: string;
+	target_revision: string;
+	changes: {
+		path: string;
+		conflict: boolean;
+		current: unknown;
+		incoming: unknown;
+		removed: boolean;
+	}[];
+}
 export const managementApi = {
+	templatePreview: (owner: string, id: string) =>
+		client.get<TemplatePreview>(`/agent-management/${id}/template-preview`, scope(owner), {
+			silent: true,
+		}),
+	templateUpdate: (owner: string, id: string, preview: TemplatePreview, takeSource: string[]) =>
+		client.post<ManagedAgent>(
+			`/agent-management/${id}/template-update`,
+			{
+				source_revision: preview.source_revision,
+				target_revision: preview.target_revision,
+				take_source: takeSource,
+			},
+			scope(owner),
+			{ silent: true },
+		),
 	list: () =>
 		client.get<{ agents: ManagedAgent[]; users: Owner[]; admin: boolean; total: number }>(
 			'/agent-management',

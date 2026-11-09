@@ -782,8 +782,12 @@ export function ChatViewport({
 									/>
 									<LlmSelect
 										id="tour-llm-select"
-										variant="ghost"
-										className="font-mono text-muted-foreground hover:text-foreground"
+										variant={selectedModel ? 'ghost' : 'outline'}
+										className={
+											selectedModel
+												? 'font-mono text-muted-foreground hover:text-foreground'
+												: 'font-mono ring-2 ring-primary/40'
+										}
 										value={selectedModel}
 										onChange={handleLlmChange}
 										onAddCredential={() => setCredentialOpen(true)}
@@ -945,6 +949,11 @@ export function ChatViewport({
 										voiceBusy ||
 										messagesLoading ||
 										historyError !== null
+									}
+									inputPlaceholder={
+										selectedModel === null
+											? t('chat.inputDisabledNoModel')
+											: undefined
 									}
 									onSend={send}
 									messageQueue={messageQueue}

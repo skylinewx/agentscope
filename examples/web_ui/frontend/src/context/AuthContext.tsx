@@ -2,7 +2,7 @@ import { useEffect, useState, useSyncExternalStore, type ReactNode } from 'react
 
 import { authApi } from '@/api/auth';
 import { getAuth, getAuthNotice, setAuth, subscribeAuth } from '@/api/auth-state';
-import { ApiError } from '@/api/client';
+import { ApiError, appPath, clearSsoSessionToken } from '@/api/client';
 import { Button } from '@/components/ui/button';
 import { useTranslation } from '@/i18n/useI18n';
 import { SetupPage } from '@/pages/setup';
@@ -42,7 +42,8 @@ export function AuthGate({ children }: { children: ReactNode }) {
 		const changed = (event: StorageEvent) => {
 			if (event.key === 'auth_changed') {
 				setAuth(null);
-				window.location.replace('/login');
+				clearSsoSessionToken();
+				window.location.replace(appPath('/login'));
 			}
 		};
 		window.addEventListener('storage', changed);

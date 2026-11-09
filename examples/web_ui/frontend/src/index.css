@@ -247,3 +247,10 @@ svg.lucide {
 		@apply font-sans;
 	}
 }
+
+/* Nuwa FUNCTAB embed: never let a leftover tour shield steal clicks. */
+html[data-embedded='1'] [data-name='onborda-overlay'],
+html[data-embedded='1'] [data-name='onborda-wrapper'] > [class*='fixed'] {
+	display: none !important;
+	pointer-events: none !important;
+}

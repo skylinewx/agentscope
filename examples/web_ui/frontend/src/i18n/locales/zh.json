@@ -258,6 +258,9 @@
 			"elapsed": "已等待 {{seconds}} 秒"
 		},
 		"inputPlaceholder": "输入消息...",
+		"inputDisabledNoModel": "请先在上方选择模型…",
+		"selectModelHintTitle": "还没有选择模型",
+		"selectModelHintBody": "请点击右上角「选择模型」。若列表为空，请添加模型凭证，或联系管理员开通模型使用权限。",
 		"confirmToolCall": "允许此操作？",
 		"subagentConfirmTitle": "{{name}} 请求确认",
 		"newSession": "新会话",

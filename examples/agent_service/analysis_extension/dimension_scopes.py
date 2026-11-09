@@ -181,25 +181,17 @@ def selector_evidence(selector):
     return ([selector['rootText']] if selector.get('rootText') else []) + list(selector.get('members', []))
 
 
-def check_original_requirement(request):
-    """Catch an omitted explicit range before budget I/O; this does not infer its dimension."""
-    if request.get('sourceSelection') and request.get('purpose') == 'ANALYZE':
-        return
-    question = request.get('question', '')
+def check_scope_evidence(request):
+    """The host validates supplied evidence; dimension/range semantics belong to the metadata service."""
     scopes = (request.get('intentDraft') or {}).get('dimensionScopes', [])
-    markers = re.finditer(r'(?:所有|全部|各个)(?!指标|单元格|表样|报表|数据|结果|信息|明细|公式|内容|问题)|全集团|各(?=部门|项目|单位|机构|企业|公司|产品|区域)', question)
-    for match in markers:
-        represented = False
-        for scope in scopes:
-            source = scope.get('sourceText', '')
-            if source and any(found.start() <= match.start() < found.end() for found in re.finditer(re.escape(source), question)):
-                if scope.get('selector', {}).get('type') == 'VALUES':
-                    raise AnalysisError('DIMENSION_SCOPE_NARROWED', '明确的全部范围不能改为默认成员列表。')
-                represented = True
-        if not represented:
-            raise AnalysisError('DIMENSION_SCOPE_REQUIRED',
-                '用户明确的范围尚未表达，请在 intentDraft.dimensionScopes 中保留维度含义及范围，不能改查默认成员。',
-                {'sourceText': match.group(), 'requiresSourceQuery': False})
+    if not scopes:
+        return
+    evidence = ' '.join(str(request.get(key) or '') for key in ('question', 'contextText'))
+    for scope in scopes:
+        source = scope.get('sourceText')
+        if not isinstance(source, str) or not source.strip() or source not in evidence:
+            raise AnalysisError('DIMENSION_SCOPE_EVIDENCE_INVALID',
+                '维度范围必须引用本轮原文或宿主已确认上下文，不能编造范围要求。')
 
 
 def validate_execution(request, data):
@@ -207,7 +199,7 @@ def validate_execution(request, data):
     scopes = (request.get('intentDraft') or {}).get('dimensionScopes', [])
     if not scopes:
         return
-    check_original_requirement(request)
+    check_scope_evidence(request)
     resolved = [item for item in data.get('scopeResolution', []) if item.get('status') == 'RESOLVED']
     if not data.get('scopeVerification', {}).get('bindingComplete'):
         raise AnalysisError('BUDGET_QUERY_SCOPE_UNVERIFIED', '维度范围没有完成模型绑定校验。')

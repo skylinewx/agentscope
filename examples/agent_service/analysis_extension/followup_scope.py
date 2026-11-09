@@ -224,11 +224,11 @@ def _apply_form_year(request, year):
 
 def prepare_request(turn, origin, request):
     if origin.get('originalToolName') == 'execute_budget_query':
-        from .dimension_scopes import inherit, check_original_requirement
+        from .dimension_scopes import inherit, check_scope_evidence
         result = _inherit_business_request(turn, origin, request)
         if not result.get('sourceSelection'):
             result = inherit(turn, result)
-        check_original_requirement(result)
+        check_scope_evidence(result)
         return result
     result = _inherit_request(turn, origin, request)
     year = turn.state.get('queryIntent', {}).get('formExecutionYear')
@@ -252,7 +252,7 @@ def _inherit_business_request(turn, origin, request):
     if result.get('sourceSelection') is not None:
         # Immutable references are resolved and authorized by the ontology service.
         # No previous root selector or guessed natural-language replacement belongs in this request.
-        if _changes(turn) & {'task', 'period', 'scenario', 'metric'} or turn.state.get('followupContext', {}).get('changedDimensions'):
+        if _changes(turn) & {'task', 'period', 'scenario', 'metric', 'population'} or turn.state.get('followupContext', {}).get('changedDimensions'):
             raise AnalysisError('FOLLOWUP_SCOPE_CONFLICT', '变更取数条件时不能复用上一轮事实定位，请先查询新范围。')
         return result
     if turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':

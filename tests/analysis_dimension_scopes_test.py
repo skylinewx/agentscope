@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from unittest import TestCase, IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock
 
-from analysis_extension.dimension_scopes import check_original_requirement, inherit, snapshot, validate_execution
+from analysis_extension.dimension_scopes import check_scope_evidence, inherit, snapshot, validate_execution
 from analysis_extension.models import AnalysisError
 from analysis_extension.query_attempts import failure_key
 from numeric_tools import calculate_requests
@@ -14,6 +14,20 @@ def scope(identifier='departments', hint='部门', text='所有部门'):
 
 
 class DimensionScopeTests(TestCase):
+    def test_explicit_value_switch_cannot_reuse_previous_fact_identity(self):
+        from analysis_extension.followup_scope import prepare_request
+        origin = {'originalToolName': 'execute_budget_query'}
+        reference = {'executionId': 'old', 'resultSetId': 'old-set', 'factIds': ['old-fact']}
+        for field in ('population', 'period', 'scenario', 'metric'):
+            with self.subTest(field=field):
+                turn = SimpleNamespace(state={'request': '改查另一个值',
+                    'followupContext': {'mode': 'CONTINUE', 'changedFields': [field]}})
+                with self.assertRaises(AnalysisError) as failure:
+                    prepare_request(turn, origin, {'sourceSelection': reference})
+                self.assertEqual(failure.exception.code, 'FOLLOWUP_SCOPE_CONFLICT')
+        turn = SimpleNamespace(state={'request': '解释刚才的结果', 'followupContext': {'mode': 'CONTINUE'}})
+        self.assertEqual(prepare_request(turn, origin, {'sourceSelection': reference})['sourceSelection'], reference)
+
     def test_confirmed_hierarchy_keeps_root_and_original_wording_on_next_analysis(self):
         old = {'id': 'units', 'dimensionHint': '组织机构', 'sourceText': '二级单位',
                'selector': {'type': 'HIERARCHY', 'rootText': '久其集团', 'level': 2}}
@@ -111,15 +125,14 @@ class DimensionScopeTests(TestCase):
         with self.assertRaisesRegex(AnalysisError, '实际批量请求'):
             validate_execution(request, data)
 
-    def test_every_explicit_range_must_be_preserved_without_a_dimension_keyword_list(self):
-        for text in ('所有部门', '全部项目', '全集团', '各单位', '所有合同'):
-            with self.subTest(text=text), self.assertRaises(AnalysisError):
-                check_original_requirement({'question': '查询2026年' + text + '的预算'})
-            check_original_requirement({'question': text + '预算', 'intentDraft': {'dimensionScopes': [scope(text=text)]}})
-        check_original_requirement({'question': '读取全部指标和所有数据'})
+    def test_host_defers_range_semantics_and_checks_only_supplied_scope_evidence(self):
+        for question in ('查询所有部门预算', '查询所有项目预算', '金额全部用万元展示', '读取全部指标和所有数据'):
+            check_scope_evidence({'question': question})
+        check_scope_evidence({'question': '所有部门预算', 'intentDraft': {'dimensionScopes': [scope()]}})
+        check_scope_evidence({'question': '继续分析', 'contextText': '所有部门',
+                              'intentDraft': {'dimensionScopes': [scope()]}})
         with self.assertRaises(AnalysisError):
-            check_original_requirement({'question': '我要看所有单位的', 'purpose': 'QUERY',
-                                        'sourceSelection': {'executionId': 'old-default-result'}})
+            check_scope_evidence({'question': '查部门甲预算', 'intentDraft': {'dimensionScopes': [scope()]}})
 
     def test_followup_changes_only_one_dimension_and_keeps_the_other(self):
         departments, projects = scope(), scope('projects', '项目', '全部项目')

@@ -60,6 +60,7 @@ def auth_settings(path: str | Path, environ=None):
         ("session_ttl_seconds", "AGENTSCOPE_SESSION_TTL_SECONDS"),
         ("cookie_secure", "AGENTSCOPE_COOKIE_SECURE"),
         ("cookie_path", "AGENTSCOPE_COOKIE_PATH"),
+        ("public_base_path", "AGENTSCOPE_PUBLIC_BASE_PATH"),
     ):
         if name in env:
             values[field] = env[name]
@@ -83,7 +84,9 @@ def nvwa_settings(path: str | Path, environ=None):
     configured = read_settings(path).get("nvwa")
     if configured is None and "AGENTSCOPE_NVWA_BASE_URL" not in env:
         return None
-    values = dict(configured) if isinstance(configured, dict) else {}
+    if configured is not None and not isinstance(configured, dict):
+        raise ValueError("Nvwa configuration must be an object.")
+    values = dict(configured or {})
     if "AGENTSCOPE_NVWA_BASE_URL" in env:
         values["base_url"] = env["AGENTSCOPE_NVWA_BASE_URL"]
     if "AGENTSCOPE_NVWA_VALIDATE_PATH" in env:
@@ -92,6 +95,10 @@ def nvwa_settings(path: str | Path, environ=None):
         values["auth_mode"] = env["AGENTSCOPE_NVWA_AUTH_MODE"]
     if "AGENTSCOPE_NVWA_USER_INFO_PATH" in env:
         values["user_info_path"] = env["AGENTSCOPE_NVWA_USER_INFO_PATH"]
+    if "AGENTSCOPE_NVWA_TEMPLATE_AGENT_ID" in env:
+        values["template_agent_id"] = env["AGENTSCOPE_NVWA_TEMPLATE_AGENT_ID"]
+    if "AGENTSCOPE_NVWA_TEMPLATE_OWNER_ID" in env:
+        values["template_owner_id"] = env["AGENTSCOPE_NVWA_TEMPLATE_OWNER_ID"]
     if not values.get("base_url"):
         return None
     try:

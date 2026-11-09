@@ -9,18 +9,17 @@
     "admin_password": "CHANGE_ME",
     "session_ttl_seconds": 43200,
     "cookie_secure": false,
-    "allowed_origins": [
-      "http://10.2.9.103:9000",
-      "http://10.2.9.103:9080"
-    ],
-    "cookie_path": "/agentscope"
+    "allowed_origins": [],
+    "cookie_path": "/agentscope",
+    "public_base_path": "/agentscope"
   },
   "nvwa": {
     "base_url": "http://10.2.9.103:8080",
     "auth_mode": "auto",
     "user_info_path": "/nvwa-user/v1/user/current",
     "validate_path": "/nvwa-certification/v1/ticket/resolve",
-    "timeout_seconds": 10
+    "timeout_seconds": 10,
+    "template_owner_id": "admin",
+    "template_agent_id": "REPLACE_WITH_SOURCE_AGENT_ID"
   }
 }
-

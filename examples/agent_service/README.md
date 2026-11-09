@@ -71,10 +71,13 @@ pnpm install
 pnpm dev
 ```
 
-The Web UI uses a fixed same-origin `/api` endpoint. Its development proxy
+The Web UI uses a same-origin `/api` endpoint under its configured public base path. Its development proxy
 forwards to `http://127.0.0.1:8000`; deployment operators can override the target
 with `AGENTSCOPE_BACKEND_URL` in the frontend `.env.local` or environment.
 Users sign in with their username and password, without entering an address.
+
+女娲登录和首次安装/手动更新智能体的配置，见 [女娲 SSO 与智能体模板](NVWA_SSO.md)。
+需求确认、PR 评审、实现及验证过程，见 [女娲 SSO 实施记录](NVWA_SSO_IMPLEMENTATION.md)。
 
 ## 用户登录与管理
 

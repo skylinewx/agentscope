@@ -1,8 +1,11 @@
 import { toast } from 'sonner';
 
 import { getAuth, getAuthSignal, getCsrfToken, handleUnauthorized } from './auth-state';
+import { withPublicBase } from '@/lib/public-path';
 
-export const getBaseUrl = () => new URL('/api/', window.location.origin).toString();
+
+export const appPath = (path: string) => withPublicBase(path, import.meta.env.BASE_URL || '/');
+export const getBaseUrl = () => new URL(appPath('/api/'), window.location.origin).toString();
 export const getUserId = () => getAuth()?.user.id ?? '';
 export const apiUrl = (path: string) => new URL(path.replace(/^\/+/, ''), getBaseUrl());
 
@@ -55,7 +58,7 @@ export function clearSsoSessionToken(): void {
 	}
 }
 
-function buildHeaders(hasBody: boolean): Record<string, string> {
+export function buildHeaders(hasBody = false): Record<string, string> {
 	const headers: Record<string, string> = { 'X-CSRF-Token': getCsrfToken() };
 	if (hasBody) headers['Content-Type'] = 'application/json';
 	const sso = getSsoSessionToken();

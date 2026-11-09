@@ -339,28 +339,16 @@ async def create_session(
 
     # Sharing an agent does not implicitly share its credentials or KBs.
     # Validate the effective defaults too, while preserving explicit nulls.
-    # Inherited fields whose credentials the viewer cannot see are dropped
-    # (Nuwa SSO JIT users often lack admin credentials until seed runs).
-    inherited = list(inherited)
-    for field in list(MODEL_FIELDS):
-        is_inherited = (
-            agent.data.defaults is not None and field in inherited
-        )
+    for field in MODEL_FIELDS:
         value = (
             getattr(agent.data.defaults, field)
-            if is_inherited
+            if agent.data.defaults is not None and field in inherited
             else getattr(body, field)
         )
-        try:
-            if field == "knowledge_config":
-                await _ensure_knowledge_bases_exist(access, user_id, value)
-            else:
-                await _ensure_credential_exists(access, user_id, value)
-        except HTTPException:
-            if is_inherited:
-                inherited.remove(field)
-                continue
-            raise
+        if field == "knowledge_config":
+            await _ensure_knowledge_bases_exist(access, user_id, value)
+        else:
+            await _ensure_credential_exists(access, user_id, value)
 
     # Resolve the workspace binding for this session. Explicit
     # ``body.workspace_id`` always wins (used by team invite / borrow

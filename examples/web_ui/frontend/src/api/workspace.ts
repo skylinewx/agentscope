@@ -1,5 +1,5 @@
-import { getAuthSignal, getCsrfToken, handleUnauthorized } from './auth-state';
-import { ApiError, client, apiUrl } from './client';
+import { getAuthSignal, handleUnauthorized } from './auth-state';
+import { buildHeaders, ApiError, client, apiUrl } from './client';
 import type { UploadProgress } from './knowledgeBase';
 import type {
 	AddFromLibraryResponse,
@@ -58,7 +58,7 @@ function uploadSkillXhr(
 		url.searchParams.set('agent_id', agentId);
 		url.searchParams.set('session_id', sessionId);
 		xhr.open('POST', url.toString(), true);
-		xhr.setRequestHeader('X-CSRF-Token', getCsrfToken());
+		Object.entries(buildHeaders()).forEach(([name, value]) => xhr.setRequestHeader(name, value));
 
 		const onAbort = () => xhr.abort();
 		signal?.addEventListener('abort', onAbort, { once: true });

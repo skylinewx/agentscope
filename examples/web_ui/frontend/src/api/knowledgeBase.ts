@@ -1,5 +1,5 @@
-import { getAuthSignal, getCsrfToken, handleUnauthorized } from './auth-state';
-import { ApiError, client, apiUrl } from './client';
+import { getAuthSignal, handleUnauthorized } from './auth-state';
+import { buildHeaders, ApiError, client, apiUrl } from './client';
 import type {
 	CreateKnowledgeBaseRequest,
 	CreateKnowledgeBaseResponse,
@@ -103,7 +103,7 @@ function uploadDocumentXhr(
 		const xhr = new XMLHttpRequest();
 		const url = apiUrl(`/knowledge_bases/${knowledgeBaseId}/documents`);
 		xhr.open('POST', url.toString(), true);
-		xhr.setRequestHeader('X-CSRF-Token', getCsrfToken());
+		Object.entries(buildHeaders()).forEach(([name, value]) => xhr.setRequestHeader(name, value));
 
 		const onAbort = () => xhr.abort();
 		signal?.addEventListener('abort', onAbort, { once: true });

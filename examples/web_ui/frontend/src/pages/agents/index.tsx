@@ -25,6 +25,7 @@ import { CopyAgentDialog } from './CopyAgentDialog';
 import { Check, Field, JsonField, ModelField } from './fields';
 import { MemoryFiles } from './MemoryFiles';
 import { CredentialEditor, ResourceBindings } from './Resources';
+import { TemplateUpdateDialog } from './TemplateUpdateDialog';
 import {
 	managementApi,
 	type AgentDefaults,
@@ -479,6 +480,8 @@ function AgentEditor({
 			'',
 	);
 	const [copy, setCopy] = useState(false);
+	const [templateUpdate, setTemplateUpdate] = useState(false);
+	const templateTrigger = useRef<HTMLButtonElement>(null);
 	const allowNavigate = useRef(false);
 	const blocker = useBlocker(() => dirty && !allowNavigate.current);
 	useBeforeUnload(
@@ -511,6 +514,19 @@ function AgentEditor({
 	];
 	return (
 		<main className="h-full overflow-auto">
+			{agent && templateUpdate && (
+				<TemplateUpdateDialog
+					agent={agent}
+					onClose={() => setTemplateUpdate(false)}
+					onReturnFocus={() => templateTrigger.current?.focus()}
+					onUpdated={(saved) => {
+						setTemplateUpdate(false);
+						onSaved(saved);
+						void refresh();
+						toast.success('智能体已更新，历史记录和个人文件已保留');
+					}}
+				/>
+			)}
 			<form
 				onInput={(e) => {
 					if (e.currentTarget.contains(e.target as Node)) setDirty(true);
@@ -588,6 +604,18 @@ function AgentEditor({
 						</div>
 						{agent && (
 							<div className="flex gap-2">
+								{agent.template && (
+									<Button
+										ref={templateTrigger}
+										type="button"
+										variant="outline"
+										disabled={dirty || busy}
+										tooltip={dirty ? '请先保存配置再检查更新' : ''}
+										onClick={() => setTemplateUpdate(true)}
+									>
+										检查更新
+									</Button>
+								)}
 								<Button
 									type="button"
 									variant="outline"

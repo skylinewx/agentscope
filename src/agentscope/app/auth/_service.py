@@ -14,7 +14,7 @@ if TYPE_CHECKING:
     from ._http import NewUser
 
 from fastapi import HTTPException
-from pydantic import BaseModel, ConfigDict, Field, SecretStr
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
 
 class AuthSettings(BaseModel):
@@ -26,6 +26,20 @@ class AuthSettings(BaseModel):
     cookie_secure: bool = False
     allowed_origins: list[str] = Field(default_factory=list)
     cookie_path: str = "/"
+    public_base_path: str = "/"
+
+    @field_validator("cookie_path", "public_base_path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        if (
+            not value.startswith("/")
+            or value.startswith("//")
+            or any(c in value for c in "\\?#;%")
+            or any(ord(c) < 33 for c in value)
+            or any(p in {".", ".."} for p in value.split("/"))
+        ):
+            raise ValueError("Use an absolute, same-origin path.")
+        return value.rstrip("/") or "/"
 
     def validate_password(self) -> None:
         value = self.admin_password.get_secret_value()
@@ -251,38 +265,48 @@ class AuthService:
     async def ensure_sso_user(
         self, username: str, display_name: str = ""
     ) -> dict[str, Any]:
-        """Find a user by username or JIT-create one for Nuwa SSO."""
+        """Atomically match a verified Nuwa username, preserving local passwords."""
         from ._http import NewUser
 
-        users = await self.store.users()
-        existing = next(
-            (
-                u
-                for u in users.values()
-                if u["status"] != "deleted"
-                and u["username"].casefold() == username.casefold()
-            ),
-            None,
+        body = NewUser(
+            username=username,
+            password=secrets.token_urlsafe(24),
+            display_name=display_name or username,
         )
-        if existing is not None:
-            # Built-in admin is server-managed; SSO may only reuse the account.
-            if existing.get("id") == "admin":
-                return existing
-            if (
-                display_name
-                and existing.get("display_name", "") != display_name
-            ):
-                return await self.edit_user(
-                    existing["id"], {"display_name": display_name}
-                )
-            return existing
-        return await self.create_user(
-            NewUser(
-                username=username,
-                password=secrets.token_urlsafe(24),
-                display_name=display_name or username,
+        if username.casefold() == "admin":
+            reject(403, "内置 admin 请使用用户名密码登录。")
+        encoded = await self.hash_password(body.password.get_secret_value())
+        uid = uuid.uuid4().hex
+
+        def provision(users):
+            existing = next(
+                (
+                    u
+                    for u in users.values()
+                    if u["username"].casefold() == username.casefold()
+                ),
+                None,
             )
-        )
+            if existing is not None:
+                if (
+                    existing["status"] != "active"
+                    or existing["role"] != "user"
+                ):
+                    reject(403, "账号已停用或不允许通过女娲登录。")
+                if display_name:
+                    existing["display_name"] = body.display_name
+                existing.update(sso_provider="nvwa", updated_at=now())
+                return existing
+            user = self.new_user(
+                uid,
+                body.username,
+                body.display_name,
+                encoded,
+            )
+            user["sso_provider"] = "nvwa"
+            return user
+
+        return await self.store.mutate(provision)
 
     async def authenticate(
         self, token: str | None

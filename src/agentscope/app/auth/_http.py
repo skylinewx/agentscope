@@ -1,6 +1,7 @@
 """Authentication boundary and user-management HTTP endpoints."""
 
 import hmac
+from urllib.parse import unquote, urlsplit
 from typing import Annotated, Literal, Any
 from starlette.types import ASGIApp, Scope, Receive, Send, Message
 
@@ -92,13 +93,38 @@ def set_session_cookie(
 
 
 def safe_next_path(next_path: str | None, default: str = "/chat") -> str:
-    """Allow only same-origin relative redirects."""
-    if not next_path:
+    """Accept only application routes, rejecting browser URL aliases."""
+    value = (next_path or default).strip()
+    decoded = unquote(value)
+    if (
+        not decoded.startswith("/")
+        or decoded.startswith("//")
+        or any(c in decoded for c in "\\<>\"'`")
+        or any(ord(c) < 32 or ord(c) == 127 for c in decoded)
+        or any(p in {".", ".."} for p in urlsplit(decoded).path.split("/"))
+    ):
         return default
-    value = next_path.strip()
-    if not value.startswith("/") or value.startswith("//") or "://" in value:
+    parsed = urlsplit(decoded)
+    if parsed.scheme or parsed.netloc:
         return default
     return value
+
+
+def sso_target(service: AuthService, next_path: str | None) -> str:
+    base = service.settings.public_base_path.rstrip("/")
+    value = safe_next_path(next_path)
+    if base and (value == base or value.startswith(base + "/")):
+        value = value[len(base) :] or "/chat"
+    if urlsplit(value).path.split("/")[1] not in {
+        "chat",
+        "agents",
+        "account",
+        "credential",
+        "knowledge",
+        "schedule",
+    }:
+        value = "/chat"
+    return base + value
 
 
 def auth_router(service: AuthService) -> APIRouter:
@@ -132,104 +158,62 @@ def auth_router(service: AuthService) -> APIRouter:
     @router.get("/sso/nvwa")
     async def sso_nvwa(
         request: Request,
-        ticket: str | None = Query(default=None),
-        nv_t: str | None = Query(default=None),
-        token: str | None = Query(default=None),
-        username: str | None = Query(default=None),
-        display_name: str | None = Query(default=None),
-        displayName: str | None = Query(default=None),
-        next: str | None = Query(default=None),  # noqa: A002
+        ticket: str | None = Query(default=None, max_length=16384),
+        nv_t: str | None = Query(default=None, max_length=16384),
+        token: str | None = Query(default=None, max_length=16384),
+        next: str | None = Query(default=None, max_length=2048),
     ) -> RedirectResponse:
-        if service.nvwa_settings is None:
+        settings = service.nvwa_settings
+        if settings is None:
             raise HTTPException(503, "未配置女娲换票。")
-        # URL App：ticket=短期票；token/nv_t=会话 Authorization（优先）
-        session_token = None
-        for value in (token, nv_t):
-            if isinstance(value, str) and value.strip():
-                session_token = value.strip()
-                break
-        short_ticket = (
-            ticket.strip() if isinstance(ticket, str) and ticket.strip() else None
-        )
-        embed_username = (
-            username.strip() if isinstance(username, str) and username.strip() else None
-        )
-        embed_display = None
-        for value in (display_name, displayName):
-            if isinstance(value, str) and value.strip():
-                embed_display = value.strip()
-                break
-        if not session_token and not short_ticket and not embed_username:
-            raise HTTPException(400, "缺少 token / nv_t / ticket / username。")
-        from ._nvwa_ticket import NvwaUser, resolve_ticket
+        bearer = (token or nv_t or "").strip()
+        credential = bearer or (ticket or "").strip()
+        if not credential:
+            raise HTTPException(400, "缺少女娲 ticket / token。")
+        from ._nvwa_ticket import resolve_ticket
 
-        nvwa_user = None
-        resolve_error = None
-        if session_token or short_ticket:
-            try:
-                if session_token:
-                    nvwa_user = await resolve_ticket(
-                        service.nvwa_settings,
-                        session_token,
-                        prefer="bearer",
-                    )
-                else:
-                    nvwa_user = await resolve_ticket(
-                        service.nvwa_settings,
-                        short_ticket,
-                        prefer="auto",
-                    )
-            except ValueError as exc:
-                resolve_error = str(exc)
-        # 本地常无 nvwa-user 微服务（404）；url-app 可附带 username 回退。
-        if nvwa_user is None and embed_username:
-            nvwa_user = NvwaUser(
-                username=embed_username,
-                display_name=embed_display or "",
+        try:
+            identity = await resolve_ticket(
+                settings,
+                credential,
+                prefer="bearer" if bearer else "ticket_post",
             )
-        if nvwa_user is None:
-            detail = resolve_error or "验票失败。"
-            if not session_token and not embed_username:
-                detail += (
-                    " 当前请求只有短期 ticket、没有 token/username。"
-                    " 请确认女娲 url-app 已加载补丁并强制刷新后重开菜单。"
-                )
-            raise HTTPException(401, detail)
+        except ValueError as exc:
+            raise HTTPException(401, str(exc)) from None
         user = await service.ensure_sso_user(
-            nvwa_user.username, nvwa_user.display_name
+            identity.username, identity.display_name
         )
-        # JIT: copy usable model credentials + create an isolated default
-        # agent under this user only (other Nuwa users cannot see it).
-        storage = getattr(request.app.state, "storage", None)
-        if storage is not None:
-            try:
-                from ._sso_bootstrap import provision_sso_user
+        if identity.access_token is not None:
+            await service.store.save_nvwa_token(
+                user,
+                identity.access_token.get_secret_value(),
+                settings.mcp_token_ttl_seconds,
+            )
+        else:
+            await service.store.delete_nvwa_token(user["id"])
+        if settings.template_agent_id:
+            from .._service._agent_template import AgentTemplateService
 
-                await provision_sso_user(storage, user)
-            except Exception:  # noqa: BLE001 — never block SSO on provision failure
-                pass
-        session_token, _session, _user = await service.create_session_for_user(
-            user
-        )
-        target = safe_next_path(next)
-        # Cross-site iframe blocks Set-Cookie. Do NOT 302 to /sso/nvwa/handoff:
-        # under Vite `/api` proxy that Location drops the `/api` prefix and the
-        # SPA swallows the page. Return handoff HTML on this same response.
-        html = f"""<!DOCTYPE html>
-<html lang="zh-CN"><head><meta charset="utf-8"/><title>SSO</title></head>
-<body><p>正在进入…</p>
-<script>
-(function () {{
-  try {{
-    sessionStorage.setItem("agentscope_session", {session_token!r});
-    sessionStorage.setItem("agentscope_embed", "1");
-  }} catch (e) {{}}
-  location.replace({target!r});
-}})();
-</script></body></html>"""
-        response = Response(content=html, media_type="text/html; charset=utf-8")
+            try:
+                await AgentTemplateService(request.app.state).ensure(
+                    user["id"]
+                )
+            except HTTPException:
+                raise
+            except Exception:
+                logger.exception(
+                    "SSO template initialization failed: user_id=%s",
+                    user["id"],
+                )
+                raise HTTPException(
+                    503, "智能体初始化失败，请重试；重复登录不会重复创建。"
+                ) from None
+        session_token, _, _ = await service.create_session_for_user(user)
+        response = RedirectResponse(sso_target(service, next), status_code=303)
         set_session_cookie(response, service, session_token)
-        response.headers["Cache-Control"] = "no-store"
+        response.headers.update(
+            {"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"}
+        )
         return response
 
     @router.get("/auth/me")
@@ -247,13 +231,12 @@ def auth_router(service: AuthService) -> APIRouter:
         response: Response,
         user: dict[str, Any] = Depends(current),
     ) -> None:
-        await service.store.delete_session(
-            request.cookies[service.cookie_name]
-        )
+        await service.store.delete_session(request.state.auth_token)
+        await service.store.delete_nvwa_token(user["id"])
         logger.info("Login revoked: reason=logout user_id=%s", user["id"])
         response.delete_cookie(
             service.cookie_name,
-            path="/",
+            path=service.settings.cookie_path,
             httponly=True,
             secure=service.settings.cookie_secure,
             samesite="lax",
@@ -409,7 +392,9 @@ class AuthMiddleware:
             token = request.cookies.get(self.service.cookie_name)
             if not token:
                 # Third-party iframe fallback: frontend sends session from sessionStorage.
-                header = request.headers.get("x-agentscope-session", "").strip()
+                header = request.headers.get(
+                    "x-agentscope-session", ""
+                ).strip()
                 token = header or None
             identity = await self.service.authenticate(token)
             if identity is None:
@@ -440,7 +425,7 @@ class AuthMiddleware:
                     if name == b"set-cookie"
                 )
             scope.setdefault("state", {}).update(
-                auth_user=user, auth_session=session
+                auth_user=user, auth_session=session, auth_token=token
             )
             scope["headers"] = [
                 (k, v)
@@ -468,11 +453,24 @@ class AuthMiddleware:
                 )
         except Exception as exc:
             # Auth reads also use Redis, but a storage outage does not revoke the cookie.
-            from ..storage._errors import is_storage_unavailable, unavailable_detail
+            from ..storage._errors import (
+                is_storage_unavailable,
+                unavailable_detail,
+            )
+
             if not is_storage_unavailable(exc):
                 raise
             if not started:
-                await JSONResponse({'detail': unavailable_detail()}, status_code=503,
-                                   headers={'Cache-Control': 'no-store', 'Retry-After': '1'})(scope, receive, send)
+                await JSONResponse(
+                    {"detail": unavailable_detail()},
+                    status_code=503,
+                    headers={"Cache-Control": "no-store", "Retry-After": "1"},
+                )(scope, receive, send)
             elif not completed:
-                await send({'type': 'http.response.body', 'body': b'', 'more_body': False})
+                await send(
+                    {
+                        "type": "http.response.body",
+                        "body": b"",
+                        "more_body": False,
+                    }
+                )

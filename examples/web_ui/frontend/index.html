@@ -27,6 +27,24 @@
 				document.documentElement.classList.toggle('dark', dark);
 				document.documentElement.style.colorScheme = dark ? 'dark' : 'light';
 				document.documentElement.dataset.palette = palette;
+
+				// Nuwa FUNCTAB iframe: mark embed before React boots so tour /
+				// mobile-sheet overlays never flash a full-screen click shield.
+				try {
+					if (window.parent !== window) {
+						document.documentElement.dataset.embedded = '1';
+						localStorage.setItem('chat_tour_done', '1');
+						sessionStorage.removeItem('force_tour');
+					}
+				} catch {
+					document.documentElement.dataset.embedded = '1';
+					try {
+						localStorage.setItem('chat_tour_done', '1');
+						sessionStorage.removeItem('force_tour');
+					} catch {
+						/* ignore */
+					}
+				}
 			})();
 		</script>
 	</head>

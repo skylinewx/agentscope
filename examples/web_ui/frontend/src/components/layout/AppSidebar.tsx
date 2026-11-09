@@ -33,6 +33,7 @@ import {
 import { useAuth } from '@/context/AuthContext';
 import i18n from '@/i18n';
 import { useTranslation } from '@/i18n/useI18n';
+import { isEmbedded } from '@/lib/embed';
 
 export function AppSidebar() {
 	const auth = useAuth();
@@ -40,8 +41,10 @@ export function AppSidebar() {
 	const location = useLocation();
 	const { t } = useTranslation();
 	const { startOnborda } = useOnborda();
+	const embedded = isEmbedded();
 
 	const handleStartTour = () => {
+		if (embedded) return;
 		if (!location.pathname.startsWith('/chat')) {
 			// Page not mounted yet — leave a flag, navigate, and let the
 			// ChatTourController auto-trigger after ChatPage mounts.
@@ -196,15 +199,17 @@ export function AppSidebar() {
 							<Languages />
 						</SidebarMenuButton>
 					</SidebarMenuItem>
-					<SidebarMenuItem>
-						<SidebarMenuButton
-							tooltip={{ children: t('tour.trigger'), hidden: false }}
-							onClick={handleStartTour}
-							className="justify-center"
-						>
-							<Compass />
-						</SidebarMenuButton>
-					</SidebarMenuItem>
+					{!embedded && (
+						<SidebarMenuItem>
+							<SidebarMenuButton
+								tooltip={{ children: t('tour.trigger'), hidden: false }}
+								onClick={handleStartTour}
+								className="justify-center"
+							>
+								<Compass />
+							</SidebarMenuButton>
+						</SidebarMenuItem>
+					)}
 					<SidebarMenuItem>
 						<SidebarMenuButton
 							tooltip={{ children: t('auth.account'), hidden: false }}

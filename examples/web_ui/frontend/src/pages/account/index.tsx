@@ -24,13 +24,17 @@ export function AccountPage() {
 	async function logout() {
 		setBusy(true);
 		setError('');
+		const { clearSsoSessionToken } = await import('@/api/client');
 		try {
 			await authApi.logout();
+			clearSsoSessionToken();
 			navigate('/login', { replace: true });
 			setAuth(null, true);
 		} catch (e) {
-			if (e instanceof ApiError && e.status === 401) setAuth(null, true);
-			else setError(e instanceof Error ? e.message : t('auth.failed'));
+			if (e instanceof ApiError && e.status === 401) {
+				clearSsoSessionToken();
+				setAuth(null, true);
+			} else setError(e instanceof Error ? e.message : t('auth.failed'));
 		} finally {
 			setBusy(false);
 		}

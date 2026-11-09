@@ -250,6 +250,7 @@ class ResourceService(ResourceConfigService):
         self._health: dict[tuple[str, str, str, str, str], dict] = {}
         self._pool_lock = asyncio.Lock()
         self._max_idle_clients = max_idle_clients
+        self.runtime_headers_provider = None
 
     @staticmethod
     def source(record: MCPRecord | SkillRecord) -> str:
@@ -769,14 +770,23 @@ class ResourceService(ResourceConfigService):
                         if entry:
                             await entry.retire()
                         continue
+                    runtime_headers = {}
                     try:
+                        if self.runtime_headers_provider:
+                            runtime_headers = (
+                                await self.runtime_headers_provider(
+                                    user_id, agent_id, record
+                                )
+                            )
                         data = resolve_environment(
                             record.client.model_dump(mode="json")
                         )
                         if names[("mcp", record.name)] > 1:
                             data["name"] = f"{record.name}_{resource_id[:10]}"
                         fingerprint = hashlib.sha256(
-                            json.dumps(data, sort_keys=True).encode()
+                            json.dumps(
+                                [data, runtime_headers], sort_keys=True
+                            ).encode()
                         ).hexdigest()
                         entry = self._pool.get(key)
                         if entry and (
@@ -795,6 +805,10 @@ class ResourceService(ResourceConfigService):
                                 session_id=session_id,
                                 instance_id=uuid.uuid4().hex,
                             )
+                            if runtime_headers:
+                                await client.set_runtime_headers(
+                                    runtime_headers
+                                )
                             entry = _MCPEntry(
                                 client,
                                 user_id,
@@ -830,9 +844,12 @@ class ResourceService(ResourceConfigService):
                             ],
                         }
                     except Exception as exc:
+                        error = self._safe_error(exc, record)
+                        for secret in runtime_headers.values():
+                            error = error.replace(secret, "[redacted]")
                         self._health[key] = {
                             "status": "error",
-                            "error": self._safe_error(exc, record),
+                            "error": error,
                             "tools": [],
                         }
                 idle = sorted(

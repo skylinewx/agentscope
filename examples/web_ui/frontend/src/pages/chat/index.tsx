@@ -12,7 +12,7 @@ import {
 	Trash2,
 	Users,
 } from 'lucide-react';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 
 import { ChatViewport } from './ChatViewport';
@@ -107,6 +107,7 @@ const ChatPageInner = () => {
 	const { agents, refetch: refetchAgents, remove: removeAgent } = useAgents();
 	const {
 		sessions,
+		loading: sessionsLoading,
 		refetch: refetchSessions,
 		create: createSession,
 		update: updateSession,
@@ -119,6 +120,7 @@ const ChatPageInner = () => {
 	const [renameSession, setRenameSession] = useState<SessionRecord | null>(null);
 	const [deleteSessionOpen, setDeleteSessionOpen] = useState(false);
 	const [sessionToDelete, setSessionToDelete] = useState<SessionRecord | null>(null);
+	const autoSessionForAgentRef = useRef<string | null>(null);
 
 	const selectedAgent = agents.find((a) => a.id === urlAgentId) ?? null;
 	const currentView = sessions.find((v) => v.session.id === urlSessionId) ?? null;
@@ -193,6 +195,27 @@ const ChatPageInner = () => {
 		});
 		navigate(`/chat/${urlAgentId}/${res.session_id}`);
 	};
+
+	// No session → chat input stays disabled (selectedModel is null).
+	// Auto-create the first session so the composer becomes usable after
+	// picking an agent (especially important inside Nuwa FUNCTAB).
+	useEffect(() => {
+		if (!urlAgentId || sessionsLoading || sessions.length > 0) return;
+		if (autoSessionForAgentRef.current === urlAgentId) return;
+		autoSessionForAgentRef.current = urlAgentId;
+		let cancelled = false;
+		void (async () => {
+			try {
+				const res = await createSession({ agent_id: urlAgentId });
+				if (!cancelled) navigate(`/chat/${urlAgentId}/${res.session_id}`);
+			} catch {
+				if (!cancelled) autoSessionForAgentRef.current = null;
+			}
+		})();
+		return () => {
+			cancelled = true;
+		};
+	}, [urlAgentId, sessionsLoading, sessions.length, createSession, navigate]);
 
 	const handleAgentDeleted = async () => {
 		navigate('/chat', { replace: true });
@@ -569,7 +592,9 @@ const ChatPageInner = () => {
 				sessionsCount={sessions.length}
 				onEnsureSidebarOpen={() => {
 					setOpen(true);
-					setOpenMobile(true);
+					// Never force the mobile Sheet open — its overlay eats clicks
+					// in narrow FUNCTAB iframes even when the tour itself is skipped.
+					if (!isMobile) setOpenMobile(false);
 				}}
 			/>
 		</div>

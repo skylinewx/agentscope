@@ -143,6 +143,8 @@ class AgentData(BaseModel):
     # from a form and keep a copied agent's workspace stable before first chat.
     workspace_id: SkipJsonSchema[str | None] = None
     copy_fingerprint: SkipJsonSchema[str | None] = None
+    template_sync: SkipJsonSchema[dict | None] = None
+    """Server-owned provenance and last applied, secret-free template snapshot."""
 
     @property
     def context_config(self) -> ContextConfig:

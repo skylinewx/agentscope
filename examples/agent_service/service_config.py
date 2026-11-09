@@ -9,8 +9,14 @@ from pathlib import Path
 def read_settings(path: str | Path) -> dict:
     path = Path(path)
     document = json.loads(path.read_text("utf-8")) if path.exists() else {}
-    if not isinstance(document, dict) or set(document) - {"redis", "auth"}:
-        raise ValueError("Service configuration supports redis and auth objects.")
+    if not isinstance(document, dict) or set(document) - {
+        "redis",
+        "auth",
+        "nvwa",
+    }:
+        raise ValueError(
+            "Service configuration supports redis, auth, and nvwa objects."
+        )
     return document
 
 
@@ -49,15 +55,56 @@ def auth_settings(path: str | Path, environ=None):
     if not isinstance(configured, dict):
         raise ValueError("Auth configuration must be an object.")
     values = dict(configured)
-    for field, name in (("admin_password", "AGENTSCOPE_ADMIN_PASSWORD"),
-                        ("session_ttl_seconds", "AGENTSCOPE_SESSION_TTL_SECONDS"),
-                        ("cookie_secure", "AGENTSCOPE_COOKIE_SECURE")):
+    for field, name in (
+        ("admin_password", "AGENTSCOPE_ADMIN_PASSWORD"),
+        ("session_ttl_seconds", "AGENTSCOPE_SESSION_TTL_SECONDS"),
+        ("cookie_secure", "AGENTSCOPE_COOKIE_SECURE"),
+        ("cookie_path", "AGENTSCOPE_COOKIE_PATH"),
+        ("public_base_path", "AGENTSCOPE_PUBLIC_BASE_PATH"),
+    ):
         if name in env:
             values[field] = env[name]
     try:
         settings = AuthSettings.model_validate(values)
         settings.validate_password()
     except ValueError:
-        raise ValueError("Invalid auth configuration. Set admin_password (8–128 characters), "
-                         "session_ttl_seconds (60–604800), cookie_secure, and optional allowed_origins.") from None
+        raise ValueError(
+            "Invalid auth configuration. Set admin_password (8–128 characters), "
+            "session_ttl_seconds (60–604800), cookie_secure, optional "
+            "allowed_origins, and optional cookie_path."
+        ) from None
     return settings
+
+
+def nvwa_settings(path: str | Path, environ=None):
+    """Load optional Nuwa ticket-exchange settings; ``None`` if unset."""
+    from agentscope.app.auth._nvwa_ticket import NvwaTicketSettings
+
+    env = os.environ if environ is None else environ
+    configured = read_settings(path).get("nvwa")
+    if configured is None and "AGENTSCOPE_NVWA_BASE_URL" not in env:
+        return None
+    if configured is not None and not isinstance(configured, dict):
+        raise ValueError("Nvwa configuration must be an object.")
+    values = dict(configured or {})
+    if "AGENTSCOPE_NVWA_BASE_URL" in env:
+        values["base_url"] = env["AGENTSCOPE_NVWA_BASE_URL"]
+    if "AGENTSCOPE_NVWA_VALIDATE_PATH" in env:
+        values["validate_path"] = env["AGENTSCOPE_NVWA_VALIDATE_PATH"]
+    if "AGENTSCOPE_NVWA_AUTH_MODE" in env:
+        values["auth_mode"] = env["AGENTSCOPE_NVWA_AUTH_MODE"]
+    if "AGENTSCOPE_NVWA_USER_INFO_PATH" in env:
+        values["user_info_path"] = env["AGENTSCOPE_NVWA_USER_INFO_PATH"]
+    if "AGENTSCOPE_NVWA_TEMPLATE_AGENT_ID" in env:
+        values["template_agent_id"] = env["AGENTSCOPE_NVWA_TEMPLATE_AGENT_ID"]
+    if "AGENTSCOPE_NVWA_TEMPLATE_OWNER_ID" in env:
+        values["template_owner_id"] = env["AGENTSCOPE_NVWA_TEMPLATE_OWNER_ID"]
+    if not values.get("base_url"):
+        return None
+    try:
+        return NvwaTicketSettings.model_validate(values)
+    except ValueError as exc:
+        raise ValueError(
+            "Invalid nvwa configuration. Set base_url and optional "
+            "auth_mode / user_info_path / validate_path / timeout_seconds."
+        ) from exc

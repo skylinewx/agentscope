@@ -148,6 +148,29 @@ class RedisAuthStore:
     async def delete_session(self, token: str) -> None:
         await self.connection.delete(self.session_key(token))
 
+    async def save_nvwa_token(self, user: dict, token: str, ttl: int) -> None:
+        """Keep delegated business credentials out of user/resource responses."""
+        await self.connection.set(
+            self.prefix + "nvwa:" + user["id"],
+            json.dumps({"token": token, "auth_version": user["auth_version"]}),
+            ex=ttl,
+        )
+
+    async def nvwa_token(self, user_id: str) -> str | None:
+        user = await self.user(user_id)
+        raw = await self.connection.get(self.prefix + "nvwa:" + user_id)
+        if not user or user["status"] != "active" or not raw:
+            return None
+        value = json.loads(raw)
+        return (
+            value["token"]
+            if value["auth_version"] == user["auth_version"]
+            else None
+        )
+
+    async def delete_nvwa_token(self, user_id: str) -> None:
+        await self.connection.delete(self.prefix + "nvwa:" + user_id)
+
     async def branding(self) -> dict[str, Any]:
         """Read global display settings without exposing account records."""
         value = await self.connection.get(self.prefix + "branding")

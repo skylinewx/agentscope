@@ -359,6 +359,13 @@ def create_app(
     app.state.resource_access_policy = (
         resource_access_policy or DenyAllResourceAccessPolicy()
     )
+    if auth_service is not None and auth_service.nvwa_settings is not None:
+        from ._service._agent_template import TemplateAccessPolicy
+
+        app.state.resource_access_policy = TemplateAccessPolicy(
+            auth_service,
+            app.state.resource_access_policy,
+        )
     # Channel types this service allows. A channel class self-describes
     # its credentials / config, so the registry is built straight from
     # the list — it has no lifecycle, so it lives on app.state directly
@@ -371,6 +378,12 @@ def create_app(
         storage,
         skill_store,
     )
+    if auth_service is not None and auth_service.nvwa_settings is not None:
+        from ._service._agent_template import AgentTemplateService
+
+        app.state.resource_service.runtime_headers_provider = (
+            AgentTemplateService(app.state).mcp_headers
+        )
     app.state.download_secret = download_secret or secrets.token_urlsafe(32)
     app.state.realtime_ice_servers = _load_realtime_ice_servers(
         realtime_ice_servers,
@@ -494,17 +507,35 @@ def create_app(
             content={"detail": str(exc)},
         )
 
-    from .storage._errors import StorageTemporarilyUnavailable, unavailable_detail
+    from .storage._errors import (
+        StorageTemporarilyUnavailable,
+        unavailable_detail,
+    )
 
-    async def storage_unavailable_response(_: Request, exc: Exception) -> JSONResponse:
-        return JSONResponse(status_code=503, content={'detail': unavailable_detail()},
-                            headers={'Retry-After': '1', 'Cache-Control': 'no-store'})
+    async def storage_unavailable_response(
+        _: Request, exc: Exception
+    ) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": unavailable_detail()},
+            headers={"Retry-After": "1", "Cache-Control": "no-store"},
+        )
 
-    app.add_exception_handler(StorageTemporarilyUnavailable, storage_unavailable_response)
+    app.add_exception_handler(
+        StorageTemporarilyUnavailable, storage_unavailable_response
+    )
     try:
-        from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
-        app.add_exception_handler(RedisConnectionError, storage_unavailable_response)
-        app.add_exception_handler(RedisTimeoutError, storage_unavailable_response)
+        from redis.exceptions import (
+            ConnectionError as RedisConnectionError,
+            TimeoutError as RedisTimeoutError,
+        )
+
+        app.add_exception_handler(
+            RedisConnectionError, storage_unavailable_response
+        )
+        app.add_exception_handler(
+            RedisTimeoutError, storage_unavailable_response
+        )
     except ImportError:
         pass
 

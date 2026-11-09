@@ -25,14 +25,18 @@ from agentscope.permission import PermissionContext, PermissionMode
 from agentscope.rag import ApproxTokenChunker, QdrantStore
 from agentscope.workspace import WorkspaceBase
 
-from service_config import auth_settings, redis_settings
+from service_config import auth_settings, nvwa_settings, redis_settings
 from business_instructions import WORKSPACE_INSTRUCTIONS
 
 service_dir = os.path.dirname(os.path.abspath(__file__))
 setup_io_file(Path(__file__).resolve().parents[2] / ".cache" / "agentscope")
 config_path = os.path.join(service_dir, "service-config.local.json")
 redis_config = redis_settings(config_path)
-auth = AuthService(RedisAuthStore(**redis_config), auth_settings(config_path))
+auth = AuthService(
+    RedisAuthStore(**redis_config),
+    auth_settings(config_path),
+    nvwa_settings=nvwa_settings(config_path),
+)
 storage = RedisStorage(**redis_config)
 
 vector_store = QdrantStore(location=":memory:")

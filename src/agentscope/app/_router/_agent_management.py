@@ -19,6 +19,7 @@ from ._schema._agent_management import (
     CopyAgentRequest,
     MemoryWrite,
     SaveManagedAgent,
+    TemplateUpdateRequest,
 )
 from ._schema._hub_skill import SkillView
 from ._schema._hub_mcp import MCPView
@@ -85,9 +86,7 @@ async def resources(owner_id: str | None = None, service=Depends(management)):
             }
             for r in credentials
         ],
-        "knowledge_bases": [
-            {"id": r.id, "name": r.name} for r in knowledge
-        ],
+        "knowledge_bases": [{"id": r.id, "name": r.name} for r in knowledge],
     }
 
 
@@ -150,6 +149,37 @@ async def copy(
 ):
     record = await service.agent(owner_id, agent_id)
     return await service.copy(record, body)
+
+
+@management_router.get("/{agent_id}/template-preview")
+async def template_preview(
+    agent_id: str,
+    owner_id: str | None = None,
+    service=Depends(management),
+):
+    from .._service._agent_template import AgentTemplateService
+
+    record = await service.agent(owner_id, agent_id)
+    return await AgentTemplateService(service.state).preview(record)
+
+
+@management_router.post("/{agent_id}/template-update")
+async def template_update(
+    agent_id: str,
+    body: TemplateUpdateRequest,
+    owner_id: str | None = None,
+    service=Depends(management),
+):
+    from .._service._agent_template import AgentTemplateService
+
+    record = await service.agent(owner_id, agent_id)
+    saved = await AgentTemplateService(service.state).update(
+        record,
+        body.source_revision,
+        body.target_revision,
+        body.take_source,
+    )
+    return view(saved)
 
 
 @management_router.get("/{agent_id}/files")

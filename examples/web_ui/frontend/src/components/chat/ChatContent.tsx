@@ -124,6 +124,8 @@ interface ChatContentProps {
 	git?: GitStatus | null;
 	/** Re-reads the git state, since nothing polls for it. */
 	onRefreshGit?: () => void | Promise<void>;
+	/** Overrides the composer placeholder (e.g. when input is disabled). */
+	inputPlaceholder?: string;
 }
 
 const ChatContentComponent: React.FC<ChatContentProps> = ({
@@ -146,6 +148,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	footerSlot,
 	allowedInputTypes,
 	fileProcessor,
+	inputPlaceholder,
 	agentId,
 	sessionId,
 	cwd,
@@ -231,9 +234,22 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 						</Alert>
 					</div>
 				) : isEmpty ? (
-					<span className="text-center text-4xl font-light tracking-[-0.035em] text-foreground mb-2">
-						{t('chat.greeting')}
-					</span>
+					<div className="flex flex-col items-center gap-4 px-4">
+						<span className="text-center text-4xl font-light tracking-[-0.035em] text-foreground">
+							{t('chat.greeting')}
+						</span>
+						{disabled && (
+							<div
+								role="status"
+								className="max-w-md rounded-xl border border-primary/30 bg-primary/5 px-4 py-3 text-center text-sm text-muted-foreground"
+							>
+								<p className="font-medium text-foreground">
+									{t('chat.selectModelHintTitle')}
+								</p>
+								<p className="mt-1">{t('chat.selectModelHintBody')}</p>
+							</div>
+						)}
+					</div>
 				) : (
 					<MessageScrollerProvider
 						key={inputScope}
@@ -379,7 +395,13 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 							className="min-w-full max-w-full w-full rounded-[32px] bg-muted p-1"
 							onSend={onSend}
 							allowQueue={!!messageQueue?.state}
-							placeholder={messageQueue?.state && (phase !== 'idle' || !!messageQueue.state.items.length) ? t('queue.inputPlaceholder') : undefined}
+							placeholder={
+								inputPlaceholder ??
+								(messageQueue?.state &&
+								(phase !== 'idle' || !!messageQueue.state.items.length)
+									? t('queue.inputPlaceholder')
+									: undefined)
+							}
 							disabled={disabled || connectionLost}
 							autoComplete={autoComplete}
 							allowedInputTypes={allowedInputTypes}

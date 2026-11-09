@@ -269,6 +269,29 @@ class BusinessQueryTest(TestCase):
         with patch('analysis_extension.followup_scope._same_source', return_value=False):
             self.assertNotIn('预算', prepare_request(turn, origin, {'purpose': 'QUERY'})['contextText'])
 
+    def test_historical_sentence_quotes_are_reduced_only_to_retained_confirmed_terms(self):
+        from analysis_extension.followup_scope import _inherit_phrase_quotes
+        quote = '请查示例企业2027年的运输收入预算'
+        phrases = [{'text': word, 'sourceText': quote} for word in ('运输收入', '预算', '2027年')]
+        request = {'intentDraft': {'sharedConditions': [], 'targets': [{'businessPhrases': phrases}]}}
+        terms = ['运输收入', '实际数', '2026年']
+        _inherit_phrase_quotes(request, [{'question': quote}], terms)
+        self.assertEqual(phrases[0]['sourceText'], '运输收入')
+        self.assertEqual(phrases[1]['sourceText'], quote)
+        self.assertEqual(phrases[2]['sourceText'], quote)
+        self.assertNotIn(quote, terms)
+        self.assertNotIn('预算', terms)
+        self.assertNotIn('2027年', terms)
+
+        # A fragment of a confirmed member name, or a fabricated source sentence,
+        # cannot acquire evidence merely because its characters look related.
+        for word, source in [('收入', quote), ('运输收入', '此前已确认运输收入')]:
+            phrase = {'text': word, 'sourceText': source}
+            result = {'intentDraft': {'sharedConditions': [phrase]}}
+            original = deepcopy(result)
+            _inherit_phrase_quotes(result, [{'question': quote}], ['运输收入'])
+            self.assertEqual(result, original)
+
     def test_unknown_physical_state_is_displayed_as_waiting_not_failure(self):
         from agentscope.app._service._progress_context import public_observations
         receipt = {'status': 'FAILED', 'executionState': 'UNKNOWN', 'data': {},

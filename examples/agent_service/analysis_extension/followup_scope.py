@@ -349,6 +349,15 @@ def _inherit_phrase_quotes(result, requests, terms):
     """
     sources = [request.get('question', '') + ' ' + request.get('contextText', '') for request in requests]
     parts = {re.sub(r'\s+', '', term) for term in terms if isinstance(term, str) and term.strip()}
+
+    def retained(value):
+        text = re.sub(r'\s+', '', value)
+        reachable = {0}
+        for at in range(len(text)):
+            if at in reachable:
+                reachable.update(at + len(part) for part in parts if text.startswith(part, at))
+        return bool(text) and len(text) in reachable
+
     draft = result.get('intentDraft') or {}
     phrases = list(draft.get('sharedConditions', [])) + [phrase for target in draft.get('targets', [])
                                                         for phrase in target.get('businessPhrases', [])]
@@ -356,13 +365,14 @@ def _inherit_phrase_quotes(result, requests, terms):
         quote = phrase.get('sourceText', '')
         if not quote or not any(quote in source for source in sources):
             continue
-        text = re.sub(r'\s+', '', quote)
-        reachable = {0}
-        for at in range(len(text)):
-            if at in reachable:
-                reachable.update(at + len(part) for part in parts if text.startswith(part, at))
-        if len(text) in reachable:
+        if retained(quote):
             terms.append(quote)
+        elif phrase.get('text') and phrase['text'] in quote and retained(phrase['text']):
+            # A verified historical sentence may include discourse or values that
+            # were replaced this turn. Retain only this still-confirmed literal
+            # span, rather than requiring the model to rewrite the same evidence.
+            phrase['sourceText'] = phrase['text']
+            terms.append(phrase['text'])
 
 
 def _inherit_confirmed_period(result, requests):

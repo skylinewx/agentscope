@@ -65,7 +65,8 @@ class RegressionReliabilityTests(TestCase):
         self.assertIn('observationId', target['query'])
 
     def test_shared_value_keeps_raw_phrase_and_committed_reference(self):
-        receipt = {'status': 'SUCCEEDED', 'executionId': 'execution', 'data': {
+        receipt = {'status': 'SUCCEEDED', 'executionId': 'execution',
+            'context': {'contextId': 'original-context'}, 'querySessionId': 'original-session', 'data': {
             'dimensionCatalog': [{'dimCode': 'MD_SCENE', 'valueDomain': 'MD_SCENE', 'label': '情景'}],
             'resultSets': [{'resolvedTerms': [{'term': '预算', 'dimensionCode': 'MD_SCENE',
                 'baseDataCode': 'MD_SCENE', 'objectCode': 'BUDGET'}]}]}}
@@ -78,7 +79,8 @@ class RegressionReliabilityTests(TestCase):
         request = inherit(turn, {})
         scope = request['intentDraft']['dimensionScopes'][0]
         self.assertEqual(scope['selector'], {'type': 'VALUES', 'members': ['预算']})
-        self.assertEqual(scope['confirmedSource'], {'executionId': 'execution', 'sharedTerm': '预算'})
+        self.assertEqual(scope['confirmedSource'], {'executionId': 'execution', 'sharedTerm': '预算',
+            'contextId': 'original-context', 'querySessionId': 'original-session'})
         self.assertEqual(turn.state['inheritedDimensionScopes'][0]['bindings'][0]['objectCode'], 'BUDGET')
         # Explicitly repeated same scope also receives the host's source proof.
         repeated = deepcopy(scope); repeated.pop('confirmedSource')

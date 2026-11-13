@@ -173,6 +173,7 @@ class _LeasedTool(ToolBase):
             "name",
             "description",
             "input_schema",
+            "model_input_schema",
             "is_concurrency_safe",
             "is_read_only",
             "is_external_tool",

@@ -291,7 +291,7 @@ class BudgetBatchTest(TestCase):
         capture, selection, scope, receipt = batch_fixture(aggregate=False)
         table = receipt['data']['stepResults'][0]['batchResults'][0]
         query = capture['request']['plan']['steps'][1]['batchQuery']
-        period = {'dimCode': 'DATATIME', 'periodRequest': {'kind': 'RANGE', 'start': {'type': 'N', 'year': 2024}, 'end': {'type': 'N', 'year': 2026}}}
+        period = {'dimCode': 'DATATIME', 'periodRequest': {'kind': 'RANGE', 'start': {'type': 'YEAR', 'year': 2024}, 'end': {'type': 'YEAR', 'year': 2026}}}
         query['batchDimensions'] = [period]
         table['request']['batchDimensions'] = deepcopy(query['batchDimensions'])
         table['data']['fixedDimValMap'].pop('DATATIME')

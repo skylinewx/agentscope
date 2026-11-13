@@ -12,6 +12,52 @@ from analysis_extension.turn_completion import TurnCompletion
 
 
 class BudgetPreparationTests(PresentationCase):
+    async def test_formula_evidence_does_not_expand_adopted_population_statistics(self):
+        from analysis_extension.source_views import register
+        capture, selection, _, receipt = self.source(False)
+        source = register(self.turn, {**selection, 'columnNames': ['metric1']})
+        declared = await self.service.task(mode='ANALYSIS', goal='分析原值和构成', requiredEvidence='VALUES',
+            subjectSources=[{'sourceRef': source['sourceRef']}])
+        input_ref = declared['subjectSources'][0]['inputRef']
+        self.register_runner(capture, receipt)
+        await self.service.task(mode='ANALYSIS', goal='分析原值和构成', requiredEvidence='FORMULAS',
+            formulaSubjects=[{'MD_ORG': '07'}])
+        built = await self.service.build(operations=[{'id': 'population-count', 'operator': 'COUNT',
+            'select': {'inputRef': input_ref}}], requestKey='population-with-formula')
+        artifact = self.store.get_analysis(OWNER, built['analysisRef'])
+        group = artifact['scope']['inputGroups'][0]
+        self.assertEqual(len(group['factRefs']), 2)
+        self.assertTrue(group['formulaFactRefs'])
+        count = next(item for item in artifact['derivedValues'] if item['derivedId'] == 'derived_population-count')
+        self.assertEqual(count['value'], '2')
+        self.assertEqual(count['calculationValidation'], 'PASS')
+        self.assertTrue(any(item['operator'] == 'FORMULA_CHECK' for item in artifact['derivedValues']))
+
+    async def test_formula_refresh_reads_exact_raw_value_and_keeps_failure_distinct_from_null(self):
+        from analysis_extension.budget_preparation import form_selector
+        from analysis_extension.adapters.budget_v2 import receipt_from_capture
+        capture, selection, _, receipt = self.source(False)
+        capture['numberFormat'] = 'grouped-dot'
+        capture.pop('captureRef')
+        ref = self.store.capture(OWNER, capture)
+        capture = self.store.get_capture(OWNER, ref)
+        selection['captureRef'] = ref
+        target = batch_targets(self.service, capture, [{**selection, 'columnNames': ['metric1'], 'rowIndices': [0]}])[0]
+        target.update(expectedValue='-8300.00', expectedValueType='DECIMAL_STRING')
+        self.register_runner(capture, receipt, amounts={target['outer']['MD_ORG']: '"-8,300.00"'})
+        refs, _ = await self.service.budget_preparation._fetch(self.turn, [target])
+        form = self.store.get_capture(OWNER, refs[-1])
+        result = receipt_from_capture(form)
+        self.assertIsNotNone(form_selector(form, result, target))
+        cell = result['data']['stepResults'][0]['formResults'][0]['cells'][0]
+        for value, issue, expected, accepted in [('"-8,301.00"', None, '-8300.00', False),
+                ('null', None, None, True), ('null', 'unavailable', None, False)]:
+            with self.subTest(value=value, issue=issue):
+                cell.update(rawValueJson=value, issue=issue)
+                target['expectedValue'] = expected
+                update(form, result)
+                self.assertEqual(form_selector(form, result, target) is not None, accepted)
+
     def setUp(self):
         super().setUp()
         self.turn = TurnCompletion(self.service, {'turnKey': 'prepared', 'mode': 'ANALYSIS', 'requiredEvidence': 'VALUES',
@@ -68,28 +114,27 @@ class BudgetPreparationTests(PresentationCase):
         self.service.budget_preparation.runner = AsyncMock(side_effect=execute)
         return self.service.budget_preparation.runner
 
-    async def test_two_accounts_prepared_once_and_neither_sample_amount_is_a_fact(self):
+    async def test_values_analysis_uses_native_group_values_without_any_formula_samples(self):
         capture, selection, scope, receipt = self.source()
         runner = self.register_runner(capture, receipt)
         ready = await self.service.budget_preparation.after_query(self.turn, capture)
-        self.assertEqual((ready['expected'], ready['ready']), (2, 2))
+        self.assertIsNone(ready)
         result = await self.service.build([capture['captureRef']], [selection], scope, [], 'two-accounts')
         artifact = self.store.get_analysis(OWNER, result['analysisRef'])
-        self.assertEqual(len(artifact['structureEvidence']), 2)
+        self.assertFalse(artifact.get('structureEvidence'))
         self.assertEqual(len(artifact['facts']), 4)
         self.assertNotIn('99999', [fact['value'] for fact in artifact['facts']])
         self.assertEqual(artifact['derivedValues'], [])
-        self.assertEqual(runner.await_count, 1)
+        runner.assert_not_awaited()
 
-    async def test_missing_structure_keeps_group_values_and_explicit_incomplete_state(self):
+    async def test_unneeded_structure_failure_does_not_make_values_work_incomplete(self):
         capture, selection, scope, receipt = self.source()
         runner = self.register_runner(capture, receipt, missing=['form2'])
         await self.service.budget_preparation.after_query(self.turn, capture)
         built = await self.service.build([capture['captureRef']], [selection], scope, [], 'missing-sample')
         self.assertEqual(built['factCount'], 4)
-        self.assertEqual((built['inputPreparation']['expected'], built['inputPreparation']['ready']), (2, 1))
-        self.assertEqual(built['completion']['state'], 'INCOMPLETE')
-        self.assertEqual(runner.await_count, 1)
+        self.assertNotIn('inputPreparation', built)
+        runner.assert_not_awaited()
 
     async def test_ordinary_query_does_not_start_structure_preparation(self):
         capture, _, _, receipt = self.source()
@@ -110,6 +155,41 @@ class BudgetPreparationTests(PresentationCase):
         with self.assertRaises(AnalysisError):
             formula_subjects(self.turn, [{'MD_ORG': '05'}])
         self.assertNotEqual(*[item['key'] for item in batch_targets(self.service, capture)])
+
+    async def test_invalid_formula_subject_returns_only_selected_fact_candidates(self):
+        from analysis_extension.budget_preparation import formula_subjects
+        capture, selection, _, _ = self.source(False)
+        self.turn.state.update(followupContext={'mode': 'CONTINUE'},
+            inheritedScope={'selections': [{**selection, 'columnNames': ['metric1'], 'rowIndices': [0]}]})
+        before = deepcopy(self.turn.state)
+        for subject in ('展示名称', {'MD_ORG': '05'}):
+            with self.assertRaises(AnalysisError) as caught:
+                formula_subjects(self.turn, [subject])
+            details = caught.exception.details
+            self.assertEqual(caught.exception.code, 'PREPARATION_SUBJECT_NOT_UNIQUE')
+            self.assertEqual(details['nextTool'], 'AnalysisInspect')
+            self.assertEqual(details['candidateCount'], 1)
+            self.assertTrue(details['candidatesComplete'])
+            chosen = details['candidates'][0]['factRef']
+            target, = formula_subjects(self.turn, [chosen])
+            self.assertEqual(target['query']['dimensions'], {'MD_ORG': '07'})
+        self.assertEqual(before, self.turn.state)
+
+    async def test_multiple_formula_sources_return_explicit_choices_without_adopting_on_failure(self):
+        from analysis_extension.source_views import register
+        _, selection, _, _ = self.source(False)
+        sources = [register(self.turn, {**selection, 'columnNames': ['metric1'], 'rowIndices': [index]})
+                   for index in (0, 1)]
+        before = deepcopy(self.turn.state)
+        with self.assertRaises(AnalysisError) as caught:
+            await self.service.task(mode='ANALYSIS', goal='解释两组构成', requiredEvidence='FORMULAS',
+                subjectSources=[{'sourceRef': source['sourceRef']} for source in sources],
+                formulaSubjects=['展示名称'])
+        self.assertEqual(caught.exception.code, 'FORMULA_SOURCE_REQUIRED')
+        self.assertEqual({item['sourceRef'] for item in caught.exception.details['sources']},
+                         {source['sourceRef'] for source in sources})
+        self.assertEqual(caught.exception.details['nextTool'], 'AnalysisInspect')
+        self.assertEqual(before, self.turn.state)
 
     def row_source(self, dimension, anchor, values, binding=None):
         raw, selection, _, receipt = batch_fixture(False)
@@ -210,7 +290,7 @@ class BudgetPreparationTests(PresentationCase):
         refs, _ = await self.service.budget_preparation._fetch(self.turn, targets)
         inputs, selections, prep = await self.service.budget_preparation.for_build(
             [capture['captureRef'], *refs], [{**selection, 'columnNames': ['metric1']}], scope)
-        self.assertEqual(prep, {'expected': 1, 'ready': 1, 'issues': []})
+        self.assertEqual({key: prep[key] for key in ('expected', 'ready', 'issues')}, {'expected': 1, 'ready': 1, 'issues': []})
         self.assertEqual(len(selections), 2)
         self.assertEqual(runner.await_count, 1)
 
@@ -239,7 +319,7 @@ class BudgetPreparationTests(PresentationCase):
         self.assertEqual(merged[1]['grain'], ['MD_ORG'])
         self.assertEqual(merged[1]['selectionReason'], first['selectionReason'])
         self.assertEqual([row['observationId'] for row in merged[1:]], ['input-form1', 'input-form2'])
-        self.assertEqual(summary, {'expected': 2, 'ready': 2, 'issues': []})
+        self.assertEqual({key: summary[key] for key in ('expected', 'ready', 'issues')}, {'expected': 2, 'ready': 2, 'issues': []})
         built = await self.service.build(refs, inputs, scope, [], 'equivalent-selector')
         self.assertEqual(built['factCount'], 4)
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
@@ -255,6 +335,13 @@ class BudgetPreparationTests(PresentationCase):
         self.assertEqual(work[0]['targetRefs'], batch_ids)
         self.assertEqual(work[0]['refs'], [])
         self.assertEqual((await self.service.build(**request))['analysisRef'], result['analysisRef'])
+        values_only = [{'taskId': 'values', 'kind': 'VALUES', 'title': '主体来源值', 'refs': batch_ids}]
+        complete = await self.service.build(**{**request, 'requestKey': 'values-plus-required-formulas', 'workPlan': values_only})
+        complete_plan = self.store.get_analysis(OWNER, complete['analysisRef'])['plan']['workPlan']
+        self.assertEqual(complete_plan[0], values_only[0])
+        self.assertEqual(len(complete_plan), 2)
+        self.assertEqual(set(complete_plan[1]['targetRefs']), root_ids)
+        self.assertEqual(len(complete_plan[1]['refs']), 2)
         from analysis_extension.budget_preparation import formula_fact_links
         mismatched = [{**fact, 'value': None} if fact.get('cellKey') else fact for fact in artifact['facts']]
         self.assertFalse(formula_fact_links(self.turn, mismatched, root_ids))
@@ -273,8 +360,8 @@ class BudgetPreparationTests(PresentationCase):
         from analysis_extension.adapters.budget_v2 import receipt_from_capture
         capture, _, _, receipt = self.source()
         self.register_runner(capture, receipt)
-        await self.service.budget_preparation.after_query(self.turn, capture)
-        selected = self.turn.state['budgetStructureInputs'][capture['captureRef']][0]['selection']
+        prepared = await self.service.budget_preparation.ensure(self.turn, batch_targets(self.service, capture), 'STRUCTURE')
+        selected = prepared[0]['selection']
         source = self.store.get_capture(OWNER, selected['captureRef'])
         reply = receipt_from_capture(source)
         form = reply['data']['stepResults'][0]['formResults'][0]

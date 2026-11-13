@@ -133,4 +133,5 @@ def selection_audit(captures, selections, scope):
                        'rangeSummary': data.get('rangeSummary', {}),
                        'aggregationSummary': data.get('aggregationSummary'),
                        'excludedMembers': excluded})
-    return audits
+    from .aggregation_explanation import annotate
+    return annotate(audits)

@@ -14,6 +14,7 @@ addEventListener('securitypolicyviolation',e=>error('resource policy: '+e.violat
 let linearScaleSequence=0;
 const waterfallBindings=new WeakMap();
 const linearBindings=new WeakMap();
+const registeredCharts=new Set(), valueLabels=new Map();
 // 原生统计和脚本表格使用 columns/rows；排序集使用对象行。两者共享同一读取与测量逻辑。
 // 仅接受明确的 factRef/value 列，不猜金额列，也不把空值当成零。
 const setDatum=(setKey,factRef)=>{
@@ -25,6 +26,17 @@ const setDatum=(setKey,factRef)=>{
     if(refIndex<0||valueIndex<0||names.lastIndexOf('factRef')!==refIndex||names.lastIndexOf('value')!==valueIndex)return undefined;
     const rows=set.rows.filter(row=>row[refIndex]===factRef);
     return rows.length===1?{factRef,value:rows[0][valueIndex]}:undefined;
+};
+const bindingDatum=binding=>{
+    if(binding.valueKey)return data.values[binding.valueKey];
+    if(binding.nodeRef!=null)return data.sets[binding.setKey]?.nodes?.find(node=>node.factRef===binding.nodeRef)?.waterfall?.steps?.[binding.stepIndex];
+    return setDatum(binding.setKey,binding.factRef);
+};
+const bindValueLabel=(element,binding)=>{
+    const datum=bindingDatum(binding);
+    if(!(element instanceof Element)||datum?.value==null)throw new Error('数值标签需要实际元素和当前文档的非空数值绑定');
+    element.textContent=datum.display??String(datum.value);
+    valueLabels.set(element,{...binding});
 };
 const bindLinearBars=(items,options={})=>{
     // 每次调用默认独立刻度，避免局部放大图误用全量图的分组名称。
@@ -40,7 +52,8 @@ const bindLinearBars=(items,options={})=>{
         element.dataset.analysisScale=scale;element.dataset.analysisBarAxis=axis;
         if(item.valueKey){element.dataset.analysisBarValue=item.valueKey;delete element.dataset.analysisBarSet;delete element.dataset.analysisBarRef;}
         else{delete element.dataset.analysisBarValue;element.dataset.analysisBarSet=item.setKey;element.dataset.analysisBarRef=item.factRef;}
-        return {element,value:Math.abs(Number(datum.value))};
+        registeredCharts.add(element);
+        return {element,value:Math.abs(Number(datum.value)),binding:item.valueKey?{valueKey:item.valueKey}:{setKey:item.setKey,factRef:item.factRef}};
     });
     const maximum=options.maximum??Math.max(...rows.map(row=>row.value));
     if(!Number.isFinite(maximum)||maximum<Math.max(...rows.map(row=>row.value)))throw new Error('线性条形的刻度上限不得小于实际最大值');
@@ -49,7 +62,7 @@ const bindLinearBars=(items,options={})=>{
         if(!Number.isFinite(pixels)||pixels<0)throw new Error('线性条形需要真实容器或非负像素长度');
         for(const row of rows){
             const length=maximum?row.value/maximum*pixels:0;
-            linearBindings.set(row.element,{axis,length});
+            linearBindings.set(row.element,{axis,length,binding:row.binding});
             if(row.element instanceof SVGElement)row.element.setAttribute(axis==='x'?'width':'height',String(length));
             else row.element.style[axis==='x'?'width':'height']=length+'px';
         }
@@ -92,10 +105,12 @@ const bindHorizontalWaterfall=(items,options={})=>{
         element.dataset.analysisWaterfallSet=options.setKey;element.dataset.analysisWaterfallNode=options.nodeRef;
         element.dataset.analysisWaterfallStep=String(index);
         delete element.dataset.analysisBarValue;delete element.dataset.analysisBarSet;delete element.dataset.analysisBarRef;
-        waterfallBindings.set(element,{track,step});
+        linearBindings.delete(element);
+        waterfallBindings.set(element,{track,step,binding:{setKey:options.setKey,nodeRef:options.nodeRef,stepIndex:index}});
+        registeredCharts.add(element);
     }
 };
-Object.defineProperty(window,'analysisCharts',{value:Object.freeze({bindLinearBars,bindHorizontalWaterfall}),writable:false,configurable:false});
+Object.defineProperty(window,'analysisCharts',{value:Object.freeze({bindLinearBars,bindHorizontalWaterfall,bindValueLabel}),writable:false,configurable:false});
 const send=()=>{
     if(!document.body)return;
     const rect=document.body.getBoundingClientRect(),style=getComputedStyle(document.body);
@@ -162,7 +177,13 @@ const measure=()=>{
     const consistencyErrors=[];
     const mismatch=text=>{if(consistencyErrors.length<20)consistencyErrors.push(text.slice(0,300));};
     const counters=[...document.querySelectorAll('[data-analysis-count-for]')];
-    const declaredBars=[...document.querySelectorAll('[data-analysis-scale]')];
+    const declaredBars=[...new Set([...document.querySelectorAll('[data-analysis-scale]'),...registeredCharts].filter(el=>el.isConnected))];
+    const charted=new Map(), presented=new Map();
+    const keep=(map,binding)=>{if(binding)map.set(JSON.stringify(binding),binding);};
+    const chartBinding=bar=>linearBindings.get(bar)?.binding||waterfallBindings.get(bar)?.binding||
+        (bar.dataset.analysisWaterfallSet?{setKey:bar.dataset.analysisWaterfallSet,nodeRef:bar.dataset.analysisWaterfallNode,stepIndex:Number(bar.dataset.analysisWaterfallStep)}:
+        bar.dataset.analysisBarValue?{valueKey:bar.dataset.analysisBarValue}:
+        bar.dataset.analysisBarSet&&bar.dataset.analysisBarRef?{setKey:bar.dataset.analysisBarSet,factRef:bar.dataset.analysisBarRef}:null);
     const numericChecks={counts:{declared:counters.length,measured:0,failed:0},
         linearBars:{declared:declaredBars.length,measured:0,invalid:0,scaleGroups:0,checkedGroups:0,failedGroups:0}};
     for(const counter of counters.slice(0,50)){
@@ -182,6 +203,9 @@ const measure=()=>{
         const axis=bar.dataset.analysisBarAxis||'x';
         if(!rendered(bar))continue;
         numericChecks.linearBars.measured++;
+        const numericBinding=chartBinding(bar);
+        keep(charted,numericBinding);keep(presented,numericBinding);
+        if(!bar.dataset.analysisScale){numericChecks.linearBars.invalid++;mismatch('实际条形移除了比例尺标记：'+elementPath(bar));continue;}
         const scalar=bar.dataset.analysisBarValue;
         const waterfall=waterfallBindings.get(bar);
         const datum=waterfall?.step||(scalar?data.values[scalar]:setDatum(bar.dataset.analysisBarSet,bar.dataset.analysisBarRef));
@@ -276,6 +300,49 @@ const measure=()=>{
         }
     }
     let labelChecks=0;
+    // A table/label can replace a tiny bar. Compare exact decimal text, without
+    // float rounding or guessing units, and retain the immutable value identity.
+    const decimal=text=>{
+        const raw=String(text??'').replaceAll(',','').replaceAll('−','-');
+        if(!/^[+-]?\d+(\.\d+)?$/.test(raw))return null;
+        const negative=raw.startsWith('-'),parts=raw.replace(/^[+-]/,'').split('.');
+        const whole=parts[0].replace(/^0+(?=\d)/,''),fraction=(parts[1]||'').replace(/0+$/,'');
+        return (negative&&(whole!=='0'||fraction)?'-':'')+whole+(fraction?'.'+fraction:'');
+    };
+    const containsValue=(element,datum)=>{
+        if(!datum||datum.value==null)return false;
+        const wanted=decimal(datum.value),display=decimal(datum.display);
+        return [...(element.innerText??element.textContent??'').matchAll(/[+\-−]?\d[\d,]*(?:\.\d+)?/g)]
+            .some(match=>{const actual=decimal(match[0]);return actual!==null&&(actual===wanted||display!==null&&actual===display);});
+    };
+    for(const [element,binding] of valueLabels){
+        if(!element.isConnected||!visible(element))continue;
+        if(containsValue(element,bindingDatum(binding)))keep(presented,binding);
+        else mismatch('数值标签与冻结绑定不一致：'+elementPath(element));
+    }
+    const numericRows=[...document.querySelectorAll('[data-analysis-ref]')];
+    for(const row of numericRows.slice(0,1200)){
+        if(!visible(row))continue;
+        const setKey=row.closest('[data-analysis-set]')?.dataset.analysisSet;
+        const binding={setKey,factRef:row.dataset.analysisRef};
+        if(setKey&&containsValue(row,bindingDatum(binding)))keep(presented,binding);
+    }
+    const walker=document.createTreeWalker(document.body,NodeFilter.SHOW_COMMENT);
+    const markerPrefix='analysis-static:'+FRAME_KEY+':', staticKeys=new Set(data.staticKeys||[]);
+    while(walker.nextNode()){
+        const start=walker.currentNode,tag=start.data;
+        if(!tag.startsWith(markerPrefix)||!tag.endsWith(':start'))continue;
+        const key=tag.slice(markerPrefix.length,-6),datum=data.values[key];
+        if(!staticKeys.has(key)||!datum||datum.value==null)continue;
+        const text=start.nextSibling,end=text?.nextSibling;
+        if(text?.nodeType!==Node.TEXT_NODE||end?.nodeType!==Node.COMMENT_NODE||
+           end.data!==markerPrefix+key+':end'||!rendered(start.parentElement))continue;
+        const range=document.createRange();range.selectNodeContents(text);
+        const rect=range.getBoundingClientRect();
+        if(rect.width<=0||rect.height<=0||rect.right<=0||rect.left>=width)continue;
+        if(range.toString()===String(datum.display))keep(presented,{valueKey:key});
+        else mismatch('静态数值与冻结绑定不一致：'+key);
+    }
     for(const group of document.querySelectorAll('svg,[data-analysis-label-group]')){
         const labels=[...group.querySelectorAll(group.tagName.toLowerCase()==='svg'?'text':'[data-analysis-label]')].filter(visible);
         for(let i=0;i<labels.length&&labelChecks<20000;i++)for(let j=i+1;j<labels.length&&labelChecks++<20000;j++){
@@ -302,14 +369,20 @@ const measure=()=>{
         }
         orders.push({key:container.dataset.analysisSet,partial:container.dataset.analysisPartial==='true',refs,truncated:refs.length<items.length});
     }
-    const result={version:3,viewport:{width,height:Math.round(innerHeight)},numericChecks,
+    const result={version:4,viewport:{width,height:Math.round(innerHeight)},numericChecks,
+        valueCoverage:{charted:[...charted.values()].slice(0,1200),presented:[...presented.values()].slice(0,1200),
+            complete:charted.size<=1200&&presented.size<=1200&&numericRows.length<=1200&&declaredBars.length<=1000},
         pageOverflow:document.documentElement.scrollWidth>width+2,overflow,overlaps,smallText,clippedText,orders,errors:[...errors,...consistencyErrors].slice(0,20),
         truncated:diagnosticsTruncated||elements.length>limit||containers.length>50||counters.length>50||declaredBars.length>1000||labelChecks>=20000};
     // Fit the host's 60 kB transport limit without losing script errors or order evidence.
     const diagnostics=[overflow,overlaps,smallText,clippedText];
     while(encoder.encode(JSON.stringify(result)).length>58000){
         const largest=diagnostics.filter(items=>items.length).sort((a,b)=>JSON.stringify(b).length-JSON.stringify(a).length)[0];
-        if(!largest)break;
+        if(!largest){
+            const coverage=[result.valueCoverage.charted,result.valueCoverage.presented].filter(items=>items.length).sort((a,b)=>b.length-a.length)[0];
+            if(!coverage)break;
+            coverage.length=Math.floor(coverage.length/2);result.valueCoverage.complete=false;result.truncated=true;continue;
+        }
         largest.pop();result.truncated=true;
     }
     return result;

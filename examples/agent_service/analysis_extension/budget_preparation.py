@@ -107,14 +107,27 @@ def metric_target(capture, receipt, metric, subject=None):
                                                                if key not in ('DATATIME', 'MD_STAGE')})
     binding = context['target']['formBindingKey']
     identity = [boundary(capture, receipt), context['target'], period, outer, selected, expression, metric['measureCode']]
-    return {'key': digest(identity), 'boundary': boundary(capture, receipt), 'binding': binding, 'outer': outer, 'period': period,
+    from .adapters.budget_v2 import budget_receipt
+    original = budget_receipt(capture['response'])
+    return {'key': digest(identity), 'boundary': boundary(capture, receipt),
+            'sourceIdentity': source_identity(capture), 'sourceContext': deepcopy(original['context']),
+            'sourceSessionId': original['querySessionId'], 'binding': binding, 'outer': outer, 'period': period,
             'context': context, 'query': query, 'source': capture['captureRef'], 'subject': subject or {}}
 
 
 def form_selector(capture, receipt, target):
     """只复用同一上下文中确实含目标及公式结构的观察。"""
     if boundary(capture, receipt) != target['boundary']:
-        return None
+        proof = receipt.get('data', {}).get('sourceBasis', {}).get('basis', {})
+        source = proof.get('source', {})
+        expected = target.get('sourceSelection', {})
+        if not (expected and proof.get('kind') == 'FACTS'
+                and source_identity(capture) == target.get('sourceIdentity')
+                and proof.get('contextId') == target.get('sourceContext', {}).get('contextId')
+                and proof.get('querySessionId') == target.get('sourceSessionId')
+                and all(source.get(key) == expected.get(key) for key in ('executionId', 'resultSetId'))
+                and set(expected.get('factIds', [])) <= set(source.get('factIds', []))):
+            return None
     from .grid_files import captured_cells
     for step, form, context, observation in prepared_forms(capture):
         if (observation.get('entryType') != 'INPUT_VO' or context['target'] != target['context']['target']
@@ -131,6 +144,15 @@ def form_selector(capture, receipt, target):
                    and cell.get('measureCode') == query['measureCode']
                    and all(cell.get('dimensions', {}).get(key) == value for key, value in query['targetDimensions'].items())]
         if len(matches) == 1:
+            if 'expectedValue' in target:
+                from .adapters.budget_v2 import cell_value
+                value, state, _ = cell_value(matches[0], capture.get('numberFormat'), target.get('expectedValueType'))
+                expected = target['expectedValue']
+                same = ((state == 'NO_VALUE' and expected is None) or state == 'PRESENT' and expected is not None and (
+                    Decimal(str(value)) == Decimal(str(expected)) if target.get('expectedValueType') == 'DECIMAL_STRING'
+                    else value == expected))
+                if not same:
+                    continue
             selector = {'captureRef': capture['captureRef'], 'stepId': step, 'observationId': observation['observationId']}
             if len(keys) == 1:
                 selector['preparedTargets'] = True
@@ -196,6 +218,7 @@ def batch_targets(service, capture, selections=None):
             target = metric_target(capture, receipt, target_metric, subject)
             if capture.get('originalToolName') == 'execute_budget_query' and indices and 'MD_ORG' in dimensions:
                 target['sourceSelection'] = _business_fact_reference(receipt, step, table, row_index, metric['name'])
+                _bind_expected_value(target, receipt)
             targets.append(target)
     return targets
 
@@ -204,11 +227,11 @@ def formula_subjects(turn, subjects, selections=None):
     """AI 选择业务主体；所有维值必须唯一命中所选历史明细，且沿用真实指标。"""
     from .followup_scope import _inherited_tables, _selectors, _changes
     if (not isinstance(subjects, list) or not 1 <= len(subjects) <= 100
-            or any(not isinstance(item, dict) or not item or
-                   any(not isinstance(key, str) or not isinstance(value, str) or not value for key, value in item.items())
+            or any(not (isinstance(item, str) and item.strip()) and (not isinstance(item, dict) or not item or
+                   any(not isinstance(key, str) or not isinstance(value, str) or not value for key, value in item.items()))
                    for item in subjects) or len({digest(item) for item in subjects}) != len(subjects)):
-        raise AnalysisError('INVALID_FORMULA_SUBJECTS', 'formulaSubjects 使用已确认且不重复的主体维值映射。')
-    if _changes(turn) & {'task', 'period', 'scenario', 'metric'}:
+        raise AnalysisError('INVALID_FORMULA_SUBJECTS', 'formulaSubjects 使用已取得的 factId/memberRef 或真实主体维值映射，不能重复。')
+    if selections is None and not turn.state.get('adoptedInputs') and _changes(turn) & {'task', 'period', 'scenario', 'metric'}:
         raise AnalysisError('PREPARATION_TARGET_AMBIGUOUS', '本轮已改变指标或取数条件，请先定位新条件下的目标。')
     tables = _inherited_tables(turn, _selectors(turn) if selections is None else selections)
     if len(tables) != 1:
@@ -228,14 +251,50 @@ def formula_subjects(turn, subjects, selections=None):
     columns = {column['name']: position for position, column in enumerate(data['columns'])
                if table['columnRoles'][column['name']]['kind'] == 'DIMENSION'}
     selected_rows = list(enumerate(data['rows'])) if rows is None else [(index, data['rows'][index]) for index in sorted(rows)]
+    selected_indices = {index for index, _ in selected_rows}
+    referenced_rows = {}
+    catalog = None
+    if any(isinstance(subject, str) for subject in subjects):
+        catalog = turn.service.sources.catalog(capture, next(iter(columns)) if len(columns) == 1 else None)
+        for item in catalog:
+            if (item.get('batchId') == table['batchId'] and item.get('stepId') == selection['stepId']
+                    and item.get('columnName') == metrics[0]['name']
+                    and item.get('rowIndex') in selected_indices):
+                for ref in (item.get('factId'), item.get('memberRef')):
+                    if ref:
+                        referenced_rows.setdefault(ref, set()).add(item['rowIndex'])
+        if capture.get('originalToolName') == 'execute_budget_query':
+            for index, _ in selected_rows:
+                reference = _business_fact_reference(receipt, selection['stepId'], table, index, metrics[0]['name'])
+                for ref in reference['factIds']:
+                    referenced_rows.setdefault(ref, set()).add(index)
     targets = []
     seen = set()
     for subject in subjects:
-        matches = ((index, row) for index, row in selected_rows if subject.keys() <= columns.keys()
-                   and all(row[columns[key]] == value for key, value in subject.items()))
+        matches = ((index, row) for index, row in selected_rows
+                   if (index in referenced_rows.get(subject, set()) if isinstance(subject, str) else
+                       subject.keys() <= columns.keys() and all(row[columns[key]] == value for key, value in subject.items())))
         matched = next(matches, None)
         if matched is None or next(matches, None) is not None:
-            raise AnalysisError('PREPARATION_SUBJECT_NOT_UNIQUE', '主体须唯一命中承接范围中的真实数据行。', {'subject': subject})
+            if catalog is None:
+                catalog = turn.service.sources.catalog(capture)
+            eligible = [item for item in catalog
+                        if item.get('batchId') == table['batchId'] and item.get('stepId') == selection['stepId']
+                        and item.get('columnName') == metrics[0]['name']
+                        and item.get('rowIndex') in selected_indices]
+            candidates = [{'factRef': item['factId'],
+                           'subject': {key: item.get('dimensionNames', {}).get(key, item.get('dimensions', {}).get(key))
+                                       for key in columns}, 'value': item.get('value')}
+                          for item in eligible[:20]]
+            raise AnalysisError('PREPARATION_SUBJECT_NOT_UNIQUE',
+                                '主体须唯一命中已选来源行。字符串必须是实际 factId/memberRef；维值映射使用来源编码，不能填展示名称。请从候选选择，不必重新查数。',
+                                {'subject': subject, 'requiresSourceQuery': False,
+                                 'allowedDimensions': sorted(columns),
+                                 'candidates': candidates, 'candidateCount': len(eligible),
+                                 'candidatesComplete': len(candidates) == len(eligible),
+                                 'nextTool': 'AnalysisInspect',
+                                 'nextRead': {'section': 'inventory', 'captureRef': capture['captureRef'],
+                                              **({'memberDimension': next(iter(columns))} if len(columns) == 1 else {})}})
         row_index, row = matched
         coordinates = {key: row[index] for key, index in columns.items()}
         target = metric_target(capture, receipt, _row_metric(table, row_index, metrics[0]), coordinates)
@@ -247,8 +306,20 @@ def formula_subjects(turn, subjects, selections=None):
         if capture.get('originalToolName') == 'execute_budget_query':
             target['sourceSelection'] = _business_fact_reference(receipt, selection['stepId'], table,
                                                                  row_index, metrics[0]['name'])
+            _bind_expected_value(target, receipt)
         targets.append(target)
     return targets
+
+
+def _bind_expected_value(target, receipt):
+    source = target['sourceSelection']
+    rows = [row for result in receipt['data']['resultSets'] if result['resultSetId'] == source['resultSetId']
+            for row in result['rows'] if row['factId'] in source['factIds']]
+    if len(rows) != 1 or rows[0]['valueState'] not in ('PRESENT', 'NULL'):
+        raise AnalysisError('PREPARATION_TARGET_UNPROVEN', '公式目标需要一个已取得的原事实。')
+    target['expectedValue'] = rows[0]['value']
+    target['expectedValueType'] = rows[0].get('valueType', 'DECIMAL_STRING')
+    target['key'] = digest([target['key'], source, target['expectedValue']])
 
 
 def _row_metric(table, row_index, metric):
@@ -277,68 +348,6 @@ def _business_fact_reference(receipt, step_id, table, row_index, column):
     if len(matches) != 1:
         raise AnalysisError('PREPARATION_TARGET_AMBIGUOUS', '已选行没有唯一的业务结果引用，请明确采用的结果集。')
     return {'executionId': receipt['executionId'], 'resultSetId': matches[0][0], 'factIds': [matches[0][1]]}
-
-
-def validate_subject_filter(condition):
-    """Validate the declared predicate without choosing a historical population."""
-    operators = {'LT': lambda a, b: a < b, 'LE': lambda a, b: a <= b,
-                 'GT': lambda a, b: a > b, 'GE': lambda a, b: a >= b,
-                 'EQ': lambda a, b: a == b, 'NE': lambda a, b: a != b}
-    if not isinstance(condition, dict) or set(condition) != {'operator', 'value'} or condition.get('operator') not in operators:
-        raise AnalysisError('INVALID_SUBJECT_FILTER', 'subjectFilter 使用 operator 和精确十进制 value。')
-    try:
-        threshold = Decimal(condition['value'])
-        if not isinstance(condition['value'], str) or not threshold.is_finite():
-            raise ValueError()
-    except (InvalidOperation, ValueError, TypeError):
-        raise AnalysisError('INVALID_SUBJECT_FILTER', '筛选阈值必须是有限十进制字符串。') from None
-    import re
-    if len(condition['value']) > 128 or not re.fullmatch(r'[+-]?[0-9]+(?:\.[0-9]+)?', condition['value']):
-        raise AnalysisError('INVALID_SUBJECT_FILTER', '筛选阈值须为精确十进制字符串，不使用科学记数法。')
-    return operators[condition['operator']], threshold
-
-
-def filter_subjects(turn, condition):
-    """模型解释筛选语义；程序以精确来源值筛选，不让模型转抄金额或补造主体。"""
-    from .followup_scope import _inherited_tables, _selectors
-    compare, threshold = validate_subject_filter(condition)
-    tables = _inherited_tables(turn, _selectors(turn))
-    matches = []
-    for selection, capture, table, rows in tables:
-        subjects, selected = _filter_table(selection, capture, table, rows, compare, threshold)
-        if subjects:
-            matches.append((subjects, selected))
-    if not matches:
-        raise AnalysisError('NO_MATCHING_SUBJECTS', '已选结果中没有满足该数值条件的主体。', {'subjectFilter': condition})
-    if len(matches) != 1:
-        raise AnalysisError('PREPARATION_TARGET_AMBIGUOUS', '多个结果口径都命中了筛选条件，请明确采用的业务口径。',
-                            {'matchingSelections': [selection for _, selection in matches]})
-    subjects, selection = matches[0]
-    if len(subjects) > 100:
-        raise AnalysisError('PREPARATION_TARGET_LIMIT', '本次筛选超过 100 个主体，请明确分批范围；未截断来源结果。')
-    return subjects, selection
-
-
-def _filter_table(selection, capture, table, rows, compare, threshold):
-    data = budget_batch.validate(capture, receipt_from_capture(capture), selection['stepId'], table)
-    metrics, _ = budget_batch.selection_scope(selection, table)
-    if len(metrics) != 1:
-        raise AnalysisError('PREPARATION_TARGET_AMBIGUOUS', '筛选需要一个已选指标，不能在不同指标之间混合比较。')
-    columns = {column['name']: index for index, column in enumerate(data['columns'])}
-    metric = next(iter(metrics))
-    if data['columns'][columns[metric]].get('type') != 'DECIMAL_STRING':
-        raise AnalysisError('INVALID_SUBJECT_FILTER', '该指标不是可比较的数值。')
-    dims = {name: index for name, index in columns.items() if table['columnRoles'][name]['kind'] == 'DIMENSION'}
-    if not dims:
-        raise AnalysisError('PREPARATION_TARGET_AMBIGUOUS', '来源没有可恢复的主体维度。')
-    indices, subjects = [], []
-    for index in (range(len(data['rows'])) if rows is None else rows):
-        row = data['rows'][index]
-        value = row[columns[metric]]
-        if value is not None and compare(Decimal(value), threshold):
-            indices.append(index)
-            subjects.append({name: row[position] for name, position in dims.items()})
-    return subjects, {**deepcopy(selection), 'rowIndices': indices}
 
 
 def formula_fact_links(turn, facts, root_ids):
@@ -393,6 +402,7 @@ def _merge_prepared(selections, addition, capture):
     for selection in selections:
         if ('batchId' in selection or selection.get('captureRef') != addition['captureRef']
                 or selection.get('stepId') != addition['stepId']
+                or selection.get('inputRef') != addition.get('inputRef')
                 or selection.get('observationId') not in (None, addition['observationId'])):
             result.append(selection)
             continue
@@ -499,6 +509,8 @@ class BudgetPreparation:
                 for target in targets]
 
     def _match(self, capture, target):
+        if capture.get('originalToolName') not in ('execute_budget_query', 'execute_semantic_plan'):
+            return None
         if str(capture.get('captureState', '')).upper() not in ('SUCCESS', 'SUCCEEDED'):
             return None
         receipt = receipt_from_capture(capture)
@@ -521,9 +533,28 @@ class BudgetPreparation:
             source = {**references[0], 'factIds': list(dict.fromkeys(fact for ref in references for fact in ref['factIds']))}
             if any((ref['executionId'], ref['resultSetId']) != (source['executionId'], source['resultSetId']) for ref in references):
                 raise AnalysisError('PREPARATION_TARGET_AMBIGUOUS', '不同结果集须各自按来源引用准备。')
-            request = {'question': turn.state['request'], 'selection': 'CELLS', 'sourceSelection': source}
-            return await self.runner(turn, capture, 'execute_budget_query',
-                                     {**base, **request, 'purpose': 'ANALYZE'})
+            raw = self.service.sources.for_capture(capture).raw_receipt(capture['response'])
+            request = {'question': turn.state['request'], 'selection': 'CELLS', 'basis': {
+                'kind': 'FACTS', 'source': source, 'contextId': raw['context']['contextId'], 'querySessionId': raw['querySessionId']}}
+            frozen = {**base, **request, 'purpose': 'ANALYZE'}
+            refs, error = await self.runner(turn, capture, 'execute_budget_query', frozen)
+            if error and error.get('recoveryAction') == 'RESTART_CONTEXT':
+                # Reopen only a definitively expired context. Never replay an
+                # unknown in-flight request or change the original fact proof.
+                opened, failure = await self.runner(turn, capture, 'get_context', {
+                    'contractVersion': '2.0', 'action': 'open',
+                    'sourceId': raw['context']['sourceId'], 'snapshotId': raw['context']['snapshotId']})
+                if failure or not opened:
+                    return refs + opened, failure or error
+                saved = self.service.store.get_capture(self.service.owner, opened[-1])
+                session = self.service.sources.for_capture(saved).raw_receipt(saved['response']).get('session', {})
+                context = session.get('context', {})
+                if any(context.get(key) != raw['context'].get(key) for key in ('sourceId', 'snapshotId', 'schemaHash')):
+                    return refs + opened, {'code': 'SOURCE_VERSION_CHANGED', 'message': '原来源版本已经变化，不能将新数据当作原事实。'}
+                retried, failure = await self.runner(turn, capture, 'execute_budget_query', {
+                    **frozen, 'contextId': context['contextId'], 'querySessionId': session['querySessionId']})
+                return refs + opened + retried, failure
+            return refs, error
         endpoints = task_form_endpoints(first['binding'])
         cache_key = first['boundary'] + ':task-form' if endpoints else first['boundary']
         capability = turn.state.get('budgetFormCapabilities', {}).get(cache_key)
@@ -555,22 +586,28 @@ class BudgetPreparation:
                                  {**base, 'plan': {'dslVersion': '1.0', 'steps': steps, 'outputStepIds': [step['id'] for step in steps[len(input_ids):]]}})
 
     async def after_query(self, turn, capture):
-        """聚合回执先保存，金额完整时在同一轮准备结构。子查询有独立回执和权限校验。"""
-        if (not data_analysis(turn) or turn.state.get('requiredEvidence', 'VALUES') != 'VALUES'
-                or not self.runner or capture.get('originalToolName') != 'execute_semantic_plan'
-                or self.service.sources.for_capture(capture).adapter_id != 'budget-v2'):
-            return None
-        if not any(step.get('batchQuery', {}).get('aggregation') for step in capture.get('request', {}).get('plan', {}).get('steps', [])):
-            return None
-        targets = batch_targets(self.service, capture)
-        if not targets:
-            return None
-        records = await self.ensure(turn, targets, 'STRUCTURE', {capture['captureRef']: capture})
-        turn.state.setdefault('budgetStructureInputs', {})[capture['captureRef']] = records
-        return {'expected': len(records), 'ready': sum('selection' in row for row in records),
-                'issues': [row['error'] for row in records if 'error' in row],
-                'build': {'captureRefs': [capture['captureRef']]},
-                'note': '构建提供本批回执和 scope，金额取原生聚合，结构自动附入。仅问分组且各组齐全时可直接交付，成员示例的展示数量不影响完成状态。'}
+        """A values receipt is sufficient for values work, including analysis and grouping.
+
+        Formula preparation is driven by confirmed formula targets, never by the
+        existence of an aggregation or by the presentation mode of this turn.
+        """
+        return None
+
+    async def ensure_grouped(self, turn, targets, captures=None):
+        groups = {}
+        for target in targets:
+            groups.setdefault((target.get('inputRef'), target.get('role', 'PRIMARY'), target.get('sourceRef')), []).append(target)
+        result = []
+        for (input_ref, role, source_ref), group in groups.items():
+            rows = await self.ensure(turn, group, role, captures)
+            for row in rows:
+                row = deepcopy(row)
+                if input_ref:
+                    row.update(inputRef=input_ref, sourceRef=source_ref)
+                    if row.get('selection'):
+                        row['selection'].update(inputRef=input_ref, sourceRef=source_ref, inputPurpose='FORMULA')
+                result.append(row)
+        return result
 
     async def for_build(self, refs, selections, scope):
         """入口统一补齐真正的目标与结构用途，原子构建前保留所有预期分支。"""
@@ -585,18 +622,18 @@ class BudgetPreparation:
             if adapter.adapter_id == 'budget-v2' and any(item['request'].get('resumeRef') for item in group.values()):
                 effective.update(resolve_form_requests(group))
         turn = self.service.turn
+        from .input_state import snapshot, require_unchanged
+        input_state = snapshot(self.service)
         declared = []
         if data_analysis(turn) and turn.state.get('budgetFormulaTargets'):
             # 准备失败后可能已通过普通表展开补得证据。以本次真实输入重新匹配，避免陈旧失败变成永久缺口。
-            declared = await self.ensure(turn, turn.state['budgetFormulaTargets'], 'PRIMARY', effective)
+            declared = await self.ensure_grouped(turn, turn.state['budgetFormulaTargets'], effective)
+            require_unchanged(self.service, input_state)
             turn.state['budgetFormulaPreparation'] = declared
         known_structure = [row for ref in refs for row in (turn.state.get('budgetStructureInputs', {}).get(ref, []) if turn else [])]
         selections = (infer_selections(self.service, {ref: effective[ref] for ref in refs}, scope, [*declared, *known_structure])
                       if selections is None else deepcopy(selections))
         records = list(declared)
-        if data_analysis(turn) and turn.state.get('requiredEvidence', 'VALUES') == 'VALUES':
-            targets = [target for capture in effective.values() for target in batch_targets(self.service, capture, selections)]
-            records.extend(await self.ensure(turn, targets, 'STRUCTURE', effective))
         for record in records:
             if 'selection' not in record:
                 continue
@@ -612,6 +649,10 @@ class BudgetPreparation:
             selections = _merge_prepared(selections, addition, effective[reference])
         errors = [{'subject': record.get('subject'), 'role': record['role'], 'error': record['error']}
                   for record in records if record.get('error')]
-        summary = {'expected': len(records), 'ready': len(records) - len(errors), 'issues': errors} if records else None
+        summary = {'expected': len(records), 'ready': len(records) - len(errors), 'issues': errors,
+                   'inputSetVersion': turn.state.get('inputSetVersion') if turn else None,
+                   'groups': [{'inputRef': ref, 'expected': sum(row.get('inputRef') == ref for row in records),
+                               'ready': sum(row.get('inputRef') == ref and 'selection' in row for row in records)}
+                              for ref in dict.fromkeys(row.get('inputRef') for row in records)]} if records else None
         selections = normalize_prepared_grains(effective, selections, scope)
         return list(captures), selections, summary

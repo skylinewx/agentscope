@@ -40,10 +40,13 @@ def numeric_coverage(observations):
 
 
 def evaluate(document, observations):
-    if not isinstance(observations, dict) or set(observations) != {'version', 'viewport', 'pageOverflow', 'overflow', 'overlaps', 'smallText', 'clippedText', 'orders', 'errors', 'truncated', 'numericChecks'}:
+    expected = {'version', 'viewport', 'pageOverflow', 'overflow', 'overlaps', 'smallText', 'clippedText', 'orders', 'errors', 'truncated', 'numericChecks'}
+    if isinstance(observations, dict) and observations.get('version') == 4:
+        expected.add('valueCoverage')
+    if not isinstance(observations, dict) or set(observations) != expected:
         invalid('页面检查字段不完整或包含未知字段。')
     viewport = observations['viewport']
-    if (type(observations['version']) is not int or observations['version'] != 3 or not isinstance(viewport, dict) or set(viewport) != {'width', 'height'}
+    if (type(observations['version']) is not int or observations['version'] not in (3, 4) or not isinstance(viewport, dict) or set(viewport) != {'width', 'height'}
             or any(type(viewport[k]) is not int or not 1 <= viewport[k] <= 24000 for k in viewport)):
         invalid('页面检查需要有效的当前视口。')
     if any(type(observations[k]) is not bool for k in ('pageOverflow', 'truncated')):
@@ -68,6 +71,10 @@ def evaluate(document, observations):
             invalid('文本裁切诊断格式无效。')
     if not all(text(item, 300) for item in observations['errors']): invalid('脚本诊断格式无效。')
     numeric_checks = numeric_coverage(observations)
+    coverage = None
+    if observations['version'] == 4:
+        from .document_coverage import evaluate as evaluate_coverage
+        coverage = evaluate_coverage(document, observations['valueCoverage'])
     sets, orders, seen = document.get('datasets', {}), [], set()
     for item in observations['orders']:
         if (not isinstance(item, dict) or set(item) != {'key', 'partial', 'refs', 'truncated'}
@@ -89,6 +96,7 @@ def evaluate(document, observations):
     blocking = bool(observations['errors']) or any(o['status'] == 'MISMATCH' for o in orders) or any(c['status'] == 'FAIL' for c in numeric_checks.values())
     warnings = bool(observations['pageOverflow'] or observations['overflow'] or observations['overlaps'] or observations['smallText'] or observations['clippedText'] or observations['truncated'] or unmeasured or any(o['status'] != 'PASS' for o in orders) or any(c['status'] in ('PARTIAL', 'NOT_MEASURED') for c in numeric_checks.values()))
     return {'checkedAt': now(), 'contentDigest': document['contentDigest'], 'viewport': viewport,
+            **({'valueCoverage': coverage} if coverage is not None else {}),
             'status': 'ERRORS' if blocking else 'REVIEW_REQUIRED' if warnings else 'MEASURED',
             'blocking': blocking, 'orders': orders, 'unmeasuredDatasets': unmeasured, 'numericChecks': numeric_checks,
             **{key: observations[key] for key in ('pageOverflow', 'overflow', 'overlaps', 'smallText', 'clippedText', 'errors', 'truncated')},
@@ -112,6 +120,25 @@ def summary(records, unavailable_reason=None):
 
 def require_publication_checks(document, records, unavailable_reason=None, requirements=None):
     checks = summary(records, unavailable_reason)
+    identities = {key for key in (requirements or {}) if key.startswith('bound:')}
+    # A static placeholder is an explicit presentation choice. Its identity
+    # must be measured even on the first preview, not only after a chart repair.
+    from .document_coverage import reference
+    if records:
+        identities.update(reference(document, {'valueKey': key}) for key in
+                          set(document.get('staticBindingKeys', [])) & set(document.get('numericBindingKeys', [])))
+    current = [record.get('valueCoverage') for record in records]
+    if current and all(item is not None for item in current):
+        identities.update(ref for item in current for ref in item['charted'])
+        if not any(item['complete'] and identities <= set(item['presented']) for item in current):
+            raise AnalysisError('DOCUMENT_CHECK_COVERAGE_LOST', '原数值可改用图形、精确标签或表格，但仍须在实测页面完整表达。',
+                                {'path': '/document/html', 'requiredValueRefs': sorted(identities),
+                                 'hint': '保留实际图形的绑定；替换为标签时用 analysisCharts.bindValueLabel，或保留带 data-analysis-ref 的精确明细行。无需维持旧条形数量。'})
+        # v4 checks actual data identities, including replacements, instead of
+        # perpetuating the number of geometric elements in the first draft.
+        requirements = {}
+    elif identities or (requirements or {}).get('coverage-v4'):
+        raise AnalysisError('DOCUMENT_CHECK_COVERAGE_LOST', '当前数值展示检查不能退回旧计数协议，请重新渲染当前文档。')
     # 响应式布局可在窄屏简化图形；完整覆盖须在至少一个实测宽度保留，
     # 每个宽度自身的比例、脚本与顺序错误仍由下面的 blocking 检查阻断。
     missing = {kind: count for kind, count in (requirements or {}).items() if count > 0 and
@@ -135,5 +162,5 @@ def require_publication_checks(document, records, unavailable_reason=None, requi
         if ordered - measured:
             raise AnalysisError('DOCUMENT_ORDER_NOT_CHECKED', '排序集合已绑定，但尚未在实际页面中检出有效的顺序标记。',
                                 {'path': '/document/html', 'missingDatasetKeys': sorted(ordered - measured),
-                                 'requiresBuild': False, 'hint': '容器标 data-analysis-set，逐项标 data-analysis-ref；展开实际列表后重新检查。不要仅在脚本中声明数据而不展示。'})
+                                 'requiresBuild': False, 'hint': '共同容器（如 tbody）标 data-analysis-set="数据集key"，其子行 tr 各标 data-analysis-ref="实际factRef"。不要把 data-analysis-set 放在每一行或与 data-analysis-ref 放在同一元素，否则检查器无法看到容器中的完整顺序。将每行的 set 标记移到共同容器，再展开实际列表检查；无需重新取数或构建。'})
     return checks

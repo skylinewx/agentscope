@@ -4,7 +4,7 @@ from copy import deepcopy
 from .models import AnalysisError
 
 
-REPAIR_FIELDS = {'document', 'claims', 'viewPlan', 'presentation', 'workRefs', 'partialReason',
+REPAIR_FIELDS = {'document', 'claims', 'viewPlan', 'presentation', 'workRefs', 'unresolvedItems',
                  'technicalDetails', 'findingPlan', 'actionPlan', 'thresholds', 'hypotheses', 'renderCheckUnavailableReason'}
 REPAIR_REASONS = {
     'invalid edit': '每项须提供 op、绝对 path；add/replace 须有 value，remove 不传 value。',

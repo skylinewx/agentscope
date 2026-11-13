@@ -48,7 +48,7 @@
       "const": 1
     },
     "engineVersion": {
-      "const": "1.5.0"
+      "const": "2.0.0"
     },
     "analysisId": {
       "type": "string",
@@ -654,6 +654,14 @@
             "type": "string"
           }
         },
+        "numericBindingKeys": {
+          "type": "array",
+          "maxItems": 2000,
+          "uniqueItems": true,
+          "items": {
+            "type": "string"
+          }
+        },
         "hasScripts": {
           "type": "boolean"
         },
@@ -743,6 +751,10 @@
             "type": "string",
             "pattern": "^[a-f0-9]{64}$"
           }
+        },
+        "formulaArithmetic": {
+          "const": "BUDGET_NULL_ZERO_V1",
+          "description": "由预算来源适配器声明：已读取的空值按0参与公式运算，除以0返回0；不改写原始值。"
         }
       }
     },

@@ -97,12 +97,19 @@ async def calculate_references(kwargs, operation):
                 if table is None:
                     raise AnalysisError('TABLE_NOT_FOUND', '结果中不存在指定业务表。')
                 candidates = table.select_rows(ref.get('filters'))
+                column = table.select_columns([ref['columnRef']])[0]['id']
                 if 'rowRefs' in ref:
                     ids = ref['rowRefs']
                     if (not isinstance(ids, list) or not ids or any(not isinstance(i, str) for i in ids)
                             or len(set(ids)) != len(ids) or set(ids) - {r['id'] for r in candidates}):
                         raise AnalysisError('INVALID_VALUE_REFERENCE', 'rowRefs 必须全部属于已选范围且无重复。')
                     candidates = [r for r in candidates if r['id'] in ids]
+                else:
+                    # A pivot may have different rows for each metric. A column
+                    # range means its actual facts, not the matrix's absent cells.
+                    # Explicit rowRefs still require every requested cell; real
+                    # null/error facts remain in the range and are not made zero.
+                    candidates = [r for r in candidates if column in r['cells']]
                 rows = [r['id'] for r in candidates]
                 if not rows:
                     raise AnalysisError('EMPTY_CALCULATION_RANGE', '计算范围没有来源事实。')

@@ -1,6 +1,6 @@
 # Findings and follow-up v1
 
-The single current contract uses artifact schema 1, engine 1.5.0, finding checks 1.1.0 and renderer 1.7.0. Required fields include findings/actions (possibly empty), findingRules, findingVersion, source origins and presentationPolicy=explicit. Other versions or missing fields are rejected on reads and writes; there is no legacy action or finding translation. Drafts built with a different calculation registry must be rebuilt with a new requestKey before publication.
+Current writes use artifact schema 1 and computation engine 2.0.0. New input groups carry an inputSetVersion; calculations and reviews cannot be reused after adoption changes. Published engine 1.5.0 artifacts remain readable/exportable as frozen history. New builds use the current engine; there is no parallel legacy execution path. Existing report HTML templates remain unchanged.
 
 ## Capabilities and explicit plans
 

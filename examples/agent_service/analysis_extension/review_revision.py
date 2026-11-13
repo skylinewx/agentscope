@@ -42,6 +42,19 @@ def focus_revision(turn, material):
 
 
 def remember_review(turn, material, verdict):
+    basis = revision_basis(material)
+    active_ids = {item.get('issueId') for item in verdict.get('issues', [])}
+    def reconcile(state):
+        for issue_id, issue in state.get('reviewIssueHistory', {}).items():
+            if issue.get('state') != 'ACTIVE':
+                continue
+            if issue.get('basis') != basis:
+                issue.update(state='SUPERSEDED', resolution='EVIDENCE_OR_SCOPE_CHANGED')
+            elif issue_id not in active_ids:
+                issue.update(state='RESOLVED', resolution='COMPLETED_SEMANTIC_REVIEW', resolvedBasis=basis)
+    # Only called after every review partition completed; a timeout or a text edit
+    # alone must not mark an earlier substantive issue resolved.
+    progress(turn, reconcile)
     text = material.get('documentText', '')
     source = material.get('documentSourceText', '')
     if len(text) + len(source) <= 48000:

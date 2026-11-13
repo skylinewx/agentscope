@@ -15,7 +15,7 @@ class LocalRenderTests(PresentationCase):
         capture, selectors, scope = saved_fixture(self.store, values)
         built = await self.service.build([capture], selectors, scope, [], 'browser-build')
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
-        self.service.render_checker = LocalRenderChecker()
+        self.service.render_checker = LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None)
         self.service.web_ui_url = 'http://localhost:5173'
         return {'analysisRef': built['analysisRef'], 'requestKey': 'browser-preview',
                 'document': {'title': '浏览器回归样例',

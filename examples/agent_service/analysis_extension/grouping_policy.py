@@ -21,8 +21,17 @@ def remember_grouping(turn, capture):
     matched_bindings = {item.get('context', {}).get('target', {}).get('formBindingKey')
                         for item in data.get('resultSets', [])}
     requested = capture.get('request', {}).get('groupBy', [])
-    # Failure to resolve is still an outstanding user requirement. Do not turn
-    # a prior unit distribution into successful sector analysis by dropping it.
+    if not isinstance(requested, list):
+        # New captures normalize against the tool schema. A malformed historical
+        # request must never create one requirement per character.
+        from .models import exact_loads
+        try:
+            decoded = exact_loads(requested) if isinstance(requested, str) else None
+        except (AnalysisError, ValueError, TypeError):
+            decoded = None
+        requested = decoded if isinstance(decoded, list) else [requested] if isinstance(requested, str) else []
+    # Keep failed grouping evidence too. grouping_requirements decides whether
+    # it belongs to the declared/adopted task or only to an unused exploration.
     for keyword in requested:
         if not isinstance(keyword, str):
             continue
@@ -54,7 +63,7 @@ def remember_grouping(turn, capture):
         key = digest([boundary, keyword])
         turn.state.setdefault('groupingRequirements', {})[key] = {
             **boundary, 'captureRef': capture['captureRef'], 'keyword': keyword,
-            'requested': capture.get('originalToolName') == 'execute_budget_query' and keyword in capture['request'].get('groupBy', []),
+            'requested': capture.get('originalToolName') == 'execute_budget_query' and keyword in requested,
             'status': finding.get('status'), 'metadataComplete': finding.get('metadataComplete'), 'message': finding.get('message'),
             'organizationType': finding.get('organizationType'), 'diagnostics': finding.get('diagnostics', []),
             'candidates': ([finding['groupBy']] if finding.get('groupBy') else
@@ -72,8 +81,8 @@ def validate_grouping_selection(turn, capture_refs):
         raise AnalysisError('INVALID_GROUPING_SELECTION', 'groupingCaptureRefs 只能选择本轮真实分组发现的 captureRef，不能填机构或属性标识。')
 
 
-def grouping_requirements(turn):
-    """区分探索证据与实际选择；默认从明确意图及提交的原生聚合请求识别选择。"""
+def grouping_requirements(turn, artifact=None):
+    """分组要求来自明确声明或实际采用的数据，探索请求本身不改变任务。"""
     from .actions import source_identity
     from .adapters.budget_v2 import data_context, _bindings, _step_request
     candidates = list(turn.state.get('groupingRequirements', {}).values())
@@ -83,10 +92,14 @@ def grouping_requirements(turn):
     if explicit is not None:
         selected = set(explicit)
     else:
+        bound_refs = set(artifact['captureRefs'] if artifact is not None else
+                         (item['selection']['captureRef'] for item in turn.state.get('adoptedInputs', [])))
         # 这里只做已声明概念的精确对应，不从用户原话猜业务字段或机构类型。
         intent = turn.state.get('queryIntent', {}).get('grouping')
-        selected = {item['captureRef'] for item in candidates if item.get('requested') or intent and item.get('keyword') == intent}
-        for ref in turn.state.get('queryCaptureRefs', []):
+        selected = {item['captureRef'] for item in candidates
+                    if (item.get('requested') and item['captureRef'] in bound_refs)
+                    or (intent and item.get('keyword') == intent)}
+        for ref in bound_refs:
             capture = turn.service.store.get_capture(turn.service.owner, ref)
             if capture.get('originalToolName') not in ('execute_semantic_plan', 'execute_budget_query'):
                 continue
@@ -113,7 +126,7 @@ def grouping_issues(turn, artifact=None):
     from .actions import source_identity
     from .adapters.budget_v2 import data_context
     from .adapters import budget_batch
-    requirements = [item for item in grouping_requirements(turn) if item['required']]
+    requirements = [item for item in grouping_requirements(turn, artifact) if item['required']]
     if not requirements:
         return []
     matched = set()

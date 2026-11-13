@@ -136,6 +136,11 @@ class VisualTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(node['recalculated'])
         self.assertEqual(trace_formula(facts,child['factId'])['status'],'BLOCKED')
         child['valueState']='NO_VALUE'; child['value']=None
+        trace=trace_formula(facts,self.results[0])
+        self.assertEqual(trace['status'],'MISMATCH')
+        self.assertEqual(trace['externalBoundaries'],[child['factId']])
+        self.assertIn(child['factId'],trace['nullAsZeroRefs'])
+        child['valueState']='FAILED'
         self.assertEqual(trace_formula(facts,self.results[0])['status'],'BLOCKED')
         child['valueState']='PRESENT'; child['value']='10'; child['formula']='ABS(B1)'
         self.assertEqual(trace_formula(facts,self.results[0])['status'],'BLOCKED')

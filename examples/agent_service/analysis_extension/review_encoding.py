@@ -15,7 +15,7 @@ ENCODING_GUIDE += ('顶层 sharedValueEncoding=1 时，先将仅含 _sharedValue
 
 def pack_shared_review_values(material):
     """Share identical large backgrounds across singleton metric batches, without trimming any fields."""
-    if len(_encode(material)) < 50000:
+    if len(_encode(material)) < 12000:
         return material
     reserved = {'_sharedValueRef', 'reviewSharedValues', 'sharedValueEncoding'}
     counts = {}

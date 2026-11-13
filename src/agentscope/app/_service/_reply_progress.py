@@ -230,6 +230,11 @@ class ReplyProgress:
                       'completed' if event.finished_reason == 'completed' else
                       'interrupted' if event.finished_reason == 'interrupted' else 'error')
             failed_step = status == 'completed' and self.step['status'] == 'error'
+            if status == 'completed' and completion.get('status') in ('DIRECT', 'READY'):
+                for previous_step in self.value['steps']:
+                    if previous_step is not self.step and previous_step.get('status') == 'error':
+                        previous_step['nextAction'] = ('此处保留的是先前尝试的失败记录；本轮后续已完成，'
+                                                       '有效结果与实际口径见最终答复。')
             self.step.update(status='error' if failed_step else status, canRewrite=False)
             self.step['nextAction'] = {
                 'completed': '本次处理已结束，最终结果已在下方答复中整理。',

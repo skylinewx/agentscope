@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation, localcontext
 from typing import Any
 
 SCHEMA_VERSION = 1
-ENGINE_VERSION = "1.5.0"
+ENGINE_VERSION = "2.0.0"
 NUMBER = re.compile(r"^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$")
 
 

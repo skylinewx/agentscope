@@ -169,6 +169,23 @@ def formula_target_refs(artifact):
     return targets
 
 
+def automatic_value_refs(artifact):
+    """Bind one unambiguous source-value task; never guess a missing metric or a comparator."""
+    plan = artifact.get('plan', {}).get('workPlan', [])
+    tasks = [task for task in plan if isinstance(task, dict) and task.get('kind') == 'VALUES']
+    scope = artifact.get('scope', {})
+    if (len(tasks) != 1 or tasks[0].get('refs') or scope.get('coverage') != 'COMPLETE'
+            or scope.get('pendingMembers') or artifact.get('inputPreparation', {}).get('issues')):
+        return {}
+    facts = [fact for fact in artifact.get('facts', []) if fact.get('inputRole', 'PRIMARY') == 'PRIMARY']
+    signatures = {(fact.get('metricKey') or fact.get('sourceMeasureCode') or fact.get('measureCode'),
+                   tuple(fact.get('headers', [])), fact.get('period'), fact.get('unit'), tuple(fact.get('grain', [])))
+                  for fact in facts}
+    if not facts or len(facts) > 1000 or len(signatures) != 1:
+        return {}
+    return {tasks[0]['taskId']: [fact['factId'] for fact in facts]}
+
+
 def completion_summary(artifact):
     plan = artifact.get('plan', {}).get('workPlan', [])
     if not isinstance(plan, list) or len(plan) > 100:
@@ -177,6 +194,7 @@ def completion_summary(artifact):
     known.update({v['derivedId']: v for v in artifact['derivedValues']})
     relations = {r['relationRef']: r for r in artifact['relations']}
     updates, updated = artifact.get('workRefs', []), {}
+    automatic = automatic_value_refs(artifact)
     if not isinstance(updates, list) or len(updates) > 100:
         raise AnalysisError('INVALID_WORK_PLAN', 'workRefs 最多 100 项。')
     for index, update in enumerate(updates):
@@ -221,7 +239,8 @@ def completion_summary(artifact):
         items, covered, statistical_subjects = [], set(), set()
         supporting_computations = set()
         effective_operator = next((update['operator'] for update in updates if update['taskId'] == task['taskId'] and 'operator' in update), task.get('operator'))
-        for reference in updated.get(task['taskId'], task['refs']):
+        references = updated.get(task['taskId'], task['refs'] or automatic.get(task['taskId'], []))
+        for reference in references:
             ref = reference_id(reference)
             if isinstance(reference, dict) and task['kind'] != 'COMPUTATION':
                 raise AnalysisError('INVALID_WORK_REF', '字段引用仅用于 COMPUTATION，取值与关系使用真实 ID。')
@@ -281,16 +300,49 @@ def completion_summary(artifact):
         if extra and state == 'READY':
             state = 'BLOCKED'
         result.append({'taskId': task['taskId'], 'title': task['title'], 'kind': task['kind'], 'state': state, 'items': items,
+                       **({'referenceBinding': 'CAPTURED_PRIMARY_VALUES'} if task['taskId'] in automatic and task['taskId'] not in updated else {}),
                        **({'operator': effective_operator} if effective_operator else {}),
                        **({'unexpectedTargetRefs': extra} if extra else {}),
                        **({'targetRefs': targets, 'missingTargetRefs': missing} if targets else {})})
     declared_state = 'UNDECLARED' if not result else 'READY' if all(t['state'] == 'READY' for t in result) else 'INCOMPLETE'
-    partial_reason = artifact.get('partialReason')
+    unresolved = artifact.get('unresolvedItems', [])
+    if not isinstance(unresolved, list) or len(unresolved) > 100:
+        raise AnalysisError('INVALID_COMPLETION_ISSUES', 'unresolvedItems 最多 100 项。')
+    tasks = {task['taskId']: task for task in result}
+    for index, item in enumerate(unresolved):
+        if (not isinstance(item, dict) or not {'requirement', 'reason'} <= set(item)
+                or set(item) - {'requirement', 'reason', 'taskId'}
+                or any(not isinstance(item.get(key), str) or not item[key].strip() or len(item[key]) > 2000
+                       for key in ('requirement', 'reason'))
+                or 'taskId' in item and (not isinstance(item['taskId'], str) or item['taskId'] not in tasks)):
+            raise AnalysisError('INVALID_COMPLETION_ISSUES', '每个未完成项需要具体用户要求和实际障碍；taskId 必须属于已有工作计划。',
+                                {'path': f'/unresolvedItems/{index}'})
+        if item.get('taskId') and tasks[item['taskId']]['state'] == 'READY':
+            raise AnalysisError('COMPLETION_ISSUE_RESOLVED', '此工作项已有完整执行依据；来源空值或复算差异作为分析发现，不再声明为未完成。',
+                                {'path': f'/unresolvedItems/{index}', 'taskId': item['taskId']})
+    unresolved = list(unresolved)
     preparation = artifact.get('inputPreparation') or {}
-    if not partial_reason and preparation.get('issues'):
-        partial_reason = f"预算材料已准备 {preparation['ready']}/{preparation['expected']} 个目标，未取得的结构或构成见 inputPreparation.issues。"
+    if preparation.get('issues'):
+        unresolved.append({'requirement': '取得已选目标的必要预算材料',
+                           'reason': f"预算材料已准备 {preparation['ready']}/{preparation['expected']} 个目标，未取得的结构或构成见 inputPreparation.issues。",
+                           'source': 'HOST_INPUT_PREPARATION'})
+    partial_reason = '；'.join(item['requirement'] + '：' + item['reason'] for item in unresolved)
     return {'state': 'INCOMPLETE' if partial_reason else declared_state,
             'declaredWorkState': declared_state,
+            'unresolvedItems': unresolved,
             **({'partialReason': partial_reason} if partial_reason else {}),
             'items': result, 'pendingTaskIds': [t['taskId'] for t in result if t['state'] != 'READY'],
-            'boundary': '仅核对模型已声明工作项的引用与执行状态；partialReason 表示仍有未完成范围，pendingTaskIds 为空不能抵消该说明。READY 不表示来源一致或用户问题已完整回答。'}
+            'boundary': '按真实工作引用和结构化未完成要求判断状态；来源空值、空属性和复算差异是数据状态或分析发现。READY 不证明用户要求已无遗漏，仍需内容核对。'}
+
+
+def apply_publication_completion(artifact, request):
+    """One path for publish, preview, repair and closeout; prose never sets status."""
+    for key in ('workRefs', 'unresolvedItems'):
+        if request.get(key) is not None:
+            artifact[key] = request[key]
+    artifact.pop('partialReason', None)
+    complete = completion_summary(artifact)
+    if complete.get('partialReason'):
+        # Existing report slots retain their markup and receive a derived display label.
+        artifact['partialReason'] = complete['partialReason']
+    return complete

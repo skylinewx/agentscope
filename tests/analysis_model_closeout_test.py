@@ -168,34 +168,31 @@ class ModelCloseoutTests(PresentationCase):
             second = await middleware._closeout('REVIEW_LIMIT', agent)
         self.assertEqual(first, second)
         self.assertIn('0.00', first)
-        self.assertEqual(turn.state['hostCloseout']['deliveryStatus'], 'MODEL_SUMMARY')
+        self.assertEqual(turn.state['hostCloseout']['deliveryStatus'], 'FACT_SUMMARY')
         self.assertEqual(turn.state['hostCloseout']['semanticReview'], 'NOT_REVIEWED')
         self.assertNotIn('analysisRef', turn.state)
-        agent.model.generate_structured_output.assert_awaited_once()
+        agent.model.generate_structured_output.assert_not_awaited()
 
-    async def test_model_failure_is_not_raw_data_or_a_pass(self):
+    async def test_model_outage_cannot_prevent_source_only_closeout(self):
         turn, agent = self.turn(), self.agent()
         agent.model.generate_structured_output.side_effect = TimeoutError()
-        with self.assertRaises(AnalysisError) as caught:
-            await model_closeout(agent, turn, 'REVIEW_LIMIT', evidence=self.evidence())
-        self.assertEqual(caught.exception.code, 'CLOSEOUT_UNAVAILABLE')
-        self.assertNotIn('result', progress(turn)['modelCloseout'])
+        result = await model_closeout(agent, turn, 'REVIEW_LIMIT', evidence=self.evidence())
+        self.assertEqual(result['deliveryStatus'], 'FACT_SUMMARY')
+        self.assertIn('0.00', result['answer'])
+        self.assertIn('空值', result['answer'])
+        self.assertEqual(result['usedRefs'], ['fact-zero', 'fact-null'])
+        agent.model.generate_structured_output.assert_not_awaited()
 
-    async def test_closeout_schema_limits_references_to_supplied_material(self):
+    async def test_rejected_narrative_and_unreviewed_python_are_not_reintroduced(self):
         turn, agent = self.turn(), self.agent()
-        await model_closeout(agent, turn, 'REVIEW_LIMIT', evidence=self.evidence())
-        schema = agent.model.generate_structured_output.call_args.kwargs['structured_model']
-        self.assertEqual(schema['properties']['usedRefs']['items']['enum'], ['fact-null', 'fact-zero'])
-
-    async def test_invalid_closeout_reference_retains_diagnostic(self):
-        turn, agent = self.turn(), self.agent()
-        agent.model.generate_structured_output.side_effect = None
-        agent.model.generate_structured_output.return_value = SimpleNamespace(
-            usage=None, content={'answer': '无法确认', 'usedRefs': ['unknown']})
-        with self.assertRaises(AnalysisError) as caught:
-            await model_closeout(agent, turn, 'REVIEW_LIMIT', evidence=self.evidence())
-        self.assertEqual(caught.exception.code, 'CLOSEOUT_REFERENCE')
-        self.assertEqual(progress(turn)['modelCloseout']['invalidRefs'], ['unknown'])
+        turn.state['reviews'] = [{'issues': [{'message': '已知支出导致亏损这句话与复算正值矛盾'}]}]
+        evidence = self.evidence()
+        evidence.update(resultRoots=['unsafe'], pythonRuns=[{'outputs': [
+            {'derivedId': 'unsafe', 'value': '已知支出导致亏损'}]}])
+        result = await model_closeout(agent, turn, 'REVIEW_UNAVAILABLE', evidence=evidence)
+        self.assertNotIn('导致亏损', result['answer'])
+        self.assertNotIn('unsafe', result['usedRefs'])
+        agent.model.generate_structured_output.assert_not_awaited()
 
     async def test_query_review_respects_shared_exhausted_budget(self):
         turn = self.turn()
@@ -206,9 +203,9 @@ class ModelCloseoutTests(PresentationCase):
             self.assertEqual(caught.exception.code, 'ANALYSIS_RETRY_LIMIT')
             model.assert_not_awaited()
 
-    def test_empty_optional_intent_does_not_clear_inherited_conditions(self):
+    def test_null_order_clears_only_order(self):
         turn = self.turn()
-        turn.task(mode='DIRECT', goal='查询', intent={'period': '2026年', 'order': ''})
+        turn.task(mode='DIRECT', goal='查询', intent={'period': '2026年', 'order': None})
         self.assertEqual(turn.state['queryIntent'], {'period': '2026年'})
 
     def test_task_schema_requires_task_mode_only_when_declaring(self):

@@ -106,6 +106,9 @@ class ToolBase(ABC):
     """The agent-oriented tool description."""
     input_schema: dict[str, Any]
     """The input schema of the tool, following JSON schema format."""
+    model_input_schema: dict[str, Any] | None = None
+    """Optional model-facing schema before host middleware adds execution
+    evidence. Execution repair and validation always use input_schema."""
     is_concurrency_safe: bool
     """If this tool is concurrency safe."""
     is_read_only: bool

@@ -1,3 +1,4 @@
+from analysis_contract_test_helpers import visible_markup
 """Domain-independent formula outcomes, recoverable gaps and free HTML delivery."""
 from copy import deepcopy
 from html import unescape
@@ -207,7 +208,7 @@ class GenericFreeHtmlTests(PresentationCase):
         exported = await self.service.render_report(built["analysisRef"], "lab-report")
         rendered = self.delivery.report(built["analysisRef"], exported["exportRef"])["html"]
         self.assertIn("main{display:grid;gap:17px;color:teal}", rendered)
-        self.assertIn("<aside>-19.125</aside><section>23.7</section>", unescape(rendered))
+        self.assertIn("<aside>-19.125</aside><section>23.7</section>", visible_markup(unescape(rendered)))
         card = self.delivery.view(published["delivery"]["path"])["freeDocument"]["html"]
         self.assertIn(card, unescape(rendered))
         self.assertNotIn("未注明", rendered)

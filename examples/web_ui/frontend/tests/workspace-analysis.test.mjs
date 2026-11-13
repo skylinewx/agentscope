@@ -8,6 +8,11 @@ import { analysisPath, remarkWorkspaceAnalyses, parseDelivery, parseSnapshot, va
 import { remarkWorkspaceReports } from '../src/lib/workspace-reports.ts';
 
 const path = './analysis/ana_0123456789abcdef0123456789abcdef/revisions/3/analysis.json';
+test('current engine and frozen historical reports remain readable', () => {
+  const fixture = JSON.parse(readFileSync(new URL('../../../agent_service/analysis_extension/presentation-v1.example.json', import.meta.url), 'utf8'));
+  for (const engineVersion of ['2.0.0', '1.5.0']) assert.equal(parseSnapshot({ ...fixture, engineVersion }).engineVersion, engineVersion);
+  assert.throws(() => parseSnapshot({ ...fixture, engineVersion: 'unknown' }));
+});
 function render(text, source = text) {
   return renderToStaticMarkup(React.createElement(Streamdown, {
     mode: 'static', remarkPlugins: [...Object.values(defaultRemarkPlugins), remarkWorkspaceReports, [remarkWorkspaceAnalyses, { source }]],

@@ -156,7 +156,7 @@ class RouteTests(PresentationCase):
         rendered=await self.service.preview_content(preview['repairRef'])
         doc=rendered['document']['freeDocument']
         from analysis_document_checks_test import measurements
-        observed=measurements();observed['orders']=[]
+        observed=measurements(static_keys=['x']);observed['orders']=[]
         body={'previewRef':preview['repairRef'],'contentDigest':doc['contentDigest'],'frameKey':doc['frameKey'],'measurements':observed}
         checked=await self.client.post('/workspace/analyses/preview-check',params=self.params,headers=self.headers,json=body)
         self.assertEqual(checked.status_code,200,checked.text)
@@ -166,7 +166,7 @@ class RouteTests(PresentationCase):
         stale=await self.client.post('/workspace/analyses/preview-check',params=self.params,headers=self.headers,json={**body,'contentDigest':'0'*64})
         self.assertEqual(stale.status_code,409)
         self.assertEqual(stale.json()['detail']['code'],'STALE_PREVIEW_CHECK')
-        narrow=measurements(width=420);narrow['orders']=[]
+        narrow=measurements(width=420, static_keys=['x']);narrow['orders']=[]
         checked=await self.client.post('/workspace/analyses/preview-check',params=self.params,headers=self.headers,
                                        json={**body,'measurements':narrow})
         self.assertEqual(checked.status_code,200,checked.text)

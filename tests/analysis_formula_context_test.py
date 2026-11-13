@@ -43,12 +43,14 @@ class FormulaContextTests(PresentationCase):
         self.assertEqual(preview['summary']['document']['bindingCount'], 1)
         self.assertIn('confirmPublish', preview)
 
-    async def test_missing_formula_operand_does_not_block_unrelated_python_statistics(self):
+    async def test_blocked_formula_does_not_block_unrelated_python_statistics(self):
         old_ref, selectors, scope = mixed_fixture(self.store, 1)
         capture = self.store.get_capture(OWNER, old_ref)
         receipt = json.loads(capture['response']['content'][0]['text'])
         receipt['data']['stepResults'][1]['formResults'][0]['page']['cells'][1].update(
             rawValueJson='null', displayValue='')
+        # 预算空值本身已可计算；用未支持的公式验证独立统计仍可继续。
+        receipt['data']['stepResults'][1]['formResults'][0]['page']['cells'][0]['formula'] = 'ABS(B1)'
         capture['response']['content'][0]['text'] = json.dumps(receipt)
         reference = self.store.capture(OWNER, capture)
         selectors[0]['captureRef'] = scope['population']['captureRef'] = reference

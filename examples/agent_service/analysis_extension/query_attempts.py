@@ -9,13 +9,24 @@ def failure_key(origin, request):
     def normalized(value):
         if isinstance(value, dict):
             return {key: normalized(child) for key, child in value.items()
-                    if key not in ('id', 'label', 'requestId', 'presentation')}
+                    if key not in ('id', 'label', 'requestId')}
         if isinstance(value, list):
             return sorted((normalized(child) for child in value), key=digest)
         return value
     from copy import deepcopy
     canonical = deepcopy(request)
     draft = canonical.get('intentDraft') or {}
+    # Presentation contains classified source wording, not only formatting.
+    # Adding a statistics/analysis caption can legitimately repair a draft
+    # coverage failure. Retain those values; only output ordering is cosmetic
+    # for failure equivalence.
+    presentation = draft.get('presentation')
+    if isinstance(presentation, dict):
+        relevant = {key: value for key, value in presentation.items() if key != 'valueOrder'}
+        if relevant:
+            draft['presentation'] = relevant
+        else:
+            draft.pop('presentation', None)
     targets = {item.get('id'): item for item in draft.get('targets', [])}
     signatures = {}
     def target_key(key, visiting=()):
@@ -76,6 +87,11 @@ def prepare(store, owner, turn_key, origin, request):
                                  'recoveryAction': prior.get('recoveryAction')})
         current = entries.setdefault(logical_key, {'attempt': 0, 'status': 'UNKNOWN'})
         current['failureKey'] = equivalent
+        if (equivalent is not None and current.get('status') == 'FAILED'
+                and not current.get('retryAllowed') and current.get('recoveryAction') != 'READ_STATUS'):
+            raise AnalysisError('QUERY_EQUIVALENT_FAILURE', '相同请求已明确失败，未重复提交。请修正实际条件或沿原失败说明受阻。',
+                                {'executionId': current.get('executionId'), 'errorCode': current.get('errorCode'),
+                                 'recoveryAction': current.get('recoveryAction')})
         if current.get('retryAllowed') and current['attempt'] < store.limits.max_query_retries:
             current = {'attempt': current['attempt'] + 1, 'status': 'UNKNOWN',
                        'previousExecutionId': current['executionId'], 'retryReason': current['errorCode']}

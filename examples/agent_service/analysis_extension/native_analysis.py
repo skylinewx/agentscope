@@ -4,7 +4,7 @@ from decimal import Decimal, Inexact, Rounded, ROUND_HALF_EVEN, localcontext
 
 from .models import AnalysisError, decimal_text, decimal_value, digest, precise_sum
 
-CAPABILITY_VERSION = 'native-analysis-20261102-formula-work'
+CAPABILITY_VERSION = 'native-analysis-20261110-population-evidence'
 STATISTIC_FIELDS = ('sum', 'positiveSum', 'negativeSum', 'minimum', 'maximum', 'mean', 'topSum', 'topShare')
 
 
@@ -88,13 +88,21 @@ def describe(items, scope, operation):
         'topSum': decimal_text(top_sum) if top_sum is not None else None,
         'topShare': rounded_ratio(top_sum, total, Decimal(100)),
     }
+    grain = list(items[0].get('grain') or [])
+    identity_columns = [{'name': f'grain{index + 1}', 'dimension': dim, 'label': f'原始维值：{dim}', 'type': 'STRING'}
+                        for index, dim in enumerate(grain)]
+
+    def identity_values(item):
+        dimensions = {**item.get('effectiveDimensions', {}), **item.get('dimensions', {}), **item.get('rowIdentity', {})}
+        return [None if dimensions.get(dim) is None else str(dimensions[dim]) for dim in grain]
+
     rows = []
     for position, (item, number) in enumerate(valid, 1):
         rows.append([item['factId'], item.get('objectLabel') or item['objectId'], str(position),
                      item['value'], '正值' if number > 0 else '负值' if number < 0 else '零值',
-                     rounded_ratio(number, total, Decimal(100))])
+                     rounded_ratio(number, total, Decimal(100)), *identity_values(item)])
     for item in missing:
-        rows.append([item['factId'], item.get('objectLabel') or item['objectId'], None, None, '无数值', None])
+        rows.append([item['factId'], item.get('objectLabel') or item['objectId'], None, None, '无数值', None, *identity_values(item)])
     unit = items[0].get('unit')
     return {
         'value': statistics['sum'], 'unit': unit, 'counts': counts, 'statistics': statistics,
@@ -106,7 +114,8 @@ def describe(items, scope, operation):
             {'name': 'value', 'label': '来源值', 'type': 'DECIMAL_STRING', 'unit': unit, 'decimalPlaces': places},
             {'name': 'sign', 'label': '数值分类', 'type': 'STRING'},
             {'name': 'share', 'label': '占所选非空数值合计比例', 'type': 'DECIMAL_STRING', 'unit': '%', 'decimalPlaces': places},
-        ], 'rows': rows,
+            *identity_columns,
+        ], 'rows': rows, 'identityColumns': identity_columns,
         'orderedFactIds': [item['factId'] for item, _ in valid],
         'unavailableFactIds': [item['factId'] for item in missing],
         'meaning': 'selected_source_values_statistics_not_consolidated_total',
@@ -129,6 +138,8 @@ def formula_check_summary(trace):
                    'recursiveStatus': node.get('status')}
                   for node in [*mismatched, *blocked]]
     return {'formulaNodeCount': len(nodes), 'localMatchedCount': len(matched),
+            'arithmeticPolicy': trace.get('arithmeticPolicy'),
+            'nullAsZeroRefs': trace.get('nullAsZeroRefs', []),
             'localMismatchedCount': len(mismatched), 'localUnavailableCount': len(blocked),
             'allLocalChecksCompleted': bool(nodes) and not blocked,
             'allLocalChecksMatch': bool(nodes) and len(matched) == len(nodes),
@@ -155,12 +166,13 @@ def document_inputs(artifact):
                                        'dimensions': {**target.get('effectiveDimensions', {}), **target.get('dimensions', {})}},
                         localStatus=trace['targetLocalCheck']['status'], recursiveStatus=trace['status'],
                         checkSummary=formula_check_summary(trace),
-                        usage='绑定 document.datasets 后直接使用 nodes/operands/values/contributions/waterfall；无数值的计算字段保留 null，不用 Python 重写公式。')
+                        usage='首次组织本表公式图形时读 report-generation 的 references/formula-visualization-examples.md；已读同版本则复用。绑定此 FORMULA dataset，完整多项加减按 node.waterfall.steps 全部贡献绘制横向瀑布图，保留后台已返回的相关下层，可折叠；展开深度由后台决定，未见底不影响已有内容展示，不要求继续展开；明细表和部分项目比较不能代替完整构成。乘除等非线性用关系图或计算步骤，单输入传递用衔接说明，不追查表外。预算原始空值保留，contributions 已使用实际运算输入；不因 operand.value 为 null 而跳过已有 waterfall。无数值的计算字段保留 null，不用 Python 重写公式。')
         elif operator == 'DESCRIBE' and value.get('statistics'):
             item.update(dataset={'valueRef': value['derivedId']}, kind='TABULAR',
                         scalarFields=['value', *value['counts'], *value['statistics']],
                         fields=field_catalog(value),
-                        usage='金额见 derivedValues.statistics，数量见 counts；直接用 {valueRef,field} 绑定或计算，不重算。字段 memberCount 是当前粒度的对象/分组数，不推断为机构户数。')
+                        identityColumns=value.get('identityColumns', []),
+                        usage='金额见 derivedValues.statistics，数量见 counts；直接用 {valueRef,field} 绑定或计算，不重算。memberCount 是当前粒度的对象/分组数，不推断为机构户数。object 仅为显示名称；筛选空属性组使用 identityColumns 对应原始维值列的 null/空值，不能以显示名称是否为空判断。')
         elif operator in ('SORT', 'RANK') and value.get('calculationValidation') == 'PASS':
             item.update(dataset={'valueRef': value['derivedId']}, kind='ORDERED')
         else:

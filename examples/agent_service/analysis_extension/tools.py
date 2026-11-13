@@ -49,11 +49,12 @@ FORM_SELECTOR['oneOf'] = [{'required': ['cellKeys'], 'not': {'anyOf': [{'require
                                                                             {'required': ['includeFormulaDependencies']}]}}]
 for selector in (FORM_SELECTOR, BATCH_SELECTOR):
     selector['properties'].update(role={'enum': ['PRIMARY', 'REFERENCE', 'STRUCTURE']},
-                                  grain=array(TEXT, 16, 1), selectionReason=TEXT)
+                                  grain=array(TEXT, 16, 1), selectionReason=TEXT,
+                                  inputRef=TEXT, sourceRef=TEXT)
 
 SCOPE = obj({"label": TEXT, "members": {**array(TEXT, 1000, 1), "description": "使用 inventory 的 memberRef 或来源唯一的 objectId/key，不能填名称。跨来源同名 ID 必须用 memberRef；构建后以返回的 objectId 选择成员，MCP 请求仍用 sourceObjectId/原始维度。"}, "memberDimension": TEXT,
              "contextMode": {"enum": ["SINGLE_SNAPSHOT", "COMPOSITE"], "description": "预算默认同连接、sourceId/snapshotId/asOf/schemaHash 等数据边界，可包含重开后的不同 contextId/querySessionId；真实边界不同用 COMPOSITE，保留各查询上下文，不自动证明可比。"},
-             "referenceMembers": {**array(TEXT, 1000), "description": "额外比较或背景对象；与主体 members 不重叠，不计入 population。计算用 inputRefs 或 select.objectId 显式选取。"},
+             "referenceMembers": {**array(TEXT, 1000), "description": "旧式 scope 中为不与 members 重叠的额外比较对象。按 selection.role 声明输入时由宿主生成，允许对照总体包含主体子集；默认计算仅主体，对照计算用 inputRefs、select.inputRole=REFERENCE 或对应 batchId 明确选取。"},
              "reportTopics": array(obj({"title": TEXT, "question": TEXT, "factRefs": array(TEXT, 1000, 1)}, ["title", "question", "factRefs"]), 50, 1),
              "expectedDimensions": {**STRING_MAP, "description": "本次全部所选单元格共同适用的维度约束。以 inventory.resolvedDimensions 为准；公式各项目不同的科目维度不能固定为目标科目。"}, "selectionReason": TEXT,
              "excludedMembers": array(obj({"objectId": TEXT, "reason": TEXT, "captureRef": TEXT}, ["objectId", "reason", "captureRef"]), 1000),
@@ -61,7 +62,8 @@ SCOPE = obj({"label": TEXT, "members": {**array(TEXT, 1000, 1), "description": "
 SCOPE['properties']['members']['description'] = '批量 TABLE 默认省略，由宿主按所选行自动生成，包含空属性组。非批量或显式主体使用 inventory 的 memberRef 或来源唯一 key；不能抄名称或猜引用。'
 OPERATION = obj({"id": TEXT, "operator": {"enum": ["SORT", "RANK", "COUNT", "SUM", "DIFFERENCE", "RATIO", "LINEAR", "CONVERT", "FORMULA_CHECK", "RECONCILE", "ARITHMETIC", "DESCRIBE"]},
                  "select": obj({"cellKey": TEXT, "measureCode": TEXT, "objectId": TEXT, "bindingRef": TEXT, "period": TEXT, "sourceContextId": TEXT, "dimensions": STRING_MAP,
-                                "batchId": TEXT, "columnName": TEXT, "sourceObjectId": TEXT, "inputRole": {"enum": ["PRIMARY", "REFERENCE"]}}),
+                                "batchId": TEXT, "columnName": TEXT, "sourceObjectId": TEXT, "inputRole": {"enum": ["PRIMARY", "REFERENCE"]},
+                                "inputRef": TEXT, "inputRefs": {**array(TEXT, 100, 1), 'uniqueItems': True}}),
                  "inputRefs": array(TEXT, 1000, 1), "ruleRef": TEXT, "comparabilityRef": {**TEXT, "description": "已登记、适用于该算子和输入范围的可比规则 ID；从 AnalysisInspect(protocol).rules 发现，不自行编造。"}, "relationRef": TEXT, "aggregation": {"enum": ["SUM"]},
                  "expression": {"type": "string", "minLength": 1, "maxLength": 4096}, "wholePopulation": {"type": "boolean"},
                  "direction": {"enum": ["asc", "desc"]}, "decimalPlaces": {"type": "integer", "minimum": 0, "maximum": 16}}, ["id", "operator"])
@@ -162,6 +164,16 @@ class _AnalysisTool(ToolBase):
             if isinstance(delivery, dict) and delivery.get("registered") is True and isinstance(delivery.get("processSummary"), dict):
                 metadata["process_summary"] = delivery["processSummary"]
             from .business_tables import model_text
+            if self.method == 'build' and 'derivedValues' in value:
+                from .build_projection import render
+                artifact = self.service.store.get_analysis(self.service.owner, value['analysisRef'])
+                return ToolChunk(content=[TextBlock(text=render(value, artifact))], metadata=metadata)
+            if self.method == 'task' and kwargs.get('action', 'declare') == 'declare':
+                from .task_projection import render
+                return ToolChunk(content=[TextBlock(text=render(value))], metadata=metadata)
+            if self.method == 'publish':
+                from .publication_projection import project
+                return ToolChunk(content=[TextBlock(text=model_text(project(value)))], metadata=metadata)
             return ToolChunk(content=[TextBlock(text=model_text(value))], metadata=metadata)
         except AnalysisError as exc:
             if self.method == 'build' and exc.code in ('UNKNOWN_MEMBER_REFERENCE', 'SCOPE_MISMATCH', 'BATCH_GRAIN_MISMATCH', 'UNDECLARED_SCOPE_EXCLUSION'):
@@ -176,41 +188,17 @@ class AnalysisTask(_AnalysisTool):
     name = 'AnalysisTask'
     method = 'task'
     is_concurrency_safe = False
-    description = '每个真实用户轮先登记本轮任务并用 intent 保留完整业务限定。DIRECT：普通查询/筛选/排序/简单统计/一般答复或必要澄清，不构建分析；ANALYSIS：分析、指标公式构成及分布构成查询，按问题完成所需 workPlan 与来源核验并首次丰富展示；构成查询不自动追加原因或预测；REPORT：用户明确要求报告，报告使用自由 HTML。不能根据负值、业务名称或工具存在推定分析。status 返回宿主实际完成检查；blocked 仅用于真实障碍，引用本轮失败调用 ID，或有明确诊断的分组 INCOMPLETE、完整确认不支持的 UNSUPPORTED 回执 evidenceCaptureRefs，并说明未完成范围。声明不证明完成，同轮不能降级绕过检查。'
-    description += ' select_results 用 resultRefs 指定普通答复实际使用的脚本产物（pythonRunRef、outputRefs 中的 derivedId），宿主恢复必要输入链；探索记录仍保存但不充当最终答案。多个运行的结果须一并选择，不默认采用最近运行。'
-    description += ' action=declare 必须同时给出 mode 和 goal；context.mode 是追问承接方式，不能代替顶层任务 mode。'
-    description += ' 用户明确要求按某个年度打开一张表、只看该年度表内内容时，在 intent.formExecutionYear 登记开表年份。请在同一表展开中按实际数据期定位本年和上年。'
-    description += ' 分组发现仅提供候选；执行原生聚合自动记录选用口径。多个候选择用或替换时，可在同一次 declare 用 groupingCaptureRefs 明确当前选用的发现回执；用户明确要求的多个口径须全部保留。'
-    description += ' contexts 可按 search/offset/limit 读取本会话业务上下文目录。承接较早结果、继续未完成任务或综合多个结果时，在 context.contextRefs 引用目录的真实 contextRef；失败任务与已交付结果分别保存，不混用意图和范围。'
-    input_schema = obj({'action': {'enum': ['declare', 'status', 'blocked', 'select_results', 'contexts']}, 'mode': {'enum': ['DIRECT', 'ANALYSIS', 'REPORT']},
-                        'search': {'type': 'string', 'maxLength': 200}, 'offset': {'type': 'integer', 'minimum': 0},
-                        'limit': {'type': 'integer', 'minimum': 1, 'maximum': 20},
-                        'resultRefs': array(obj({'pythonRunRef': TEXT, 'outputRefs': array(TEXT, 1000, 1)}, ['pythonRunRef', 'outputRefs']), 50, 1),
-                        'context': obj({'mode': {'enum': ['CONTINUE', 'NEW', 'SYNTHESIZE'], 'description': '普通关联追问 CONTINUE（默认继承上一轮有效范围）；独立新题 NEW；明确要求综合多轮内容才用 SYNTHESIZE。'},
-                                        'contextRefs': {**array(TEXT, 20), 'description': 'CONTINUE 可指定一个历史结果或未完成任务的 contextRef；SYNTHESIZE 指定相关多个，NEW 不带引用。来自宿主业务上下文目录，不是本体 contextId。'},
-                                        'changedFields': {**array({'enum': list(CHANGE_FIELDS)}, len(CHANGE_FIELDS)),
-                                                          'uniqueItems': True, 'description': '只列本轮实际改变的 intent 字段；grouping/order 等变化不解除 population、task、period 边界。'},
-                                        'changedDimensions': array({**TEXT, 'description': '本轮改变范围的业务维度名称，如部门、项目、组织机构。只替换这些维度，其他已确认范围继续保留。'}, 32),
-                                        'userQuote': {**TEXT, 'description': '换题、综合或改变既定范围时，引用本轮用户表达该意图的原话；只改变时期不放开对象范围。'}}, ['mode']),
-                        'intent': obj({**{key: {**TEXT, 'minLength': 0, 'description': '保留用户原始业务限定，追问沿用已确认条件；未指定可省略，空字符串按未提供处理；不猜系统编码。'}
-                                         for key in INTENT_FIELDS},
-                                       'task': {**TEXT, 'description': '仅填用户明确指定的预算任务名称；预算、实际、预计属于情景，不是任务。未指定任务时省略，由应用服务确定适用任务。'},
-                                       'scenario': {**TEXT, 'description': '用户明确指定的情景原文；不要把情景填入 task 或 grouping。'},
-                                       'grouping': {**TEXT, 'description': '仅填用户明确要求分组聚合的字段原文，例如按区域汇总中的区域。单个成员条件、逐成员列表、排序及逐成员构成分析不填。不能根据业务名词猜测分组维度。'},
-                                       'formExecutionYear': {'type': 'string', 'pattern': '^[1-9][0-9]{3}$',
-                                           'description': '用户明确固定某张年度表的开表年份，例如按2025年末打开利润表填2025。数据归属年份用 period。普通按数据年查询、跨开表年度对比时省略此字段。'}}),
-                        'requiredEvidence': {'enum': ['VALUES', 'FORMULAS'], 'description': '预算指标构成、负值原因、公式分析使用 FORMULAS；须取得分析对象的表展开和适用公式，不能用批量金额代替。'},
-                        'formulaSubjects': {**array(STRING_MAP, 100, 1), 'uniqueItems': True,
-                            'description': '解释上一轮已确定的明细对象时，在本次 declare 中直接提供需解释的主体维值映射列表。须唯一命中已选批量表的真实维值行，宿主一次取得各对象 INPUT_VO 并准备目标；总体分析仍可沿用原明细。不填写本体能力标识或单元格坐标。'},
-                        'subjectFilter': obj({'operator': {'enum': ['LT', 'LE', 'GT', 'GE', 'EQ', 'NE']}, 'value': TEXT}, ['operator', 'value']),
-                        'groupingCaptureRefs': {**array(TEXT, 20), 'uniqueItems': True,
-                            'description': '可选：当前采用的分组发现 captureRef 全集。省略时沿用明确意图及原生聚合请求；仅探索未选用的候选不必取数。不能借此省略用户要求的口径。'},
-                        'goal': {**TEXT, 'description': '登记用户实际要求的目标与范围。自行选用的例子、图表或附加明细属于展示选择。'},
-                        'reason': TEXT, 'failedToolCallIds': array(TEXT, 20, 1), 'evidenceCaptureRefs': array(TEXT, 20, 1),
-                        'delivery': {'enum': ['TEXT', 'DOCUMENT'], 'description': '分析、数据构成查询及报告使用 DOCUMENT，首次提供适用图形、解读和明细；普通单值、筛选、排序及简单统计可用 TEXT。'}}, ['action'])
-    input_schema['allOf'] = [{'if': {'properties': {'action': {'const': 'declare'}}},
-                              'then': {'required': ['mode', 'goal']}}]
-    description += ' 解释上一轮结果的数值子集时，优先用 subjectFilter（例如亏损为 {operator:LT,value:"0"}）代替转抄主体编码；与 formulaSubjects 二选一。程序按唯一已选指标筛选真实结果并准备各主体公式，返回 populationSelection 用于构建。'
+    # This operation changes the live user-turn contract. It must finish before
+    # the model can query or build, including while the requirement model runs.
+    is_state_injected = True
+
+    async def call(self, _agent_state=None, **kwargs):
+        # The middleware already binds service.turn to this live agent state.
+        # Consume the injected state argument instead of passing it as business input.
+        return await super().call(**kwargs)
+
+    from .task_contract import DESCRIPTION as description, schema as _task_schema
+    input_schema = _task_schema(obj, array, TEXT, STRING_MAP, INTENT_FIELDS)
 
 
 class QueryResultRead(_AnalysisTool):
@@ -247,6 +235,7 @@ WORK_REFS = array(obj({'taskId': TEXT, 'refs': array(SCALAR_REFERENCE, 1000),
 OPERATION['properties']['inputRefs']['description'] = '非空的实际 factId/derivedId，或同一计划中已经定义的前序运算 id。按 select 筛选时省略 inputRefs，不能传 []。宿主解析并保存真实引用，不需要手工拼前缀。'
 WORK_ITEM['properties']['refs']['description'] = 'VALUES 使用 factId；COMPUTATION 使用真实 derivedId 或本计划运算 id；RELATION 使用 relationRef。尚未得到结果填空数组。'
 WORK_ITEM['properties']['refs']['description'] += ' COMPUTATION 可用 {valueRef,field,nodeRef?} 引用已有标量。统计任务引用 DESCRIBE 及其字段，不为每个统计值另建 ARITHMETIC。'
+WORK_ITEM['properties']['refs']['description'] += ' 只有一个 VALUES 工作项且主体数据为完整、同口径单指标时，空 refs 由宿主关联本版本主体事实；多指标、多取值任务或待补范围须明确引用，参考数据不自动加入。'
 OPERATION['properties']['inputRefs']['description'] += ' ARITHMETIC 可用 {valueRef,field,nodeRef?} 直接计算已返回字段，如 negativeSum/sum；其他算子使用完整 ID。'
 OPERATION['properties']['ruleRef'] = {**TEXT, 'description': '适用的已登记规则；同一原生聚合批次、同一指标、互斥组且来源 CalcType=SUM 时，SUM 可省略，由宿主使用来源规则；其他情况不推定可加。'}
 WORK_ITEM['properties']['operator']['enum'] = [*OPERATION['properties']['operator']['enum'], 'PYTHON']
@@ -283,7 +272,7 @@ VIEW['properties']['showChecks']['description'] += ' WATERFALL 始终按直接�
 PRESENTATION['properties']['labels']['description'] = '模型声明业务简称。measure 复用于同源同口径同指标的全部事实，object 复用于同一对象；不改来源名称。公式用简洁指标名，避免序号、填列说明和重复年份。重建/综合时从已有结果 summary.presentation.labels 取回仍适用的简称，核对当前事实引用并完整提交；仅补新增简称不会自动继承旧映射。'
 WORK_REFS['items']['properties']['refs']['description'] = '发布阶段填已有真实引用：VALUES 用 factId，COMPUTATION 用 derivedId 或 {valueRef,field,nodeRef?}，RELATION 用 relationRef；不使用计划内别名。'
 WORK_ITEM['properties']['kind']['description'] = 'RELATION 只枚举关系成员；数值汇总核对另外声明 COMPUTATION，operator=RECONCILE；不能以枚举完成代替数值核对完成。'
-OPERATION['properties']['operator']['description'] = '按来源数值排序选择 SORT（含无单位原值及负数）；RANK 另外要求可比单位、缩放和口径。FORMULA_CHECK 每项仅处理一个目标；批量目标分别运算。NO_CAPTURED_FORMULA 表示当前捕获未提供可复算公式，检查完成但不产生数值、不证明来源一致；executionStatus=COMPLETED 且 completionReason=SOURCE_VALUE_MISSING 表示来源空值已核对，无须补取；calculationValidation 仍 BLOCKED，不能作为有效数值。其他断点按实际缺口处理。分析方法与汇总预期由任务选择，算子不自动安排业务流程。'
+OPERATION['properties']['operator']['description'] = '按来源数值排序选择 SORT（含无单位原值及负数）；RANK 另外要求可比单位、缩放和口径。FORMULA_CHECK 每项仅处理一个目标；批量目标分别运算。NO_CAPTURED_FORMULA 表示当前捕获未提供可复算公式，检查完成但不产生数值、不证明来源一致；预算来源公式中已读取的空值按0参与运算、除以0返回0；raw value 保留空，formulaTrace 的 arithmeticPolicy/nullAsZeroRefs 说明规则，localCheck.inputValues 是实际运算输入。按真实结果判定 MATCH/MISMATCH。其他未声明空值规则的来源可返回 completionReason=SOURCE_VALUE_MISSING，数值仍不可用。其他断点按实际缺口处理。分析方法与汇总预期由任务选择，算子不自动安排业务流程。'
 OPERATION['properties']['operator']['description'] += ' DESCRIBE 一次完成同一指标的来源值正负零/缺值计数、合计、均值、极值、排序、占比及可选 top；提供可直接绑定的 TABULAR 表和 statistics/counts。描述统计不证明业务合并或层级去重；业务口径聚合使用来源接口。用 select.batchId+columnName 隔离实际集合，不能以是否存在某个维度猜输入类型。'
 SCOPE['properties']['population']['description'] = '主体 members 的完整枚举来源，必须恰好对应 members。额外比较对象用 referenceMembers；不要为加入比较值删除本字段。'
 
@@ -292,7 +281,7 @@ class AnalysisBuild(_AnalysisTool):
     name = "AnalysisBuild"
     method = "build"
     description = (
-        '从已捕获来源构建分析或报告。普通查询直接答复。首次传 captureRefs/scope/operations/requestKey，目标和用途已确定时由宿主生成 selections；需要指定子集、对照或候选才传选项。'
+        '从已捕获来源构建分析或报告。已用 AnalysisTask.subjectSources 采用来源时，只需 operations/requestKey，宿主沿用这些输入组；多个主体分别用 select.inputRef 计算，跨组计算显式列 inputRefs。也可首次传 captureRefs/scope/operations/requestKey，目标和用途已确定时由宿主生成 selections。'
         '已有分析追加计算或工作项传 baseAnalysisRef/operations/requestKey，省略三个输入字段以沿用冻结事实、范围、粒度和有效 Python 结果；换数据才完整提交。'
         '已知 analysisMaterials/selections 直接使用，缺字段才定向 Inspect。批量 TABLE 选择 batchId/columnNames/可选 rowIndices，省略行号取全部实际行；'
         'scope.members 可省略，由选择器生成。显式成员用真实 memberRef 或唯一 objectId，名称不能替代 ID；expectedDimensions 仅共同口径。'
@@ -301,25 +290,41 @@ class AnalysisBuild(_AnalysisTool):
         '同计划 inputRefs 可用前序 operation.id，COMPUTATION.refs 可用本计划运算 id，宿主解析真实 derivedId。'
         '单纯原值展示 operations=[]，workPlan 可省略；本体准备的目标使用 preparedTargets=true，自动带入来源值、依赖、公式计算和默认工作项，无需另填 targetRefs 或空的 VALUES 工作项。'
         '必要的额外计算和关系检查可声明工作项，概览不扩大公式范围。金额和构成使用 PRIMARY/REFERENCE，STRUCTURE 仅用于模板结构，不纳入数值计算。'
-        '续建继承已有工作项及 population，不通过省略或空数组删除；partialReason 保留真实未完成范围。'
+        '续建继承已有工作项及 population，不通过省略或空数组删除；unresolvedItems 关联真实未完成的用户要求与障碍。'
         '同连接固定 sourceId/snapshotId/asOf/schemaHash 可纳入多查询身份；跨边界用 COMPOSITE，各事实保留来源，汇编不证明可比。'
         '跨期/跨指标运算需要适用可比规则；原值顺序用 SORT，可比业务排名才 RANK。分组金额直接使用原生聚合，宿主另附同绑定 STRUCTURE 样本。'
-        '公式核对执行完成不表示数值可用：来源真实空值保持 null/计算 BLOCKED，检查已完成时无需补取。'
+        '预算来源公式中的已确认空值保留原值 null、按0参与运算，除以0返回0；未加载依赖或读取错误不能当0。检查完成不等于来源与复算一致。'
         '绑定 documentInputs 展示本层/逐层结果与差额，不能用本层通过证明逐层。综合报告用 reportTopics 声明用户所指主题。'
         '分析方法见 data-analysis，页面交付见 report-generation；字段形状与运算约束见当前 Schema。')
     input_schema = obj({"captureRefs": array(TEXT, 1000, 1), "selections": array(SELECTOR, 1000, 1), "scope": SCOPE,
                         "operations": {**array(OPERATION, 100), "description": "必填；不需要运算时显式传 []，不能省略。"}, 'workPlan': array(WORK_ITEM, 100), "requestKey": TEXT, "baseAnalysisRef": TEXT, "actionRunRef": TEXT},
                        ["operations", "requestKey"])
-    input_schema["anyOf"] = [{"required": ["captureRefs", "scope"]}, {"required": ["baseAnalysisRef"]}]
-    input_schema["dependentRequired"] = {'selections': ['captureRefs', 'scope'], 'scope': ['captureRefs'], 'captureRefs': ['scope']}
+    # A caller may refine presentation scope while retaining explicitly adopted inputs.
+    # Whether adoption exists is a stateful service check, not a static schema dependency.
+    input_schema["dependentRequired"] = {'selections': ['captureRefs', 'scope'], 'captureRefs': ['scope']}
+
+    @property
+    def model_input_schema(self):
+        # Once sources have been explicitly adopted, the host owns their exact
+        # selection. Expose the choices still open to the model, rather than
+        # asking it to retype the same capture/selection provenance.
+        turn = getattr(self.service, 'turn', None)
+        if turn is None or not turn.state.get('adoptedInputs'):
+            return None
+        schema = deepcopy(self.input_schema)
+        for field in ('captureRefs', 'selections'):
+            schema['properties'].pop(field, None)
+        schema.pop('dependentRequired', None)
+        return schema
     description += ' 优先使用原生能力，必要计算可一次 operations 提交。DESCRIBE 已提供来源值分布表、计数、合计和占比；公式数据集由 FORMULA_CHECK 提供，不为制作表格重写 Python。返回 documentInputs 给出直接可用的绑定方式，AI 继续决定解释、布局与配色。'
+    description += ' 数值条件产生的新子集先用预算查询 basis=FACTS 和 valueFilter 取得，再采用其 sourceRef；select 只按当前 Schema 定位输入。select.inputRef 的统计使用该组已采用原值，自动补充的公式材料不加入总体计数或合计。'
 
 
 class AnalysisPython(_AnalysisTool):
     name = 'AnalysisPython'
     method = 'python'
     is_concurrency_safe = False
-    description = '通用的 AI Python 分析执行：数据清洗、连接、透视、比较、统计、诊断、条件测算和图表数据准备。analysisRef+inputRefs 引用已有事实或代码产物；也可用 captureRefs+scope 汇编已准备的查询结果；范围有歧义、指定子集或对照时再传 selections；fileInputs 可补充工作区 JSON/CSV/TSV/TXT 文件，文件单独执行返回 pythonRunRef。inputs 含 ref、精确 value、dimensionNames、formula、inputRole、grain；表产物含 columns/rows，文件含 data。支持循环、条件、推导式、自定义函数以及 D/Decimal、json_read/json_write、csv_read/csv_write；支持正常 import/from import：decimal、collections、itertools、statistics、datetime、json、csv、io、math，以及已锁定的 pandas/NumPy/SciPy/statsmodels。第三方库由宿主自动准备并复用隔离环境；代码不能安装库或任意读写文件、联网。金额使用 Decimal/object，pandas 空值汇总保留 null；浮点金额与统计浮点产物当前不接收，不使用科学计数法输出。result 是非空数组，每项有 name/label 和来源 inputRefs。唯一网格被完整读取后，省略的来源引用可由宿主补记。kind=SCALAR 另需 value/unit，可用 decimalPlaces 指定输出小数位0～16（ROUND_HALF_EVEN，仅处理输出）；TABLE或CHART_DATA 另需 columns[{name,label,type,unit?,decimalPlaces?}]/rows，decimalPlaces只用于DECIMAL_STRING列，type=STRING/DECIMAL_STRING/BOOLEAN；DIAGNOSTIC 需 data；FILE 需 filename/text，只能输出 csv/tsv/json/txt。宿主保存代码、真实输入依赖、输出、错误及耗时，表产物可继续作为输入或 document.datasets 的 valueRef。金额使用 D("0.1")，null 不隐式变零。不替代预算取数、任务机构口径、CalcType、原生聚合或真实来源公式；执行成功仍需审查逻辑与解释。'
+    description = '通用的 AI Python 分析执行：数据清洗、连接、透视、比较、统计、诊断、条件测算和图表数据准备。analysisRef+inputRefs 引用已有事实或代码产物；也可用 captureRefs+scope 汇编已准备的查询结果；范围有歧义、指定子集或对照时再传 selections；fileInputs 可补充工作区 JSON/CSV/TSV/TXT 文件，文件单独执行返回 pythonRunRef。inputs 含 ref、精确 value、dimensionNames、formula、inputRole、grain；表产物含 columns/rows，文件含 data。支持循环、条件、推导式、自定义函数以及 D/Decimal、json_read/json_write、csv_read/csv_write；支持正常 import/from import：decimal、collections、itertools、statistics、datetime、json、csv、io、math，以及已锁定的 pandas/NumPy/SciPy/statsmodels。第三方库由宿主自动准备并复用隔离环境；代码不能安装库或任意读写文件、联网。金额使用 Decimal/object，pandas 空值汇总保留 null；浮点金额与统计浮点产物当前不接收，不使用科学计数法输出。result 是非空数组，每项有 name/label 和来源 inputRefs。唯一网格被完整读取后，省略的来源引用可由宿主补记。kind=SCALAR 另需 value/unit，可用 decimalPlaces 指定输出小数位0～16（ROUND_HALF_EVEN，仅处理输出）；TABLE或CHART_DATA 另需 columns[{name,label,type,unit?,decimalPlaces?}]/rows，decimalPlaces只用于DECIMAL_STRING列，type=STRING/DECIMAL_STRING/BOOLEAN；DIAGNOSTIC 需 data；FILE 需 filename/text，只能输出 csv/tsv/json/txt。宿主保存代码、真实输入依赖、输出、错误及耗时，表产物可继续作为输入或 document.datasets 的 valueRef。金额使用 D("0.1")，null 不隐式变零；预算来源公式优先使用 FORMULA_CHECK，其已确认空值按0、除以0返回0的规则由宿主执行。不替代预算取数、任务机构口径、CalcType、原生聚合或真实来源公式；执行成功仍需审查逻辑与解释。'
     description += ' 仅当现有原生能力不足以表达本题必要处理时编写代码。先看已有工具说明，不必试调用；fallbackReason 说明具体能力缺口，purpose 说明代码处理的内容。原因、代码和实际运行结果持久保存，供提取公共能力；不因偏好 Python 重写已有公式计算、分布统计或预算原生聚合。'
     input_schema = obj({'analysisRef': {**TEXT, 'description': '仅填写工具实际返回的业务分析 analysisRef；纯文件执行的 pythonRunRef 不能填这里。'}, 'inputRefs': array(TEXT, 5000, 0),
                         'fallbackReason': {'type': 'string', 'minLength': 1, 'maxLength': 2000,
@@ -335,12 +340,14 @@ class AnalysisPython(_AnalysisTool):
                         'gridInputs': array(obj({'captureRef': TEXT, 'fileRef': TEXT}, ['captureRef', 'fileRef']), 20, 1)},
                        ['code', 'purpose', 'fallbackReason', 'requestKey'])
     input_schema['dependentRequired'] = deepcopy(AnalysisBuild.input_schema['dependentRequired'])
+    input_schema['dependentRequired']['scope'] = ['captureRefs']
     description += ' 只有汇编事实或传入已有 analysisRef 时才创建可发布的 analysisRef，workPlan 可同次登记并引用 result.name，直接用返回的 derivedValues 发布。仅文件执行返回 pythonRunRef，不创建 analysisRef；继续计算复用 continuation.input，不把执行引用当分析引用。已有分析用 analysisRef+inputRefs 继续，失败按 retryInput 修代码，保留已取得的输入。'
     description += ' 大网格使用 gridInputs[{captureRef,fileRef}]，来源工具或 AnalysisInspect(gridFiles) 返回引用。inputs 中 kind=GRID_FILE 的 ref 可传给 grid_rows(ref,where) 流式遍历，返回迭代器而非列表，文件不进入 inputs.data；where 支持 cellKeys、dimensions、measureCode、headerText、mapTypes、startRow/endRowExclusive/startColumn/endColumnExclusive。返回单元格保留 key/headers/formula/rawValueJson，另有 sourceRef 而非 ref；result.inputRefs 引用输入文件的 inputs[*].ref。value 为原始精确值，dimensions 已合并表外条件。fileReads 由工具记录扫描量、命中量、是否遍历完成；只读取样例不得当作全表分析。最多60秒。需要生成报告时可与已有 analysisRef 同时使用，或先用脚本定位 cellKeys 再 AnalysisBuild，复用原文件，不重查预算。'
     description += ' 同一范围上的相关计算一次输出多个 result 项，例如排序表、占比、差额与图表数据；不强制每项单独执行。小表/诊断直接随 derivedValues 返回，payloadComplete=true 表示已完整返回，无需再 Inspect。代码依赖未知输入时才分步探索；不能为减少轮数省略必要公式或范围判断。'
     description += ' workPlan 引用脚本产物时用 kind=COMPUTATION、operator=PYTHON、refs=[result.name]，不因代码做比例而填写原生 RATIO；原生算子工作项须真实提供 operations。VALUES 仅引用实际 factId，不能填结果名称或 batchId。'
     description += ' 纯网格只传工具参数 gridInputs。脚本从 inputs 读取，例如单文件 ref=inputs[0]["ref"]；各产物的 inputRefs 可写 [ref]。TABLE/CHART_DATA 的 rows 必须是二维数组，例如 [["项目甲", "1.20"]]，每行按 columns 的顺序取值，不是字典列表。'
     description += ' 网格含文本表头；计算金额前按实际 measureCode 或 cellKeys 选中数据格，再读 value，空值保留。mapTypes 必须为数组，不是 mapType。'
+    description += ' 事实的 inputMemberships 保留每组 inputRef/inputRole/inputPurpose；VALUES 是已采用原数据，FORMULA 是补充构成材料。按组统计原结果时只选 VALUES；需要自定义公式分析时可明确读取 FORMULA 或其 factRef。同一事实可以属于多组，不能把多组成员直接相加充当去重总体。'
 
 
 class AnalysisInspect(_AnalysisTool):
@@ -355,8 +362,8 @@ class AnalysisInspect(_AnalysisTool):
                         'pythonPath': {**TEXT, 'description': 'section=python 的完整记录 JSON Pointer，沿返回的 readOptions/read/nextRead 读取代码、输入和输出；支持 offset/limit/fields 分页，默认仅摘要。'},
                         "previewRef": {**TEXT, 'description': '仅 section=preview，传成功预览返回的 repairRef；读取当前文档的页面检查记录，不会代替浏览器运行检查。'},
                         "analysisRef": TEXT, "captureRef": TEXT,
-                        "derivedId": {**TEXT, "description": "section=order 使用 SORT/RANK 派生引用。section=formulas 使用 factRef，不能填这里；section=derived 列出当前版本已完成计算。"}, "stepId": TEXT, "search": TEXT,
-                        "detail": {"enum": ["compact", "full"]}, "fields": {**array(TEXT, 30, 1), 'description': 'section=facts 或 python 可用；inventory 不传 fields，用 detail=compact 和对象/单元格筛选。'}, "cellKey": TEXT, "factRef": {**TEXT, "description": "section=formulas 必填目标来源 factId；section=facts 可按实际 factId 定位。公式计算结果的 derivedId 不放这里。"}, "memberDimension": TEXT, "objectId": TEXT, "bindingRef": TEXT, "period": TEXT, "measureCode": TEXT,
+                        "derivedId": {**TEXT, "description": "当前分析已返回的计算引用。products 自动按类型读取标量、表格或公式核对；formulas 也接受 FORMULA_CHECK 的 derivedId，复用已完成追溯；derived 可定向读取。"}, "stepId": TEXT, "search": TEXT,
+                        "detail": {"enum": ["compact", "full"]}, "fields": {**array(TEXT, 30, 1), 'description': 'facts/python/formulas 可选实际字段；公式可选 nodes、pendingDependencies、targetLocalCheck、checkSummary。inventory 用 detail=compact 和对象/单元格筛选。'}, "cellKey": TEXT, "factRef": {**TEXT, "description": "目标来源 factId；formulas 可使用 factRef 或对应 FORMULA_CHECK 的 derivedId，二者同时提供时必须指向同一目标。facts 按实际 factId 定位。"}, "memberDimension": TEXT, "objectId": TEXT, "bindingRef": TEXT, "period": TEXT, "measureCode": TEXT,
                         "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 100},
                         "findingPlan": array(FINDING_CHECK, 100), "thresholds": array(THRESHOLD, 20)})
     description += ' 查询返回的 analysisMaterials 已含值、公式、上下文和真实选择器；材料足够时直接 Build/Python。section=materials 按 captureRef 补读同一份资料。多个目标或部分用 requests:[单次参数,...] 一次读取，allPages=true 自动续页；每项必须明确 captureRef/analysisRef/pythonRunRef，不扫描其他历史，不发出源查询。'
@@ -391,7 +398,7 @@ DOCUMENT_DATASET = obj({'key': DOCUMENT_BINDING['properties']['key'], 'valueRef'
                         'nodeRefs': array(TEXT, 200, 1), 'format': NUMBER_FORMAT}, ['key', 'valueRef'])
 DOCUMENT_DATASET['description'] = '绑定 SORT/RANK、FORMULA_CHECK 或 RECONCILE 的真实 derivedId。window.analysisSets[key] 提供后端排好序的 rows、公式 nodes/operands/values/contributions 或 parent/children/values。nodeRefs 仅为公式选择关键计算层，每层仍保留全部操作数。数字为精确字符串，display 已格式化。'
 DOCUMENT_DATASET['description'] += ' 也接受 AnalysisPython 的 TABLE/CHART_DATA 产物，生成 kind=TABULAR 的 columns/rows/rowCount；复用已有页面组件绘图，不改模板。'
-DOCUMENT_DATASET['description'] += ' DESCRIBE 同样直接提供 TABULAR columns/rows 与 statistics/counts；不需要为组装展示表另写 Python。公式集合从 window.analysisSets[key].nodes 读取：节点金额用 node.values.sourceValue/localValue/localDifference 的 value/display；节点状态是 localStatus/recursiveStatus。直接操作数在 node.operands，金额为 operand.value/display。不能把公式节点的金额对象当成普通 fact，也不能把真实 null 补零。'
+DOCUMENT_DATASET['description'] += ' DESCRIBE 同样直接提供 TABULAR columns/rows 与 statistics/counts；不需要为组装展示表另写 Python。公式集合从 window.analysisSets[key].nodes 读取：节点金额用 node.values.sourceValue/localValue/localDifference 的 value/display；节点状态是 localStatus/recursiveStatus。直接操作数在 node.operands，金额为 operand.value/display。不能把公式节点的金额对象当成普通 fact。预算来源原始 null 保留，operand.calculationValue 是实际运算输入，contributions/waterfall 已应用空值按0规则。本表公式展示参考 report-generation 的 references/formula-visualization-examples.md；完整多项加减遍历 waterfall.steps 绘制横向瀑布图，后台已返回的相关下层可折叠但不漏项，重点比较图仅作补充；展开深度由后台决定，未见底不影响展示，不为出图继续展开；非线性用关系图或步骤，单输入用衔接说明。不自行重算、把未读数据补零或为画图追查表外。'
 DOCUMENT = obj({'title': {'type':'string','minLength':1,'maxLength':300},
                 'path': {**TEXT, 'description':'当前工作区内 UTF-8 .html 的相对路径；成功读取后冻结内容。'},
                 'html': {'type':'string','minLength':1,'maxLength':524288},
@@ -403,6 +410,7 @@ DOCUMENT['description'] = '自由 HTML 页面，无固定布局或图型。path/
 DOCUMENT['description'] += ' bindings/datasets 至少一个非空。表格与图共用同一排序集合 rows，不手抄重排；容器标 data-analysis-set="集合key"，行/图形项标 data-analysis-ref="factRef" 以检查顺序；筛选或分页容器加 data-analysis-partial="true"。公式树使用 factRef 与运算符，由模型为全部操作数编写简称，按问题选图，不能把差额当作来源值的一部分。'
 DOCUMENT['description'] += ' 声明了已完成排序工作项时必须绑定其排序集合。部分交付在模型选择的可见正文位置放 {{analysisPartialReason}}，宿主只填声明内容，不插入固定版式。'
 DOCUMENT['description'] += ' 同一零基线线性条形须调用 analysisCharts.bindLinearBars(items,{extent:真实轨道元素})，items 每项为 {element:实际条形元素,valueKey:绑定key} 或 {element,setKey:集合key,factRef:行引用}。函数绑定数值、标记和长度；模型仍决定布局、颜色、文字与分析重点。每次调用默认独立刻度，全量与局部放大分别调用。点图、区间、堆叠终点等不适用图型不套用。diagnostics.renderChecks.viewports[].numericChecks 说明受检范围，NOT_DECLARED 不表示图形正确。'
+DOCUMENT['description'] += ' 极小值可用精确标签或明细表代替条形，无须维持首稿条形数量。analysisCharts.bindValueLabel(element,{valueKey}) 或 {setKey,factRef} 绑定标签；明细行保留 data-analysis-ref 及所属 data-analysis-set。实际图形保留数值及比例尺绑定，不能只删除检查标记。'
 
 
 class AnalysisPublish(_AnalysisTool):
@@ -414,12 +422,15 @@ class AnalysisPublish(_AnalysisTool):
         '文字实质错误 textRepairable=true 时优先沿用 repairAndFinalize，一次传齐 repairs:[{op:"replaceText",path:"/document/html",value:{oldText:textTargets原文片段,newText:修正文字,textRef:textTargets引用}}]，直接修改冻结页面，无需 Read/Edit/Build。结合 issues 的原句与 repairEvidence 一并修正正文、摘要、图注。textRepairable=false 不猜定位；标签、脚本或绑定确需改变时编辑当前 HTML（已有 documentEditSource 则用其 path），用 {op:"replace",path:"/document/path",value:实际文件路径} 刷新；不重抄原 bindings/datasets。'
         'previewOnly=true 仅预览，与 finalize=true 二选一；成功预览也可原样使用 confirmPublish。语义 REVISE 只修实质错误，合理解释不反复润色；NOT_REVIEWED/UNAVAILABLE 不是通过。宿主完成两种宽度测量则复用记录，不重复调用浏览器 MCP；确实不可用时保留未检查状态，不放过已测错误。'
         '线性条形使用 analysisCharts.bindLinearBars(items,{extent:trackElement})；第二参数必填，trackElement 是已挂入页面的真实轨道元素，每项用 {element,valueKey} 或 {element,setKey,factRef}。原生 DESCRIBE 的 TABULAR 与 ORDERED 集均可直接绑定。'
-        '仅 delivery.registered=true 才交付链接。workRefs 补已声明工作项；真实缺失用 partialReason。显式组件用 claims+viewPlan，与 document 二选一。参数不套 arguments，title/path/html/bindings/datasets 均在 document 内。已发布版本修改时宿主自动续版，无需版本参数。')
+        '仅 delivery.registered=true 才交付链接。workRefs 补已声明工作项；真实缺失用 unresolvedItems，已补齐时传 [] 清除。来源正常返回空值、空属性及已完成核对的复算差异写在分析正文，不算未完成。显式组件用 claims+viewPlan，与 document 二选一。参数不套 arguments，title/path/html/bindings/datasets 均在 document 内。已发布版本修改时宿主自动续版，无需版本参数。')
     input_schema = obj({"document": DOCUMENT, "finalize": {"type": "boolean", "description": "true 在一次调用内完成预览、页面检查、内容核对和通过后的发布；有问题返回保存草稿及局部修复入口，不自动改写业务内容。"}, "previewOnly": {"type": "boolean", "description": "true 只检查预览，不发布；与 finalize=true 互斥。"}, "presentation": PRESENTATION, "analysisRef": TEXT, "claims": array(CLAIM, 50), "viewPlan": array(VIEW, 20), "requestKey": TEXT,
                         'repairRef': {**TEXT, 'description': '失败或预览返回的保存草案。通常复用 repairAndFinalize，以 analysisRef/requestKey/repairRef/repairs 和 finalize=true 完成修复检查及通过后的发布；仅预览才用 previewOnly=true，不重写完整计划。'},
                         'repairs': {**REPAIRS, 'minItems': 0},
                         'workRefs': {**WORK_REFS, 'description': '为已有 taskId 关联真实结果或字段；可显式修正普通计算的 operator。保留目标范围及来源核对、业务汇总要求，不删除或重命名工作项。'},
-                        'partialReason': {'type': 'string', 'minLength': 1, 'maxLength': 2000, 'description': '用户要求的指标、范围、必要构成或核对确有缺口时说明。用户所需分组齐全、页面仅节选可选成员示例时正常完整交付。部分页面正文放 {{analysisPartialReason}}，聊天也说明缺口。'},
+                        'unresolvedItems': {**array(obj({'requirement': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
+                                                       'reason': {'type': 'string', 'minLength': 1, 'maxLength': 2000}, 'taskId': TEXT},
+                                                      ['requirement', 'reason']), 100),
+                                            'description': '仅列确实未完成的用户要求(requirement)与实际障碍(reason)，对应已声明工作项时附 taskId；已有 READY 工作不能再列未完成。未声明但确实遗漏的要求仍应列出，并由内容核对确认。空值、空属性和复算差异保留为正常数据状态/分析发现。[] 明确清除旧缺口，正文可复用 {{analysisPartialReason}} 显示宿主派生说明。'},
                         'renderCheckUnavailableReason': {'type': 'string', 'minLength': 1, 'maxLength': 1000, 'description': '仅浏览器检查确实不可用时填写具体原因；记录未检查状态，不证明布局合格，也不能跳过已测到的错误。修复草案时通过 repairs 修改此字段。'},
                         "technicalDetails": {"type": "boolean"},
                         "findingPlan": array(FINDING_CHECK, 100), "actionPlan": array(ACTION_PLAN, 300),
@@ -428,7 +439,7 @@ class AnalysisPublish(_AnalysisTool):
     input_schema['oneOf'] = [{'required': ['document'], 'not': {'anyOf': [{'required':['repairRef']}, {'required':['viewPlan']}, {'required':['presentation']}]}},
                              {'required': ['claims', 'viewPlan'], 'not': {'anyOf': [{'required':['repairRef']}, {'required':['document']}]}},
                              {'required': ['repairRef', 'repairs'], 'not': {'anyOf': [{'required': [key]} for key in
-                              ('claims', 'viewPlan', 'document', 'presentation', 'workRefs', 'partialReason', 'renderCheckUnavailableReason', 'technicalDetails', 'findingPlan', 'actionPlan', 'thresholds', 'hypotheses')]}}]
+                              ('claims', 'viewPlan', 'document', 'presentation', 'workRefs', 'unresolvedItems', 'renderCheckUnavailableReason', 'technicalDetails', 'findingPlan', 'actionPlan', 'thresholds', 'hypotheses')]}}]
     input_schema['allOf'] = [{'not': {'required': ['finalize', 'previewOnly'],
                                     'properties': {'finalize': {'const': True}, 'previewOnly': {'const': True}}}}]
 

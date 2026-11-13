@@ -145,7 +145,7 @@
       "valueState": "PRESENT"
     }
   ],
-  "engineVersion": "1.5.0",
+  "engineVersion": "2.0.0",
   "facts": [
     {
       "bindingRef": "binding-A",

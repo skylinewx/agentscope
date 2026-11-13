@@ -120,20 +120,20 @@ class DeliveryContractTests(PresentationCase):
     async def test_partial_free_document_discloses_reason_without_forcing_markup(self):
         await self.setup_values(work=[{'taskId': 'unfinished', 'title': '尚缺的关系', 'kind': 'RELATION', 'refs': []}])
         args = {'analysisRef': self.built['analysisRef'], 'previewOnly': True,
-                'partialReason': '来源暂不可用 <补查>', 'requestKey': 'partial'}
+                'unresolvedItems': [{'requirement': '补齐来源', 'reason': '来源暂不可用 <补查>'}], 'requestKey': 'partial'}
         with self.assertRaises(AnalysisError) as caught: await self.service.publish(**args, document=self.doc())
         self.assertEqual(caught.exception.code, 'PARTIAL_RESULT_UNDISCLOSED')
         doc = self.doc('{{value}} <em>{{analysisPartialReason}}</em>')
         preview = await self.service.publish(**args, document=doc)
         result = await self.service.preview_content(preview['repairRef'])
         html = result['document']['freeDocument']['html']
-        self.assertIn('<em>来源暂不可用 &lt;补查&gt;</em>', html)
+        self.assertIn('<em>补齐来源：来源暂不可用 &lt;补查&gt;</em>', html)
         self.assertEqual(result['summary']['completion']['state'], 'INCOMPLETE')
         self.assertNotIn('未注明', html)
         from analysis_document_checks_test import measurements
         compiled = result['document']['freeDocument']
         for width in (420,900):
-            sample = measurements(width=width); sample['orders'] = []
+            sample = measurements(width=width, static_keys=['value']); sample['orders'] = []
             await self.service.record_preview_check(preview['repairRef'], compiled['contentDigest'], compiled['frameKey'], sample)
         published = await self.service.publish(**preview['confirmPublish'])
         self.assertEqual(published['summary']['completion']['state'], 'INCOMPLETE')

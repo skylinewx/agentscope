@@ -83,6 +83,23 @@ class ProgressFactsTests(TestCase):
 
 
 class ProgressStreamTests(IsolatedAsyncioTestCase):
+    def test_completed_retry_labels_previous_failure_as_history_without_hiding_it(self):
+        tracker = ReplyProgress()
+        tracker.observe(ReplyStartEvent(session_id='session', reply_id='reply', name='agent'))
+        tracker.observe(ToolCallStartEvent(reply_id='reply', tool_call_id='failed', tool_call_name='query'))
+        tracker.observe(ToolResultTextDeltaEvent(reply_id='reply', tool_call_id='failed',
+            delta=json.dumps({'error': {'message': '口径依据未确认'}})))
+        tracker.observe(ToolResultEndEvent(reply_id='reply', tool_call_id='failed', state='success'))
+        failed = tracker.step
+        for event in list(events())[1:]:
+            tracker.observe(event)
+        tracker.observe(ReplyEndEvent(session_id='session', reply_id='reply', finished_reason='completed',
+            metadata={'analysisCompletion': {'status': 'DIRECT'}}))
+        self.assertEqual(failed['status'], 'error')
+        self.assertIn('口径依据未确认', str(failed))
+        self.assertIn('先前尝试', failed['nextAction'])
+        self.assertEqual(tracker.step['status'], 'completed')
+
     def test_reply_completion_does_not_promote_failed_receipt_to_success(self):
         tracker = ReplyProgress()
         tracker.observe(ReplyStartEvent(session_id='session', reply_id='reply', name='agent'))

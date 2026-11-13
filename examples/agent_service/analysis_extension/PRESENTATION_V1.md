@@ -1,6 +1,6 @@
 # Registered presentation protocol v1
 
-Current contract: storage schema 1, engine 1.5.0, public schema 1 and renderer 1.11.1. Other artifact schemas and computation engines are rejected. Renderer versions identify derived layouts, not the validity of published data. There are no legacy readers or conversions. Export layout is required and must be standard or table.
+Current writes use artifact schema 1 and computation engine 2.0.0. New input groups carry an inputSetVersion; calculations and reviews cannot be reused after adoption changes. Published engine 1.5.0 artifacts remain readable/exportable as frozen history. New builds use the current engine; there is no parallel legacy execution path. Existing report HTML templates remain unchanged.
 
 All artifacts require `presentationPolicy=explicit`. `viewPlan` selects METRIC fact/scalar-derived references, TABLE groups, BAR_VALUES source facts, BAR_RANK references to successful RANK operations, BRIDGE references to successful LINEAR operations, and ORDER for initial display order. Empty viewPlan produces no tables, metrics or charts; frozen source facts remain intact. Public `chartsRequested`, `findings`, `actions` and `findingsScopeLabel` are required. An empty viewPlan sets chartsRequested=false, so a deliberately absent chart is not presented as an error.
 
@@ -102,7 +102,7 @@ Each table now carries viewId. Every section block has metricIndexes, sceneIndex
 
 Explicit tables retain their complete selected row sets independently of the raw member page. The 1 MiB response limit is checked before publication: an oversized result is rejected, never silently truncated. Table controls sort exact decimal strings before local pagination and do not modify other tables, chart data, claims or the published report. Per-view orderRef sequences may differ across tables. API filters/Top N remain explicit operations on the selected whole scope; the first selected ordering supplies their default order, without imposing cross-table ordering constraints.
 
-workRefs updates actual refs for Build's existing workPlan task IDs while preserving the original plan and computations. Completion is recomputed from real fact/derived/relation references. A declared pending/blocked task prevents a claim of complete publication; a partial result may be published with a model-authored partialReason explaining the remaining work. This text appears in the existing summary notice, while completion remains INCOMPLETE. READY proves usable execution references, not source agreement, business causation or full satisfaction of a user request.
+workRefs updates actual refs for Build's existing workPlan task IDs while preserving the original plan and computations. Completion is recomputed from real fact/derived/relation references. A declared pending/blocked task prevents a claim of complete publication; a partial result may be published with structured unresolvedItems ({requirement, reason, taskId?}) identifying the unmet user requirements and real obstacles. The host derives partialReason for the existing summary notice; free prose, source nulls and completed formula discrepancies do not control completion, while completion remains INCOMPLETE. READY proves usable execution references, not source agreement, business causation or full satisfaction of a user request.
 
 ## Composition
 

@@ -92,6 +92,19 @@ def _normalize_local_path(path: str) -> str:
     return os.path.abspath(os.path.expanduser(path))
 
 
+def _drops_tool_arguments(original: Any, repaired: Any) -> bool:
+    """A type repair must not discard nested conditions or list entries."""
+    if isinstance(original, dict):
+        return not isinstance(repaired, dict) or bool(original.keys() - repaired.keys()) or any(
+            _drops_tool_arguments(value, repaired[key]) for key, value in original.items()
+        )
+    if isinstance(original, list):
+        return not isinstance(repaired, list) or len(original) != len(repaired) or any(
+            _drops_tool_arguments(left, right) for left, right in zip(original, repaired)
+        )
+    return False
+
+
 def _json_loads_with_repair(
     json_str: str,
     schema: dict | None = None,
@@ -164,9 +177,9 @@ def _json_loads_with_repair(
             res = parsed
 
         if isinstance(res, dict):
-            if isinstance(parsed, dict) and parsed.keys() - res.keys():
+            if isinstance(parsed, dict) and _drops_tool_arguments(parsed, res):
                 # Dropping arguments, e.g. under `additionalProperties:
-                # false`, is a rewrite rather than a type repair.
+                # false`, is a rewrite rather than a type repair, at any depth.
                 res = parsed
 
             try:

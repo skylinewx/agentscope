@@ -82,6 +82,8 @@ class HorizontalWaterfallTests(TestCase):
         self.assertEqual(waterfall['minimum'], '0')
         self.assertEqual(waterfall['maximum'], '10')
         self.assertEqual(waterfall['steps'][1]['geometry'], {'left': 0.7, 'width': 0.3})
+        self.assertEqual(waterfall['steps'][-1]['factRef'], node['factRef'])
+        self.assertEqual(waterfall['steps'][-1]['headers'], node['headers'])
 
     def test_negative_input_subtracted_increases_result_and_crosses_zero(self):
         node = formula_node(waterfall_artifact('B1-C1', first='-10', second='-15'))
@@ -133,13 +135,26 @@ class HorizontalWaterfallTests(TestCase):
 
 @skipUnless(os.environ.get('RUN_ANALYSIS_BROWSER_TESTS') == '1', '显式启用本地无头浏览器回归')
 class HorizontalWaterfallBrowserTests(IsolatedAsyncioTestCase):
+    async def test_budget_null_contribution_renders_at_both_widths(self):
+        from analysis_budget_formula_arithmetic_test import budget_facts, computed
+        for first, source in [('10', '10'), (None, '0')]:
+            facts = budget_facts(first=first, source=source)
+            value = computed(facts)
+            value['derivedId'] = 'derived_formula'
+            document = waterfall_document({'facts': facts, 'derivedValues': [value], 'scope': {'scopeId': 's'}})
+            for observation in await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None, widths=(420, 1280)).check(document):
+                result = evaluate(document, {key: value for key, value in observation.items() if key != 'hostRenderedText'})
+                self.assertFalse(result['blocking'], result)
+                self.assertFalse(result['pageOverflow'], result)
+                self.assertEqual(result['numericChecks']['linearBars']['status'], 'PASS')
+
     async def test_positive_negative_zero_and_high_precision_at_two_widths(self):
         for artifact in [waterfall_artifact(), waterfall_artifact('B1-C1', '-10', '-15'),
                          waterfall_artifact('B1-C1', '0', '0', '0'),
                          waterfall_artifact('B1-C1', '123456789012345678.123456789',
                                             '123456789012345678.123456788', '0.000000001')]:
             document = waterfall_document(artifact)
-            for observation in await LocalRenderChecker(widths=(420, 1280)).check(document):
+            for observation in await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None, widths=(420, 1280)).check(document):
                 result = evaluate(document, {key: value for key, value in observation.items() if key != 'hostRenderedText'})
                 self.assertFalse(result['blocking'], result)
                 self.assertFalse(result['pageOverflow'], result)
@@ -149,7 +164,7 @@ class HorizontalWaterfallBrowserTests(IsolatedAsyncioTestCase):
 
     async def test_wrong_cumulative_position_blocks_even_when_length_is_correct(self):
         document = waterfall_document(extra_script="rows[1].element.style.left='0%';")
-        for observation in await LocalRenderChecker(widths=(420, 1280)).check(document):
+        for observation in await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None, widths=(420, 1280)).check(document):
             result = evaluate(document, {key: value for key, value in observation.items() if key != 'hostRenderedText'})
             self.assertTrue(result['blocking'])
             self.assertTrue(any('累计位置或长度' in error for error in result['errors']))
@@ -159,7 +174,7 @@ class HorizontalWaterfallBrowserTests(IsolatedAsyncioTestCase):
                        "analysisCharts.bindHorizontalWaterfall(rows,{setKey:'formula',nodeRef:'missing'});",
                        "analysisCharts.bindHorizontalWaterfall(rows.map(row=>({...row,element:rows[0].element,track:rows[0].track})),{setKey:'formula',nodeRef:'root'});"]:
             document = waterfall_document(extra_script=script)
-            observation = (await LocalRenderChecker(widths=(420,)).check(document))[0]
+            observation = (await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None, widths=(420,)).check(document))[0]
             self.assertTrue(evaluate(document, {key: value for key, value in observation.items() if key != 'hostRenderedText'})['blocking'])
 
     async def test_switching_an_element_to_linear_binding_discards_waterfall_geometry(self):
@@ -167,7 +182,7 @@ class HorizontalWaterfallBrowserTests(IsolatedAsyncioTestCase):
 analysisCharts.bindLinearBars([{element:rows[0].element,valueKey:'difference'}],
                              {extent:rows[0].track,maximum:10});
 """)
-        for observation in await LocalRenderChecker(widths=(420, 1280)).check(document):
+        for observation in await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None, widths=(420, 1280)).check(document):
             result = evaluate(document, {key: value for key, value in observation.items() if key != 'hostRenderedText'})
             self.assertFalse(result['blocking'], result)
             self.assertEqual(result['numericChecks']['linearBars']['measured'], 4)

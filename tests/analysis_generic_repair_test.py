@@ -17,6 +17,30 @@ from analysis_extension.review_evidence import supplement
 
 
 class GenericDisplayTests(unittest.TestCase):
+    def test_same_capture_grouping_supports_named_other_form_without_expanding_analysis(self):
+        primary = {'factId': 'p', 'batchId': 'b1', 'captureRefs': ['cap'], 'formName': '主表',
+                   'period': '2026N0001', 'taskName': '任务', 'dataContext': {'snapshotId': 's'},
+                   'aggregation': {'groupBy': [{'dimCode': 'ORG', 'field': 'TYPE'}]}}
+        other = {**primary, 'factId': 'o', 'batchId': 'b2', 'formName': '对照表',
+                 'valueState': 'PRESENT', 'value': '12', 'dimensions': {'ORG__TYPE': None}}
+        artifact = {'facts': [primary], 'scope': {'memberDimension': 'ORG__TYPE'}}
+        service = SimpleNamespace(owner=None,
+            store=SimpleNamespace(get_capture=lambda *_: {'captureRef': 'cap'}),
+            sources=SimpleNamespace(catalog=lambda *_: [primary, other]))
+        turn = SimpleNamespace(service=service)
+        before = deepcopy(artifact)
+        supported = supplement(turn, artifact, '对照表也返回空属性组。')
+        self.assertEqual([f['factId'] for f in supported['facts']], ['o'])
+        self.assertEqual(supported['facts'][0]['inputRole'], 'REVIEW_SUPPORT')
+        self.assertEqual(artifact, before)
+        self.assertEqual(supplement(turn, artifact, '只分析主表。')['facts'], [])
+        for key in ('period', 'taskName', 'dataContext'):
+            with self.subTest(field=key):
+                changed = {**other, key: 'different'}
+                service._review_evidence_cache = {}
+                service.sources.catalog = lambda *_: [primary, changed]
+                self.assertEqual(supplement(turn, artifact, '对照表')['facts'], [])
+
     def test_code_fallback_uses_resolved_name_without_mutating_facts(self):
         base = dict(objectId='member-1', sourceObjectId='A', objectModelCode='model-1',
                     sourceOrigins=['source-1'], period='period-1', objectLabelState='RESOLVED')

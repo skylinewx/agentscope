@@ -121,6 +121,23 @@ class NativeAnalysisTests(PresentationCase):
         self.assertEqual(result['counts']['total'], 2)
         self.assertNotIn('organizationCount', result['counts'])
 
+    async def test_display_labels_do_not_replace_nullable_raw_group_keys(self):
+        _, artifact = await self.build_values(('3', '0'))
+        facts = artifact['facts']
+        for index, fact in enumerate(facts):
+            key = None if index == 0 else 'A'
+            fact.update(grain=['group'], dimensions={'group': key}, rowIdentity={'group': key},
+                        objectLabel='（属性为空）' if key is None else '已标注组')
+        result = describe(facts, {'memberDimension': 'group'}, {})
+        columns = [column['name'] for column in result['columns']]
+        rows = [dict(zip(columns, row)) for row in result['rows']]
+        self.assertEqual(rows[0]['object'], '（属性为空）')
+        self.assertIsNone(rows[0]['grain1'])
+        self.assertEqual(rows[1]['grain1'], 'A')
+        self.assertEqual(rows[1]['value'], '0')
+        self.assertEqual(result['counts']['total'], 2)
+        self.assertEqual(result['identityColumns'][0]['dimension'], 'group')
+
     async def test_native_formula_directory_reuses_check_and_retains_missing(self):
         from analysis_closeout_test import mixed_fixture
         reference, selectors, scope = mixed_fixture(self.store, 1)
@@ -134,13 +151,16 @@ class NativeAnalysisTests(PresentationCase):
             [{'id': 'formula', 'operator': 'FORMULA_CHECK', 'select': {'cellKey': '2:1', 'objectId': 'object-0'}}], 'formula')
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
         directory = document_inputs(artifact)
-        self.assertEqual(directory[0]['localStatus'], 'BLOCKED')
-        self.assertEqual(directory[0]['recursiveStatus'], 'BLOCKED')
-        self.assertFalse(directory[0]['checkSummary']['allLocalChecksCompleted'])
+        self.assertEqual(directory[0]['localStatus'], 'MISMATCH')
+        self.assertEqual(directory[0]['recursiveStatus'], 'MISMATCH')
+        self.assertTrue(directory[0]['checkSummary']['allLocalChecksCompleted'])
         self.assertFalse(directory[0]['checkSummary']['allLocalChecksMatch'])
-        self.assertGreater(directory[0]['checkSummary']['localUnavailableCount'], 0)
+        self.assertEqual(directory[0]['checkSummary']['localUnavailableCount'], 0)
         datasets, _ = compile_datasets(artifact, [{'key': 'formula', **directory[0]['dataset']}])
-        self.assertIsNone(datasets['formula']['nodes'][0]['values']['localValue']['value'])
+        node = datasets['formula']['nodes'][0]
+        self.assertEqual(node['values']['localValue']['value'], '-15')
+        self.assertIsNone(node['operands'][0]['value'])
+        self.assertEqual(node['waterfall']['steps'][0]['value'], '0')
         self.assertEqual(len(artifact['derivedValues']), 1)
 
     def test_formula_summary_distinguishes_root_match_from_incomplete_chain(self):

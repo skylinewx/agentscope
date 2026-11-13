@@ -8,6 +8,7 @@ import asyncio
 import json
 import sqlite3
 import logging
+from copy import deepcopy
 from time import perf_counter
 
 from agentscope.message import TextBlock, ToolResultState
@@ -40,6 +41,20 @@ def host_request(owner, turn_key, origin, request):
     return {**request, 'requestId': request_identity(logical_request(owner, turn_key, origin, request))}
 
 
+def canonical_arguments(text, schema):
+    """Freeze the same schema-normalized arguments that the SDK executes."""
+    from agentscope._utils._common import _json_loads_with_repair
+    from jsonschema import validate, ValidationError
+    from agentscope.exception import ToolJSONDecodeError
+    try:
+        request = _json_loads_with_repair(text, schema)
+        validate(request, schema)
+        return request
+    except (ValidationError, ToolJSONDecodeError) as error:
+        raise AnalysisError('INVALID_TOOL_ARGUMENTS', '工具参数未满足当前 Schema；保留业务条件并修正指定字段。',
+                            {'path': getattr(error, 'json_path', '$'), 'reason': str(error)[:1200]}) from error
+
+
 class ReceiptCapture:
     def __init__(self, store: AnalysisStore, owner: Owner, resource_ids: frozenset[str], authorize, number_formats: dict | None = None, sources=None):
         self.store, self.owner, self.resource_ids, self.authorize = store, owner, resource_ids, authorize
@@ -50,6 +65,7 @@ class ReceiptCapture:
         self.query_cache_provider = lambda: None
         self.task_context_provider = lambda: {}
         self.request_preparer = lambda origin, request: request
+        self.model_submission = True
 
     def _model_projection(self, adapter, receipt, capture, source_chars):
         try:
@@ -88,6 +104,10 @@ class ReceiptCapture:
                 if len(encode(prepared)) < 4000:
                     navigation['preparedTargets'] = prepared
             # No duplicate JSON fact rows in the analysis preview either.
+            from .query_recovery import target_recovery
+            recovery = target_recovery(receipt, capture['request'])
+            if recovery:
+                navigation['recovery'] = recovery
             projected = business_view(receipt, reference, max_chars=MODEL_CHARS - len(encode(navigation)) - 100)
             projected.update(navigation)
             return projected
@@ -102,6 +122,14 @@ class ReceiptCapture:
                     projected['analysisMaterials'] = material
                     projected['analysisRead'] = {'tool': 'AnalysisInspect', 'arguments': {'section': 'materials', 'captureRef': reference}}
                     return projected
+        from .scope_candidates import candidates
+        choices = candidates(receipt, capture)
+        if choices:
+            return {'viewType': 'scope_candidates', 'captureRef': reference, 'status': receipt['status'],
+                    'scopeCandidates': choices, 'context': receipt.get('context'), 'querySessionId': receipt.get('querySessionId'),
+                    'read': {'captureRef': reference, 'pointer': '/data/candidates', 'offset': 0, 'limit': 20},
+                    'candidateCount': len(receipt.get('data', {}).get('candidates', [])),
+                    'note': '以下是已核验的任务/表样候选；其余搜索候选保存在 read。结合用户原话、年份及上下文选择，必要时读取候选详情；不能默认第一条或最新版本。'}
         return adapter.compact(receipt, reference, source_chars)
 
     async def run(self, agent, input_kwargs, next_handler):
@@ -128,9 +156,10 @@ class ReceiptCapture:
         events, seen, started, stopped = [], set(), perf_counter(), 'SOURCE_STOPPED'
         retries = []
         status_reads = []
+        frozen_request = None
         while True:
             response = None
-            async for event in self._run_page(agent, input_kwargs, next_handler):
+            async for event in self._run_page(agent, input_kwargs, next_handler, frozen_request=frozen_request):
                 if enabled and isinstance(event, ToolResponse):
                     response = event
                 else:
@@ -146,6 +175,7 @@ class ReceiptCapture:
                 return
             try:
                 saved = self.store.get_capture(self.owner, response.metadata['analysisCaptureRef'])
+                frozen_request = deepcopy(saved['request'])
                 receipt = adapter.raw_receipt(saved['response'])
                 from .query_waiting import waiting, wait_limit
                 if waiting(receipt):
@@ -199,6 +229,7 @@ class ReceiptCapture:
             # 同一调用身份登记每页，后台恢复能一次找回所有证据；不生成新的业务计划。
             call = input_kwargs['tool_call'].model_copy(update={'input': encode(request)})
             input_kwargs = {**input_kwargs, 'tool_call': call}
+            frozen_request = deepcopy(request)
         if len(events) == 1:
             yield events[0]
         else:
@@ -212,7 +243,7 @@ class ReceiptCapture:
                 response.metadata['analysisCaptureRefs'] = [event.metadata['analysisCaptureRef'] for event in events]
             yield response
 
-    async def _run_page(self, agent, input_kwargs, next_handler):
+    async def _run_page(self, agent, input_kwargs, next_handler, *, frozen_request=None):
         call = input_kwargs["tool_call"]
         tool = await agent.toolkit.get_tool(call.name)
         origin = leased_mcp_origin(tool, self.resource_ids)
@@ -231,7 +262,21 @@ class ReceiptCapture:
             request = json_values(exact_loads(request_text))
             if not isinstance(request, dict):
                 raise AnalysisError('INVALID_JSON', '工具参数必须是 JSON 对象；字符串与标识须使用双引号。')
-            normalized = self.request_preparer(origin, request) if adapter.adapter_id == 'budget-v2' else request
+            # Use the same schema-guided type repair as actual tool execution.
+            # Preserve submitted_request_text for audit, but never freeze/cache or
+            # validate a different request from the one sent to the MCP server.
+            if frozen_request is None:
+                schema = (tool.model_input_schema if self.model_submission and tool.model_input_schema is not None
+                          else tool.input_schema)
+                request = canonical_arguments(encode(request), schema)
+            # Only the host continuation loop supplies this private argument.
+            # A model parameter/requestId never skips preparation or authorization.
+            normalized = (deepcopy(frozen_request) if frozen_request is not None else
+                          self.request_preparer(origin, request) if adapter.adapter_id == 'budget-v2' else request)
+            if frozen_request is None:
+                if adapter.adapter_id == 'budget-v2' and origin['originalToolName'] == 'execute_budget_query':
+                    normalized = host_request(self.owner, turn_key, origin, {**normalized, 'requestId': normalized.get('requestId', 'host-pending')})
+                normalized = canonical_arguments(encode(normalized), tool.input_schema)
         except AnalysisError as error:
             # 在发出外部查询前返回可执行的修复参数；错误仍由本轮工具记录接管。
             yield ToolResponse(id=call.id, state=ToolResultState.ERROR,
@@ -257,7 +302,7 @@ class ReceiptCapture:
                     return
             else:
                 normalized = host_request(self.owner, turn_key, origin, normalized)
-        if normalized != request:
+        if normalized != request or request != json_values(exact_loads(request_text)):
             request = normalized
             request_text = json.dumps(request, ensure_ascii=False)
             # 保存原提交与实际执行条件；标识和缓存均基于已继承范围后的请求。
@@ -268,6 +313,8 @@ class ReceiptCapture:
                 "requestText": request_text, "submittedRequestText": submitted_request_text,
                 "request": request, "capturedAt": now(),
                 "numberFormat": self.number_formats.get(origin["resourceId"]), "turnKey": turn_key,
+                "intentRevision": self.task_context_provider().get('intentRevision', 0),
+                "inputSetVersion": self.task_context_provider().get('inputSetVersion'),
                 **({'queryAttempt': attempt} if attempt else {})}
         # 只复用当前用户轮、同一连接及完全相同的只读执行参数。
         # PARTIAL/后台执行/失败回执不缓存，续取仍执行原恢复协议。

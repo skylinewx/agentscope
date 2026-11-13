@@ -110,6 +110,15 @@ def _target(value):
 
 def validate(capture, receipt):
     request, data = capture['request'], receipt.get('data', {})
+    if data.get('sourceBasis', {}).get('operation') == 'IMMUTABLE_FACT_VIEW':
+        from .budget_source_view import validate_view
+        return validate_view(capture, receipt, validate)
+    basis = request.get('basis') or {}
+    if basis.get('kind') in ('FACTS', 'MEMBERS'):
+        from .budget_source_view import validate_basis
+        validate_basis(request, data)
+        if basis['kind'] == 'FACTS':
+            request = {**request, 'sourceSelection': basis['source']}
     _require(data.get('resultType') == 'BUDGET_QUERY_RESULT', '业务查询没有返回对应的数据契约。')
     _require(data.get('purpose') == request.get('purpose'), '查询与分析用途发生变化。')
     selection = request.get('selection', 'CELLS')
@@ -179,8 +188,9 @@ def validate(capture, receipt):
     _require(not data['complete'] or not data.get('unresolvedGroups'), '未确认的执行组不能声明全部完成。')
     from ..dimension_scopes import validate_execution
     validate_execution(request, data)
+    scope = _resolved_scope(request, data)
     if selection == 'FULL_FORM':
-        _require(any(request.get('scope', {}).get(k) for k in ('formCodes', 'formNames')),
+        _require(any(scope.get(k) for k in ('formCodes', 'formNames')),
                  '整表读取必须来自明确表样范围。')
 
     steps = data.get('runtimeRequests', [])
@@ -190,7 +200,6 @@ def validate(capture, receipt):
     _require(len({step['id'] for step in steps}) == len(steps)
              and {step['id'] for step in steps} == {step.get('stepId') for step in results},
              '服务端步骤与结果没有一一对应。')
-    scope = request.get('scope') or {}
 
     def check_context(context, names, named_result=True):
         target = context.get('target', {})
@@ -321,12 +330,89 @@ def validate(capture, receipt):
     return steps
 
 
+def _resolved_scope(request, data):
+    """Enforce the actual identities verified by native candidate resolution."""
+    scope = dict(request.get('scope') or {})
+    bindings = scope.get('bindings', [])
+    proofs = (data.get('resolution') or {}).get('scopeBindings', [])
+    _require(isinstance(proofs, list) and len(proofs) == len(bindings), '候选范围缺少完整的服务端确认依据。')
+    for binding, proof in zip(bindings, proofs):
+        _require(isinstance(proof, dict) and proof.get('binding') == binding,
+                 '候选范围确认依据与请求不一致。')
+        model, code, name = binding.get('modelCode'), proof.get('code'), proof.get('name')
+        _require(model in ('BUDGET_TASK', 'BUDGET_FORM_TEMPLATE')
+                 and isinstance(code, str) and bool(code.strip()) and isinstance(name, str) and bool(name.strip()),
+                 '候选范围缺少确定的任务或表样身份。')
+        prefix = 'task' if model == 'BUDGET_TASK' else 'form'
+        scope[prefix + 'Codes'] = list(dict.fromkeys([*scope.get(prefix + 'Codes', []), code]))
+        scope[prefix + 'Names'] = [value for value in scope.get(prefix + 'Names', []) if value != binding['text']]
+    return scope
+
+
 def _validate_value_filter(request, data, origins, results):
     expected = (request.get('intentDraft') or {}).get('valueFilter')
     if expected is None:
         return
-    from ..budget_preparation import validate_subject_filter
-    compare, threshold = validate_subject_filter(expected)
+    proof = data.get('valueFilter') or {}
+    if proof.get('basis') in ('BUDGET_NATIVE_RESULT_WHERE', 'BUDGET_NATIVE_FILTER'):
+        from ..value_predicates import validate, compile_native
+        _require(validate(proof.get('condition')) == validate(expected), '原生数值筛选与业务条件不一致。')
+        native = {batch['batchId']: batch for step in results.values() for batch in step.get('batchResults', [])}
+        verified = set()
+        for item in proof.get('batches', []):
+            batch = native.get(item.get('batchId'))
+            _require(batch is not None, '筛选摘要缺少原生回执。')
+            aliases = item.get('logicalTargetColumns') or {}
+            _require(bool(aliases) and len(set(aliases.values())) == len(aliases), '筛选目标与指标列没有一一绑定。')
+            filter_key = 'having' if item.get('filterStage') == 'HAVING' else 'resultWhere'
+            if filter_key == 'having':
+                _require(bool(batch.get('request', {}).get('aggregation')), '汇总值筛选缺少分组汇总请求。')
+            _require(compile_native(expected, aliases) == batch.get('request', {}).get(filter_key) == item.get(filter_key),
+                     '批量请求未原样执行完整的组合条件。')
+            _require(item.get('rangeSummary') == batch.get('data', {}).get('rangeSummary', {}), '筛选统计与预算回执不一致。')
+            _require(item.get('aggregationSummary', {}) == batch.get('data', {}).get('aggregationSummary', {}),
+                     '汇总统计与预算回执不一致。')
+            _require(item.get('status') == batch.get('disposition'), '筛选状态与原生回执不一致。')
+            verified.add(batch['batchId'])
+        selected = []
+        for selection in proof.get('analysisSelection', []):
+            batch = native.get(selection.get('batchId'), {})
+            metric = next((m for m in batch.get('metrics', []) if m.get('name') == selection.get('sourceColumn')), {})
+            rows = batch.get('data', {}).get('rows', [])
+            index = selection.get('rowIndex')
+            _require(selection.get('batchId') in verified and metric and type(index) is int and 0 <= index < len(rows),
+                     '分析目标缺少筛选命中行的来源。')
+            dimensions = dict(metric.get('selectedDimensions') or {})
+            for position, column in enumerate(batch.get('data', {}).get('columns', [])):
+                role = batch.get('columnRoles', {}).get(column.get('name'), {})
+                if role.get('kind') in ('DIMENSION', 'PROPERTY') and rows[index][position] is not None:
+                    key = role['dimCode'] + ('__' + role['field'] if role.get('field') else '')
+                    dimensions[key] = rows[index][position]
+            _require(selection.get('dimensions') == dimensions
+                     and selection.get('measureCode') == metric.get('measureCode')
+                     and selection.get('modelCode') == str(metric.get('cellExp', '')).split('[', 1)[0]
+                     and selection.get('binding') == metric.get('context', {}).get('target', {}).get('formBindingKey'),
+                     '公式目标的坐标与筛选来源不一致。')
+            selected.append(selection)
+        for result in data.get('resultSets', []):
+            for row in result.get('rows', []):
+                if 'analysisSelection' in proof:
+                    _require(any(item.get('targetId') == result.get('targetId')
+                        and item.get('binding') == result.get('context', {}).get('target', {}).get('formBindingKey')
+                        and item.get('dimensions') == row.get('dimensions')
+                        and item.get('measureCode') == row.get('measureCode')
+                        and item.get('modelCode') == str(row.get('cellExp', '')).split('[', 1)[0] for item in selected),
+                        '分析格不是完整数值条件命中的对象。')
+                    continue
+                for ref in row.get('originRefs', []):
+                    origin = origins.get(ref, {})
+                    if origin.get('sourceType') == 'BATCH_QUERY' and row.get('valueState') not in ('ERROR', 'NOT_LOADED'):
+                        _require(origin.get('batchId') in verified, '结果没有对应已执行的筛选回执。')
+        if data.get('complete'):
+            _require(bool(verified), '筛选尚未执行，不能声明完整。')
+        return
+    from ..value_predicates import scalar_comparison
+    compare, threshold = scalar_comparison(expected)
     proof = data.get('valueFilter') or {}
     _require(all(proof.get(key) == value for key, value in expected.items()), '数值筛选与原始要求不一致。')
     candidates = proof.get('evaluatedFacts', [])

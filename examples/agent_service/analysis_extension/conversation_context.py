@@ -16,8 +16,8 @@ def _snapshot(state, status):
     answer = state.get('deliveredAnswer', '') if completed else ''
     captures = state.get('queryCaptureRefs', []) + scope.get('captureRefs', [])
     captures += [selection['captureRef'] for selection in scope.get('selections', [])]
-    from .dimension_scopes import snapshot
-    dimension_scopes = snapshot(state, scope.get('captureRefs', []) + [item['captureRef'] for item in scope.get('selections', [])] or captures) if completed else []
+    from .dimension_scopes import snapshot, retained_scopes
+    dimension_scopes = snapshot(state, scope.get('captureRefs', []) + [item['captureRef'] for item in scope.get('selections', [])] or captures) if completed else retained_scopes(state)
     return {
         'dimensionScopes': dimension_scopes,
         'contextRef': 'ctx_' + digest(state['turnKey'])[:24],
@@ -29,6 +29,8 @@ def _snapshot(state, status):
         'baseContextRefs': deepcopy(state.get('selectedContextRefs', [])),
         'pendingChanges': [] if completed else list(dict.fromkeys(
             state.get('basePendingChanges', []) + state.get('followupContext', {}).get('changedFields', []))),
+        'pendingDimensions': [] if completed else list(dict.fromkeys(
+            state.get('basePendingDimensions', []) + state.get('followupContext', {}).get('changedDimensions', []))),
         'analysisRef': state.get('analysisRef') or scope.get('analysisRef'),
         'resultRefs': deepcopy(state.get('queryResultRefs', [])),
         'captureRefs': list(dict.fromkeys(captures)),
@@ -36,6 +38,10 @@ def _snapshot(state, status):
         # continues to expose only the answer summary and source references.
         'referencedCalculations': deepcopy(state.get('referencedCalculations', {})),
         'remainingIssues': deepcopy(state.get('lastCheck', {}).get('issues', [])),
+        'adoptedInputs': deepcopy(state.get('adoptedInputs', [])),
+        'inputSetVersion': state.get('inputSetVersion'),
+        'intentDecisions': deepcopy(state.get('intentDecisions', {})),
+        'scopeEdits': deepcopy(state.get('scopeEdits', [])),
     }
 
 
@@ -72,6 +78,8 @@ def next_context_state(saved):
               'previousQueryIntent': deepcopy(active['intent']) if active else {},
               'inheritedScope': deepcopy(active['subjectScope']) if active else {},
               'inheritedDimensionScopes': deepcopy(active.get('dimensionScopes', [])) if active else []}
+    if active and active.get('adoptedInputs'):
+        result.update(adoptedInputs=deepcopy(active['adoptedInputs']), inputSetVersion=active.get('inputSetVersion'))
     if not records:
         # 仅旧状态有可核对的上一轮意图时恢复，不能把失败轮当前意图当成交付意图。
         result['previousQueryIntent'] = deepcopy(saved.get('previousQueryIntent', {}))
@@ -116,7 +124,7 @@ def select_context(turn, context):
     quote = context.get('userQuote')
     changed_base = bool(refs or turn.state.get('previousQueryIntent') or turn.state.get('inheritedScope'))
     if changed_base and (not isinstance(quote, str) or not quote.strip() or quote not in turn.state.get('request', '')):
-        raise AnalysisError('FOLLOWUP_CHANGE_BASIS_REQUIRED', '选择其他历史结果或恢复未完成任务时，userQuote 引用本轮原话。')
+        raise AnalysisError('FOLLOWUP_CHANGE_BASIS_REQUIRED', '选择其他历史结果或恢复未完成任务时，宿主必须保留本轮用户原话作为依据。')
     selected = [known[ref] for ref in refs]
     # 综合时仅继承一致的条件；冲突条件交给模型依据用户意图确定，不做隐式并集。
     intent = deepcopy(selected[0]['intent']) if selected else {}
@@ -125,11 +133,46 @@ def select_context(turn, context):
     scopes = [item['subjectScope'] for item in selected]
     scope = deepcopy(scopes[0]) if len(scopes) == 1 else {}
     turn.state.update(selectedContextRefs=list(refs), previousQueryIntent=intent, inheritedScope=scope,
-                      inheritedDimensionScopes=deepcopy(selected[0].get('dimensionScopes', [])) if len(selected) == 1 else [],
-                      basePendingChanges=deepcopy(selected[0].get('pendingChanges', [])) if len(selected) == 1 else [])
+                      inheritedDimensionScopes=_confirmed_context_scopes(selected[0], known) if len(selected) == 1 else [],
+                      basePendingChanges=deepcopy(selected[0].get('pendingChanges', [])) if len(selected) == 1 else [],
+                      basePendingDimensions=deepcopy(selected[0].get('pendingDimensions', [])) if len(selected) == 1 else [])
     # 本轮改选依据时清除旧的临时声明，随后由 declare 合并本次显式意图。
     turn.state.pop('queryIntent', None)
+    turn.state.pop('intentDecisions', None)
     turn.state.pop('inheritedScopeUnavailable', None)
+    turn.state.pop('scopeEdits', None)
+    turn.state.pop('adoptedInputs', None)
+    turn.state.pop('inputSetVersion', None)
+    if selected:
+        if len(selected) == 1 and selected[0].get('kind') == 'PENDING':
+            # A pending task includes explicit clears and custom dimensions, not
+            # merely its readable intent. Resume the whole declaration atomically.
+            turn.state['scopeEdits'] = deepcopy(selected[0].get('scopeEdits', []))
+            turn.state['intentDecisions'] = deepcopy(selected[0].get('intentDecisions', {}))
+            turn.state['queryIntent'] = deepcopy(selected[0]['intent'])
+        inputs = [deepcopy(value) for item in selected for value in item.get('adoptedInputs', [])]
+        if inputs:
+            from .source_views import install
+            install(turn, list({value['inputRef']: value for value in inputs}.values()))
+
+
+def _confirmed_context_scopes(record, known, visited=()):
+    """Restore pre-fix pending contexts only along their explicit base reference."""
+    ref = record.get('contextRef')
+    if ref in visited:
+        return []
+    scopes = deepcopy(record.get('dimensionScopes', []))
+    if record.get('kind') != 'PENDING':
+        return scopes
+    bases = record.get('baseContextRefs', [])
+    base = known.get(bases[0]) if len(bases) == 1 else None
+    if not scopes and base:
+        scopes = _confirmed_context_scopes(base, known, (*visited, ref))
+    from .dimension_scopes import retained_scopes
+    return retained_scopes({'inheritedDimensionScopes': scopes,
+        'previousQueryIntent': (base or {}).get('intent', {}),
+        'basePendingChanges': record.get('pendingChanges', []),
+        'basePendingDimensions': record.get('pendingDimensions', [])})
 
 
 def selected_contexts(state):
@@ -139,6 +182,29 @@ def selected_contexts(state):
              ('contextRef', 'request', 'intent', 'status', 'kind', 'analysisRef', 'resultRefs', 'captureRefs', 'remainingIssues',
               'answerPreview', 'answerPreviewComplete')}
             for item in state.get('businessContexts', []) if item['contextRef'] in wanted]
+
+
+def inheritance_intents(state):
+    """Find replaced wording along the explicitly selected pending task's base.
+
+    A resumed intent already names the new metric while its source can still be
+    the earlier delivered metric. These records only identify obsolete terms;
+    they do not authorize conditions or select an unrelated historical source.
+    """
+    intents = [state.get('previousQueryIntent', {})]
+    known = {item['contextRef']: item for item in state.get('businessContexts', [])}
+    pending = list(state.get('selectedContextRefs', []))
+    seen = set()
+    while pending:
+        ref = pending.pop()
+        if ref in seen or ref not in known:
+            continue
+        seen.add(ref)
+        record = known[ref]
+        intents.append(record.get('intent', {}))
+        if record.get('kind') == 'PENDING':
+            pending.extend(record.get('baseContextRefs', []))
+    return intents
 
 
 def evidence_turn(turn):

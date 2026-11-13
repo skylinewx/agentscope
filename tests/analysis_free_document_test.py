@@ -1,3 +1,4 @@
+from analysis_contract_test_helpers import visible_markup
 """Document publication must preserve values, preview identity and isolation."""
 import json
 from copy import deepcopy
@@ -39,10 +40,10 @@ class FreeDocumentTests(PresentationCase):
         self.assertTrue(result['delivery']['registered'])
         view=self.delivery.view(result['delivery']['path'])
         doc=view['freeDocument']
-        self.assertIn('1,234,567,890.12',doc['html'])
-        self.assertIn('1234567890.123456',doc['html'])
-        self.assertNotIn('changed after preview',doc['html'])
-        self.assertNotIn('未注明',doc['html'])
+        self.assertIn('1,234,567,890.12',visible_markup(doc['html']))
+        self.assertIn('1234567890.123456',visible_markup(doc['html']))
+        self.assertNotIn('changed after preview',visible_markup(doc['html']))
+        self.assertNotIn('未注明',visible_markup(doc['html']))
         saved=self.store.get_analysis(OWNER,self.ref)
         self.assertEqual(saved['facts'],original['facts'])
         self.assertEqual(saved['derivedValues'],original['derivedValues'])
@@ -86,12 +87,12 @@ class FreeDocumentTests(PresentationCase):
         req=await self.request();artifact=self.store.get_analysis(OWNER,self.ref)
         artifact['facts'][0]['objectLabel']='</script><script>bad()</script>{{notASlot}}'
         doc=compile_document(artifact,req['document'])
-        self.assertNotIn('</script><script>bad()',doc['html'])
-        self.assertIn('\\u003c/script>',doc['html'])
+        self.assertNotIn('</script><script>bad()',visible_markup(doc['html']))
+        self.assertIn('\\u003c/script>',visible_markup(doc['html']))
         req['document']['bindings'].append({'key':'unit','valueRef':self.fact,'field':'unit'})
         req['document']['html']=req['document']['html'].replace('{{amount}}','{{amount}}{{unit}}')
         doc=compile_document(artifact,req['document'])
-        self.assertIn('<p>1,234,567,890.12</p>',doc['html'])
+        self.assertIn('<p>1,234,567,890.12</p>',visible_markup(doc['html']))
 
     async def test_dynamic_data_declaration_is_not_claimed_as_visible_topic_coverage(self):
         req=await self.request();artifact=self.store.get_analysis(OWNER,self.ref)

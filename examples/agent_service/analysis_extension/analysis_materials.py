@@ -85,7 +85,11 @@ def materials(capture, sources, *, offset=0, limit=100, max_chars=MATERIAL_CHARS
     # 批量表由适配器给出指标列和分组维度，不能把属性组还原为机构明细。
     for item in selection_candidates(capture, sources, catalog):
         if item.get('batchId') and item.get('columnNames'):
-            selections.append({key: item[key] for key in ('captureRef', 'stepId', 'batchId', 'columnNames')})
+            # A filtered selector is executable only with its original row boundary.
+            # Projection must preserve that boundary and the host's selection basis.
+            selections.append({key: deepcopy(item[key]) for key in
+                               ('captureRef', 'stepId', 'batchId', 'columnNames', 'rowIndices', 'selectionReason')
+                               if key in item})
         elif item.get('cellKeys') or item.get('preparedTargets'):
             selections.append(item)
     rows = []

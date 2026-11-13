@@ -196,7 +196,7 @@ class ResultEvidenceTests(PresentationCase):
         verdict = await middleware._check_end(SimpleNamespace(state=state, name='agent', model=SimpleNamespace(generate_structured_output=AsyncMock(side_effect=summary_response))))
         self.assertEqual(verdict['status'], 'PARTIAL')
         self.assertEqual(verdict['semanticReview'], 'NOT_REVIEWED')
-        self.assertEqual(verdict['deliveryStatus'], 'MODEL_SUMMARY')
+        self.assertEqual(verdict['deliveryStatus'], 'FACT_SUMMARY')
         self.assertNotIn('999999', turn.state['hostCloseout']['answer'])
         self.assertIn('-2', turn.state['hostCloseout']['answer'])
         turn.state.pop('hostCloseout')
@@ -222,7 +222,7 @@ class ResultEvidenceTests(PresentationCase):
         self.assertNotIn('999999', delivered)
         self.assertIn('-2', delivered)
         self.assertEqual(saved.metadata['analysisCompletion'], ends[0].metadata['analysisCompletion'])
-        self.assertEqual(saved.metadata['analysisCompletion']['deliveryStatus'], 'MODEL_SUMMARY')
+        self.assertEqual(saved.metadata['analysisCompletion']['deliveryStatus'], 'FACT_SUMMARY')
         self.assertEqual(ends[0].finished_reason, ReplyFinishedReason.COMPLETED)
 
     async def test_failed_dependency_review_never_runs_global_approval(self):
@@ -278,7 +278,7 @@ class ResultEvidenceTests(PresentationCase):
         self.assertEqual(first['recoveryAction'],'FOCUS_SAVED_GRID')
         self.assertNotIn('hostCloseout',turn.state)
         second=await middleware._check_end(agent)
-        self.assertEqual(second['deliveryStatus'],'MODEL_SUMMARY')
+        self.assertEqual(second['deliveryStatus'],'FACT_SUMMARY')
         self.assertEqual(second['semanticReview'],'NOT_REVIEWED')
 
     async def test_focus_diagnostic_change_is_reviewed_instead_of_forced_closeout(self):
@@ -363,7 +363,9 @@ class ResultPartitionTests(TestCase):
     def evidence(self):
         runs = []
         for index in range(2):
-            runs.append({'runRef':str(index),'code':'x'*8000,'dependencies':[],
+            # Different programs keep this fixture above the partition limit;
+            # identical programs may now be shared losslessly in one review.
+            runs.append({'runRef':str(index),'code':chr(97 + index)*8000,'dependencies':[],
                          'sourceData':[{'complete':True,'rows':[['0'],[None]],'columns':['value']}],
                          'outputs':[{'derivedId':'d'+str(index),'value':str(index),'inputRefs':['source']} ]})
         return {'sources':[], 'pythonRuns':runs, 'resultRoots':['d0','d1'],

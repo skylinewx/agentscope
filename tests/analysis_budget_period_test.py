@@ -10,8 +10,8 @@ from analysis_extension.models import AnalysisError
 def period_fixture():
     first, selectors, scope = fixture(values=('100',))
     scope['expectedDimensions'] = {}
-    intent = {'kind': 'RANGE', 'start': {'type': 'Y', 'year': 2026, 'period': 1},
-              'end': {'type': 'Y', 'year': 2026, 'period': 2}}
+    intent = {'kind': 'RANGE', 'start': {'type': 'MONTH', 'year': 2026, 'period': 1},
+              'end': {'type': 'MONTH', 'year': 2026, 'period': 2}}
     first['request']['plan']['steps'][1]['formQuery'].pop('periodCode')
     first['request']['plan']['steps'][1]['formQuery']['periodRequest'] = intent
     receipt = json.loads(first['response']['content'][0]['text'])

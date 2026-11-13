@@ -2557,17 +2557,23 @@ class Agent:
                 self.state.tool_context.activated_groups,
             )
 
-            # Try to parse the input with the tool schema
+            # Before on_acting middleware, these are model arguments. The host
+            # may later translate references and add execution-only evidence.
+            call_schema = (
+                tool.model_input_schema
+                if tool.model_input_schema is not None
+                else tool.input_schema
+            )
             parsed_input = _json_loads_with_repair(
                 tool_call.input,
-                tool.input_schema,
+                call_schema,
             )
 
             # Validate the parsed input with the tool schema
             # TODO: Maybe some logic to mix the validation error in runtime
             try:
                 if tool.is_external_tool or not tool.validates_input_in_call:
-                    jsonschema.validate(parsed_input, tool.input_schema)
+                    jsonschema.validate(parsed_input, call_schema)
             except jsonschema.ValidationError as e:
                 raise AgentOrientedException(
                     f"Input validation failed for tool '{tool_call.name}': "

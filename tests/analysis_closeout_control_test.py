@@ -143,9 +143,9 @@ class CloseoutControlTests(PresentationCase):
         answer = await middleware._closeout('REVIEW_UNAVAILABLE', agent)
         self.assertEqual(turn.state['hostCloseout']['status'], 'PARTIAL', answer)
         self.assertEqual(turn.state['hostCloseout']['semanticReview'], 'NOT_REVIEWED')
-        self.assertEqual(turn.state['hostCloseout']['deliveryStatus'], 'MODEL_SUMMARY')
+        self.assertEqual(turn.state['hostCloseout']['deliveryStatus'], 'FACT_SUMMARY')
         self.assertEqual(self.store.get_analysis(OWNER, turn.state['analysisRef'])['facts'], artifact['facts'])
-        agent.model.generate_structured_output.assert_awaited_once()
+        agent.model.generate_structured_output.assert_not_awaited()
 
     async def test_real_agent_delivers_interpreted_summary_without_restarting_business_loop(self):
         from agentscope.agent import Agent, InjectionConfig
@@ -185,8 +185,8 @@ class CloseoutControlTests(PresentationCase):
         self.assertEqual(model.cnt, 0)
         saved = [event for event in events if isinstance(event, Msg)][-1]
         answer = ''.join(block.text for block in saved.content if block.type == 'text')
-        model.generate_structured_output.assert_awaited_once()
-        self.assertIn('当前已取得的金额', answer)
+        model.generate_structured_output.assert_not_awaited()
+        self.assertIn('已取得以下来源数据', answer)
         self.assertEqual(saved.metadata['presentation']['answer_block_ids'],
                          [block.id for block in saved.content if block.type == 'text'])
 

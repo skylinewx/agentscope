@@ -17,7 +17,7 @@ def input_record(ref, value):
     record = {'ref': ref, **{key: deepcopy(value[key]) for key in
         ('value', 'valueState', 'unit', 'scale', 'period', 'executionPeriod', 'dimensions', 'dimensionNames',
          'effectiveDimensions', 'objectId', 'objectLabel', 'headers', 'measureCode', 'sourceMeasureCode',
-         'formula', 'formulaStatus', 'cellAddress', 'inputRole', 'grain', 'rowIdentity',
+         'formula', 'formulaStatus', 'cellAddress', 'inputRole', 'inputMemberships', 'grain', 'rowIdentity',
          'stepId', 'bindingRef', 'observationId', 'batchId', 'rowIndex', 'columnName', 'cellKey',
          'operator', 'checkScope', 'sourceValue', 'localValue', 'localDifference', 'difference', 'formulaTrace',
          'outputKind', 'columns', 'rows', 'data', 'text', 'filename', 'sourceFactIds', 'kind', 'contentDigest') if key in value}}
@@ -172,6 +172,12 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
                                     baseAnalysisRef=analysisRef, workPlan=pending_work)
         analysisRef = built['analysisRef']
     base = service.store.get_analysis(service.owner, analysisRef) if analysisRef else None
+    from .input_state import snapshot, require_unchanged, validate_analysis
+    input_state = snapshot(service)
+    if base is not None:
+        from .protocol import validate_artifact
+        validate_artifact(base)
+        validate_analysis(service, base)
     if service.turn is not None and base is not None:
         from .grouping_policy import grouping_issues
         issues = grouping_issues(service.turn, base)
@@ -320,6 +326,7 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
                 'fileReads': read_summary(execution.get('fileReads', [])),
                 'boundary': ('网格来源及完整文件已绑定；fileReads 记录实际扫描范围。公式和业务聚合仍沿用预算口径。'
                              if grids else '工作区文件已冻结并执行；文件内容不是预算来源核验证据。')}
+    require_unchanged(service, input_state)
     artifact = deepcopy(base)
     artifact['captureRefs'] = list(dict.fromkeys([*artifact['captureRefs'], *[value['captureRef'] for value in grids]]))
     artifact['derivedValues'] += values

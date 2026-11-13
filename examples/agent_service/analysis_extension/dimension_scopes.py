@@ -31,7 +31,7 @@ def changed_fields(state):
     """Both public change declarations must release the same inherited conditions."""
     context = state.get('followupContext', {})
     fields = set(context.get('changedFields', [])) | set(state.get('basePendingChanges', []))
-    dimensions = {concept(value) for value in context.get('changedDimensions', [])}
+    dimensions = {concept(value) for value in context.get('changedDimensions', []) + state.get('basePendingDimensions', [])}
     for record in state.get('inheritedDimensionScopes', []):
         aliases = _scope_aliases(record)
         prior = state.get('previousQueryIntent', {})
@@ -47,8 +47,14 @@ def changed_fields(state):
 def changed_dimensions(state):
     context = state.get('followupContext', {})
     fields = changed_fields(state)
-    return {concept(value) for value in context.get('changedDimensions', [])} | {
+    return {concept(value) for value in context.get('changedDimensions', []) + state.get('basePendingDimensions', [])} | {
         dimension for dimension, field in STANDARD_FIELDS.items() if field in fields}
+
+
+def retained_scopes(state):
+    """Keep confirmed base conditions of an unfinished task, excluding explicit changes."""
+    changes = changed_dimensions(state)
+    return [deepcopy(item) for item in state.get('inheritedDimensionScopes', []) if not changes & _scope_aliases(item)]
 
 
 def remember(turn, capture):
@@ -70,7 +76,8 @@ def remember(turn, capture):
             continue
         records.append({'draft': deepcopy(scope), 'bindings': deepcopy(confirmed),
                         'captureRef': capture['captureRef'],
-                        'confirmedSource': {'executionId': receipt.get('executionId'), 'scopeId': scope['id']},
+                        'confirmedSource': {'executionId': receipt.get('executionId'), 'scopeId': scope['id'],
+                                            'contextId': receipt.get('context', {}).get('contextId'), 'querySessionId': receipt.get('querySessionId')},
                         'appliesToAllTargets': not scope.get('targetIds') or set(scope['targetIds']) == target_ids})
     # Single values from explicit shared phrases are also per-dimension conditions.
     # Never infer them from opening defaults or from metric phrases in a target.
@@ -95,7 +102,8 @@ def remember(turn, capture):
                 'sourceText': phrase['sourceText'], 'targetIds': [],
                 'selector': {'type': 'VALUES', 'members': [phrase['text']]}}
         records.append({'draft': item, 'bindings': deepcopy(matches), 'captureRef': capture['captureRef'],
-                        'confirmedSource': {'executionId': receipt.get('executionId'), 'sharedTerm': phrase['text']},
+                        'confirmedSource': {'executionId': receipt.get('executionId'), 'sharedTerm': phrase['text'],
+                                            'contextId': receipt.get('context', {}).get('contextId'), 'querySessionId': receipt.get('querySessionId')},
                         'appliesToAllTargets': True, 'basis': 'EXPLICIT_SHARED_CONDITION'})
     for record in records:
         roles = {(binding.get('dimCode', binding.get('dimensionCode')),
@@ -127,7 +135,11 @@ def inherit(turn, request):
     context = turn.state.get('followupContext', {})
     if context.get('mode', 'CONTINUE') != 'CONTINUE':
         return request
-    previous = turn.state.get('inheritedDimensionScopes', [])
+    previous = deepcopy(turn.state.get('inheritedDimensionScopes', []))
+    # Index migration uses the original capture; a historical quote is never
+    # rewritten into the current question when the active native session changes.
+    turn.state['inheritedDimensionScopes'] = previous
+    cohort = set((request.get('basis') or {}).get('memberDimensions', []))
     if not previous:
         return request
     changes = changed_dimensions(turn.state)
@@ -139,8 +151,17 @@ def inherit(turn, request):
         old = record['draft']
         key = concept(old['dimensionHint'])
         aliases = _scope_aliases(record)
+        if cohort & {binding.get('dimCode', binding.get('dimensionCode')) for binding in record.get('bindings', [])}:
+            continue
         if changes & aliases:
             continue
+        proof = record.get('confirmedSource') or {}
+        if proof and not (proof.get('contextId') and proof.get('querySessionId')):
+            capture = turn.service.store.get_capture(turn.service.owner, record['captureRef'])
+            receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
+            if not receipt.get('context', {}).get('contextId') or not receipt.get('querySessionId'):
+                raise AnalysisError('SOURCE_CONTEXT_UNAVAILABLE', '历史范围缺少原始查询凭据，需要重新确认该范围。')
+            proof.update(contextId=receipt['context']['contextId'], querySessionId=receipt['querySessionId'])
         if record.get('ambiguousScope'):
             raise AnalysisError('FOLLOWUP_DIMENSION_SCOPE_AMBIGUOUS',
                 '所选历史结果在同一维度上具有不同范围，请选择来源或明确本轮范围，不能丢弃条件。',
@@ -151,13 +172,12 @@ def inherit(turn, request):
         if matches:
             if matches[0].get('selector') != old.get('selector'):
                 raise AnalysisError('FOLLOWUP_DIMENSION_SCOPE_CONFLICT',
-                    '改变已有维度范围须在 context.changedDimensions 声明，并引用本轮原话。', {'dimensionHint': old['dimensionHint']})
+                    '使用 scopeEdits 明确修改维度范围，或提交由本轮原话支持的实际选择器。', {'dimensionHint': old['dimensionHint']})
             if record.get('confirmedSource', {}).get('executionId'):
                 matches[0]['confirmedSource'] = deepcopy(record['confirmedSource'])
             # Identical selectors inherit their already confirmed wording as well.
             # A model paraphrase is not new evidence for a prior range.
             matches[0]['sourceText'] = old['sourceText']
-            inherited_text.append(old['sourceText'])
             inherited_text.extend(selector_evidence(old['selector']))
             continue
         if not record.get('appliesToAllTargets'):
@@ -169,7 +189,6 @@ def inherit(turn, request):
         item['id'] = 'inherited-' + digest([key, item['selector']])[:16]
         item['targetIds'] = []
         scopes.append(item)
-        inherited_text.append(item['sourceText'])
         inherited_text.extend(selector_evidence(item['selector']))
     if inherited_text:
         request['contextText'] = ' '.join(dict.fromkeys([request.get('contextText', ''), *inherited_text])).strip()
@@ -189,7 +208,7 @@ def check_scope_evidence(request):
     evidence = ' '.join(str(request.get(key) or '') for key in ('question', 'contextText'))
     for scope in scopes:
         source = scope.get('sourceText')
-        if not isinstance(source, str) or not source.strip() or source not in evidence:
+        if not isinstance(source, str) or not source.strip() or not scope.get('confirmedSource') and source not in evidence:
             raise AnalysisError('DIMENSION_SCOPE_EVIDENCE_INVALID',
                 '维度范围必须引用本轮原文或宿主已确认上下文，不能编造范围要求。')
 

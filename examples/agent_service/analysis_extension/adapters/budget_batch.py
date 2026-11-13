@@ -12,9 +12,14 @@ def tables(receipt):
 
 
 def result_ranges(receipt, step_id, table):
-    """A filtered business result exposes only its retained source coordinates."""
+    """Business results expose final facts, including queries without a value filter.
+
+    Runtime probe tables can be successful without contributing any final fact.
+    They must not become answer sources merely because they ran first.
+    """
     data = receipt.get('data', {})
-    if not data.get('valueFilter'):
+    if (data.get('resultType') != 'BUDGET_QUERY_RESULT' and not data.get('valueFilter')
+            and data.get('sourceBasis', {}).get('operation') != 'IMMUTABLE_FACT_VIEW'):
         return None
     references = {ref for result in data.get('resultSets', []) for row in result.get('rows', [])
                   for ref in row.get('originRefs', [])}
@@ -167,8 +172,12 @@ def catalog(capture, selections=None, max_facts=Limits().max_facts):
             if requested:
                 for selection in requested:
                     names, indices = selection_scope(selection, table)
+                    # Omitted rowIndices means all actual rows, including for a
+                    # native result already reduced to the matching population.
+                    # Never silently intersect a wider selection with the filter.
+                    indices = set(range(data['rowCount'])) if indices is None else indices
                     for name in names:
-                        if indices is None or not indices <= allowed.get(name, set()):
+                        if not indices <= allowed.get(name, set()):
                             raise AnalysisError('VALUE_FILTER_SCOPE_MISMATCH', '分析选择超出应用服务确认的数值筛选结果，请使用返回的行选择器。')
             retained = [{'stepId': step_id, 'batchId': table['batchId'], 'columnNames': [name], 'rowIndices': sorted(rows)}
                         for name, rows in allowed.items()]
@@ -272,12 +281,16 @@ def selectors(capture):
                        'rowIndicesOptional': True, 'rowsPointer': path + ('/data/cellResults' if native_exact else '/data/rows'),
                        'inputGuidance': '所选指标和行确定范围；selection 加 role=PRIMARY 后由宿主生成组合粒度成员，scope 仅需 label/selectionReason，不抄机构到 members。空数值保留 null，显示占位符不作为数字。',
                        'columnsPointer': path + ('/request/metrics' if native_exact else '/data/columns')}
-        if allowed is None:
+        narrowed = (receipt.get('data', {}).get('valueFilter')
+                    or receipt.get('data', {}).get('sourceBasis', {}).get('operation') == 'IMMUTABLE_FACT_VIEW')
+        full_table = (allowed is not None and set(allowed) == set(item['columnNames'])
+                      and all(rows == set(range(data.get('rowCount', 0))) for rows in allowed.values()))
+        if allowed is None or full_table and not narrowed:
             result.append(item)
         else:
             for name, rows in allowed.items():
                 result.append({**item, 'columnNames': [name], 'rowIndices': sorted(rows), 'rowIndicesOptional': False,
-                               'selectionReason': '应用服务已根据原生数值完成筛选'})
+                               'selectionReason': '应用服务已根据原生数值完成筛选' if narrowed else '仅采用最终业务结果实际引用的行列'})
     return result
 
 
@@ -381,6 +394,9 @@ def adapt(captures, selections, scope, max_facts):
     from ..batch_scope import selection_audit
     source_scopes = selection_audit(captures, selections, scope)
     selected_complete &= not any(item['missingSelectedCellCount'] for item in source_scopes)
+    from ..formula_arithmetic import BUDGET_FORMULA
+    for fact in result_facts:
+        fact['formulaArithmetic'] = BUDGET_FORMULA
     return {'facts': result_facts, 'context': combined_context(list(contexts.values())), 'sourceContexts': list(contexts.values()),
             'scope': {**scope, 'scopeId': 'scope_' + digest(scope)[:24], 'semanticCompleteness': 'UNVERIFIED',
                       'coverage': 'COMPLETE' if population_complete and selected_complete else 'PARTIAL' if not selected_complete else 'UNKNOWN',

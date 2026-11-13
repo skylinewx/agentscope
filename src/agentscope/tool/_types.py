@@ -73,7 +73,9 @@ class RegisteredTool:
         Returns:
             `dict`: The JSON schema of the tool function.
         """
-        input_schema = deepcopy(self.tool.input_schema)
+        input_schema = deepcopy(self.tool.model_input_schema
+                                if self.tool.model_input_schema is not None
+                                else self.tool.input_schema)
         _remove_title_field(input_schema)
         function_schema: dict = {
             "type": "function",

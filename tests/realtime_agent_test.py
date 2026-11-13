@@ -3,6 +3,7 @@
 transport — no network, no sound card."""
 # pylint: disable=protected-access, unused-argument
 import asyncio
+import json
 from typing import Any, AsyncIterator, Sequence
 from unittest.async_case import IsolatedAsyncioTestCase
 from utils import AnyString, MockModel
@@ -1518,10 +1519,14 @@ class RealtimeAgentToolTest(IsolatedAsyncioTestCase):
         self,
         tool: ToolBase,
         confirm: bool | None = None,
+        arguments: str | None = None,
     ) -> tuple[list[tuple[Any, ...]], ScriptedModel]:
         """Run one tool-calling reply; answer a permission prompt with
         *confirm* if one appears. Returns the tool-related events."""
-        model = ScriptedModel([_tool_script(tool.name)])
+        script = _tool_script(tool.name)
+        if arguments is not None:
+            script[1].tool_call.input = arguments
+        model = ScriptedModel([script])
         agent = RealtimeAgent(
             "Friday",
             "be brief",
@@ -1583,6 +1588,27 @@ class RealtimeAgentToolTest(IsolatedAsyncioTestCase):
                                 ),
                             )
         return events, model
+
+    async def test_model_schema_is_used_before_execution_repair(self) -> None:
+        class ProjectedTool(StreamTool):
+            is_read_only = False
+            input_schema = {"type": "object", "properties": {"q": {"type": "integer"}}}
+            model_input_schema = {"type": "object", "properties": {"q": {"type": "string"}}}
+
+            async def check_permissions(self, tool_input, context):
+                permission_inputs.append(tool_input)
+                return await super().check_permissions(tool_input, context)
+
+            async def __call__(self, q, **kwargs):
+                execution_inputs.append(q)
+                async for chunk in super().__call__(q, **kwargs):
+                    yield chunk
+
+        permission_inputs, execution_inputs = [], []
+        events, _ = await self._run_tool_scenario(ProjectedTool(), arguments='{"q":"42"}')
+        self.assertEqual(permission_inputs, [{"q": "42"}])
+        self.assertEqual(execution_inputs, [42])
+        self.assertIn(("result_end", "success", "finished"), events)
 
     async def test_streamed_tool_result_is_not_duplicated(self) -> None:
         """Chunks are shown as they come; the provider gets only the
@@ -1653,17 +1679,23 @@ class RealtimeAgentToolTest(IsolatedAsyncioTestCase):
         is forwarded as-is."""
         events, model = await self._run_tool_scenario(BrokenTool())
 
+        error_text = next(event[1] for event in events if event[0] == "delta")
+        diagnostic = json.loads(error_text[error_text.index("{"):])
+        self.assertEqual(diagnostic["code"], "TOOL_EXECUTION_FAILED")
+        self.assertEqual(diagnostic["toolName"], "broken_tool")
+        self.assertEqual(diagnostic["causes"], [{"type": "RuntimeError", "message": "boom"}])
+
         self.assertListEqual(
             events,
             [
                 ("call_start", "broken_tool"),
                 ("call_end", "c1"),
                 ("result_start", "broken_tool"),
-                ("delta", "boom"),
+                ("delta", error_text),
                 ("result_end", "error", "finished"),
             ],
         )
-        self.assertIn("tool_result(c1,'boom')", model.calls)
+        self.assertIn(f"tool_result(c1,{error_text!r})", model.calls)
 
     async def test_tool_call_arguments_reach_the_event_stream(self) -> None:
         """A client rebuilding the reply from the event stream sees the

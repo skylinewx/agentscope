@@ -28,7 +28,7 @@ def business_query_projection(capture, receipt, source):
         contexts[context_ref] = context
         for row in result.get('rows', []):
             fact = {key: deepcopy(row[key]) for key in
-                    ('factId', 'title', 'measureCode', 'dimensions', 'dimensionNames', 'dataPeriod',
+                    ('factId', 'title', 'objectLabel', 'measureCode', 'dimensions', 'dimensionNames', 'dataPeriod',
                      'value', 'valueType', 'valueState', 'unit', 'unitBasis', 'originRefs') if key in row}
             if row.get('originRefs') and set(row['originRefs']) <= fallback_origins:
                 fact['formulaStatus'] = 'NO_TARGET_CELL'
@@ -102,7 +102,7 @@ def markdown_review_material(value):
         # not expendable transport detail. Keep them once, without native rows.
         business = source.get('businessQuery', {})
         item['source']['businessQuery'] = {key: deepcopy(business[key]) for key in
-            ('question', 'purpose', 'selection', 'complete', 'requestedTargets', 'verifiedPresentation', 'failureSummary', 'unresolvedGroups') if key in business}
+            ('question', 'purpose', 'selection', 'complete', 'requestedTargets', 'verifiedPresentation', 'failureSummary', 'unresolvedGroups', 'valueFilter') if key in business}
         item['source']['verification'] = '原生请求、结果、来源及范围已通过现有程序校验；本表保留全部业务事实。审查仍核对原问题、答复、口径、异常及计算。'
     return value
 

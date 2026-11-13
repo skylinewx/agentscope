@@ -146,6 +146,11 @@ def receipt_from_capture(capture: dict) -> dict:
     if capture.get('originalToolName') == 'execute_budget_query':
         from .budget_query import validate
         validate(capture, receipt)
+        proof = receipt.get('data', {}).get('sourceBasis', {})
+        if proof.get('operation') == 'IMMUTABLE_FACT_VIEW':
+            # The new receipt proves current access. Archived native observations
+            # retain their actual original context; do not relabel them as new I/O.
+            receipt = {**receipt, 'context': proof['sourceContext']}
     return receipt
 
 
@@ -357,6 +362,9 @@ def catalog(capture, *, grid_selection=None):
                           "formulaTarget": cell.get('key') in (form.get('formulaGraph') or {}).get('targetKeys', [])})
     from .budget_batch import catalog as batch_catalog
     items.extend(batch_catalog(capture))
+    from ..formula_arithmetic import BUDGET_FORMULA
+    for item in items:
+        item['formulaArithmetic'] = BUDGET_FORMULA
     return items
 
 
@@ -757,6 +765,9 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
     selected_complete = all(item['selectedDataComplete'] for item in periods) and observed_members == selected_members
     primary_complete = observed_primary == set(scope_members) and all(item['selectedDataComplete'] for item in periods)
     coverage = "COMPLETE" if population_complete and primary_complete else "PARTIAL" if not primary_complete else "UNKNOWN"
+    from ..formula_arithmetic import BUDGET_FORMULA
+    for fact in facts:
+        fact['formulaArithmetic'] = BUDGET_FORMULA
     return {"facts": facts, "scope": {**scope_request, "scopeId": "scope_" + digest(scope_request)[:24],
             "coverage": coverage, "populationComplete": population_complete, "selectedDataComplete": selected_complete,
             "sourcePagesComplete": pages_complete,
@@ -891,7 +902,7 @@ class BudgetV2Adapter(SourceAdapter):
                 'resultSetCatalog': result_set_summaries(data), 'presentValueGroups': present_value_groups(data)}
             if data.get('valueFilter'):
                 business['businessQuery']['valueFilter'] = {key: value for key, value in data['valueFilter'].items()
-                                                            if key != 'evaluatedFacts'}
+                                                            if key not in ('evaluatedFacts', 'analysisSelection')}
         return {'context': receipt.get('context'), 'querySessionId': receipt.get('querySessionId'),
                 'status': receipt.get('status'), 'error': receipt.get('error'),
                 'branches': receipt.get('branches', []), 'completeness': receipt.get('completeness'),

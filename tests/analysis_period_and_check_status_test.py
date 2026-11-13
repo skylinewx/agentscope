@@ -23,7 +23,7 @@ class PeriodAndCheckStatusTest(unittest.TestCase):
         with self.assertRaises(AnalysisError):
             validate(capture, receipt)
         capture['request']['scope'].pop('periodCode')
-        capture['request']['scope']['periodRequest'] = {'kind': 'PERIOD', 'start': {'type': 'J', 'year': 2026, 'period': 2}}
+        capture['request']['scope']['periodRequest'] = {'kind': 'PERIOD', 'start': {'type': 'QUARTER', 'year': 2026, 'period': 2}}
         for result in receipt['data']['resultSets']:
             proof = result['context']['dataPeriodSelection']
             proof['requestedPeriods'] = ['2026J0002']

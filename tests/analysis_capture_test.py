@@ -43,13 +43,13 @@ class CaptureTest(IsolatedAsyncioTestCase):
         self.owner = Owner("u", "a", "s")
         self.allowed = AsyncMock()
 
-    def make_tool(self, text, delay=0, resource_id="registered-budget", sent=None, tool_name="execute_budget_query"):
+    def make_tool(self, text, delay=0, resource_id="registered-budget", sent=None, tool_name="execute_budget_query", input_schema=None):
         async def call_tool(*args, **kwargs):
             if sent is not None:
                 sent.append((args, kwargs))
             await asyncio.sleep(delay)
             return mcp.types.CallToolResult(content=[mcp.types.TextContent(type="text", text=text)])
-        inner = MCPTool("not-a-hardcoded-prefix", mcp.types.Tool(name=tool_name, inputSchema={
+        inner = MCPTool("not-a-hardcoded-prefix", mcp.types.Tool(name=tool_name, inputSchema=input_schema or {
             "type": "object", "properties": {"contractVersion": {"const": "2.0"}},
             "required": ["contractVersion"]}, _meta={"version": "2.0", "exactContractResource": "semantic://contracts/external-query"}), session=SimpleNamespace(call_tool=call_tool))
         entry = SimpleNamespace(resource_id=resource_id, fingerprint="connection-v1", users=1, release=AsyncMock())
@@ -63,6 +63,35 @@ class CaptureTest(IsolatedAsyncioTestCase):
         agent = Agent(name="capture-test", system_prompt="test", model=MockModel(),
             toolkit=Toolkit(tools=[tool]), middlewares=[ToolOffloadMiddleware(manager, bus, "u", "a", timeout_secs=timeout), CaptureMiddleware(capture)])
         return agent, manager
+
+    async def test_source_adoption_guidance_reaches_stream_and_final_response_once(self):
+        from agentscope.tool import ToolChunk
+        from analysis_business_query_test import business_fixture
+        from analysis_extension.middleware import AnalysisMiddleware
+        from analysis_extension.turn_completion import TurnCompletion
+        fixture, receipt = business_fixture()
+        tool = self.make_tool(json.dumps(receipt))
+        middleware = AnalysisMiddleware(self.store, self.owner, {'registered-budget'}, self.allowed)
+        middleware.service.turn = TurnCompletion(middleware.service, {
+            'turnKey': 'source-guidance', 'request': fixture['request']['question'],
+            'mode': 'DIRECT', 'goal': '查询科目', 'requiredEvidence': 'VALUES', 'failures': {},
+            'followupContext': {'mode': 'NEW'}, 'buildRefs': []})
+        agent = Agent(name='guidance', system_prompt='test', model=MockModel(),
+                      toolkit=Toolkit(tools=[tool]), middlewares=[middleware])
+        call = ToolCallBlock(id='guidance-call', name=tool.name,
+                            input=json.dumps({'contractVersion': '2.0', **fixture['request']}))
+        events = [event async for event in agent._acting(call)]
+        response = next(event for event in events if isinstance(event, ToolResponse))
+        chunks = [event for event in events if isinstance(event, ToolChunk)]
+        streamed = '\n'.join(block.text for event in chunks for block in event.content)
+        final = '\n'.join(block.text for block in response.content)
+        for text in ('来源引用', 'src_', '先用 AnalysisTask.subjectSources'):
+            self.assertIn(text, streamed)
+            self.assertIn(text, final)
+        self.assertEqual(streamed.count('本次查询不会替换已采用的分析输入'), 1)
+        self.assertEqual(final.count('本次查询不会替换已采用的分析输入'), 1)
+        saved = self.store.get_capture(self.owner, response.metadata['analysisCaptureRef'])
+        self.assertEqual(json.loads(saved['response']['content'][0]['text']), receipt)
 
     async def test_host_request_id_reaches_actual_mcp_and_saved_receipt(self):
         sent = []
@@ -80,6 +109,64 @@ class CaptureTest(IsolatedAsyncioTestCase):
         self.assertTrue(actual['requestId'].startswith('host_'))
         self.assertEqual(json.loads(saved['submittedRequestText']), submitted)
 
+    async def test_host_formula_preparation_uses_native_schema_with_source_proof(self):
+        from agentscope.permission import PermissionBehavior
+        from analysis_extension.middleware import AnalysisMiddleware
+        from analysis_extension.turn_completion import TurnCompletion
+        from analysis_extension.capture import leased_mcp_origin
+        from analysis_extension.query_contract import model_schema
+        sent = []
+        native = {'type': 'object', 'additionalProperties': False,
+                  'properties': {'contractVersion': {'const': '2.0'}, 'requestId': {'type': 'string'},
+                                 'purpose': {'type': 'string'}, 'question': {'type': 'string'},
+                                 'basis': {'type': 'object'}},
+                  'required': ['contractVersion', 'requestId', 'basis']}
+        tool = self.make_tool('{"contractVersion":"2.0","data":{}}', sent=sent, input_schema=native)
+        tool._tool._tool.meta.update(risk='READ_ONLY', dataBoundary='PINNED_SOURCE_SNAPSHOT_ASOF', evidencePolicy='EVIDENCE_REQUIRED')
+        tool.model_input_schema = model_schema(native)
+        middleware = AnalysisMiddleware(self.store, self.owner, {'registered-budget'}, self.allowed)
+        turn = TurnCompletion(middleware.service, {'turnKey': 'formula-host', 'request': '分析前面结果',
+            'mode': 'ANALYSIS', 'goal': '分析前面结果', 'requiredEvidence': 'FORMULAS', 'failures': {},
+            'followupContext': {'mode': 'NEW'}, 'buildRefs': []})
+        middleware.service.turn = turn
+        agent = Agent(name='host-preparation', system_prompt='test', model=MockModel(), toolkit=Toolkit(tools=[tool]))
+        agent._check_permission = AsyncMock(return_value=SimpleNamespace(behavior=PermissionBehavior.ALLOW, updated_input=None))
+        proof = {'kind': 'FACTS', 'source': {'executionId': 'execution', 'resultSetId': 'set', 'factIds': ['fact']},
+                 'contextId': 'context', 'querySessionId': 'session'}
+        refs, error = await middleware._call_readonly_source(agent, turn,
+            leased_mcp_origin(tool, frozenset({'registered-budget'})), 'execute_budget_query',
+            {'contractVersion': '2.0', 'purpose': 'ANALYZE', 'question': '分析前面结果', 'basis': proof})
+        self.assertIsNone(error)
+        self.assertEqual(len(refs), 1)
+        self.assertEqual(self.store.get_capture(self.owner, refs[0])['request']['basis'], proof)
+        self.assertEqual(len(sent), 1)
+        agent._check_permission.assert_awaited_once()
+
+    async def test_schema_repair_is_frozen_before_preparation_and_actual_execution(self):
+        sent, prepared = [], []
+        tool = self.make_tool('{"contractVersion":"2.0","data":{}}', sent=sent,
+            input_schema={'type': 'object', 'properties': {'contractVersion': {'const': '2.0'},
+                'groupBy': {'type': 'array', 'items': {'oneOf': [{'type': 'string'},
+                    {'type': 'object', 'properties': {'scopeId': {'type': 'string'}}, 'required': ['scopeId']}]}}}})
+        capture = ReceiptCapture(self.store, self.owner, frozenset({'registered-budget'}), self.allowed)
+        capture.request_preparer = lambda origin, request: prepared.append(request) or request
+        agent = Agent(name='canonical-test', system_prompt='test', model=MockModel(),
+                      toolkit=Toolkit(tools=[tool]), middlewares=[CaptureMiddleware(capture)])
+        for index, raw in enumerate(('板块', '["板块"]', ['板块'], [{'scopeId': 'region'}])):
+            submitted = {'contractVersion': '2.0', 'groupBy': raw, 'intentDraft': {
+                         'valueFilter': {'op': 'LT', 'value': '-0.000000000000000001'}}}
+            events = [event async for event in agent._acting(ToolCallBlock(
+                id='normalize-' + str(index), name=tool.name, input=json.dumps(submitted)))]
+            response = next(event for event in events if isinstance(event, ToolResponse))
+            saved = self.store.get_capture(self.owner, response.metadata['analysisCaptureRef'])
+            args, kwargs = sent[-1]
+            actual = kwargs.get('arguments', args[1] if len(args) > 1 else None)
+            self.assertEqual(actual, saved['request'])
+            self.assertEqual(prepared[-1], {key: value for key, value in actual.items() if key != 'requestId'})
+            self.assertEqual(actual['groupBy'], raw if isinstance(raw, list) else ['板块'])
+            self.assertEqual(actual['intentDraft']['valueFilter'], submitted['intentDraft']['valueFilter'])
+            self.assertEqual(json.loads(saved['submittedRequestText']), submitted)
+
     async def test_malformed_model_arguments_return_tool_error_without_aborting_turn(self):
         from agentscope.message import ToolResultState
         sent = []
@@ -96,6 +183,23 @@ class CaptureTest(IsolatedAsyncioTestCase):
         # 同一工具在修正参数后仍可正常执行，错误没有中止会话或伪造来源回执。
         await self.invoke(agent, tool)
         self.assertEqual(len(sent), 1)
+
+    async def test_host_owned_query_id_is_absent_from_model_schema_but_sent_to_native(self):
+        from analysis_extension.query_contract import model_schema
+        native = {'type': 'object', 'properties': {'contractVersion': {'const': '2.0'},
+                  'requestId': {'type': 'string'}}, 'required': ['contractVersion', 'requestId']}
+        sent = []
+        tool = self.make_tool('{"contractVersion":"2.0","data":{}}', sent=sent, input_schema=native)
+        tool.model_input_schema = model_schema(native)
+        self.assertNotIn('requestId', tool.model_input_schema['properties'])
+        agent, _ = self.agent(tool)
+        events = await self.invoke(agent, tool)
+        response = next(event for event in events if isinstance(event, ToolResponse))
+        saved = self.store.get_capture(self.owner, response.metadata['analysisCaptureRef'])
+        self.assertTrue(saved['request']['requestId'].startswith('host_'))
+        self.assertNotIn('requestId', json.loads(saved['submittedRequestText']))
+        args, kwargs = sent[0]
+        self.assertEqual(kwargs.get('arguments', args[1] if len(args) > 1 else None), saved['request'])
 
     async def test_successful_identical_query_reuses_capture_only_in_same_turn(self):
         sent, cache = [], {}

@@ -44,7 +44,8 @@ def validate_operation(operation):
         tree = parse_arithmetic(expression)
     except AnalysisError as exc:
         raise AnalysisError(exc.code, str(exc), details) from exc
-    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} - set(ARITHMETIC_FUNCTIONS)
+    callees = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name) and id(node) not in callees}
     expected = {f'v{i}' for i in range(len(references))}
     if names - expected:
         raise AnalysisError('UNKNOWN_ARITHMETIC_VARIABLE', '表达式变量未与 inputRefs 对应。',

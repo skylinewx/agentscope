@@ -145,10 +145,13 @@ def record_review_issue(turn, item, material_key, material):
     known.update(value['derivedId'] for value in material.get('derived', []))
     refs = sorted(set(item.get('evidenceRefs', [])) & known)
     issue_id = 'review_issue_' + digest([item['code'], [valid_statement, *related] if matches else item['message'], refs])[:24]
+    from .review_revision import revision_basis
+    basis = revision_basis(material)
     def record(state):
         ledger = state.setdefault('reviewIssueHistory', {})
         record = ledger.setdefault(issue_id, {'issueId': issue_id, 'code': item['code'],
                                               'statement': valid_statement, 'evidenceRefs': refs, 'observations': []})
+        record.update(basis=basis, state='ACTIVE' if item['severity'] != 'ADVISORY' else 'ADVISORY')
         if related:
             record['relatedStatements'] = related
         if statement != valid_statement:

@@ -2,6 +2,12 @@
 import re
 
 
+def type_code(value):
+    # Public intent names and immutable source codes are different representations.
+    return {'YEAR': 'N', 'HALF_YEAR': 'H', 'QUARTER': 'J', 'MONTH': 'Y',
+            'TEN_DAY': 'X', 'WEEK': 'Z', 'DAY': 'R'}.get(value, value)
+
+
 def bounds(code):
     if not isinstance(code, str) or not re.fullmatch(r'\d{4}[NJY]\d{4}', code):
         return None
@@ -40,8 +46,9 @@ def selected_period(context, row, scope, exact=False):
     # Absolute PERIOD points need no offset calculation. Preserve their exact requested
     # grain even when the task is opened at its containing annual period.
     if request.get('kind') == 'PERIOD' and point.get('year') is not None:
-        period = point.get('period', 1 if point.get('type') == 'N' else None)
-        if period is None or requested != [f"{point['year']:04d}{point['type']}{period:04d}"]:
+        code = type_code(point.get('type'))
+        period = point.get('period', 1 if code == 'N' else None)
+        if period is None or requested != [f"{point['year']:04d}{code}{period:04d}"]:
             return False
     actual = row.get('dataPeriod')
     return (actual == row.get('dimensions', {}).get('DATATIME')

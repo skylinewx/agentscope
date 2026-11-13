@@ -65,19 +65,20 @@ class SourceIdentityTests(TestCase):
             wrong = {**batch, field: 'different'}
             self.assertFalse(same_source_position(wrong, form), field)
 
-    def test_real_null_dependency_stays_unavailable(self):
+    def test_budget_null_dependency_uses_zero_without_overwriting_source(self):
         data = self.form_data()
         target = next(fact for fact in data['facts'] if fact['formula'])
         operand = next(fact for fact in data['facts'] if fact['observationId'] == target['observationId'] and not fact['formula'])
         operand.update(value=None, valueState='NO_VALUE')
         trace = trace_formula(data['facts'], target['factId'])
-        self.assertEqual(trace['status'], 'BLOCKED')
+        self.assertEqual(trace['status'], 'MISMATCH')
         self.assertEqual(trace['pendingDependencies'], [])
-        self.assertTrue(any(d['code'] == 'FORMULA_SOURCE_VALUE_MISSING' for n in trace['nodes'] for d in n['diagnostics']))
         self.assertEqual(trace['executionStatus'], 'COMPLETED')
-        self.assertEqual(trace['completionReason'], 'SOURCE_VALUE_MISSING')
-        self.assertEqual(trace['sourceConsistency'], 'NOT_CHECKED')
-        self.assertEqual(trace['recovery']['nextAction'], 'EXPLAIN_SOURCE_NULL')
+        self.assertEqual(trace['targetLocalCheck']['value'], '0')
+        self.assertEqual(trace['sourceConsistency'], 'MISMATCH')
+        self.assertIn(operand['factId'], trace['nullAsZeroRefs'])
+        self.assertIsNone(operand['value'])
+        self.assertIsNone(trace['recovery'])
 
     def test_dependent_calculations_accept_plan_names_and_save_actual_refs(self):
         facts = [{'factId': 'f1', 'objectId': 'one', 'value': '3', 'valueState': 'PRESENT'},
@@ -184,7 +185,7 @@ class PublicationFlowTests(PresentationCase):
             self.assertTrue(rendering.is_set(), '页面测量应先于内容审查完成')
             return {'issues': [{'code': 'UNSUPPORTED_CAUSE', 'message': '缺少原因证据。'}]}
         async def render(document):
-            samples = [measurements(width=width) for width in (420, 900)]
+            samples = [measurements(width=width, static_keys=document.get('staticBindingKeys', [])) for width in (420, 900)]
             for sample in samples:
                 sample['orders'] = []
             rendering.set()
@@ -243,7 +244,7 @@ class PublicationFlowTests(PresentationCase):
         document = compile_document(self.store.get_analysis(OWNER, self.ref), request['document'])
         records = []
         for width, count in ((420, 1), (900, 2)):
-            sample = measurements(width=width)
+            sample = measurements(width=width, static_keys=document.get('staticBindingKeys', []))
             sample['orders'] = []
             sample['numericChecks']['linearBars'].update(declared=count, measured=count, invalid=0,
                                                         scaleGroups=1, checkedGroups=1)

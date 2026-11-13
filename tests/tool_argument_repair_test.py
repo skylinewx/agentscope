@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unittests for the schema-guided repair of the tool call arguments."""
 import unittest
+import json
 from typing import Any
 from unittest.async_case import IsolatedAsyncioTestCase
 
@@ -120,6 +121,18 @@ class JsonLoadsWithRepairTest(unittest.TestCase):
             with self.subTest(json_str=json_str):
                 self.assertDictEqual(_json_loads_with_repair(json_str), {})
 
+    def test_nested_unknown_conditions_are_not_silently_discarded(self) -> None:
+        schema = {"type": "object", "properties": {"operations": {"type": "array", "items": {
+            "type": "object", "properties": {"select": {"type": "object", "properties": {
+                "inputRef": {"type": "string"}}, "additionalProperties": False}}, "additionalProperties": False}}}}
+        request = {"operations": [{"select": {"inputRef": "actual", "filters": [{"operator": "LT", "value": "0"}]}}]}
+        self.assertEqual(_json_loads_with_repair(json.dumps(request), schema), request)
+
+    def test_nested_type_repairs_still_work_when_no_arguments_are_lost(self) -> None:
+        schema = {"type": "object", "properties": {"items": {"type": "array", "items": {
+            "type": "object", "properties": {"count": {"type": "integer"}}, "additionalProperties": False}}}}
+        self.assertEqual(_json_loads_with_repair('{"items":[{"count":"2"}]}', schema), {"items": [{"count": 2}]})
+
     def test_reject_invalid_arguments(self) -> None:
         """Test the arguments that cannot be loaded into a valid dict."""
         for json_str in ['"hello"', "[1, 2]"]:
@@ -143,6 +156,37 @@ class JsonLoadsWithRepairTest(unittest.TestCase):
 
 class ToolCallArgumentRepairTest(IsolatedAsyncioTestCase):
     """Unittest for repairing the arguments within an agent reply."""
+
+    async def test_model_reference_is_validated_before_host_translates_execution_evidence(self) -> None:
+        from agentscope.middleware import MiddlewareBase
+        native_value = {'type': 'object', 'properties': {'source': {'type': 'string'}, 'sourceText': {'type': 'string'}},
+                        'required': ['source', 'sourceText'], 'additionalProperties': False}
+        tool = _RecordTool(native_value)
+        tool.model_input_schema = {'type': 'object', 'properties': {'value': {
+            'type': 'object', 'properties': {'sourceRef': {'type': 'string'}},
+            'required': ['sourceRef'], 'additionalProperties': False}}, 'required': ['value'], 'additionalProperties': False}
+
+        class Translate(MiddlewareBase):
+            async def on_acting(self, agent, input_kwargs, next_handler):
+                call = input_kwargs['tool_call']
+                original = json.loads(call.input)
+                self_outer.assertEqual(original, {'value': {'sourceRef': 'host-reference'}})
+                prepared = {'value': {'source': 'native-evidence', 'sourceText': '上一轮原话'}}
+                call = call.model_copy(update={'input': json.dumps(prepared, ensure_ascii=False)})
+                async for event in next_handler(**{**input_kwargs, 'tool_call': call}):
+                    yield event
+
+        self_outer = self
+        model = MockModel()
+        original_call = ToolCallBlock(id='with-source', name='record', input='{"value":{"sourceRef":"host-reference"}}')
+        model.set_responses([[ChatResponse(content=[original_call], is_last=True)],
+                             [ChatResponse(content=[TextBlock(text='Done')], is_last=True)]])
+        agent = Agent(name='Friday', system_prompt='Use the provided source.', model=model,
+            toolkit=Toolkit(tools=[tool]), middlewares=[Translate()], injection_config=InjectionConfig(inject_runtime_state=False))
+        await agent.reply(UserMsg(name='user', content='Continue the previous result'))
+        self.assertEqual(tool.permission_inputs, [{'value': {'sourceRef': 'host-reference'}}])
+        self.assertEqual(tool.executed, [{'source': 'native-evidence', 'sourceText': '上一轮原话'}])
+        self.assertEqual(json.loads(original_call.input), {'value': {'sourceRef': 'host-reference'}})
 
     async def test_repaired_arguments_reach_permission_and_execution(
         self,

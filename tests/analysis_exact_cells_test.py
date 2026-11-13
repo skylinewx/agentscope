@@ -157,10 +157,11 @@ class DiscoveryEvidenceTests(TestCase):
 
     def test_automatically_discovered_task_does_not_constrain_a_new_metric(self):
         from analysis_extension.followup_scope import prepare_request
+        from analysis_extension.adapters import default_sources
         capture, receipt = exact_fixture()
         capture['request']['scope'].pop('taskCodes')
         table = receipt['data']['stepResults'][0]['batchResults'][0]
-        turn = SimpleNamespace(state={'request': '再查询一下EVA', 'previousQueryIntent': {
+        turn = SimpleNamespace(service=SimpleNamespace(sources=default_sources()), state={'request': '再查询一下EVA', 'previousQueryIntent': {
             'metric': '净利润', 'population': '久其集团', 'period': '2026年', 'scenario': '预算'},
             'followupContext': {'mode': 'CONTINUE', 'changedFields': ['metric']}})
         origin = {'originalToolName': 'execute_budget_query', 'resourceId': capture['resourceId']}

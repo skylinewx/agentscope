@@ -7,12 +7,15 @@ from analysis_extension.free_document import compile_document
 from analysis_extension.models import AnalysisError, Owner
 
 
-def measurements(refs=(), width=900, partial=False):
-    return {'version':3,'viewport':{'width':width,'height':500},'pageOverflow':False,'overflow':[],
+def measurements(refs=(), width=900, partial=False, static_keys=None):
+    result = {'version':3,'viewport':{'width':width,'height':500},'pageOverflow':False,'overflow':[],
             'numericChecks': {'counts': {'declared': 0, 'measured': 0, 'failed': 0},
                               'linearBars': {'declared': 0, 'measured': 0, 'invalid': 0, 'scaleGroups': 0, 'checkedGroups': 0, 'failedGroups': 0}},
             'overlaps':[],'smallText':[],'clippedText':[],'errors':[],'truncated':False,
             'orders':[{'key':'ranking','refs':list(refs),'partial':partial,'truncated':False}]}
+    if static_keys is not None:
+        result.update(version=4, valueCoverage={'charted': [], 'presented': [{'valueKey': key} for key in static_keys], 'complete': True})
+    return result
 
 
 class DocumentCheckTests(PresentationCase):

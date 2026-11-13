@@ -82,24 +82,19 @@ class InspectionRecoveryTests(PresentationCase):
         self.ref = built['analysisRef']
         self.fact = self.store.get_analysis(OWNER, self.ref)['facts'][0]['factId']
 
-    async def test_derived_formula_reference_returns_executable_fact_call(self):
+    async def test_derived_formula_reference_reads_completed_trace(self):
         await self.prepare()
-        with self.assertRaises(AnalysisError) as caught:
-            await self.service.inspect(section='formulas', analysisRef=self.ref, derivedId='derived_f')
-        self.assertEqual(caught.exception.code, 'INVALID_INSPECT_ARGUMENT')
-        suggestion = caught.exception.details['retryInspect']
-        Draft202012Validator(AnalysisInspect.input_schema).validate(suggestion)
-        self.assertEqual(suggestion['factRef'], self.fact)
-        result = await self.service.inspect(**suggestion)
+        result = await self.service.inspect(section='formulas', analysisRef=self.ref, derivedId='derived_f')
         self.assertEqual(result['targetFactRef'], self.fact)
+        self.assertEqual(result['derivedId'], 'derived_f')
 
-    async def test_both_reference_kinds_rejected_and_explicit_fact_preserved(self):
+    async def test_consistent_references_are_accepted_and_conflicts_rejected(self):
         await self.prepare()
+        result = await self.service.inspect(section='formulas', analysisRef=self.ref, factRef=self.fact, derivedId='derived_f')
+        self.assertEqual(result['targetFactRef'], self.fact)
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.inspect(section='formulas', analysisRef=self.ref, factRef=self.fact, derivedId='derived_f')
-        suggestion = caught.exception.details['retryInspect']
-        self.assertNotIn('derivedId', suggestion)
-        self.assertEqual(suggestion['factRef'], self.fact)
+            await self.service.inspect(section='formulas', analysisRef=self.ref, factRef='other', derivedId='derived_f')
+        self.assertEqual(caught.exception.details['targetFactRef'], self.fact)
 
     async def test_missing_reference_guidance_does_not_guess_formula_target(self):
         await self.prepare()
@@ -124,11 +119,11 @@ class InspectionRecoveryTests(PresentationCase):
         doc = {'title': '已取得的结果', 'html': '<html><head></head><body><p>{{v}}</p><p>{{analysisPartialReason}}</p></body></html>',
                'bindings': [{'key': 'v', 'valueRef': self.fact}]}
         preview = await self.service.publish(self.ref, requestKey='preview',
-            document=doc, partialReason=reason, previewOnly=True, renderCheckUnavailableReason='本单元测试不调用浏览器')
+            document=doc, unresolvedItems=[{'requirement': '汇总核对', 'reason': reason}], previewOnly=True, renderCheckUnavailableReason='本单元测试不调用浏览器')
         complete = preview['summary']['completion']
         self.assertEqual(complete['state'], 'INCOMPLETE')
         self.assertEqual(complete['declaredWorkState'], 'UNDECLARED')
-        self.assertEqual(complete['partialReason'], reason)
+        self.assertEqual(complete['partialReason'], '汇总核对：' + reason)
         published = await self.service.publish(**preview['confirmPublish'])
         self.assertEqual(published['summary']['completion'], complete)
         inspected = await self.service.inspect(section='summary', analysisRef=self.ref)
@@ -139,13 +134,22 @@ class PartialCompletionTests(TestCase):
     def test_partial_scope_does_not_become_ready_when_declared_subset_finished(self):
         artifact = {'facts': [{'factId': 'fact', 'valueState': 'PRESENT'}], 'derivedValues': [], 'relations': [],
                     'plan': {'workPlan': [{'taskId': 'value', 'title': '已取值', 'kind': 'VALUES', 'refs': ['fact']}]},
-                    'partialReason': '仍有另一项查询受阻'}
+                    'unresolvedItems': [{'requirement': '另一项查询', 'reason': '来源运行失败'}]}
         result = completion_summary(artifact)
         self.assertEqual(result['state'], 'INCOMPLETE')
         self.assertEqual(result['declaredWorkState'], 'READY')
         self.assertEqual(result['pendingTaskIds'], [])
-        del artifact['partialReason']
+        artifact['unresolvedItems'] = []
         self.assertEqual(completion_summary(artifact)['state'], 'READY')
+
+    def test_null_values_and_explanatory_prose_do_not_make_finished_work_incomplete(self):
+        artifact = {'facts': [{'factId': 'fact', 'valueState': 'NO_VALUE'}], 'derivedValues': [], 'relations': [],
+                    'plan': {'workPlan': [{'taskId': 'value', 'title': '查询结果', 'kind': 'VALUES', 'refs': ['fact']}]},
+                    'partialReason': '来源为空，复算差异保留为发现。'}
+        self.assertEqual(completion_summary(artifact)['state'], 'READY')
+        artifact['unresolvedItems'] = [{'taskId': 'value', 'requirement': '查询结果', 'reason': '来源为空'}]
+        with self.assertRaises(AnalysisError):
+            completion_summary(artifact)
 
 
 class NumericCoverageTests(TestCase):

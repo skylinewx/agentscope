@@ -11,7 +11,7 @@ from agentscope.event import (ReplyEndEvent, HintBlockEvent, ModelCallStartEvent
     TextBlockStartEvent, TextBlockDeltaEvent, TextBlockEndEvent,
     DataBlockStartEvent, DataBlockDeltaEvent, DataBlockEndEvent)
 from agentscope.types import ReplyFinishedReason, ErrorInfo, ErrorType
-from agentscope.tool import ToolChoice, ToolResponse
+from agentscope.tool import ToolChoice, ToolChunk, ToolResponse
 
 from .capture import ReceiptCapture
 from .service import AnalysisService
@@ -46,6 +46,7 @@ class AnalysisMiddleware(MiddlewareBase):
         from .followup_scope import review_context
         turn = self.service.turn
         return {'userRequest': turn.state['request'], 'queryIntent': turn.state.get('queryIntent', {}),
+                'intentRevision': turn.state.get('intentRevision', 0), 'inputSetVersion': turn.state.get('inputSetVersion'),
                 'followupScope': review_context(turn)}
 
     async def on_reply(self, agent, input_kwargs, next_handler):
@@ -69,6 +70,10 @@ class AnalysisMiddleware(MiddlewareBase):
                 agent.state.append_context(agent.name, [hint])
                 saved['contextDirectoryProvided'] = True
         preview_turn = self.service.turn
+        async def resolve_requirement(payload):
+            from .analysis_requirements import assess
+            return await assess(agent, payload)
+        self.service.requirement_resolver = resolve_requirement if preview_turn is not None else None
         async def review_preview(artifact):
             # 审查的是已经冻结、与最终发布相同的页面，模型输入不含执行指令。
             return await self.answer_reviewer(agent, preview_turn, artifact, '')
@@ -137,7 +142,20 @@ class AnalysisMiddleware(MiddlewareBase):
                                 terminal_error = event.error
                             else:
                                 saved['nudges'] += 1
-                                instruction = '<system-reminder>本轮尚未完成。这是宿主内部检查，不是用户的新问题。核对以下问题与实际来源，局部修正后直接回应原始用户请求，不复述内部登记、文件检查或修订过程，不称“你指出”。保持本轮类型与目标：DIRECT 按已声明展示方式交付；ANALYSIS/REPORT 使用 DOCUMENT，不得降级成文字绕过。不删减目标，不因措辞润色扩大取数或分析范围。工具参数错误先读协议修正；真实外部障碍可用 AnalysisTask(blocked) 引用失败调用并说明。\n' + json.dumps(status, ensure_ascii=False) + '</system-reminder>'
+                                instruction = (
+                                    '<system-reminder>本轮尚未完成。这是宿主内部检查，不是用户的新问题。'
+                                    '未通过检查的候选答复尚未向用户展示，下一版答复将整体替换它。核对以下问题与实际来源，'
+                                    '复用已有正确数据、计算和仍适用的内容，只修正实质问题，直接回应原始用户请求。'
+                                    '普通文字答复须输出可独立阅读的完整替代答复，保留本题所需的完整列表、排序、图表和关键说明；'
+                                    '不要只输出修改说明，不能用“上表不变”“仅修正如下”引用本轮未发布的草稿。'
+                                    '例如排序表正确、表后统计说明有错时，修正说明后仍须交付完整排序表，无须重新查询正确数据。'
+                                    'DOCUMENT 报告保持现有局部编辑与发布流程，以修正后的完整页面交付；'
+                                    '已由有效发布报告承载的内容，通过真实报告入口交付即可，不必在聊天中重复图表。'
+                                    '不复述内部登记、文件检查或修订过程，不称“你指出”。'
+                                    '保持本轮类型与目标：DIRECT 按已声明展示方式交付；ANALYSIS/REPORT 使用 DOCUMENT，不得降级成文字绕过。'
+                                    '不删减目标，不增加本题不需要的图表或分析，不因措辞润色重复取数、计算或扩大范围。'
+                                    '工具参数错误先读协议修正；真实外部障碍可用 AnalysisTask(blocked) 引用失败调用并说明。\n'
+                                    + json.dumps(status, ensure_ascii=False) + '</system-reminder>')
                                 hint = HintBlock(hint=instruction, source=json.dumps({'label': 'System', 'sublabel': 'Completion check'}))
                                 agent.state.append_context(agent.name, [hint])
                                 yield HintBlockEvent(reply_id=agent.state.reply_id, block_id=hint.id, source=hint.source, hint=instruction)
@@ -389,6 +407,9 @@ class AnalysisMiddleware(MiddlewareBase):
 
     async def on_reasoning(self, agent, input_kwargs, next_handler):
         started = perf_counter()
+        from .query_contract import configure
+        if agent is not None and getattr(agent, 'toolkit', None) is not None:
+            await configure(agent.toolkit, self.capture.resource_ids)
         turn = self.service.turn
         if turn is not None:
             turn.recover_background_evidence()
@@ -422,7 +443,7 @@ class AnalysisMiddleware(MiddlewareBase):
                 return
         if turn is not None and not turn.state.get('mode'):
             if not turn.state.get('declarationHint'):
-                agent.state.append_context(agent.name, [HintBlock(hint='先调用 AnalysisTask 声明当前用户的任务类型与目标。DIRECT 用于普通查询、排序、简单统计、一般答复或必要澄清；ANALYSIS 用于分析、指标公式构成和分布构成查询，首次以 DOCUMENT 丰富展示；REPORT 用于明确报告。构成查询只完成所需构成，不自动追加原因或预测。只依据本轮意图和上下文选择，不因负值、公式、层级或工具可用就升级任务。普通关联追问 context.mode=CONTINUE，继承上轮有效范围；用户换题用 NEW，明确综合多轮用 SYNTHESIZE。只改变部分条件时用 changedFields，并以本轮 userQuote 记录依据，不为背景比较放开主体范围。')])
+                agent.state.append_context(agent.name, [HintBlock(hint='先调用 AnalysisTask 声明当前用户的任务类型与目标。DIRECT 用于普通查询、排序、简单统计、一般答复或必要澄清；ANALYSIS 用于分析、指标公式构成和分布构成查询，首次以 DOCUMENT 丰富展示；REPORT 用于明确报告。构成查询只完成所需构成，不自动追加原因或预测。只依据本轮意图和上下文选择，不因负值、公式、层级或工具可用就升级任务。普通关联追问 context.mode=CONTINUE，继承上轮有效范围；用户换题用 NEW，明确综合多轮用 SYNTHESIZE。部分条件用 intent 或 scopeEdits 修改，null 明确清除，省略保留。原话由宿主记录。承接实际结果先用 sources 查看来源，再以 subjectSources 明确采用；不为背景比较放开主体范围。')])
                 turn.state['declarationHint'] = True
             # Filtering with auto also works for providers that reject a named
             # forced tool while reasoning is enabled. The end guard still
@@ -635,7 +656,8 @@ class AnalysisMiddleware(MiddlewareBase):
             tool = registration.tool
             origin = leased_mcp_origin(tool, self.capture.resource_ids)
             if (origin and origin.get('originalToolName') == tool_name and source_identity(origin) == source_identity(capture)
-                    and readonly_capability(tool, origin, self.capture.sources)):
+                    and (readonly_capability(tool, origin, self.capture.sources)
+                         or tool_name == 'get_context' and arguments.get('action') == 'open')):
                 candidates.append(tool)
         if len(candidates) != 1:
             raise AnalysisError('VERIFICATION_TOOL_UNAVAILABLE' if tool_name == 'validate_evidence' else 'PREPARATION_TOOL_UNAVAILABLE',
@@ -656,6 +678,9 @@ class AnalysisMiddleware(MiddlewareBase):
         from copy import copy
         from .followup_scope import prepare_request
         capture_runtime = copy(self.capture)
+        # This is a host-built, permission-checked native request. It may carry
+        # execution proofs deliberately absent from the model-facing schema.
+        capture_runtime.model_submission = False
         capture_runtime.turn_key_provider = lambda: turn.state['turnKey']
         capture_runtime.query_cache_provider = lambda: turn.state.setdefault('sourceQueryCache', {})
         capture_runtime.request_preparer = lambda origin, request: prepare_request(turn, origin, request)
@@ -672,7 +697,16 @@ class AnalysisMiddleware(MiddlewareBase):
                     receipt = adapter.raw_receipt(saved['response'])
                     source_error = receipt.get('error')
                 if event.state.value != 'success' and not source_error:
-                    source_error = {'code': 'SOURCE_READ_FAILED', 'message': '来源读取失败。'}
+                    for block in event.content:
+                        if getattr(block, 'type', None) == 'text':
+                            try:
+                                error = json.loads(block.text).get('error')
+                                if isinstance(error, dict) and error.get('code'):
+                                    source_error = error
+                                    break
+                            except (ValueError, AttributeError):
+                                pass
+                    source_error = source_error or {'code': 'SOURCE_READ_FAILED', 'message': '来源读取失败。'}
                 return refs, source_error
         raise AnalysisError('SOURCE_RECEIPT_MISSING', '来源工具没有返回可核验的回执。')
 
@@ -711,12 +745,27 @@ class AnalysisMiddleware(MiddlewareBase):
         from .value_references import reference_context
         with tool_timing_context(call.id, call.name), reference_context(self.service, turn):
             async for event in self.capture.run(agent, input_kwargs, next_handler):
+                additions = []
                 if turn is not None:
                     if isinstance(event, ToolResponse):
                         turn.record_tool_result(call, event, sequence, (perf_counter() - started) * 1000)
                     turn.observe(call, event)
                     if isinstance(event, ToolResponse) and event.state.value == 'success' and self.service.turn is turn:
                         reference = event.metadata.get('analysisCaptureRef')
+                        if reference:
+                            capture = self.service.store.get_capture(self.service.owner, reference)
+                            if capture.get('originalToolName') == 'execute_budget_query':
+                                from .source_views import directory
+                                try:
+                                    sources = directory(turn, limit=6)
+                                    if sources['sources']:
+                                        from agentscope.message import TextBlock
+                                        additions.append(TextBlock(text='\n\n' + sources['markdown'] +
+                                            '\n来源引用由宿主生成。本次查询不会替换已采用的分析输入。'
+                                            '要分析新查询结果，先用 AnalysisTask.subjectSources 明确采用完整来源组，再 AnalysisBuild；'
+                                            '普通查询可直接答复，无需为采用来源增加步骤。'))
+                                except AnalysisError as error:
+                                    event.metadata['sourceDirectoryError'] = error.as_dict()
                         if reference and turn.state.get('mode') in ('ANALYSIS', 'REPORT'):
                             capture = self.service.store.get_capture(self.service.owner, reference)
                             try:
@@ -726,7 +775,14 @@ class AnalysisMiddleware(MiddlewareBase):
                                 prepared = {'ready': 0, 'issues': [error.as_dict()]}
                             if prepared:
                                 from agentscope.message import TextBlock
-                                event.content.append(TextBlock(text=json.dumps({'structurePreparation': prepared}, ensure_ascii=False)))
+                                additions.append(TextBlock(text='\n\n' + json.dumps({'structurePreparation': prepared}, ensure_ascii=False)))
+                if additions:
+                    # ReceiptCapture has already emitted the bounded receipt chunk.
+                    # Appending only to the final ToolResponse loses these additions
+                    # from streamed/persisted tool messages used by the next model call.
+                    event.content.extend(additions)
+                    yield ToolChunk(content=[block.model_copy(deep=True) for block in additions],
+                                    state=event.state, metadata=event.metadata.copy())
                 yield event
 
     async def list_tools(self):
@@ -744,7 +800,7 @@ class AnalysisMiddleware(MiddlewareBase):
 每个真实用户轮用 AnalysisTask 登记目标及承接范围。普通查询、筛选、排序、简单统计直接答复；分析和构成查询首次使用 DOCUMENT 提供图形、解释与明细。仅展示原值无需形式化 workPlan；必要计算、构成及关系检查声明真实工作项，已有事项不能清空。模型选择方法，无固定业务检查清单。
 来源已经排序直接复用；已有完整结果仅改顺序用 SortRecords，分析派生顺序用 SORT/DESCRIBE。现有能力足够时合并计算和读取；必要缺口才 AnalysisPython，声明 fallbackReason 与 purpose。
 对象范围来自用户条件及真实来源字段，不凭名称或编号猜归属。PRIMARY、REFERENCE 与 STRUCTURE 按用途分开。总体查询覆盖总体，局部分析只补其目标和必要依赖；实际分组结果足够时不默认追加成员、公式或对照。来源完整性与必要凭据核验由宿主增量完成，不为登记重建。
-FORMULA_CHECK 默认 LOCAL，明确逐层才 RECURSIVE。executionStatus 表示检查执行，sourceConsistency 表示一致性；completionReason=SOURCE_VALUE_MISSING 表示已确认来源空值，检查可完成，金额仍不可用，不重复补查或补零。其他缺失、冲突按具体诊断处理。
+FORMULA_CHECK 默认 LOCAL，明确逐层才 RECURSIVE。executionStatus 表示检查执行，sourceConsistency 表示一致性；预算来源已读取的空值按0参与公式运算、除以0返回0，来源原始值保持为空；按实际 MATCH/MISMATCH 说明结果。适用加减公式优先绑定公式 dataset 的 waterfall，在现有模板内绘图。未读依赖、查询错误、冲突和精度不足按具体诊断处理，不作为空值；其他未声明空值运算规则的来源仍可能返回 SOURCE_VALUE_MISSING。
 数据准确、计算有依据、解释言之有理即可。合理推断及建议说明必要条件，不逐句另查证明唯一成因。只修有依据的数值、范围、口径、关键遗漏、编造事实或实质矛盾；措辞、标题和可选补充不阻断。审查意见不是来源事实，不改变原值迎合意见。
 仅改展示使用现有 analysisRef 和编辑源，服务生成下一修订并复用事实计算；输入、范围、必要计算变化才 Build。已发布且 delivery.registered=true 时直接原样输出 delivery.markdown，状态有歧义才查 status，不重复整份结果。
 """

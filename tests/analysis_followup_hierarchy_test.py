@@ -88,6 +88,28 @@ class HierarchyFollowupTest(TestCase):
                 result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
             self.assertNotIn(old, result.get('contextText', ''), dimension)
 
+    def test_public_phrase_without_source_text_reuses_exact_retained_historical_span(self):
+        turn, _ = self.confirmed_turn()
+        request = self.request()
+        request['intentDraft']['targets'] = [{'id': 'profit', 'businessPhrases': [
+            {'text': '净利润预算', 'alternatives': [['净利润', '预算']]}]}]
+        with patch('analysis_extension.followup_scope._same_source', return_value=True):
+            result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
+        self.assertIn('净利润预算', result['contextText'])
+        self.assertEqual(result['intentDraft']['targets'][0]['businessPhrases'][0]['sourceText'], '净利润预算')
+
+    def test_public_compound_cannot_revive_changed_scenario_or_invent_quote(self):
+        for text, changes in (('净利润预算', ['MD_SCENE']), ('预算净利润', [])):
+            turn, _ = self.confirmed_turn()
+            turn.state['request'] = '改查实际' if changes else '继续查询'
+            turn.state['followupContext'] = {'mode': 'CONTINUE', 'changedDimensions': changes}
+            request = {'purpose': 'QUERY', 'intentDraft': {'targets': [{'id': 'profit',
+                'businessPhrases': [{'text': text}]}]}}
+            with patch('analysis_extension.followup_scope._same_source', return_value=True):
+                with self.assertRaises(AnalysisError) as caught:
+                    prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
+            self.assertEqual(caught.exception.code, 'QUERY_DRAFT_EVIDENCE_INVALID')
+
     def test_quote_must_come_from_confirmed_source_not_concatenation_alone(self):
         turn, _ = self.confirmed_turn()
         request = self.request()
@@ -121,15 +143,16 @@ class HierarchyFollowupTest(TestCase):
             result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'QUERY'})
         self.assertIn('年度二上', result['contextText'])
 
-    def test_grouping_is_forwarded_and_loss_filter_is_owned_by_program(self):
+    def test_grouping_is_forwarded_without_reusing_legacy_filter_state(self):
         turn, _ = self.confirmed_turn()
         turn.state['queryIntent'] = {'grouping': '版块'}
         turn.state['budgetValueFilter'] = {'operator': 'LT', 'value': '0'}
         with patch('analysis_extension.followup_scope._same_source', return_value=True):
-            result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'ANALYZE'})
+            result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'ANALYZE',
+                'intentDraft': {'targets': [{'id': 'profit', 'businessPhrases': [{'text': '净利润'}]}]}})
         self.assertEqual(result['groupBy'], ['版块'])
         self.assertEqual(result['scope']['periodCode'], '2026N0001')
-        self.assertEqual(result['intentDraft']['valueFilter'], {'operator': 'LT', 'value': '0'})
+        self.assertNotIn('valueFilter', result['intentDraft'])  # legacy persisted field cannot leak into independent queries
 
     def state(self):
         return {'request': '从利润表进行分析，把二级单位的净利润做一个倒序排列',
@@ -153,9 +176,11 @@ class HierarchyFollowupTest(TestCase):
     def test_changing_root_or_starting_new_question_does_not_inherit_old_root(self):
         state = self.state()
         state['queryIntent']['population'] = '其他集团下属二级单位'
+        state['request'] = '查询其他集团的二级单位净利润'
         result = prepare_request(SimpleNamespace(state=state), {'originalToolName': 'execute_budget_query'}, self.request('其他集团'))
         self.assertNotIn('久其集团', result.get('contextText', ''))
         state['followupContext']['mode'] = 'NEW'
+        state['request'] = '查询久其集团的二级单位净利润'
         result = prepare_request(SimpleNamespace(state=state), {'originalToolName': 'execute_budget_query'}, self.request())
         self.assertNotIn('contextText', result)
 

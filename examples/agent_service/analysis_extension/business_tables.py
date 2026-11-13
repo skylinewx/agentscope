@@ -312,8 +312,34 @@ def state_markdown(receipt):
     lines = [f"执行状态：{receipt.get('status', 'UNKNOWN')}；执行覆盖：{'完整' if data.get('complete') else '未完整'}。"]
     if data.get('question'):
         lines.append('查询问题：' + escape(data['question']))
+    from .aggregation_explanation import receipt_markdown
+    lines.extend(receipt_markdown(receipt))
     filtering = data.get('valueFilter')
-    if filtering:
+    if filtering and filtering.get('basis') in ('BUDGET_NATIVE_RESULT_WHERE', 'BUDGET_NATIVE_FILTER'):
+        targets = {t.get('logicalTargetId', t.get('id')): t.get('label', t.get('id')) for t in data.get('targets', [])}
+        def label(condition):
+            op = condition.get('operator')
+            if op in ('AND', 'OR'):
+                return '（' + (' 且 ' if op == 'AND' else ' 或 ').join(label(child) for child in condition.get('children', [])) + '）'
+            if op == 'NOT':
+                return '非（' + label(condition['children'][0]) + '）'
+            target = condition.get('targetId') or (next(iter(targets)) if len(targets) == 1 else '')
+            sign = {'LT': '<', 'LE': '≤', 'GT': '>', 'GE': '≥', 'EQ': '=', 'NE': '≠', 'IS_NULL': '为空', 'IS_NOT_NULL': '非空'}.get(op, op)
+            return text(targets.get(target, target)) + ' ' + sign + ' ' + text(condition.get('value'))
+        lines.append('数值筛选：' + escape(label(filtering.get('condition', {}))) + '。由预算服务按同一实体和数据粒度执行；空值不按零处理。')
+        for index, batch in enumerate(filtering.get('batches', []), 1):
+            if batch.get('filterStage') == 'HAVING':
+                counts = batch.get('aggregationSummary') or {}
+                fields = [('leafTargetCombinationCount', '末级目标组合'), ('detailRowCount', '参与汇总明细'),
+                          ('groupCountBeforeHaving', '筛选前分组'), ('filteredOutGroupCount', '过滤分组')]
+            else:
+                counts = batch.get('rangeSummary') or {}
+                fields = [('targetCombinationCount', '范围目标组合'), ('alignedRowCount', '筛选前对齐记录'),
+                          ('matchedTargetCount', '命中目标组合'), ('filteredOutRowCount', '过滤记录')]
+            summary = '；'.join(f'{name}：{counts[key]}' for key, name in fields if key in counts)
+            if summary:
+                lines.append(f'筛选口径 {index}：{summary}。')
+    elif filtering:
         comparison = {'LT': '<', 'LE': '≤', 'GT': '>', 'GE': '≥', 'EQ': '=', 'NE': '≠'}.get(filtering.get('operator'), '?')
         lines.append(f"数值筛选：{comparison} {escape(filtering.get('value'))}；已核对 {filtering.get('populationCount', 0)} 项来源值，"
                      f"命中 {filtering.get('matchedCount', 0)} 项；总体{'已完整确认' if filtering.get('populationComplete') else '尚未完整确认'}。空值不按零处理。")
@@ -444,6 +470,21 @@ def resolve_cell(receipt, table_ref, row_ref, column_ref, tables=None):
 
 def model_text(value):
     """The business body is actual Markdown, not an escaped JSON string."""
+    if isinstance(value, dict) and value.get('viewType') == 'scope_candidates':
+        def cell(text):
+            return str(text or '').replace('|', '\\|').replace('\n', ' ')
+        rows = ['| 类型 | 正式名称 | 编码 | candidateRef |', '| --- | --- | --- | --- |']
+        rows += ['| ' + ' | '.join(cell(item.get(key)) for key in ('kind', 'name', 'key', 'candidateRef')) + ' |'
+                 for item in value['scopeCandidates']]
+        navigation = {key: item for key, item in value.items() if key not in ('scopeCandidates', 'note')}
+        return ('\n'.join(rows) + '\n\n' + value['note']
+                + '\n选择后在原 execute_budget_query 中追加 scope.bindings=[{text: 用户任务或表样原话, candidateRef: 所选引用}]；保留原 targets/sharedConditions、成员、时期及情景。原 selection=CELLS 保持 CELLS，找到表样候选不代表改查 FULL_FORM；不要清空目标或预算条件。'
+                + '\n\n查询上下文及读取入口：\n```json\n' + encode(navigation) + '\n```')
+    if isinstance(value, dict) and value.get('viewType') == 'result_sources':
+        sources = [{key: item[key] for key in ('sourceRef', 'label', 'rowCount', 'grain') if key in item}
+                   for item in value['sources']]
+        navigation = {'sources': sources, 'nextOffset': value['nextOffset'], 'diagnostics': value.get('diagnostics', [])}
+        return value['markdown'] + '\n\n' + value['boundary'] + '\n\n来源引用：\n```json\n' + encode(navigation) + '\n```'
     if isinstance(value, dict) and value.get('viewType') == 'business_tables':
         metadata = {k: v for k, v in value.items() if k not in ('markdown', 'note')}
         return value['markdown'] + '\n\n' + value.get('note', '') + '\n\n读取引用：\n```json\n' + encode(metadata) + '\n```'

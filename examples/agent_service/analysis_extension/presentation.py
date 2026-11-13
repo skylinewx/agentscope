@@ -55,7 +55,7 @@ def display(value, options=None):
 
 
 def published(artifact):
-    validate_artifact(artifact)
+    validate_artifact(artifact, historical=True)
     if artifact.get("publicationState") != "PUBLISHED":
         raise AnalysisError("NOT_PUBLISHED", "分析尚未发布。")
 

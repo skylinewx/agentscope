@@ -165,7 +165,7 @@ export function validateScene(value: unknown): asserts value is ChartScene {
 export function parseSnapshot(value: unknown): ViewSnapshot {
 	const v = record(value);
     if (v.freeDocument !== undefined) parseFreeDocument(v.freeDocument);
-	if (v.schemaVersion !== 1 || v.rendererVersion !== '1.11.1' || v.engineVersion !== '1.5.0') throw new Error('UNSUPPORTED_VERSION');
+	if (v.schemaVersion !== 1 || v.rendererVersion !== '1.11.1' || !['1.5.0', '2.0.0'].includes(v.engineVersion as string)) throw new Error('UNSUPPORTED_VERSION');
 	if (typeof v.technicalDetails !== 'boolean' || typeof v.chartsRequested !== 'boolean') throw new Error('INVALID_VIEW');
 	for (const key of ['analysisRef', 'dataDigest', 'viewId', 'scopeId', 'scopeLabel', 'claimsScopeLabel', 'engineVersion']) str(v[key]);
 	if (!/^ana_[0-9a-f]{32}:[1-9][0-9]{0,8}$/.test(v.analysisRef as string) || typeof v.isFiltered !== 'boolean') throw new Error('INVALID_VIEW');

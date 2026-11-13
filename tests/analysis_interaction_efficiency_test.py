@@ -222,7 +222,11 @@ class RevisionTests(PresentationCase):
                  'aggregationSummary': {'leafTargetCombinationCount': 42, 'groupCountBeforeHaving': 5,
                                         'filteredOutGroupCount': 0}}
         artifact['scope']['sourceScopes'] = [scope]
-        self.assertEqual(self.service._built(artifact)['scope']['sourceRangeSummary'], [scope])
+        actual, = self.service._built(artifact)['scope']['sourceRangeSummary']
+        self.assertEqual({key: value for key, value in actual.items() if key != 'aggregationExplanation'}, scope)
+        self.assertIn('有效末级参与目标组合 42', actual['aggregationExplanation'])
+        self.assertIn('不等于有值数', actual['aggregationExplanation'])
+        self.assertEqual(artifact['scope']['sourceScopes'], [scope])
 
     def test_revision_keeps_all_values_and_skips_only_verified_unchanged_background(self):
         from analysis_extension.turn_completion import TurnCompletion

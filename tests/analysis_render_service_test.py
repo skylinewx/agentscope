@@ -23,7 +23,7 @@ class AutomaticRenderTests(PresentationCase):
         artifact = self.store.get_analysis(OWNER,self.ref)
         self.document = {'title':'阅读结果','html':'<html><head></head><body><p>本次结果 {{v}}</p></body></html>',
                          'bindings':[{'key':'v','valueRef':artifact['facts'][0]['factId']}]}
-        samples = [measurements(width=w) for w in (420,900)]
+        samples = [measurements(width=w, static_keys=['v']) for w in (420,900)]
         for sample in samples: sample['orders'] = []
         self.checker = AsyncMock()
         self.checker.check.return_value = samples
@@ -110,7 +110,7 @@ class AutomaticRenderTests(PresentationCase):
         from analysis_extension.free_document import compile_document
         compiled = compile_document(self.store.get_analysis(OWNER, self.ref), self.document)
         refs = [row['factRef'] for row in compiled['datasets']['ranking']['rows']]
-        self.checker.check.return_value = [measurements(refs, width) for width in (420, 900)]
+        self.checker.check.return_value = [measurements(refs, width, static_keys=['v']) for width in (420, 900)]
         self.document['html'] = self.document['html'].replace('<p>', '<p data-analysis-set="ranking">')
         fixed = await self.preview()
         self.assertNotIn('publicationCheck', fixed['diagnostics'])
@@ -155,7 +155,7 @@ class RenderProtocolTests(IsolatedAsyncioTestCase):
     async def test_response_identity_and_widths_are_verified(self):
         document = {'html':'<p>test</p>','contentDigest':'a'*64,'frameKey':'bound-key'}
         answer = {'version':1,'contentDigest':'a'*64,'frameKey':'bound-key',
-                  'measurements':[measurements(width=w) for w in (420,900)]}
+                  'measurements':[measurements(width=w, static_keys=['v']) for w in (420,900)]}
         real_client = httpx.AsyncClient
         seen = []
         def respond(request):

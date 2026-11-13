@@ -45,13 +45,12 @@ class IncrementalOptimizationTests(PresentationCase):
             with self.subTest(code=code), self.assertRaises(ValueError):
                 validate_code(code)
 
-    def test_incremental_schema_requires_explicit_base_and_complete_replacements(self):
+    def test_schema_allows_adopted_inputs_and_runtime_requires_a_base_or_adoption(self):
         validator = Draft202012Validator(AnalysisBuild.input_schema)
         validator.validate({'baseAnalysisRef': 'base:1', 'operations': [], 'requestKey': 'next'})
-        for request in ({'operations': [], 'requestKey': 'missing-base'},
-                        {'baseAnalysisRef': 'base:1', 'captureRefs': ['capture'], 'operations': [], 'requestKey': 'partial-input'}):
-            with self.assertRaises(ValidationError):
-                validator.validate(request)
+        validator.validate({'operations': [], 'requestKey': 'use-adopted'})
+        with self.assertRaises(ValidationError):
+            validator.validate({'operations': [], 'requestKey': 'bad', 'unknownField': True})
 
     async def test_append_preserves_typed_grain_null_and_python_without_readaptation(self):
         capture, selection, scope, _ = batch_fixture(null_value=True)

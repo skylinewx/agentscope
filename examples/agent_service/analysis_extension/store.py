@@ -35,6 +35,9 @@ class AnalysisStore:
                 CREATE TABLE IF NOT EXISTS blobs(digest TEXT PRIMARY KEY, size INTEGER NOT NULL, created REAL NOT NULL);
                 CREATE TABLE IF NOT EXISTS captures(ref TEXT PRIMARY KEY, owner TEXT NOT NULL, digest TEXT NOT NULL, created REAL NOT NULL);
                 CREATE INDEX IF NOT EXISTS captures_owner ON captures(owner, created);
+                CREATE TABLE IF NOT EXISTS source_views(ref TEXT PRIMARY KEY, owner TEXT NOT NULL,
+                    capture TEXT NOT NULL, data TEXT NOT NULL, created REAL NOT NULL);
+                CREATE INDEX IF NOT EXISTS source_views_owner ON source_views(owner, created);
                 CREATE TABLE IF NOT EXISTS analyses(ref TEXT PRIMARY KEY, owner TEXT NOT NULL, aid TEXT NOT NULL,
                     revision INTEGER NOT NULL, base INTEGER NOT NULL, state TEXT NOT NULL, digest TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS analyses_owner ON analyses(owner, aid, revision);
@@ -264,6 +267,32 @@ class AnalysisStore:
             raise AnalysisError("NOT_FOUND", "当前会话没有该输入引用。")
         return self._read(row["digest"])
 
+    def save_source_view(self, owner: Owner, record: dict) -> dict:
+        """Immutable selector index; the original capture remains the only data copy."""
+        capture = record['selection']['captureRef']
+        self.get_capture(owner, capture)
+        ref = 'src_' + digest([owner.key, record['selection']])[:32]
+        value = {**record, 'sourceRef': ref, 'sourceViewVersion': 1}
+        with self._transaction() as db:
+            db.execute('INSERT OR IGNORE INTO source_views VALUES(?,?,?,?,?)',
+                       (ref, owner.key, capture, json.dumps(value, ensure_ascii=False, allow_nan=False), time.time()))
+        return self.get_source_view(owner, ref)
+
+    def pin_source_views(self, owner: Owner, references):
+        records = [self.get_source_view(owner, ref) for ref in references]
+        with self._transaction() as db:
+            for record in records:
+                db.execute('INSERT OR IGNORE INTO pins VALUES(?,?)',
+                           (record['sourceRef'], record['selection']['captureRef']))
+
+    def get_source_view(self, owner: Owner, ref: str) -> dict:
+        with closing(self._connect()) as db:
+            row = db.execute('SELECT capture,data FROM source_views WHERE ref=? AND owner=?', (ref, owner.key)).fetchone()
+        if row is None:
+            raise AnalysisError('UNKNOWN_SOURCE_REF', '来源引用不属于当前会话；使用 AnalysisTask(sources) 返回的引用。')
+        self.get_capture(owner, row['capture'])
+        return json.loads(row['data'])
+
     def list_captures(self, owner: Owner, offset=0, limit=100, *, newest_first=False) -> dict:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= self.limits.page_size:
             raise AnalysisError("INVALID_PAGE", "分页参数超出范围。")
@@ -303,7 +332,7 @@ class AnalysisStore:
         if not row:
             raise AnalysisError("NOT_FOUND", "当前会话没有该分析引用。")
         artifact = self._read(row["digest"])
-        validate_artifact(artifact)
+        validate_artifact(artifact, historical=True)
         return artifact
 
     def save_python_run(self, owner, ref, record):
@@ -414,7 +443,7 @@ class AnalysisStore:
                 base = db.execute("SELECT * FROM analyses WHERE owner=? AND ref=?", (owner.key, base_ref)).fetchone()
                 if not base:
                     raise AnalysisError("INVALID_BASE", "重建必须引用本会话实际存在的分析草稿或已发布版本。")
-                validate_artifact(self._read(base["digest"]))
+                validate_artifact(self._read(base["digest"]), historical=True)
                 aid = base['aid']
                 base_revision = self._continuation_revision(db, owner, base)
                 revision = db.execute("SELECT MAX(revision)+1 FROM analyses WHERE owner=? AND aid=?", (owner.key, aid)).fetchone()[0]
@@ -455,7 +484,8 @@ class AnalysisStore:
                 raise self._version_conflict(db, owner, row, head)
             # Do not trust a caller to change identity or numerical facts on publish.
             original = self._read(row["digest"])
-            for field in set(original) - {"claims", "viewPlan", "findings", "actions", "technicalDetails"}:
+            for field in set(original) - {"claims", "viewPlan", "findings", "actions", "technicalDetails",
+                                          "workRefs", "unresolvedItems", "partialReason"}:
                 if original[field] != result.get(field):
                     raise AnalysisError("IMMUTABLE_FACTS", "发布不能改变已构建的事实和范围。")
             for capture_ref in original["captureRefs"]:
@@ -598,10 +628,25 @@ class AnalysisStore:
                        (owner.key, analysis_ref, record['contentDigest'], record['viewport']['width'], blob, time.time()))
             # 内容摘要变化和检查历史裁剪不能抹除既有数值图形检查义务。
             # 展示修订沿用数据时共享此记录；新的数据集合独立计算覆盖范围。
+            existing = db.execute('SELECT kind,declared FROM document_check_requirements WHERE owner=? AND aid=? AND data=?',
+                                  (owner.key, artifact['analysisId'], data_key)).fetchall()
             for kind, checks in record.get('numericChecks', {}).items():
                 db.execute('INSERT INTO document_check_requirements VALUES(?,?,?,?,?) '
                            'ON CONFLICT(owner,aid,data,kind) DO UPDATE SET declared=MAX(declared,excluded.declared)',
                            (owner.key, artifact['analysisId'], data_key, kind, checks['declared']))
+            coverage = record.get('valueCoverage')
+            if coverage is not None:
+                identities = set(coverage['charted'])
+                # An old snapshot had counts but no identities. Migrate once;
+                # new v4 documents never acquire an arbitrary chart-count floor.
+                prior_v4 = any(row['kind'] == 'coverage-v4' for row in existing)
+                # Requirements span revisions and survive history trimming; the
+                # old viewport row may already have been replaced by this one.
+                if not prior_v4 and any(row['kind'] == 'linearBars' and row['declared'] > 0 for row in existing):
+                    identities.update(coverage['sourceRefs'])
+                for kind in [*identities, 'coverage-v4']:
+                    db.execute('INSERT OR IGNORE INTO document_check_requirements VALUES(?,?,?,?,?)',
+                               (owner.key, artifact['analysisId'], data_key, kind, 1))
             # Bounded viewport history; obsolete digests cannot validate a new document.
             db.execute('DELETE FROM document_checks WHERE owner=? AND analysis=? AND rowid NOT IN '
                        '(SELECT rowid FROM document_checks WHERE owner=? AND analysis=? ORDER BY checked DESC LIMIT 8)',

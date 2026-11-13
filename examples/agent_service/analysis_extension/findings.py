@@ -119,7 +119,12 @@ def generate(artifact, registry, thresholds=None, configured=None, hypotheses=No
         if is_selected("UNIT_GAP", fact["factId"]) and (not fact.get("unit") or not fact.get("scale")):
             add("unit", [fact], f"{subject(fact)}的单位或缩放未获来源确认，保留原值，不进行换算。", gaps=["该单元格的单位与缩放元数据"])
         if is_selected("MISSING_VALUE", fact["factId"]) and fact["valueState"] != "PRESENT":
-            add("coverage", [fact], f"{subject(fact)}当前没有可用于计算的数值，不能按零处理。", gaps=["同一对象、时期和指标的有效来源值"])
+            from .formula_arithmetic import BUDGET_FORMULA
+            if (fact.get('formulaArithmetic') == BUDGET_FORMULA and fact['valueState'] == 'NO_VALUE'
+                    and fact.get('value') is None and fact.get('precision') != 'display_only'):
+                add("coverage", [fact], f"{subject(fact)}来源为空；预算公式运算时按0处理，原始值仍保留空。")
+            else:
+                add("coverage", [fact], f"{subject(fact)}当前没有可用于计算的数值，不能按零处理。", gaps=["同一对象、时期和指标的有效来源值"])
     if checks["COVERAGE_GAP"] and artifact["coverage"] != "COMPLETE":
         add("coverage", list(facts.values()), "所选对象或来源覆盖尚未证明完整；本次结果不能代表全部对象。", gaps=["正式成员关系、缺失对象及未读完分支的完整来源"])
     for value in derived.values():

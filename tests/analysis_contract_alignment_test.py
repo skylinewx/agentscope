@@ -5,7 +5,7 @@ from copy import deepcopy
 import json
 from types import SimpleNamespace
 from unittest import TestCase, IsolatedAsyncioTestCase
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from analysis_fixtures import OWNER, saved_fixture
 from analysis_closeout_test import mixed_fixture
@@ -14,6 +14,7 @@ from analysis_presentation_fixtures import PresentationCase
 import analysis_capture_test as capture_fixture
 from analysis_extension.capture import ReceiptCapture
 from analysis_extension.query_attempts import prepare, record
+from analysis_extension.models import AnalysisError
 from analysis_extension.completion import completion_summary
 from analysis_extension.engine import calculate, RuleRegistry
 from analysis_extension.protocol import validator
@@ -53,6 +54,29 @@ class RequestAttemptTests(PresentationCase):
         record(self.store, OWNER, 'turn', attempt, {'contractVersion': '2.0', 'executionId': 'execution',
             'status': status, 'error': {'code': 'QUERY_CONCURRENCY_LIMIT', 'retryable': retryable,
                                        'recoveryAction': action} if status == 'FAILED' else None})
+
+    def test_classifying_statistics_repairs_failure_but_renaming_or_sorting_does_not(self):
+        origin = {**self.origin, 'originalToolName': 'execute_budget_query'}
+        request = {'question': '查询净利润，再统计合计', 'purpose': 'QUERY',
+                   'intentDraft': {'sharedConditions': [], 'targets': [
+                       {'id': 'profit', 'businessPhrases': [{'text': '净利润'}]}]}}
+        first, attempt = prepare(self.store, OWNER, 'turn', origin, request)
+        self.finish(attempt, retryable=False, action='CORRECT_REQUEST')
+        cosmetic = deepcopy(request)
+        cosmetic['intentDraft']['presentation'] = {'valueOrder': 'DESC'}
+        with self.assertRaises(AnalysisError) as error:
+            prepare(self.store, OWNER, 'turn', origin, cosmetic)
+        self.assertEqual(error.exception.code, 'QUERY_EQUIVALENT_FAILURE')
+        corrected = deepcopy(request)
+        corrected['intentDraft']['presentation'] = {'statistics': '统计合计'}
+        prepared, corrected_attempt = prepare(self.store, OWNER, 'turn', origin, corrected)
+        self.assertNotEqual(prepared['requestId'], first['requestId'])
+        self.assertEqual(prepared['intentDraft']['presentation'], {'statistics': '统计合计'})
+        self.finish(corrected_attempt, retryable=False, action='CORRECT_REQUEST')
+        corrected['intentDraft']['targets'][0]['id'] = 'renamed'
+        with self.assertRaises(AnalysisError) as error:
+            prepare(self.store, OWNER, 'turn', origin, corrected)
+        self.assertEqual(error.exception.code, 'QUERY_EQUIVALENT_FAILURE')
 
     def test_unknown_running_success_and_partial_preserve_identity(self):
         for status in ('IN_PROGRESS', 'SUCCEEDED', 'PARTIAL'):
@@ -126,6 +150,8 @@ class RequestAttemptTests(PresentationCase):
         agent = SimpleNamespace(toolkit=SimpleNamespace(get_tool=AsyncMock(return_value=tool)))
         capture = ReceiptCapture(self.store, OWNER, frozenset({'registered-budget'}), AsyncMock())
         capture.turn_key_provider = lambda: 'capture-turn'
+        capture.request_preparer = Mock(side_effect=lambda origin, request: {
+            **request, 'intentDraft': {'valueFilter': {'operator': 'LT', 'value': '0'}}})
         capture.query_cache_provider = lambda: cache
         sent, cache = [], {}
         async def execute(**kwargs):
@@ -141,6 +167,8 @@ class RequestAttemptTests(PresentationCase):
         call = ToolCallBlock(id='one-model-call', name=tool.name, input=json.dumps(self.request))
         events = [event async for event in capture.run(agent, {'tool_call': call}, execute) if isinstance(event, ToolResponse)]
         self.assertEqual(len(sent), 2)
+        capture.request_preparer.assert_called_once()
+        self.assertEqual(sent[1]['intentDraft']['valueFilter'], {'operator': 'LT', 'value': '0'})
         self.assertNotEqual(sent[0]['requestId'], sent[1]['requestId'])
         self.assertEqual({k: v for k, v in sent[0].items() if k != 'requestId'},
                          {k: v for k, v in sent[1].items() if k != 'requestId'})
@@ -498,13 +526,16 @@ class DeliveryContractTests(PresentationCase):
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
         validator().validate(artifact)
         self.assertEqual(built['completion']['state'], 'READY')
+        self.assertEqual(artifact['derivedValues'][0]['calculationValidation'], 'PASS')
+        self.assertEqual(artifact['derivedValues'][0]['value'], '-15')
+        self.assertTrue(any(f['valueState'] == 'NO_VALUE' and f['value'] is None for f in artifact['facts']))
         published = await self.service.publish(built['analysisRef'], [], [
             {'viewId': 'values', 'scopeId': built['scope']['scopeId'], 'type': 'TABLE',
              'valueRefs': [fact['factId'] for fact in artifact['facts']]},
             {'viewId': 'diagnostic', 'scopeId': built['scope']['scopeId'], 'type': 'TABLE', 'valueRefs': ['derived_check']}], 'publish')
         self.assertEqual(published['publicationState'], 'PUBLISHED')
         forged = deepcopy(artifact)
-        forged['derivedValues'][0]['value'] = '0'
+        forged['derivedValues'][0]['calculationValidation'] = 'BLOCKED'
         self.assertTrue(list(validator().iter_errors(forged)))
 
     async def test_final_tool_schema_describes_build_alias_and_publish_actual_refs(self):

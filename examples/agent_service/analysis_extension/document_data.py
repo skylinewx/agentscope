@@ -5,6 +5,7 @@ import re
 
 from .comparison_scenes import affine
 from .formulas import Expression
+from .formula_arithmetic import local_input_value
 from .formatting import number_text, validate_number_format
 from .models import AnalysisError, decimal_value, decimal_text
 
@@ -104,6 +105,10 @@ def formula_dataset(value, facts, node_refs, fmt):
         if not node.get('expression') or node.get('boundary'):
             raise AnalysisError('INVALID_DOCUMENT_DATASET', 'nodeRefs 须选择可展开的公式节点，叶子/外部边界不会生成计算层。')
         operands = [{**fact_record(facts[dep['factRef']], fmt)} for dep in node['dependencies']]
+        for operand in operands:
+            if node.get('arithmeticPolicy'):
+                operand['calculationValue'] = amount(local_input_value(node, facts[operand['factRef']]), fmt)
+                operand['nullAsZero'] = operand['factRef'] in node.get('localCheck', {}).get('nullAsZeroRefs', [])
         address_refs = {dep['address']: dep['factRef'] for dep in node['dependencies']}
         tree = Expression(node['expression']).tree
         local_checked = node.get('localCheck', {}).get('status') in ('MATCH', 'MISMATCH')
@@ -119,6 +124,10 @@ def formula_dataset(value, facts, node_refs, fmt):
                     'recursiveDifference': node.get('difference') if recursive_checked else None,
                     'propagatedDifference': node.get('propagatedDifference') if recursive_checked else None}.items()},
                 'differenceOriginRefs': deepcopy(node.get('differenceOriginRefs', [])),
+                'arithmeticPolicy': node.get('arithmeticPolicy'),
+                'effectiveSourceValue': amount(node.get('effectiveSourceValue', node.get('observed')), fmt),
+                'nullAsZeroRefs': deepcopy(node.get('localCheck', {}).get('nullAsZeroRefs', [])),
+                'zeroDivisorCount': node.get('localCheck', {}).get('zeroDivisorCount', 0),
                 'additive': False}
         # Exact coefficients are an optional capability, never a business attribution.
         try:
@@ -131,7 +140,8 @@ def formula_dataset(value, facts, node_refs, fmt):
                 contributions = []
                 for dep, operand in zip(node['dependencies'], operands):
                     coefficient = coefficients.get(dep['address'], Decimal(0))
-                    raw = None if operand['value'] is None else decimal_text(coefficient * decimal_value(operand['value']))
+                    effective = local_input_value(node, facts[operand['factRef']])
+                    raw = None if effective is None else decimal_text(coefficient * decimal_value(effective))
                     contributions.append({'factRef': dep['factRef'], 'coefficient': decimal_text(coefficient), **amount(raw, fmt)})
                 item.update(additive=True, contributions=contributions,
                             constant=amount(decimal_text(coefficients.get(None, Decimal(0))), fmt))
@@ -148,7 +158,7 @@ def formula_dataset(value, facts, node_refs, fmt):
 
 
 def formula_waterfall(node, fmt):
-    """用本层直接输入生成精确的累计区间；缺数时不生成完整瀑布图。"""
+    """用本层实际运算输入生成累计区间；未取得或不可用的输入不生成完整图。"""
     local_value = node['values']['localValue']['value']
     contributions = node['contributions']
     if local_value is None or any(item['value'] is None for item in contributions):
@@ -168,7 +178,8 @@ def formula_waterfall(node, fmt):
     # 终点只能是完整公式的本层计算值，不能用来源值或差额补齐。
     if current != decimal_value(local_value):
         return None
-    steps.append({'kind': 'TOTAL', **amount(local_value, fmt), 'start': '0', 'end': decimal_text(current)})
+    steps.append({'kind': 'TOTAL', 'factRef': node['factRef'], 'headers': deepcopy(node.get('headers', [])),
+                  **amount(local_value, fmt), 'start': '0', 'end': decimal_text(current)})
     endpoints = [decimal_value(step[key]) for step in steps for key in ('start', 'end')]
     minimum, maximum = min(endpoints), max(endpoints)
     span = maximum - minimum or Decimal(1)

@@ -78,12 +78,14 @@ def reviewed_publication(service, artifact):
     if not saved.get('document') or saved.get('analysisRef') != artifact['analysisRef']:
         return None
     proposed = deepcopy(artifact)
-    proposed.update({key: saved[key] for key in ('workRefs', 'partialReason') if saved.get(key) is not None})
+    from .completion import apply_publication_completion
+    apply_publication_completion(proposed, saved)
     document = compile_document(proposed, saved['document'])
     if document['contentDigest'] != proof.get('contentDigest'):
         return None
     return {'document': document, 'previewRef': proof['previewRef'],
-            'workRefs': saved.get('workRefs'), 'partialReason': saved.get('partialReason'),
+            'workRefs': saved.get('workRefs'), 'partialReason': proposed.get('partialReason'),
+            'unresolvedItems': proposed.get('unresolvedItems', []),
             'publicationCheckCode': proof.get('publicationCheckCode')}
 
 
@@ -102,4 +104,5 @@ def reviewed_preview(service, artifact):
     return {'paragraphs': parser.paragraphs, 'previewRef': publication['previewRef'],
             'contentDigest': document['contentDigest'], 'workRefs': publication['workRefs'],
             'partialReason': publication['partialReason'],
+            'unresolvedItems': publication['unresolvedItems'],
             'publicationCheckCode': publication['publicationCheckCode']}

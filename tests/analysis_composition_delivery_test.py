@@ -150,7 +150,7 @@ class ReviewedCloseoutTests(PresentationCase):
         self.service.preview_reviewer = AsyncMock(side_effect=review)
         samples = []
         for width in (420, 900):
-            sample = measurements(width=width)
+            sample = measurements(width=width, static_keys=['amount'])
             sample['orders'] = []
             samples.append(sample)
         self.service.render_checker = AsyncMock()
@@ -165,7 +165,7 @@ class ReviewedCloseoutTests(PresentationCase):
         # 先完成真正的内容审查；随后只修改图形而产生展示错误时，保留已审查的解释。
         checked = await self.service.publish(artifact['analysisRef'], requestKey='checked-preview',
                                             document=document, previewOnly=True, workRefs=work_refs,
-                                            partialReason=partial_reason)
+                                            unresolvedItems=[{'requirement': '额外所需查询', 'reason': partial_reason}] if partial_reason else None)
         if not broken:
             return artifact, checked
         for sample in samples:
@@ -197,7 +197,7 @@ class ReviewedCloseoutTests(PresentationCase):
         from analysis_extension.middleware import AnalysisMiddleware
         middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize, self.rules, delivery=self.delivery)
         self.service = middleware.service
-        reason = '某项来源为空，本次保留已有金额和局限。'
+        reason = '另一项查询接口执行失败，本次保留已有金额和局限。'
         artifact, _ = await self.preview(broken=False, partial_reason=reason)
         answer = await middleware._closeout('REPAIR_TIME_LIMIT')
         self.assertEqual(self.turn.state['hostCloseout']['status'], 'PARTIAL', answer)
@@ -206,7 +206,7 @@ class ReviewedCloseoutTests(PresentationCase):
         saved = self.store.get_analysis(OWNER, artifact['analysisRef'])
         self.assertIn('freeDocument', saved)
         self.assertNotIn('hostSummary', saved)
-        self.assertEqual(saved['partialReason'], reason)
+        self.assertEqual(saved['partialReason'], '额外所需查询：' + reason)
         self.service.preview_reviewer.assert_awaited_once()
 
     async def test_closeout_cannot_confirm_a_preview_after_its_evidence_changed(self):

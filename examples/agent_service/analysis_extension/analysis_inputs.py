@@ -39,10 +39,12 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
     from .batch_scope import selected_tables, resolve_members
     from .member_scopes import member_ref
     facts, contexts, subjects, references, audits, structures = {}, {}, set(), set(), [], []
-    period_scopes = {}
+    period_scopes, population_evidence, input_groups = {}, [], {}
     complete, pages_complete, population_complete = True, True, True
     for selection in selections:
         role = selection.get('role', 'PRIMARY')
+        input_ref = selection.get('inputRef')
+        input_purpose = selection.get('inputPurpose', 'VALUES')
         if role not in ('PRIMARY', 'REFERENCE', 'STRUCTURE'):
             raise AnalysisError('INVALID_INPUT_ROLE', '输入用途使用 PRIMARY、REFERENCE 或 STRUCTURE。')
         if selection.get('captureRef') not in captures:
@@ -95,6 +97,7 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
             population_complete &= data['scope'].get('populationComplete', False)
         contexts.update({item['sourceContextId']: item for item in data['sourceContexts']})
         namespace = adapter.member_namespace(captures[selection['captureRef']], '|'.join(sorted(grain)))
+        local_members, local_fact_refs = set(), []
         for fact in data['facts']:
             if not fact.get('captureRefs'):
                 raise AnalysisError('INPUT_DATA_INCOMPLETE', '所选输入仍有未查询的成员。')
@@ -108,10 +111,40 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
             value = {**fact, 'objectId': member, 'memberRef': member, 'objectLabel': label,
                      'grain': grain, 'rowIdentity': identity, 'inputRole': role}
             old = facts.get(fact['factId'])
-            if old and (old['grain'] != grain or old['inputRole'] != role):
-                raise AnalysisError('INPUT_ROLE_CONFLICT', '同一事实不能同时声明不同用途或粒度。')
-            facts[fact['factId']] = value
+            memberships = deepcopy((old or {}).get('inputMemberships', []))
+            if input_ref:
+                membership = {'inputRef': input_ref, 'inputRole': role, 'grain': grain,
+                              'objectId': member, 'memberRef': member, 'objectLabel': label, 'rowIdentity': identity,
+                              'inputPurpose': input_purpose}
+                if membership not in memberships:
+                    memberships.append(membership)
+            if old and not input_ref and (old['grain'] != grain or old['inputRole'] != role):
+                raise AnalysisError('INPUT_ROLE_CONFLICT', '同一事实的不同用途须通过明确的输入组分别登记。')
+            chosen = old if old and old.get('inputRole') == 'PRIMARY' else value
+            facts[fact['factId']] = {**chosen, **({'inputMemberships': memberships} if memberships else {})}
+            local_members.add(member)
+            local_fact_refs.append(fact['factId'])
             (subjects if role == 'PRIMARY' else references).add(member)
+        if input_ref:
+            group = input_groups.setdefault(input_ref, {'inputRef': input_ref, 'sourceRef': selection.get('sourceRef'),
+                'role': role, 'grain': grain, 'members': [], 'factRefs': [], 'complete': True, 'populationComplete': False})
+            if group['role'] != role or group['grain'] != grain:
+                raise AnalysisError('INPUT_GROUP_CONFLICT', '同一个输入组不能混用用途或粒度。')
+            if input_purpose == 'FORMULA':
+                group['formulaFactRefs'] = sorted(set(group.get('formulaFactRefs', [])) | set(local_fact_refs))
+            else:
+                group['members'] = sorted(set(group['members']) | local_members)
+                group['factRefs'] = sorted(set(group['factRefs']) | set(local_fact_refs))
+                group['complete'] &= data['scope']['selectedDataComplete']
+                group['populationComplete'] |= (data['scope'].get('populationComplete', False)
+                                                 or bool(selection.get('sourceRef')) and data['scope']['selectedDataComplete'])
+        if role == 'PRIMARY' and data['scope'].get('populationComplete') and data['scope']['selectedDataComplete']:
+            # A complete native result can establish its own population even when
+            # supplemental formula observations do not enumerate that population.
+            # Preserve the exact fact set; another input cannot borrow this proof.
+            population_evidence.append({'captureRef': selection['captureRef'], 'stepId': selection['stepId'],
+                                        'grain': grain, 'members': sorted(local_members),
+                                        'factRefs': sorted(local_fact_refs), 'complete': True})
         for audit in data['scope'].get('sourceScopes', []):
             audits.append({**audit, 'inputRole': role, 'grain': grain,
                            'selectionReason': selection.get('selectionReason', scope['selectionReason'])})
@@ -119,15 +152,19 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
             raise AnalysisError('FACT_LIMIT', '分析输入超过本次事实容量。')
     if not subjects:
         raise AnalysisError('EMPTY_SELECTION', '至少需要一个 PRIMARY 主体数据输入。')
-    if subjects & references:
-        raise AnalysisError('INPUT_ROLE_CONFLICT', '同一粒度对象同时出现在主体和对照范围，请明确输入用途。')
+    # A reference population may include the primary subset (e.g. loss-making
+    # entities versus all entities). Roles belong to source inputs, not mutually
+    # exclusive member identities. Conflicting roles for the same fact remain
+    # rejected above; computations must select their input role or source batch.
     # 调用方若还显式声明旧式范围，必须与每个选择器实际选中的对象一致，不能静默丢弃约束。
     for field, role, actual in (('members', 'PRIMARY', subjects), ('referenceMembers', 'REFERENCE', references)):
         if field not in scope:
             continue
         resolved = set()
         for expected in scope[field]:
-            matches = {fact['memberRef'] for fact in facts.values() if fact['inputRole'] == role
+            projections = [{**fact, **membership} for fact in facts.values()
+                           for membership in fact.get('inputMemberships') or [{}]]
+            matches = {fact['memberRef'] for fact in projections if fact['inputRole'] == role
                        and (expected == fact['memberRef'] or len(fact['grain']) == 1 and expected == fact.get('sourceObjectId'))}
             if len(matches) != 1:
                 raise AnalysisError('SCOPE_MISMATCH', '显式范围与输入选择器不一致；组合粒度按选择器选行，不按单维度省略其他对象。')
@@ -167,12 +204,16 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
     result_scope = {**scope, 'members': sorted(subjects), 'referenceMembers': sorted(references),
                     'memberDimension': common_dimension, 'scopeId': 'scope_' + digest([scope, selections])[:24],
                     'sourceScopes': audits, 'populationComplete': population_complete,
+                    'populationEvidence': population_evidence,
                     'selectedDataComplete': complete, 'sourcePagesComplete': pages_complete,
                     'coverage': 'COMPLETE' if complete and population_complete else 'UNKNOWN' if complete else 'PARTIAL',
                     'observedMembers': sorted(subjects), 'observedReferenceMembers': sorted(references),
                     'pendingMembers': [], 'pendingReferenceMembers': [], 'periodCoverage': period_coverage,
                     'excludedMembers': deepcopy(scope.get('excludedMembers', [])),
                     'semanticCompleteness': 'UNVERIFIED'}
+    if input_groups:
+        result_scope['inputGroups'] = list(input_groups.values())
+        result_scope['inputSetVersion'] = digest(result_scope['inputGroups'])
     if common_dimension != 'PER_INPUT_GRAIN':
         result_scope['memberBindings'] = [{'memberRef': fact['memberRef'], 'sourceObjectId': fact.get('sourceObjectId')}
                                           for fact in facts.values()]

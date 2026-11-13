@@ -2,6 +2,7 @@
 from decimal import Decimal, localcontext, Inexact, DecimalException
 
 from .formulas import Expression
+from .formula_arithmetic import local_input_value
 from .formatting import number_text, unit_for, formula_labels
 from .formula_selection import selected_nodes
 from .models import AnalysisError, decimal_value, digest
@@ -69,7 +70,7 @@ def comparison_scenes(artifact):
                         context.traps[Inexact] = True
                         for index,(address, coefficient) in enumerate(affine(Expression(node['expression']).tree)):
                             item = dependencies[address] if address else fact
-                            delta = decimal_value(item['value'])*coefficient if address else coefficient
+                            delta = decimal_value(local_input_value(node, item))*coefficient if address else coefficient
                             name = labels[item['factId']] if address else '公式常数'
                             if address and abs(coefficient) != 1: name += ' × ' + str(abs(coefficient))
                             rows.append({'rowKey':'node_'+digest([ref,node['factRef'],index])[:24], 'label':name,
@@ -77,12 +78,12 @@ def comparison_scenes(artifact):
                             spans.append((total,total+delta)); total += delta
                         if total != decimal_value(node['localCheck']['value']):
                             raise AnalysisError('COMPOSITION_MISMATCH','公式增减项与本层计算结果不一致。')
-                        observed = decimal_value(node['observed'])
+                        observed = decimal_value(node.get('effectiveSourceValue', node['observed']))
                         difference = observed-total
                         totals = [(labels[fact['factId']] + ('（按公式计算）' if difference else ''),total,(Decimal(0),total),True)]
                         if show_checks(artifact, view, node['localCheck']):
                             totals += [('差额（来源 − 计算）',difference,(total,observed),False),
-                                       (labels[fact['factId']]+'（来源值）',observed,(Decimal(0),observed),True)]
+                                       (labels[fact['factId']]+('（来源空值，按0核对）' if node['observed'] is None else '（来源值）'),observed,(Decimal(0),observed),True)]
                         for label,number,span,is_total in totals:
                             rows.append({'rowKey':'node_'+digest([ref,node['factRef'],label])[:24], 'label':label,
                                 'total':is_total,'exact':str(number), 'display':number_text(str(number),view.get('numberFormat'),grouping=True), 'unit':unit_for(fact,view)})

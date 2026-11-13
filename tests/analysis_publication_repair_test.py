@@ -117,7 +117,7 @@ class PublicationRepairTests(PresentationCase):
 
     async def test_partial_result_stays_incomplete_and_discloses_the_declared_gap(self):
         await self.build(work=[{'taskId': 'relation', 'title': '直属关系', 'kind': 'RELATION', 'refs': []}])
-        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'partial',  partialReason='本次先交付已取得数值，直属范围仍需核对。')
+        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'partial', unresolvedItems=[{'requirement': '核对直属范围', 'reason': '本次先交付已取得数值，直属范围仍需核对。'}])
         self.assertEqual(result['summary']['completion']['state'], 'INCOMPLETE')
         self.assertIn('直属范围仍需核对', self.delivery.view(result['delivery']['path'])['claimsScopeLabel'])
         export = self.delivery.render_report(self.ref, 'report')

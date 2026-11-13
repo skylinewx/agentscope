@@ -1,5 +1,5 @@
 """从已交付的来源范围承接追问；不靠业务关键词猜测用户是否换题。"""
-from copy import deepcopy
+from copy import copy, deepcopy
 from datetime import date
 import re
 
@@ -22,14 +22,14 @@ def declare_context(state, context):
             or result.get('mode') not in ('CONTINUE', 'NEW', 'SYNTHESIZE')
             or not isinstance(changes, list) or any(field not in CHANGE_FIELDS for field in changes)
             or len(changes) != len(set(changes))):
-        raise AnalysisError('INVALID_FOLLOWUP_CONTEXT', 'context 使用 CONTINUE、NEW 或 SYNTHESIZE；changedFields 仅列实际改变的范围项。')
+        raise AnalysisError('INVALID_FOLLOWUP_CONTEXT', 'context 使用 CONTINUE、NEW 或 SYNTHESIZE；条件修改使用 intent 或 scopeEdits。')
     dimensions = result.get('changedDimensions', [])
     if not isinstance(dimensions, list) or len(dimensions) > 32 or any(not isinstance(value, str) or not value.strip() for value in dimensions):
-        raise AnalysisError('INVALID_FOLLOWUP_CONTEXT', 'changedDimensions 使用本轮实际改变的业务维度名称。')
+        raise AnalysisError('INVALID_FOLLOWUP_CONTEXT', '范围变化记录无效；使用 scopeEdits 声明实际业务维度及选择器。')
     if inherited and (result['mode'] != 'CONTINUE' or changes or dimensions):
         quote = result.get('userQuote')
         if not isinstance(quote, str) or not quote.strip() or quote not in state.get('request', ''):
-            raise AnalysisError('FOLLOWUP_CHANGE_BASIS_REQUIRED', '换题、综合多轮或改变既定范围时，userQuote 必须引用本轮用户实际表达该意图的原话。')
+            raise AnalysisError('FOLLOWUP_CHANGE_BASIS_REQUIRED', '换题、综合多轮或改变既定范围时，宿主必须保留本轮用户原话作为依据。')
     return result
 
 
@@ -39,10 +39,13 @@ def _changes(turn):
 
 
 def _selectors(turn):
+    if turn.state.get('adoptedInputs'):
+        return [deepcopy(item['selection']) for item in turn.state['adoptedInputs'] if item['role'] == 'PRIMARY']
     context = turn.state.get('followupContext', {})
     if context.get('mode', 'CONTINUE') != 'CONTINUE':
         return []
-    return turn.state.get('selectedResultScope', turn.state.get('inheritedScope', {})).get('selections', [])
+    return [item for item in turn.state.get('selectedResultScope', turn.state.get('inheritedScope', {})).get('selections', [])
+            if item.get('role', 'PRIMARY') == 'PRIMARY']
 
 
 def _tables(turn, selectors):
@@ -173,7 +176,8 @@ def _single_annual_code(period_request):
     if not isinstance(period_request, dict) or period_request.get('kind') != 'PERIOD':
         return None
     start = period_request.get('start') or {}
-    if not isinstance(start, dict) or start.get('type') != 'N':
+    from .budget_period_selection import type_code
+    if not isinstance(start, dict) or type_code(start.get('type')) != 'N':
         return None
     if type(start.get('year')) is int:
         return f"{start['year']:04d}N0001"
@@ -224,11 +228,57 @@ def _apply_form_year(request, year):
 
 def prepare_request(turn, origin, request):
     if origin.get('originalToolName') == 'execute_budget_query':
+        if 'sourceSelection' in request:
+            raise AnalysisError('QUERY_CONTRACT_CHANGED', '采用结果使用 basis.kind 与真实 sourceRef；执行和事实凭据由宿主绑定。')
+        # Validate the whole request before installing derived scope/evidence state.
+        original_turn = turn
+        turn = copy(turn)
+        turn.state = deepcopy(original_turn.state)
+        request = deepcopy(request)
+        model_request = request
+        from .scope_candidates import bind as bind_scope_candidates
+        request = bind_scope_candidates(turn, origin, request)
+        from .source_views import query_basis
+        from .query_lineage import scope_terms
+        model_basis = request.get('basis') or {}
+        request = query_basis(turn, origin, request)
+        basis_scope_terms = scope_terms(turn, origin, model_request, model_basis.get('sourceRef'))
+        if (request.get('basis') or {}).get('kind') == 'MEMBERS':
+            # The source replaces the population. Metric/period/scenario changes
+            # still come from the declared intent, not from choosing this transport.
+            context = turn.state.setdefault('followupContext', {'mode': 'CONTINUE'})
+            context['changedFields'] = sorted(set(context.get('changedFields', [])) | {'population'})
+            context['changedDimensions'] = sorted(set(context.get('changedDimensions', [])) |
+                                                  set(request['basis'].get('memberDimensions', [])))
+            if model_basis.get('sourceRef'):
+                source = turn.service.store.get_source_view(turn.service.owner, model_basis['sourceRef'])
+                turn.state['selectedResultScope'] = {'selections': [deepcopy(source['selection'])]}
+        from .scope_changes import reconcile_selectors, retained_selector_terms, reconcile_period, apply_query_scopes
+        if (request.get('basis') or {}).get('kind') != 'FACTS':
+            apply_query_scopes(turn.state, request)
+        reconcile_selectors(turn, request)
+        reconcile_period(turn.state, request)
         from .dimension_scopes import inherit, check_scope_evidence
-        result = _inherit_business_request(turn, origin, request)
-        if not result.get('sourceSelection'):
+        result = _inherit_business_request(turn, origin, request, source_ref=model_basis.get('sourceRef'))
+        if (result.get('basis') or {}).get('kind') != 'FACTS':
             result = inherit(turn, result)
+            terms = retained_selector_terms(turn.state, result)
+            terms.extend(basis_scope_terms)
+            if terms:
+                result['contextText'] = ' '.join(dict.fromkeys([result.get('contextText', ''), *terms])).strip()
+            from .language_evidence import bind
+            result = bind(turn, result)
+            draft = result.get('intentDraft') or {}
+            if draft.get('valueFilter') is not None:
+                from .value_predicates import validate
+                draft['valueFilter'] = validate(draft['valueFilter'], {t['id'] for t in draft.get('targets', [])})
         check_scope_evidence(result)
+        if result.get('intentDraft') is not None:
+            result['intentDraft'].setdefault('sharedConditions', [])
+            result['intentDraft'].setdefault('targets', [])
+        # A speculative query has a local scope. Only explicit declaration/adoption
+        # changes the analysis base; asynchronous completions cannot overwrite it.
+        original_turn.state.setdefault('businessEvidence', {}).update(turn.state.get('businessEvidence', {}))
         return result
     result = _inherit_request(turn, origin, request)
     year = turn.state.get('queryIntent', {}).get('formExecutionYear')
@@ -237,24 +287,23 @@ def prepare_request(turn, origin, request):
     return result
 
 
-def _inherit_business_request(turn, origin, request):
+def _inherit_business_request(turn, origin, request, source_ref=None):
     result = deepcopy(request)
+    confirmed_requests = []
+    retained_scenarios = set()
+    released = set()
     if turn is not None and turn.state.get('request'):
         # The user text is supplied by the host, never reconstructed from model-selected member codes.
         result['question'] = turn.state['request']
+    if (result.get('basis') or {}).get('kind') == 'FACTS':
+        result.pop('contextText', None)
+        return result
+    if turn.state.get('requiredEvidence') == 'VALUES' and not turn.state.get('budgetFormulaTargets'):
+        # Presentation/analysis mode does not imply a formula read.
+        result['purpose'] = 'QUERY'
     # Only inherit previously declared business text. Recall and candidate
     # combinations are rebuilt by the server; never copy a member result subset.
     result.pop('contextText', None)
-    if turn.state.get('budgetValueFilter') is not None:
-        if result.get('sourceSelection') is not None:
-            raise AnalysisError('VALUE_FILTER_SCOPE_REQUIRED', '已声明按数值筛选总体；请提交本轮范围的业务草案，程序筛选后再展开，不能先用模型选择的事实缩小总体。')
-        result.setdefault('intentDraft', {})['valueFilter'] = deepcopy(turn.state['budgetValueFilter'])
-    if result.get('sourceSelection') is not None:
-        # Immutable references are resolved and authorized by the ontology service.
-        # No previous root selector or guessed natural-language replacement belongs in this request.
-        if _changes(turn) & {'task', 'period', 'scenario', 'metric', 'population'} or turn.state.get('followupContext', {}).get('changedDimensions'):
-            raise AnalysisError('FOLLOWUP_SCOPE_CONFLICT', '变更取数条件时不能复用上一轮事实定位，请先查询新范围。')
-        return result
     if turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':
         changes = _changes(turn)
         previous_intent = turn.state.get('previousQueryIntent', {})
@@ -277,7 +326,8 @@ def _inherit_business_request(turn, origin, request):
         released = set()
         source_texts = []
         confirmed_requests = []
-        confirmed = _confirmed_business_terms(turn, origin, changes, released, source_texts, confirmed_requests)
+        confirmed = _confirmed_business_terms(turn, origin, changes, released, source_texts, confirmed_requests,
+                                              result.get('intentDraft', {}).get('dimensionScopes', []), retained_scenarios)
         explicit_names = {name for prior in confirmed_requests
                           for field, role in (('taskNames', 'task'), ('taskCodes', 'task'),
                                               ('formNames', 'metric'), ('formCodes', 'metric')) if role not in changes
@@ -290,6 +340,11 @@ def _inherit_business_request(turn, origin, request):
         terms = [term for term in terms if term not in released
                  and (not source_texts or any(term in source for source in source_texts))
                  and term != unconfirmed_task]
+        # A summary such as "指标名+旧情景" is not a new business atom. If the
+        # server already split it, retain those verified atoms after a value switch.
+        terms = [term for term in terms if term in confirmed or not (
+            any(part and part in term for part in released)
+            and _covered_by_terms(term, set(confirmed) | released))]
         # A hierarchy changes the selected population, not its explicitly named root.
         # A different organization still releases the previous root normally.
         terms.extend(root for root in hierarchy_roots
@@ -303,23 +358,57 @@ def _inherit_business_request(turn, origin, request):
         if terms:
             result['contextText'] = ' '.join(dict.fromkeys(terms))
     grouping = turn.state.get('queryIntent', {}).get('grouping')
-    if grouping and not result.get('groupBy'):
+    if grouping and 'groupBy' not in result:
         # The host forwards the declared business grouping once; the application
-        # resolves the supported native property and executes it in this request.
+        # resolves it. An explicit query grouping (including [] for detail) wins:
+        # a reference/detail query need not share the main analysis grain.
         result['groupBy'] = [grouping]
-    anchors = _inherited_tables(turn, _selectors(turn))
-    previous = {digest(capture['request']): capture['request']
-                for _, capture, _, _ in anchors
-                if _same_source(capture, origin) and capture.get('originalToolName') == 'execute_budget_query'}
+    selectors = ([turn.service.store.get_source_view(turn.service.owner, source_ref)['selection']]
+                 if source_ref else _selectors(turn))
+    anchors = _inherited_tables(turn, selectors)
+    from .query_lineage import original_request
+    previous = {}
+    for selection, capture, _, _ in anchors:
+        if _same_source(capture, origin) and capture.get('originalToolName') == 'execute_budget_query':
+            receipt = (turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
+                       if capture.get('response') else {})
+            selected_set = (result.get('basis') or {}).get('source', {}).get('resultSetId') if source_ref else None
+            prior = original_request(capture, receipt, selection, selected_set)
+            previous[digest(prior)] = prior
     if len(previous) == 1:
         prior = next(iter(previous.values()))
         changed = _changes(turn)
+        from .query_lineage import restore_targets
+        supplied_targets = bool((result.get('intentDraft') or {}).get('targets'))
+        supplied_shared = 'sharedConditions' in (result.get('intentDraft') or {})
+        restore_targets(result, prior, changed, released)
+        # A confirmed scenario may originally have been written inside every
+        # target instead of sharedConditions. Its native dimension establishes
+        # the same condition either way. Retain only a unique unchanged scenario;
+        # explicit shared conditions (including []) remain authoritative.
+        if not supplied_shared and len(retained_scenarios) == 1:
+            draft = result.setdefault('intentDraft', {})
+            scenario = next(iter(retained_scenarios))
+            phrases = draft.get('sharedConditions', []) + [phrase for target in draft.get('targets', [])
+                                                           for phrase in target.get('businessPhrases', [])]
+            if not any(scenario == phrase.get('text') or any(scenario in parts for parts in phrase.get('alternatives', []))
+                       for phrase in phrases):
+                draft.setdefault('sharedConditions', []).append({'text': scenario, 'sourceText': scenario})
+        # Explicit MEMBERS conditions may deliberately query a different metric.
+        # Reuse a prior form/task only with the restored unchanged query, or an
+        # actual CONTINUE declaration; otherwise explicit source scopes are needed.
+        member_scope_reuse = ((result.get('basis') or {}).get('kind') != 'MEMBERS'
+                              or not supplied_targets and bool((result.get('intentDraft') or {}).get('targets'))
+                              or turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE'
+                              and bool(turn.state.get('previousQueryIntent')))
         scope = result.setdefault('scope', {})
         for field, intent in (('periodCode', 'period'), ('periodRequest', 'period'),
                               ('taskCodes', 'task'), ('taskNames', 'task'), ('formCodes', 'metric'), ('formNames', 'metric')):
             if intent == 'period' and any(t.get('periodText') for t in result.get('intentDraft', {}).get('targets', [])):
                 continue
             if intent in changed or field not in prior.get('scope', {}):
+                continue
+            if intent in ('task', 'metric') and not member_scope_reuse:
                 continue
             value = prior['scope'][field]
             if field in ('formCodes', 'formNames') and (scope.get('formCodes') or scope.get('formNames')):
@@ -328,8 +417,10 @@ def _inherit_business_request(turn, origin, request):
             if field in scope and _business_scope_key(scope[field]) != _business_scope_key(value):
                 raise AnalysisError('FOLLOWUP_SCOPE_CONFLICT', '关联追问改变了未声明变化的查询范围。')
             scope.setdefault(field, deepcopy(value))
+        from .scope_candidates import inherit
+        inherit(scope, prior.get('scope', {}), changed if member_scope_reuse else changed | {'task', 'metric'})
     # Automatically discovered tasks are provenance, not user constraints. Explicit
-    # prior request scopes were inherited above; exact fact follow-ups use sourceSelection.
+    # Prior request scopes were inherited above; exact fact follow-ups use FACTS.
     year = turn.state.get('queryIntent', {}).get('formExecutionYear')
     if year and not any(t.get('periodText') for t in result.get('intentDraft', {}).get('targets', [])):
         scope = result.setdefault('scope', {})
@@ -338,6 +429,21 @@ def _inherit_business_request(turn, origin, request):
             raise AnalysisError('FORM_EXECUTION_PERIOD_CONFLICT', '执行期与本轮已声明年度不一致。')
         if not scope.get('periodRequest'):
             scope.setdefault('periodCode', expected)
+    if turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':
+        # Scope and its provenance travel together. Only retain explicit, confirmed
+        # fields actually present in this request; never reintroduce an old form
+        # after a user changes the metric/form or selects a different binding.
+        changed = _changes(turn)
+        evidence = [name for prior in confirmed_requests
+                    for field, role in (('taskNames', 'task'), ('taskCodes', 'task'),
+                                        ('formNames', 'metric'), ('formCodes', 'metric')) if role not in changed
+                    for name in prior.get('scope', {}).get(field, [])
+                    if name in result.get('scope', {}).get(field, [])]
+        evidence.extend(binding['text'] for prior in confirmed_requests
+                        for binding in prior.get('scope', {}).get('bindings', [])
+                        if binding in result.get('scope', {}).get('bindings', []))
+        if evidence:
+            result['contextText'] = ' '.join(dict.fromkeys([result.get('contextText', ''), *evidence])).strip()
     return result
 
 
@@ -362,7 +468,11 @@ def _inherit_phrase_quotes(result, requests, terms):
     phrases = list(draft.get('sharedConditions', [])) + [phrase for target in draft.get('targets', [])
                                                         for phrase in target.get('businessPhrases', [])]
     for phrase in phrases:
-        quote = phrase.get('sourceText', '')
+        # The public tool no longer asks models to repeat sourceText. The phrase
+        # itself may still be a verified historical span (e.g. 净利润预算), whose
+        # retained native atoms were separated in contextText. Reuse that exact
+        # span only when it occurs in the source and all its atoms survived.
+        quote = phrase.get('sourceText') or phrase.get('text', '')
         if not quote or not any(quote in source for source in sources):
             continue
         if retained(quote):
@@ -393,9 +503,10 @@ def _inherit_confirmed_period(result, requests):
     if len(periods) != 1:
         return None
     period = next(iter(periods))
-    if not any(period in (request.get('question', '') + ' ' + request.get('contextText', ''))
-               for request in requests):
-        return None
+    # These requests passed native language resolution. Its confirmed caption
+    # can normalize the user's wording (26年 -> 2026年). Requiring another
+    # literal match here discards that proof and makes the next query fail.
+    # Reuse the explicit target period, never a runtime cell's shifted period.
     for target in result.get('intentDraft', {}).get('targets', []):
         target['periodText'] = period
     # An explicitly annual request must not drift to January through a model's
@@ -411,16 +522,24 @@ def _inherit_confirmed_period(result, requests):
     return period
 
 
-def _confirmed_business_terms(turn, origin, changes, released=None, source_texts=None, confirmed_requests=None):
+def _confirmed_business_terms(turn, origin, changes, released=None, source_texts=None, confirmed_requests=None, proposed_scopes=(), retained_scenarios=None):
     """Recover explicit phrases from selected successful captures, not from opening defaults or a model summary."""
     from .dimension_scopes import concept, changed_dimensions
     scope = turn.state.get('selectedResultScope', turn.state.get('inheritedScope', {}))
     refs = list(dict.fromkeys(scope.get('captureRefs', [])
                 + [item['captureRef'] for item in scope.get('selections', [])]))
+    if not refs:
+        # A runtime outage may leave no fact selection. Its completed language
+        # resolution is still usable; never recover amounts or scope completeness from it.
+        from .conversation_context import selected_contexts
+        refs = list(dict.fromkeys(ref for context in selected_contexts(turn.state)
+                                  for ref in context.get('captureRefs', []) or []))
     dimension_changes = changed_dimensions(turn.state)
     standard_fields = {'MD_ORG': 'population', 'MD_SCENE': 'scenario', 'DATATIME': 'period'}
     standard_aliases = {'MD_ORG': ['组织机构'], 'MD_SCENE': ['情景'], 'DATATIME': ['时期']}
-    previous_metric = turn.state.get('previousQueryIntent', {}).get('metric', '')
+    from .conversation_context import inheritance_intents
+    prior_intents = inheritance_intents(turn.state)
+    previous_metrics = [intent['metric'] for intent in prior_intents if intent.get('metric')]
     terms = []
     for ref in refs:
         try:
@@ -432,16 +551,63 @@ def _confirmed_business_terms(turn, origin, changes, released=None, source_texts
         if capture.get('originalToolName') != 'execute_budget_query' or not _same_source(capture, origin):
             continue
         receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
-        if receipt.get('status') not in ('SUCCEEDED', 'PARTIAL'):
-            continue
         data = receipt.get('data') or {}
         results = data.get('resultSets', [])
-        if not results:
+        resolution = data.get('resolution') or {}
+        resolved_targets = data.get('targets', [])
+        language_only = not results and resolution.get('exactRecallComplete') and resolved_targets
+        if receipt.get('status') not in ('SUCCEEDED', 'PARTIAL') and not (
+                receipt.get('status') == 'FAILED' and language_only):
             continue
-        request = capture.get('request') or {}
+        if not results and not language_only:
+            continue
+        resolved_members = [member for result in results for member in result.get('resolvedTerms', [])]
+        if not results:
+            resolved_members = [{'term': condition.get('term'), 'dimensionCode': entry.get('dimCode')}
+                for target in resolved_targets for condition in target.get('allOf', [])
+                for member in condition.get('anyOf', []) for entry in data.get('dimensionCatalog', [])
+                if member.get('baseDataCode') == entry.get('valueDomain')]
+        from .query_lineage import original_request
+        request = original_request(capture, receipt)
         if confirmed_requests is not None:
             confirmed_requests.append(request)
         draft = request.get('intentDraft') or {}
+        # Scope-bound names may have been removed from target terms by the native
+        # resolver (e.g. a hierarchy root also present in sharedConditions).
+        # Their confirmed dimension still determines whether they can be inherited.
+        from .query_lineage import scope_phrase_terms
+        query_dimensions = set(dimension_changes)
+        for scope in draft.get('dimensionScopes', []):
+            codes = {item.get('dimCode') for item in data.get('scopeResolution', [])
+                     if item.get('status') == 'RESOLVED' and item.get('id') == scope.get('id')} - {None}
+            if len(codes) == 1:
+                # Explicitly adopted FACTS can outlive the session's scope index.
+                # Compare a supplied selector against the native source proof too;
+                # never require a second declaration merely to release an old root.
+                aliases = {concept(scope.get('dimensionHint')), *(concept(code) for code in codes)}
+                aliases.update(concept(alias) for entry in data.get('dimensionCatalog', [])
+                               if entry.get('dimCode') in codes
+                               for alias in [entry.get('label'), *entry.get('names', [])] if alias)
+                proposed = [item for item in proposed_scopes if concept(item.get('dimensionHint')) in aliases]
+                if len(proposed) == 1:
+                    # Native scope proof also authorizes an explicitly reused
+                    # root/member when the session's scope index is absent.
+                    # Intersect actual proposed names; ALL/MEMBERS cannot revive
+                    # an old root merely because it existed in the source.
+                    old_names = set(scope_phrase_terms(scope.get('selector', {})))
+                    terms.extend(text for text in scope_phrase_terms(proposed[0].get('selector', {}))
+                                 if text in old_names)
+                if len(proposed) == 1 and proposed[0].get('selector') != scope.get('selector'):
+                    query_dimensions.update(concept(code) for code in codes)
+                    if released is not None:
+                        previous_intent = turn.state.get('previousQueryIntent', {})
+                        released.update(previous_intent[field] for code in codes
+                                        if (field := standard_fields.get(code)) in previous_intent)
+                        population = previous_intent.get('population')
+                        if isinstance(population, str) and any(text in population for text in scope_phrase_terms(scope.get('selector', {}))):
+                            released.add(population)
+                resolved_members.extend({'term': text, 'dimensionCode': next(iter(codes))}
+                                        for text in scope_phrase_terms(scope.get('selector', {})))
         targets = draft.get('targets', [])
         # Supplement only unambiguous shared wording. Different target scenarios in
         # a comparison must not be flattened into one inherited condition.
@@ -452,7 +618,7 @@ def _confirmed_business_terms(turn, origin, changes, released=None, source_texts
         # A submitted phrase can span several confirmed dimensions (e.g. 净利润预算).
         # Inherit the declared, actually matched segmentation so changing its scenario
         # cannot reintroduce that scenario through the original combined phrase.
-        resolved = {member.get('term') for result in results for member in result.get('resolvedTerms', [])}
+        resolved = {member.get('term') for member in resolved_members}
         matched_ids = {result.get('targetId') for result in results}
         resolved.update(term for target in data.get('targets', []) if target.get('id') in matched_ids
                         for term in target.get('titleTerms', []))
@@ -474,11 +640,10 @@ def _confirmed_business_terms(turn, origin, changes, released=None, source_texts
             # The earlier model may have placed a scenario or another dimension in
             # the wrong intent field. A declared change still releases that exact
             # prior phrase; confirmed metadata must not silently reintroduce it.
-            previous_intent = turn.state.get('previousQueryIntent', {})
-            if any(previous_intent.get(field) in (text, quote) for field in changes):
+            if any(intent.get(field) in (text, quote) for intent in prior_intents for field in changes):
                 if released is not None: released.update((text, quote))
                 continue
-            codes = {member.get('dimensionCode') for result in results for member in result.get('resolvedTerms', [])
+            codes = {member.get('dimensionCode') for member in resolved_members
                      if member.get('term') == text} - {None}
             aliases = set(codes)
             for code in codes:
@@ -486,18 +651,29 @@ def _confirmed_business_terms(turn, origin, changes, released=None, source_texts
             for entry in data.get('dimensionCatalog', []):
                 if entry.get('dimCode') in codes:
                     aliases.update([entry.get('label'), *entry.get('names', [])])
-            if dimension_changes & {concept(alias) for alias in aliases if alias}:
+            if query_dimensions & {concept(alias) for alias in aliases if alias}:
                 if released is not None: released.update((text, quote))
                 continue
             fields = {standard_fields[code] for code in codes if code in standard_fields}
             if fields & changes:
                 if released is not None: released.update((text, quote))
                 continue
-            if 'metric' in changes and not fields and (not codes or text in previous_metric or previous_metric in text):
+            if 'metric' in changes and not fields and (not codes or any(
+                    text in metric or metric in text for metric in previous_metrics)):
                 continue
             # Retain the smallest exact quote for this phrase. A scenario quote must not reintroduce a changed metric.
             terms.append(text if text in quote else quote)
+            if fields == {'scenario'} and retained_scenarios is not None:
+                retained_scenarios.add(text)
     return terms
+
+
+def _covered_by_terms(text, terms):
+    reached = {0}
+    for at in range(len(text)):
+        if at in reached:
+            reached.update(at + len(part) for part in terms if part and text.startswith(part, at))
+    return len(text) in reached
 
 
 def _business_scope_key(value):
@@ -773,6 +949,27 @@ def remember_subject(turn, status):
     selected_results = result_subject(turn)
     if selected_results is not None and not status.get('analysisRef'):
         turn.state['resolvedSubjectScope'] = selected_results
+        _remember_sources(turn, selected_results.get('selections', []))
+        save_context(turn.state, status['status'])
+        return
+    # A DIRECT query may adopt the old source to establish its context, then
+    # deliver a different reviewed population. Freeze that actual answer below;
+    # the earlier adoption is the query base, not the delivered result.
+    answer_subject = None
+    if not status.get('analysisRef') and turn.state.get('queryCaptureRefs'):
+        from .query_subject import remembered_subject
+        answer_subject = remembered_subject(turn)
+    has_query_subject = bool(answer_subject and (answer_subject.get('selections') or answer_subject.get('candidateCount')))
+    # Metadata/failed probes do not replace an explicitly adopted fact source.
+    if turn.state.get('adoptedInputs') and (status.get('analysisRef') or not has_query_subject):
+        selections = [deepcopy(item['selection']) for item in turn.state['adoptedInputs']]
+        captures = list(dict.fromkeys(item['captureRef'] for item in selections))
+        if status.get('analysisRef'):
+            artifact = turn.service.store.get_analysis(turn.service.owner, status['analysisRef'])
+            captures = list(dict.fromkeys(captures + artifact['captureRefs']))
+        turn.state['resolvedSubjectScope'] = {'scopeRef': 'scope_' + digest(selections)[:24],
+            'selections': selections, 'captureRefs': captures,
+            'inputSetVersion': turn.state['inputSetVersion'], 'analysisRef': status.get('analysisRef')}
         save_context(turn.state, status['status'])
         return
     selectors, artifact = [], None
@@ -799,7 +996,7 @@ def remember_subject(turn, status):
             selectors.append(selected)
     else:
         from .query_subject import remembered_subject
-        answer_subject = remembered_subject(turn)
+        answer_subject = answer_subject or remembered_subject(turn)
         selectors = answer_subject['selections']
     if selectors:
         turn.state['resolvedSubjectScope'] = {'scopeRef': 'scope_' + digest(selectors)[:24], 'selections': selectors}
@@ -836,7 +1033,27 @@ def remember_subject(turn, status):
         # 恢复旧报告可能没有新取数，同样保留构成表等回执供下一轮复用。
         scope['captureRefs'] = list(dict.fromkeys(scope.get('captureRefs', []) + artifact.get('captureRefs', [])))
         scope['analysisRef'] = status['analysisRef']
+    _remember_sources(turn, scope.get('selections', []))
     save_context(turn.state, status['status'])
+
+
+def _remember_sources(turn, selections):
+    """Index the actually delivered selection, including filtered subsets and roles."""
+    from .source_views import register_selections, select, input_version
+    choices = []
+    for selection in selections:
+        for source in register_selections(turn, [selection]):
+            choice = {'sourceRef': source['sourceRef'], 'role': selection.get('role', 'PRIMARY')}
+            if choice not in choices:
+                choices.append(choice)
+    if choices:
+        inputs = select(turn, choices)
+        turn.service.store.pin_source_views(turn.service.owner, [item['sourceRef'] for item in inputs])
+        version = input_version(turn, inputs)
+        turn.state.update(adoptedInputs=inputs, inputSetVersion=version)
+    else:
+        turn.state.pop('adoptedInputs', None)
+        turn.state.pop('inputSetVersion', None)
 
 
 def review_context(turn):
@@ -849,8 +1066,15 @@ def review_context(turn):
                           'selectedRowCount': len(rows) if rows is not None else table['data']['rowCount'],
                           'selectedRowsOnly': rows is not None})
     from .conversation_context import selected_contexts
+    from .scope_changes import presentation_summary
     inherited = turn.state.get('inheritedScope', {})
     return {'context': turn.state.get('followupContext', {}), 'inheritedSubject': summaries,
+            'scopeEdits': deepcopy(turn.state.get('scopeEdits', [])),
+            'adoptedInputs': [{key: deepcopy(value) for key, value in item.items() if key != 'selection'}
+                              for item in turn.state.get('adoptedInputs', [])],
+            'inputSetVersion': turn.state.get('inputSetVersion'),
+            'intentSummary': presentation_summary(turn.state),
+            'intentDecisions': deepcopy(turn.state.get('intentDecisions', {})),
             'selectedContexts': selected_contexts(turn.state),
             **({'resultSubject': {key: deepcopy(inherited[key]) for key in ('basis', 'resultRefs', 'outputs', 'boundary') if key in inherited}}
                if inherited.get('basis') == 'SELECTED_RESULTS' else {}),

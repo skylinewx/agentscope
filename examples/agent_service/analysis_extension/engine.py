@@ -47,15 +47,48 @@ def _select(facts, operation, known):
             raise AnalysisError("UNKNOWN_VALUE", "计算引用不存在或尚未计算的值。",
                                 {'missingRefs': missing, 'nextAction': 'USE_EXISTING_VALUE_REFS',
                                  'hint': '使用真实 factId、derivedId 或前序运算 id；不要重新查询已有数据。'}) from exc
-    selected = facts
+    # Supplemental formula observations explain an adopted population. They are
+    # not extra population rows. Explicit factRefs still address every dependency.
+    selected = [fact for fact in facts if operation.get('operator') == 'FORMULA_CHECK'
+                or not fact.get('inputMemberships')
+                or any(item.get('inputPurpose', 'VALUES') == 'VALUES' for item in fact['inputMemberships'])]
     selector = operation.get("select", {})
     allowed = {"cellKey", "measureCode", "objectId", "bindingRef", "period", "sourceContextId", "dimensions",
-               "batchId", "columnName", "inputRole", "sourceObjectId"}
+               "batchId", "columnName", "inputRole", "sourceObjectId", "inputRef", "inputRefs"}
     if set(selector) - allowed:
         raise AnalysisError("INVALID_SELECTOR", "计算选择器包含不支持的字段。")
+    group_refs = ([selector['inputRef']] if 'inputRef' in selector else selector.get('inputRefs'))
+    if group_refs is not None:
+        if (not isinstance(group_refs, list) or not group_refs or any(not isinstance(ref, str) for ref in group_refs)
+                or len(group_refs) != len(set(group_refs))):
+            raise AnalysisError('INVALID_SELECTOR', '输入组选择使用 inputRef 或不重复的 inputRefs。')
+        grouped = []
+        for fact in selected:
+            matches = [item for item in fact.get('inputMemberships', []) if item['inputRef'] in group_refs
+                       and (operation.get('operator') == 'FORMULA_CHECK' or item.get('inputPurpose', 'VALUES') == 'VALUES')
+                       and ('inputRole' not in selector or item['inputRole'] == selector['inputRole'])]
+            if matches:
+                if len({digest([item['grain'], item['rowIdentity']]) for item in matches}) != 1:
+                    raise AnalysisError('INPUT_GRAIN_CONFLICT', '同一事实在不同粒度下不能隐式合并统计。')
+                grouped.append({**fact, **{key: value for key, value in matches[0].items() if key != 'inputRef'}})
+        selected = grouped
     for key, expected in selector.items():
+        if key in ('inputRef', 'inputRefs'):
+            continue
         if key == "dimensions":
             selected = [f for f in selected if all(f.get("dimensions", {}).get(k) == v for k, v in expected.items())]
+        elif key == 'inputRole' and group_refs is None:
+            role_selected = []
+            for fact in selected:
+                memberships = [item for item in fact.get('inputMemberships', []) if item['inputRole'] == expected
+                               and (operation.get('operator') == 'FORMULA_CHECK' or item.get('inputPurpose', 'VALUES') == 'VALUES')]
+                if memberships:
+                    if len({digest([item['grain'], item['rowIdentity']]) for item in memberships}) != 1:
+                        raise AnalysisError('INPUT_GRAIN_CONFLICT', '相同用途包含不同粒度，需明确 inputRef。')
+                    role_selected.append({**fact, **{name: value for name, value in memberships[0].items() if name != 'inputRef'}})
+                elif fact.get(key) == expected:
+                    role_selected.append(fact)
+            selected = role_selected
         else:
             selected = [f for f in selected if f.get(key) == expected]
     return selected
@@ -126,14 +159,27 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
             # Comparators are available for explicit operations, never silently
             # included in the subject population's default selection.
             pool = facts
-            if scope.get('referenceMembers') and not operation.get('select', {}).get('objectId'):
-                pool = [f for f in facts if f['objectId'] in scope['members']]
+            selector = operation.get('select', {})
+            explicit_input = selector.get('inputRole') or selector.get('batchId') or selector.get('inputRef') or selector.get('inputRefs')
+            reference_only_member = (selector.get('objectId') in scope.get('referenceMembers', [])
+                                     and selector.get('objectId') not in scope.get('members', []))
+            if scope.get('referenceMembers') and not explicit_input and not reference_only_member:
+                # An overlapping member in a reference population must not enter
+                # primary totals twice. Legacy inputs have no per-fact role.
+                pool = [f for f in facts if f.get('inputRole') == 'PRIMARY'
+                        or 'inputRole' not in f and f['objectId'] in scope['members']]
             # 同一计算计划可直接引用前序运算 id；保存结果统一为真实 derivedId。
             aliases = {ref.removeprefix('derived_'): ref for ref in known if ref.startswith('derived_')}
             aliases.update({ref: ref for ref in known})
             bindings = [normalize_reference(ref, aliases) for ref in operation.get('inputRefs', [])]
             resolved = {**operation, 'inputRefs': [reference_id(ref) for ref in bindings]}
             items = _select(pool, resolved, known)
+            if not bindings and not selector.get('inputRef') and not selector.get('inputRefs'):
+                groups = {membership['inputRef'] for item in items for membership in item.get('inputMemberships', [])
+                          if membership['inputRole'] == selector.get('inputRole', 'PRIMARY')}
+                if len(groups) > 1:
+                    raise AnalysisError('INPUT_GROUP_REQUIRED', '存在多个输入组，请用 select.inputRef 分别计算；明确跨组时用 select.inputRefs。',
+                                        {'inputRefs': sorted(groups), 'requiresSourceQuery': False})
             if operator == 'ARITHMETIC':
                 items = [scalar_record(item, binding, known) for item, binding in zip(items, bindings)]
                 result['inputBindings'] = bindings
@@ -154,11 +200,23 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
                     raise AnalysisError('RULE_REQUIRED', '所引用规则未声明可比范围。')
                 result.update(comparabilityRef=operation['comparabilityRef'],
                               comparabilityVersion=comparison_rule['version'], comparabilitySource=comparison_rule['source'])
-            if operation.get("wholePopulation") and scope["coverage"] != "COMPLETE":
+            chosen_groups = set(selector.get('inputRefs', [])) | ({selector['inputRef']} if selector.get('inputRef') else set())
+            groups = [group for group in scope.get('inputGroups', []) if group['inputRef'] in chosen_groups]
+            expected_members = ({member for group in groups for member in group['members']}
+                                if chosen_groups else set(scope.get('members', [])))
+            group_population = bool(chosen_groups) and {group['inputRef'] for group in groups} == chosen_groups and all(
+                group['complete'] and group['populationComplete'] for group in groups)
+            own_population = next((proof for proof in scope.get('populationEvidence', [])
+                                   if proof.get('complete') and source_ids
+                                   and set(source_ids) <= set(proof.get('factRefs', []))
+                                   and set(proof.get('members', [])) == expected_members), None)
+            if operation.get("wholePopulation") and scope["coverage"] != "COMPLETE" and not own_population and not group_population:
                 raise AnalysisError("POPULATION_INCOMPLETE", "来源尚未证明该分析覆盖全部对象。")
-            if operation.get('wholePopulation') and {f['objectId'] for f in source_facts} != set(scope['members']):
+            if operation.get('wholePopulation') and {f['objectId'] for f in items if 'objectId' in f} != expected_members:
                 raise AnalysisError('POPULATION_MISMATCH', 'wholePopulation 的输入必须恰好覆盖主体 members，不能包含比较对象或遗漏主体。')
             result["scopeMeaning"] = "whole_population" if operation.get("wholePopulation") else "selected_members"
+            if operation.get('wholePopulation') and own_population:
+                result['populationEvidence'] = {key: own_population[key] for key in ('captureRef', 'stepId', 'grain')}
             if operator == "FORMULA_CHECK":
                 from .formulas import trace_formula
                 if len(items) != 1 or "factId" not in items[0]:
@@ -179,7 +237,7 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
                         result.update(executionStatus='COMPLETED', valueState='NO_VALUE', value=None,
                                       completionReason='SOURCE_VALUE_MISSING', diagnostics=[{
                                           'code': 'FORMULA_SOURCE_VALUE_MISSING',
-                                          'message': '必要输入已读取，来源空值导致无法完整复算；可说明限制，无须重复取数。'}])
+                                          'message': '必要输入已读取为空，但该来源未声明空值运算规则；可说明限制，无须重复取数。'}])
                         results.append(result)
                         known[result['derivedId']] = result
                         if failure_cache is not None:

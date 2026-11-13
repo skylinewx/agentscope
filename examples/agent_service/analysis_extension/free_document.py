@@ -84,7 +84,7 @@ class DocumentCheck(HTMLParser):
             self.raw_text = None
 
     def handle_comment(self, data):
-        if SLOT.search(data):
+        if SLOT.search(data) or data.startswith('analysis-static:'):
             fail('INVALID_DOCUMENT_BINDING', '数值占位符不能放在注释中。', '/document/html')
 
     def handle_startendtag(self, tag, attrs):
@@ -210,14 +210,23 @@ def compile_document(artifact, document):
                     and ref not in dataset_refs):
                 fail('ORDER_DATASET_REQUIRED', '已声明的排序须绑定 document.datasets 并遍历 rows，不能仅绑定金额后手排。',
                      '/document/datasets', valueRef=ref, taskId=task['taskId'])
-    data_json = json.dumps({'values': payload, 'sets': datasets}, ensure_ascii=False, separators=(',', ':')).replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
-    frame_key = digest({'source': source, 'data': payload, 'sets': datasets, 'partialReason': partial})
+    data_json = json.dumps({'values': payload, 'sets': datasets, 'staticKeys': sorted(checked.text_slots & set(payload))}, ensure_ascii=False, separators=(',', ':')).replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
+    frame_key = digest({'rendererVersion': 'static-bindings-2', 'source': source,
+                        'data': payload, 'sets': datasets, 'partialReason': partial})
     runtime = Path(__file__).with_name('document_runtime.js').read_text('utf-8').replace('FRAME_KEY', json.dumps(frame_key))
     injection = (f'<meta http-equiv="Content-Security-Policy" content="{escape(CSP, quote=True)}">'
                  f'<script id="analysis-host-data" type="application/json">{data_json}</script>'
                  f'<script id="analysis-host-runtime">{runtime}</script>')
     # Never substitute inside the injected source labels or numeric payload.
-    replace = lambda part: SLOT.sub(lambda m: escape(str(partial if m[1] == PARTIAL_SLOT else payload[m[1]]['display'])), part)
+    def substitute(match):
+        key = match[1]
+        if key == PARTIAL_SLOT:
+            return escape(str(partial))
+        # Comments preserve element structure, CSS selectors and textContent.
+        # A text range identifies this occurrence even when another value equals it.
+        marker = f'analysis-static:{frame_key}:{key}'
+        return f'<!--{marker}:start-->{escape(str(payload[key]["display"]))}<!--{marker}:end-->'
+    replace = lambda part: SLOT.sub(substitute, part)
     compiled = replace(source[:checked.head_end]) + injection + replace(source[checked.head_end:])
     if len(compiled.encode('utf-8')) > MAX_DOCUMENT_BYTES:
         fail('DOCUMENT_TOO_LARGE', '绑定后的页面超过展示容量，请缩小展示范围。')
@@ -226,6 +235,7 @@ def compile_document(artifact, document):
             'bindings': deepcopy(bindings), 'valueRefs': sorted(refs | dataset_refs),
             'datasets': datasets, 'datasetBindings': deepcopy(document.get('datasets', [])),
             'staticBindingKeys': sorted(checked.text_slots), 'hasScripts': bool(checked.scripts),
+            'numericBindingKeys': sorted(key for key, value in payload.items() if value['value'] is not None and value['field'] != 'unit'),
             'bindingCount': len(bindings), 'datasetCount': len(datasets)}
 
 

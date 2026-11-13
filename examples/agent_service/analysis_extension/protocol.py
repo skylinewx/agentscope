@@ -9,19 +9,21 @@ from jsonschema import Draft202012Validator
 from .models import AnalysisError, ENGINE_VERSION, SCHEMA_VERSION
 
 
-@lru_cache(maxsize=1)
-def validator():
+@lru_cache(maxsize=2)
+def validator(engine_version=ENGINE_VERSION):
     schema = json.loads(Path(__file__).with_name("artifact-v1.schema.json").read_text("utf-8"))
+    schema['properties']['engineVersion'] = {'const': engine_version}
     Draft202012Validator.check_schema(schema)
     return Draft202012Validator(schema)
 
 
-def validate_artifact(artifact):
+def validate_artifact(artifact, *, historical=False):
     from .findings import FINDING_VERSION
-    if (artifact.get("schemaVersion") != SCHEMA_VERSION or artifact.get("engineVersion") != ENGINE_VERSION
+    versions = {ENGINE_VERSION, '1.5.0'} if historical else {ENGINE_VERSION}
+    if (artifact.get("schemaVersion") != SCHEMA_VERSION or artifact.get("engineVersion") not in versions
             or artifact.get("findingVersion") != FINDING_VERSION or artifact.get("presentationPolicy") != "explicit"):
         raise AnalysisError("UNSUPPORTED_VERSION", "仅支持当前分析协议，请重新构建分析。")
-    errors = list(islice(validator().iter_errors(artifact), 9))
+    errors = list(islice(validator(artifact['engineVersion']).iter_errors(artifact), 9))
     if errors:
         # 不把整个事实、HTML 或来源报文塞进错误；保留可定位的字段及约束。
         issues = []

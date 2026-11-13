@@ -3,11 +3,11 @@ from copy import deepcopy
 from types import SimpleNamespace
 import json
 import unittest
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from agentscope.message import UserMsg, TextBlock
 from analysis_extension.conversation_context import (save_context, next_context_state, context_directory,
-                                                    select_context, result_subject, evidence_turn)
+                                                    select_context, result_subject, evidence_turn, inheritance_intents)
 from analysis_extension.completion import formula_target_refs, continue_plan
 from analysis_extension.models import AnalysisError
 from analysis_extension.followup_scope import remember_subject
@@ -16,6 +16,9 @@ from analysis_extension.turn_completion import current_turn, STATE_KEY
 
 class ConversationContextTest(unittest.TestCase):
     def setUp(self):
+        index = patch('analysis_extension.followup_scope._remember_sources')
+        index.start()
+        self.addCleanup(index.stop)
         self.first = {'turnKey': 't1', 'request': '查询第一组', 'goal': '第一组金额', 'mode': 'DIRECT',
                       'queryIntent': {'task': '任务甲', 'period': '2026', 'population': '第一组'},
                       'resolvedSubjectScope': {'scopeRef': 's1', 'selections': [{'captureRef': 'c1'}]},
@@ -37,6 +40,24 @@ class ConversationContextTest(unittest.TestCase):
                                                        'userQuote': state['request']})
         self.assertEqual(state['previousQueryIntent']['task'], '任务乙')
         self.assertEqual(state['basePendingChanges'], ['task', 'period'])
+
+    def test_pending_wording_follows_only_explicit_bases_until_delivery(self):
+        state = {'previousQueryIntent': {'metric': '收入'}, 'selectedContextRefs': ['pending'],
+            'businessContexts': [
+                {'contextRef': 'pending', 'kind': 'PENDING', 'intent': {'metric': '收入'}, 'baseContextRefs': ['saved']},
+                {'contextRef': 'saved', 'kind': 'DELIVERED', 'intent': {'metric': '利润'}, 'baseContextRefs': ['unrelated']},
+                {'contextRef': 'unrelated', 'kind': 'DELIVERED', 'intent': {'metric': '成本'}}]}
+        original = deepcopy(state)
+        self.assertEqual([item['metric'] for item in inheritance_intents(state)], ['收入', '收入', '利润'])
+        self.assertEqual(state, original)
+
+    def test_pending_wording_handles_missing_and_cyclic_bases_without_fallback(self):
+        state = {'previousQueryIntent': {'metric': '收入'}, 'selectedContextRefs': ['pending'],
+            'businessContexts': [
+                {'contextRef': 'pending', 'kind': 'PENDING', 'intent': {'metric': '收入'},
+                 'baseContextRefs': ['missing', 'pending']},
+                {'contextRef': 'unselected', 'kind': 'DELIVERED', 'intent': {'metric': '利润'}}]}
+        self.assertEqual([item['metric'] for item in inheritance_intents(state)], ['收入', '收入'])
 
     def test_history_selection_uses_matching_intent_and_scope(self):
         second = {**next_context_state(self.first), 'turnKey': 't2', 'request': '另一组',

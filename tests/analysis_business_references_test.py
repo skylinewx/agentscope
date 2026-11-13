@@ -108,6 +108,25 @@ class ValueReferenceTest(unittest.IsolatedAsyncioTestCase):
                 'captureRef': 'cap1', 'tableRef': 'T1', 'columnRef': 'C1', 'aggregation': 'SUM'}}}, calculate_requests)
         self.assertEqual('TOTAL_DETAIL_OVERLAP', error.exception.code)
 
+    async def test_sparse_column_range_uses_actual_facts_but_explicit_missing_and_null_still_fail(self):
+        rows = [fact('a', {'科目': 'A'}, '1', measure='amount', title='指标甲'),
+                fact('b', {'科目': 'B'}, '2', measure='amount', title='指标甲'),
+                fact('c', {'科目': 'C'}, '10', measure='amount', title='指标乙')]
+        service, turn = self.service(receipt(rows))
+        ref = {'captureRef': 'cap1', 'tableRef': 'T1', 'columnRef': 'C1', 'aggregation': 'SUM'}
+        with reference_context(service, turn):
+            result = await calculate_references({'expression': 'x', 'valueRefs': {'x': ref}}, calculate_requests)
+            self.assertEqual('3', result['value'])
+            self.assertEqual(2, result['sourceReferences'][0]['inputs'][0]['rowCount'])
+            with self.assertRaises(AnalysisError) as missing:
+                await calculate_references({'expression': 'x', 'valueRefs': {'x': {**ref, 'rowRefs': ['R3']}}}, calculate_requests)
+            self.assertEqual('TABLE_CELL_NOT_FOUND', missing.exception.code)
+        rows[1].update(value=None, valueState='NULL')
+        service, turn = self.service(receipt(rows))
+        with reference_context(service, turn), self.assertRaises(AnalysisError) as null:
+            await calculate_references({'expression': 'x', 'valueRefs': {'x': ref}}, calculate_requests)
+        self.assertEqual('NON_NUMERIC_TABLE_CELL', null.exception.code)
+
     async def test_batch_keeps_other_success_when_a_reference_fails(self):
         service, turn = self.service(receipt([fact('1', {'MD_SCENE': 'BUDGET'}, '2')]))
         with reference_context(service, turn):

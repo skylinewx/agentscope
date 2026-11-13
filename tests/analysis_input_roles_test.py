@@ -84,6 +84,34 @@ class InputRolesTests(TestCase):
         self.assertEqual(len(result['facts']), 4)
         self.assertEqual(result['structureEvidence'][0]['cells'][0]['key'], '2:1')
 
+    def test_complete_batch_population_survives_supplemental_formula_input(self):
+        from analysis_extension.engine import calculate, RuleRegistry
+        capture, selection, _, _ = batch_fixture(aggregate=False)
+        form, selectors, _ = fixture(('10',))
+        form = json.loads(json.dumps(form).replace('object-0', '07'))
+        form['captureRef'], form['resourceId'] = 'formula', capture['resourceId']
+        result = adapt_inputs(self.registry, {'batch-ref': capture, 'formula': form},
+                              [{**selection, 'columnNames': ['metric1'], 'role': 'PRIMARY', 'grain': ['MD_ORG']},
+                               {**selectors[0], 'captureRef': 'formula', 'role': 'PRIMARY', 'grain': ['MD_ORG']}],
+                              self.scope, 100)
+        operation = {'id': 'all', 'operator': 'DESCRIBE', 'wholePopulation': True,
+                     'select': {'batchId': 'batch-A', 'columnName': 'metric1'}}
+        value = calculate(result['facts'], result['scope'], [operation], RuleRegistry())[0]
+        self.assertEqual(value['calculationValidation'], 'PASS')
+        self.assertEqual(value['counts']['total'], 2)
+        self.assertEqual(value['value'], '86293800.00')
+        self.assertEqual(value['populationEvidence']['captureRef'], 'batch-ref')
+        # A formula observation cannot borrow the native batch's population proof.
+        formula_ref = next(f['factId'] for f in result['facts'] if f.get('observationId'))
+        other = calculate(result['facts'], result['scope'], [
+            {'id': 'wrong', 'operator': 'COUNT', 'wholePopulation': True, 'inputRefs': [formula_ref]}], RuleRegistry())[0]
+        self.assertEqual(other['diagnostics'][0]['code'], 'POPULATION_INCOMPLETE')
+        # Dropping a source row cannot promote a subset into the original population.
+        proof = result['scope']['populationEvidence'][0]
+        proof['complete'] = False
+        blocked = calculate(result['facts'], result['scope'], [operation], RuleRegistry())[0]
+        self.assertEqual(blocked['diagnostics'][0]['code'], 'POPULATION_INCOMPLETE')
+
     def test_observation_upgrade_requires_input_vo_and_traced_old_new_ids(self):
         capture, _, _ = fixture(('10',))
         receipt = json.loads(capture['response']['content'][0]['text'])

@@ -34,8 +34,7 @@ def _number(value):
 def calculate(expression, variables=None, decimalPlaces=None):
     variables = {} if variables is None else variables
     if (not isinstance(variables, dict) or len(variables) > MAX_ARITHMETIC_INPUTS or any(
-            not isinstance(k, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', k)
-            or k in ARITHMETIC_FUNCTIONS for k in variables)):
+            not isinstance(k, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', k) for k in variables)):
         raise AnalysisError("INVALID_VARIABLES", f"变量须使用互不重复的名称，最多 {MAX_ARITHMETIC_INPUTS} 个。")
     if decimalPlaces is not None and (type(decimalPlaces) is not int or not 0 <= decimalPlaces <= 16):
         raise AnalysisError("INVALID_PRECISION", "小数位数须在 0 至 16 之间。")

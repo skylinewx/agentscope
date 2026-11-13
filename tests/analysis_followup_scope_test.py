@@ -47,7 +47,7 @@ class FollowupScopeTest(PresentationCase):
         origin = {'originalToolName':'execute_semantic_plan'}
         request = {'plan':{'steps':[{'operation':'BATCH_DATA_QUERY','batchQuery':{
             'metrics':[{'selection':{'measureCode':'AMT','targetDimensions':{'SCENE':'FORECAST'}}}],
-            'batchDimensions':[{'dimCode':'DATATIME','periodRequest':{'kind':'PERIOD','start':{'type':'N','year':2024}}}]}}]}}
+            'batchDimensions':[{'dimCode':'DATATIME','periodRequest':{'kind':'PERIOD','start':{'type':'YEAR','year':2024}}}]}}]}}
         metric = prepare_request(turn,origin,request)['plan']['steps'][0]['batchQuery']['metrics'][0]['selection']
         self.assertEqual(metric,{'periodCode':'2025N0001','measureCode':'AMT','targetDimensions':{'SCENE':'FORECAST','DATATIME':'2024N0001'}})
         self.assertNotIn('periodCode', request['plan']['steps'][0]['batchQuery']['metrics'][0]['selection'])
@@ -63,11 +63,11 @@ class FollowupScopeTest(PresentationCase):
         def prepare(query):
             request = {'plan':{'steps':[{'operation':'FORM_VIEW_QUERY','formQuery':query}]}}
             return prepare_request(turn,origin,request)['plan']['steps'][0]['formQuery']
-        dated = {'periodRequest':{'kind':'PERIOD','start':{'type':'N','date':'2025-12-31'}},'targetDimensions':{'DATATIME':'2024N0001'}}
+        dated = {'periodRequest':{'kind':'PERIOD','start':{'type':'YEAR','date':'2025-12-31'}},'targetDimensions':{'DATATIME':'2024N0001'}}
         self.assertEqual(prepare(dated),dated)
         self.assertEqual(prepare({'observationId':'prev'}),{'observationId':'prev','periodCode':'2025N0001'})
         for wrong in ({'periodCode':'2026N0001'},{'dimensions':{'DATATIME':'2024N0001'}},
-                      {'periodRequest':{'kind':'PERIOD','start':{'type':'N','date':'2026-01-01'}}}):
+                      {'periodRequest':{'kind':'PERIOD','start':{'type':'YEAR','date':'2026-01-01'}}}):
             with self.assertRaises(AnalysisError) as error:
                 prepare(wrong)
             self.assertEqual(error.exception.code,'FORM_EXECUTION_PERIOD_CONFLICT')
@@ -379,7 +379,7 @@ class FollowupScopeTest(PresentationCase):
         self.state['request'] = '按自定义分类分析'
         self.state['previousQueryIntent']['grouping'] = '原来的分类'
         request = {'action': 'declare', 'mode': 'ANALYSIS', 'goal': '按用户分类分析',
-                   'context': {'mode': 'CONTINUE', 'changedFields': ['grouping'], 'userQuote': self.state['request']},
+                   'context': {'mode': 'CONTINUE'},
                    'intent': {'grouping': '自定义分类'}}
         Draft202012Validator(AnalysisTask.input_schema).validate(request)
         result = self.turn.task(**request)

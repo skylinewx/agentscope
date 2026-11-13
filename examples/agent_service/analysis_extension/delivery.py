@@ -137,8 +137,8 @@ class AnalysisDelivery:
         if not isinstance(renderer, str) or not renderer or renderer != saved["document"].get("rendererVersion"):
             raise AnalysisError("INVALID_PRESENTATION", "展示登记的渲染版本不一致。")
         document = saved["document"]
-        if document.get("engineVersion") != ENGINE_VERSION:
-            raise AnalysisError("UNSUPPORTED_VERSION", "仅支持当前计算引擎的展示结果。")
+        if document.get("engineVersion") not in {ENGINE_VERSION, '1.5.0'}:
+            raise AnalysisError("UNSUPPORTED_VERSION", "此历史计算版本没有可用的展示协议。")
         if (type(document.get("technicalDetails")) is not bool or type(document.get("chartsRequested")) is not bool or not isinstance(document.get("findings"), list)
                 or not isinstance(document.get("actions"), list) or not isinstance(document.get("findingsScopeLabel"), str)):
             raise AnalysisError("INVALID_PRESENTATION", "分析展示缺少当前协议要求的字段。")

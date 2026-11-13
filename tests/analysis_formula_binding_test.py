@@ -1,3 +1,4 @@
+from analysis_contract_test_helpers import visible_markup
 """本层计算成功、逐层缺数时，报告不能把不可用差额渲染为空白。"""
 from copy import deepcopy
 import json
@@ -72,7 +73,7 @@ class FormulaBindingTests(TestCase):
                                 ('localAbsoluteDifference', '1,322,980.43')]:
             with self.subTest(field=field):
                 compiled = compile_document(artifact, self.document(field))
-                self.assertIn('<p>差额 ' + expected + ' 元</p>', compiled['html'])
+                self.assertIn('<p>差额 ' + expected + ' 元</p>', visible_markup(compiled['html']))
 
     def test_default_value_respects_operation_scope_but_node_value_is_recursive(self):
         artifact = self.artifact()
@@ -80,7 +81,7 @@ class FormulaBindingTests(TestCase):
         self.assertEqual(selected_value(value), '1314680.43')
         self.assertTrue(executable_field(value))
         self.assertFalse(executable_field(value, 'value', 'root'))
-        self.assertIn('1,314,680.43', compile_document(artifact, self.document('value'))['html'])
+        self.assertIn('1,314,680.43', visible_markup(compile_document(artifact, self.document('value'))['html']))
         with self.assertRaises(AnalysisError):
             compile_document(artifact, self.document('value', nodeRef='root'))
 
@@ -90,7 +91,7 @@ class FormulaBindingTests(TestCase):
         for field, expected in [('localValue', '1,314,680.43'),
                                 ('localAbsoluteDifference', '1,322,980.43'),
                                 ('sourceValue', '-8,300.00')]:
-            self.assertIn(expected, compile_document(artifact, self.document(field))['html'])
+            self.assertIn(expected, visible_markup(compile_document(artifact, self.document(field))['html']))
         with self.assertRaises(AnalysisError):
             compile_document(artifact, self.document('value'))
 
@@ -100,7 +101,7 @@ class FormulaBindingTests(TestCase):
         self.assertNotEqual(selected_value(value, 'localAbsoluteDifference'),
                             selected_value(value, 'absoluteDifference'))
         compiled = compile_document(artifact, self.document('absoluteDifference'))
-        self.assertIn('<p>差额 1,537,393.00 元</p>', compiled['html'])
+        self.assertIn('<p>差额 1,537,393.00 元</p>', visible_markup(compiled['html']))
 
     def test_zero_difference_remains_available(self):
         artifact = self.artifact()
@@ -110,7 +111,7 @@ class FormulaBindingTests(TestCase):
             'id': 'formula', 'operator': 'FORMULA_CHECK', 'inputRefs': ['root'], 'checkScope': 'LOCAL',
         }], RuleRegistry())
         self.assertIn('<p>差额 0.00 元</p>',
-                      compile_document(artifact, self.document('localAbsoluteDifference'))['html'])
+                      visible_markup(compile_document(artifact, self.document('localAbsoluteDifference'))['html']))
 
     def test_source_null_and_missing_unit_are_preserved(self):
         artifact = self.artifact()
@@ -121,7 +122,7 @@ class FormulaBindingTests(TestCase):
         self.assertIsNone(payload['values']['difference']['value'])
         self.assertEqual(payload['values']['difference']['display'], '')
         document['bindings'][0] = {'key': 'difference', 'valueRef': 'root', 'field': 'unit'}
-        self.assertIn('<p>差额  元</p>', compile_document(artifact, document)['html'])
+        self.assertIn('<p>差额  元</p>', visible_markup(compile_document(artifact, document)['html']))
 
     def test_invalid_node_lists_actual_choices(self):
         with self.assertRaises(AnalysisError) as caught:
@@ -148,7 +149,7 @@ class FormulaBindingTests(TestCase):
         with self.assertRaises(AnalysisError):
             compile_document(artifact, self.document('value'))
         # 没有可复算公式仍可展示已经取得的来源数。
-        self.assertIn('-8,300.00', compile_document(artifact, self.document('sourceValue'))['html'])
+        self.assertIn('-8,300.00', visible_markup(compile_document(artifact, self.document('sourceValue'))['html']))
 
     def test_document_schema_rejects_invented_formula_fields(self):
         valid = self.document('localAbsoluteDifference')['bindings'][0]

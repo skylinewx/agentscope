@@ -22,6 +22,11 @@ class NumericTests(unittest.TestCase):
         self.assertEqual(calculate('9.995', decimalPlaces=2)['value'], '10.00')
         self.assertEqual(calculate('1 / 10000000000000000000000000000000000000000')['value'], '0.' + '0' * 39 + '1')
 
+    def test_variable_names_and_allowlisted_function_calls_have_distinct_ast_roles(self):
+        self.assertEqual(calculate('sum / 2 + sum(sum, min)', {'sum': '10', 'min': '2'})['value'], '17')
+        with self.assertRaises(AnalysisError):
+            calculate('other(1)', {'other': '10'})
+
     def test_calculator_refuses_executable_syntax_bad_values_and_capacity(self):
         for expression in ('1 / 0', '__import__("os")', '1 ** 1000', 'x.real', '[1,2]', 'True', 'abs(1, 2)', '1e9999', 'min(a=1)', '+'.join(['1'] * 500)):
             with self.subTest(expression=expression), self.assertRaises(AnalysisError): calculate(expression)

@@ -24,15 +24,16 @@ class DimensionScopeTests(TestCase):
                     'followupContext': {'mode': 'CONTINUE', 'changedFields': [field]}})
                 with self.assertRaises(AnalysisError) as failure:
                     prepare_request(turn, origin, {'sourceSelection': reference})
-                self.assertEqual(failure.exception.code, 'FOLLOWUP_SCOPE_CONFLICT')
+                self.assertEqual(failure.exception.code, 'QUERY_CONTRACT_CHANGED')
         turn = SimpleNamespace(state={'request': '解释刚才的结果', 'followupContext': {'mode': 'CONTINUE'}})
-        self.assertEqual(prepare_request(turn, origin, {'sourceSelection': reference})['sourceSelection'], reference)
+        with self.assertRaises(AnalysisError):
+            prepare_request(turn, origin, {'sourceSelection': reference})
 
     def test_confirmed_hierarchy_keeps_root_and_original_wording_on_next_analysis(self):
         old = {'id': 'units', 'dimensionHint': '组织机构', 'sourceText': '二级单位',
                'selector': {'type': 'HIERARCHY', 'rootText': '久其集团', 'level': 2}}
         record = {'draft': old, 'appliesToAllTargets': True,
-                  'confirmedSource': {'executionId': 'prior-query', 'scopeId': 'units'}}
+                  'confirmedSource': {'executionId': 'prior-query', 'scopeId': 'units', 'contextId': 'original-context', 'querySessionId': 'original-session'}}
         turn = SimpleNamespace(state={'followupContext': {'mode': 'CONTINUE'}, 'inheritedDimensionScopes': [record]})
         for current in ([], [{**deepcopy(old), 'sourceText': '久其集团二级单位'}]):
             request = {'question': '分析一下亏损企业', 'intentDraft': {'dimensionScopes': current}}
@@ -41,7 +42,8 @@ class DimensionScopeTests(TestCase):
             self.assertEqual(actual['sourceText'], '二级单位')
             self.assertEqual(actual['confirmedSource'], record['confirmedSource'])
             self.assertIn('久其集团', result['contextText'])
-            self.assertIn('二级单位', result['contextText'])
+            self.assertNotIn('二级单位', result['contextText'])
+            check_scope_evidence(result)
         turn.state['followupContext']['changedDimensions'] = ['MD_ORG']
         result = inherit(turn, {'question': '换个机构', 'intentDraft': {'dimensionScopes': []}})
         self.assertNotIn('contextText', result)
@@ -50,7 +52,7 @@ class DimensionScopeTests(TestCase):
     def test_changed_scenario_removes_both_confirmed_scope_and_inherited_text(self):
         from analysis_extension.dimension_scopes import remember
         from analysis_extension.followup_scope import prepare_request
-        receipt = {'status': 'SUCCEEDED', 'executionId': 'old-execution', 'data': {
+        receipt = {'status': 'SUCCEEDED', 'executionId': 'old-execution', 'context': {'contextId': 'original-context'}, 'querySessionId': 'original-session', 'data': {
             'resultSets': [{'resolvedTerms': [{'term': '预算', 'dimensionCode': 'MD_SCENE',
                 'baseDataCode': 'MD_SCENE', 'objectCode': 'BUDGET'}]}],
             'dimensionCatalog': [{'dimCode': 'MD_SCENE', 'valueDomain': 'MD_SCENE',
@@ -63,7 +65,8 @@ class DimensionScopeTests(TestCase):
             sources=SimpleNamespace(for_capture=lambda value: SimpleNamespace(raw_receipt=lambda response: response)))
         turn = SimpleNamespace(state={}, service=service)
         remember(turn, capture)
-        scopes = snapshot(turn.state, ['old']) + [{'draft': scope(), 'appliesToAllTargets': True}]
+        scopes = snapshot(turn.state, ['old']) + [{'draft': scope(), 'appliesToAllTargets': True,
+            'confirmedSource': {'executionId': 'department-execution', 'scopeId': 'departments', 'contextId': 'original-context', 'querySessionId': 'original-session'}}]
         for change in ({'changedFields': ['scenario']}, {'changedDimensions': ['情景']},
                        {'changedDimensions': ['MD_SCENE']}, {'changedDimensions': ['业务口径']},
                        {'basePendingChanges': ['scenario']}):
@@ -78,7 +81,8 @@ class DimensionScopeTests(TestCase):
                 self.assertNotIn('预算', result['contextText'])
                 self.assertIn('净利润', result['contextText'])
                 self.assertIn('久其集团', result['contextText'])
-                self.assertIn('所有部门', result['contextText'])
+                self.assertEqual(result['intentDraft']['dimensionScopes'][0]['sourceText'], '所有部门')
+                self.assertNotIn('所有部门', result['contextText'])
         turn.state['followupContext'] = {'mode': 'CONTINUE'}
         turn.state['basePendingChanges'] = []
         result = prepare_request(turn, capture, {'intentDraft': {}})
@@ -142,12 +146,13 @@ class DimensionScopeTests(TestCase):
         result = inherit(turn, {'intentDraft': {'dimensionScopes': [new]}})
         self.assertEqual([item['dimensionHint'] for item in result['intentDraft']['dimensionScopes']], ['部门', '项目'])
         self.assertEqual(result['intentDraft']['dimensionScopes'][1]['selector'], {'type': 'ALL'})
-        self.assertIn('全部项目', result['contextText'])
+        self.assertEqual(result['intentDraft']['dimensionScopes'][1]['sourceText'], '全部项目')
+        self.assertNotIn('全部项目', result.get('contextText', ''))
 
     def test_undeclared_range_change_and_cross_target_expansion_are_rejected(self):
         turn = SimpleNamespace(state={'followupContext': {'mode': 'CONTINUE'},
             'inheritedDimensionScopes': [{'draft': scope(), 'appliesToAllTargets': True}]})
-        with self.assertRaisesRegex(AnalysisError, 'changedDimensions'):
+        with self.assertRaisesRegex(AnalysisError, 'scopeEdits'):
             inherit(turn, {'intentDraft': {'dimensionScopes': [{**scope(), 'selector': {'type': 'VALUES', 'members': ['A']}}]}})
         turn.state['inheritedDimensionScopes'][0]['appliesToAllTargets'] = False
         with self.assertRaisesRegex(AnalysisError, '部分指标'):

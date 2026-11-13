@@ -106,6 +106,7 @@ def collect_expired(store, db, cutoff, stop):
     check_stopped(stop)
     with store._transaction(connection=db):
         deleted = db.execute('DELETE FROM captures WHERE created<? AND ref NOT IN (SELECT capture FROM pins)', (cutoff,)).rowcount
+        db.execute('DELETE FROM source_views WHERE capture NOT IN (SELECT ref FROM captures)')
         db.execute('DELETE FROM semantic_reviews WHERE created<?', (cutoff,))
         db.execute('DELETE FROM native_results WHERE created<?', (cutoff,))
         db.execute('DELETE FROM turn_progress WHERE updated<?', (cutoff,))

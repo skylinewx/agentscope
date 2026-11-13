@@ -51,6 +51,20 @@ def business_fixture():
 
 
 class BusinessQueryTest(TestCase):
+    def test_independent_query_does_not_inherit_or_conflict_with_previous_value_filter(self):
+        from types import SimpleNamespace
+        from analysis_extension.followup_scope import prepare_request
+        turn = SimpleNamespace(state={'request': '查询净利润小于0', 'followupContext': {'mode': 'NEW'}})
+        origin = {'originalToolName': 'execute_budget_query'}
+        targets = [{'id': 't', 'businessPhrases': [{'text': '净利润'}]}]
+        first = prepare_request(turn, origin, {'purpose': 'QUERY', 'intentDraft': {'targets': targets, 'valueFilter': {'operator': 'LT', 'value': '0'}}})
+        self.assertEqual(first['intentDraft']['valueFilter'], {'operator': 'LT', 'value': '0'})
+        independent = prepare_request(turn, origin, {'purpose': 'QUERY', 'intentDraft': {'targets': targets}})
+        self.assertNotIn('valueFilter', independent['intentDraft'])
+        changed = prepare_request(turn, origin, {'purpose': 'QUERY', 'intentDraft': {'targets': targets, 'valueFilter': {'operator': 'GT', 'value': '0'}}})
+        self.assertEqual(changed['intentDraft']['valueFilter'], {'operator': 'GT', 'value': '0'})
+        self.assertNotIn('budgetValueFilter', turn.state)
+
     def test_changed_population_keeps_proven_hierarchy_root_even_when_intent_omits_its_name(self):
         from types import SimpleNamespace
         from analysis_extension.followup_scope import prepare_request
@@ -63,8 +77,9 @@ class BusinessQueryTest(TestCase):
         result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
         self.assertIn('久其集团', result['contextText'])
         request['intentDraft']['relations'][0]['hierarchy']['rootText'] = '别的集团'
-        result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
-        self.assertNotIn('别的集团', result['contextText'])
+        with self.assertRaises(AnalysisError) as invalid:
+            prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
+        self.assertEqual(invalid.exception.code, 'QUERY_DRAFT_EVIDENCE_INVALID')
     def test_names_fact_references_and_verified_sort_do_not_require_raw_row_reads(self):
         from analysis_extension.adapters.budget_query import present_value_groups
         capture, receipt = business_fixture()
@@ -269,6 +284,34 @@ class BusinessQueryTest(TestCase):
         with patch('analysis_extension.followup_scope._same_source', return_value=False):
             self.assertNotIn('预算', prepare_request(turn, origin, {'purpose': 'QUERY'})['contextText'])
 
+    def test_explicit_scenario_switch_uses_resolved_words_even_when_previous_runtime_returned_no_facts(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from analysis_extension.followup_scope import prepare_request
+        capture = {'originalToolName': 'execute_budget_query', 'response': {}, 'request': {
+            'question': '2026年示例集团净利润预算', 'intentDraft': {
+                'sharedConditions': [{'text': '示例集团', 'sourceText': '示例集团'}, {'text': '预算', 'sourceText': '预算'}],
+                'targets': [{'id': 'profit', 'periodText': '2026年', 'businessPhrases': [{'text': '净利润', 'sourceText': '净利润'}]}]}}}
+        receipt = {'status': 'PARTIAL', 'data': {'resultSets': [], 'resolution': {'exactRecallComplete': True},
+            'targets': [{'allOf': [{'term': term, 'anyOf': [{'baseDataCode': domain}]}
+                        for term, domain in [('示例集团', 'ORG_DEF'), ('净利润', 'ACCOUNT_DEF'), ('预算', 'SCENE_DEF')]]}],
+            'dimensionCatalog': [{'valueDomain': domain, 'dimCode': code} for domain, code in
+                [('ORG_DEF', 'MD_ORG'), ('ACCOUNT_DEF', 'ACCOUNT'), ('SCENE_DEF', 'MD_SCENE')]]}}
+        service = SimpleNamespace(owner='owner', store=SimpleNamespace(get_capture=Mock(return_value=capture)),
+            sources=SimpleNamespace(for_capture=Mock(return_value=SimpleNamespace(raw_receipt=Mock(return_value=receipt)))))
+        turn = SimpleNamespace(service=service, state={'request': '改看实际数，其余条件不变',
+            'previousQueryIntent': {'metric': '净利润预算', 'population': '示例集团', 'scenario': '预算', 'period': '2026年'},
+            'followupContext': {'mode': 'CONTINUE', 'changedFields': ['scenario']}, 'selectedContextRefs': ['ctx'],
+            'businessContexts': [{'contextRef': 'ctx', 'captureRefs': ['prior']}], 'inheritedScope': {}})
+        with patch('analysis_extension.followup_scope._same_source', return_value=True):
+            for status in ('PARTIAL', 'FAILED'):
+                receipt['status'] = status
+                result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'QUERY'})
+                self.assertIn('净利润', result['contextText'])
+                self.assertIn('示例集团', result['contextText'])
+                self.assertNotIn('预算', result['contextText'])
+                self.assertNotIn('selections', result)
+
     def test_historical_sentence_quotes_are_reduced_only_to_retained_confirmed_terms(self):
         from analysis_extension.followup_scope import _inherit_phrase_quotes
         quote = '请查示例企业2027年的运输收入预算'
@@ -376,6 +419,39 @@ class BusinessQueryTest(TestCase):
             validate(capture, receipt)
         receipt['data']['complete'] = False
         validate(capture, receipt)
+
+    def test_bound_full_form_is_readable_and_enforces_verified_task_and_form(self):
+        from analysis_extension.adapters.budget_v2 import catalog
+        capture, receipt = business_fixture()
+        capture['request'].update(selection='FULL_FORM', targets=[])
+        receipt['data'].update(selection='FULL_FORM', targets=[])
+        proofs = [{'binding': {'text': text, 'modelCode': model, 'executionId': 'search-' + code,
+                              'candidateId': code, 'contextId': 'context', 'querySessionId': 'session'},
+                   'code': code, 'name': name}
+                  for model, code, text, name in [('BUDGET_TASK', 'TASK', '年度预算简称', '年度预算'),
+                                                   ('BUDGET_FORM_TEMPLATE', 'LRB', '利润表简称', '利润表')]]
+        capture['request']['scope'] = {'bindings': [proof['binding'] for proof in proofs],
+                                       'formNames': ['利润表简称']}
+        receipt['data']['resolution']['scopeBindings'] = proofs
+        update(capture, receipt)
+        # Catalog/AnalysisPython source loading uses the same receipt validator.
+        receipt_from_capture(capture)
+        self.assertTrue(catalog({**capture, 'captureRef': 'bound'}))
+        for field in ('taskCode', 'formCode'):
+            changed = deepcopy(receipt)
+            changed['data']['resultSets'][0]['context']['target'][field] = 'OTHER'
+            with self.assertRaises(AnalysisError):
+                validate(capture, changed)
+        for change in ('missing', 'wrong-proof', 'wrong-code'):
+            changed = deepcopy(receipt)
+            if change == 'missing':
+                changed['data']['resolution'].pop('scopeBindings')
+            elif change == 'wrong-proof':
+                changed['data']['resolution']['scopeBindings'][1]['binding']['candidateId'] = 'other'
+            else:
+                changed['data']['resolution']['scopeBindings'][1]['code'] = 'OTHER'
+            with self.assertRaises(AnalysisError):
+                validate(capture, changed)
 
     def test_full_form_catalog_keeps_data_formulas_and_nulls_without_header_facts(self):
         from analysis_extension.adapters.budget_v2 import catalog

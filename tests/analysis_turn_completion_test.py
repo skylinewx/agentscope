@@ -17,7 +17,7 @@ from analysis_extension.turn_completion import (TurnCompletion, current_turn, re
 from agentscope.agent import Agent, InjectionConfig, ReActConfig
 from agentscope.event import ReplyEndEvent
 from agentscope.message import Msg, TextBlock, ThinkingBlock, HintBlock, ToolCallBlock, ToolResultState, UserMsg
-from agentscope.model import ChatResponse
+from agentscope.model import ChatResponse, StructuredResponse
 from agentscope.permission import PermissionMode
 from agentscope.state import AgentState
 from agentscope.tool import ToolResponse, Toolkit
@@ -483,7 +483,8 @@ class TurnCompletionTests(PresentationCase):
     async def test_analysis_requires_rich_publication_after_computation_is_complete(self):
         turn = self.turn()
         artifact = await self.generic_result(turn, published=False)
-        self.assertIn('WORK_INCOMPLETE', [item['code'] for item in turn.check()['issues']])
+        self.assertNotIn('WORK_INCOMPLETE', [item['code'] for item in turn.check()['issues']])
+        self.assertIn('RESULT_NOT_PUBLISHED', [item['code'] for item in turn.check()['issues']])
         work = [{'taskId': 'values', 'title': '所选读数', 'kind': 'VALUES',
                  'refs': [fact['factId'] for fact in artifact['facts']]}]
         built = await self.service.build(artifact['captureRefs'], artifact['plan']['selections'],
@@ -833,7 +834,8 @@ class TurnLoopTests(PresentationCase):
         self.middleware.answer_reviewer = AsyncMock(return_value={'issues': []})
         if checks is not None:
             self.middleware._check_end = AsyncMock(side_effect=checks)
-        model = MockModel(context_size=1000000)
+        model = MockModel(context_size=1000000, mock_structured_response=StructuredResponse(content={
+            'requiredEvidence': 'VALUES', 'explanation': '此测试仅解释已给出的读数。'}))
         model.set_responses(responses)
         state = AgentState()
         state.permission_context.mode = PermissionMode.BYPASS
@@ -856,6 +858,7 @@ class TurnLoopTests(PresentationCase):
 
     async def test_analysis_intent_cannot_finish_by_plain_text_and_bounded_retries_stop(self):
         events, ends = await self.run_agent([call('AnalysisTask', action='declare', mode='ANALYSIS', goal='解释所选信号')] + [text('完成了') for _ in range(4)])
+        self.assertEqual(self.middleware.service.turn.state['analysisRequirement']['requiredEvidence'], 'VALUES')
         self.assertEqual(ends[0].finished_reason, ReplyFinishedReason.ERROR)
         self.assertEqual(ends[0].error.type.value, 'completion_check')
         self.assertIn('未完成项', ends[0].error.message)

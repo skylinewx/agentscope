@@ -40,6 +40,7 @@ class GroupingRecoveryTests(PresentationCase):
     def test_failed_grouping_keeps_unfulfilled_requirement(self):
         from analysis_extension.grouping_policy import remember_grouping, grouping_requirements
         turn = self.turn()
+        turn.task(mode='ANALYSIS', goal='按版块分析', intent={'grouping': '版块'})
         capture, _, _, receipt = batch_fixture()
         capture.update(originalToolName='execute_budget_query', request={'groupBy': ['版块']}, captureRef='failed')
         receipt.update(status='FAILED', error={'code': 'DIMENSION_MEMBER_UNRESOLVED'})
@@ -80,11 +81,43 @@ class GroupingRecoveryTests(PresentationCase):
         other = self.discovery(turn, '分类二', 'OTHER_CATEGORY')
         self.assertEqual(grouping_issues(turn), [])
         capture, _, _, _ = batch_fixture()
-        turn._add_query_capture(self.store.capture(OWNER, capture))
+        actual = self.store.capture(OWNER, capture)
+        turn._add_query_capture(actual)
         self.assertEqual(grouping_issues(turn), [])
         from analysis_extension.grouping_policy import grouping_requirements
-        flags = {row['captureRef']: row['required'] for row in grouping_requirements(turn)}
+        self.assertTrue(all(not row['required'] for row in grouping_requirements(turn)))
+        flags = {row['captureRef']: row['required'] for row in grouping_requirements(turn, {'captureRefs': [actual]})}
         self.assertEqual(flags, {chosen: True, other: False})
+
+    def test_unadopted_failed_query_does_not_block_selected_detail_analysis(self):
+        from analysis_extension.grouping_policy import remember_grouping, grouping_requirements
+        turn = self.turn()
+        capture, _, _, receipt = batch_fixture()
+        capture.update(originalToolName='execute_budget_query', request={'groupBy': ['组织机构']}, captureRef='failed')
+        receipt.update(status='FAILED', error={'code': 'QUERY_DRAFT_INCOMPLETE'})
+        receipt['data'] = {}
+        capture['response']['content'][0]['text'] = json.dumps(receipt)
+        remember_grouping(turn, capture)
+        actual, selections, _ = saved_fixture(self.store, ('10', '20'))
+        turn.state['adoptedInputs'] = [{'role': 'PRIMARY', 'selection': selections[0]}]
+        self.assertTrue(all(not row['required'] for row in grouping_requirements(turn)))
+        self.assertEqual(grouping_issues(turn, {'captureRefs': [actual]}), [])
+        # Explicitly requesting this grouping still requires its native result.
+        turn.task(mode='ANALYSIS', goal='按组织机构聚合', intent={'grouping': '组织机构'})
+        self.assertEqual(grouping_issues(turn, {'captureRefs': [actual]})[0]['code'], 'GROUPING_RESULT_REQUIRED')
+
+    def test_clearing_or_replacing_grouping_clears_old_discovery_selection(self):
+        from analysis_extension.grouping_policy import grouping_requirements
+        turn = self.turn()
+        first = self.discovery(turn, '分类一', 'MD_YWBK')
+        second = self.discovery(turn, '分类二', 'OTHER_CATEGORY')
+        turn.task(mode='ANALYSIS', goal='按分类一分析', groupingCaptureRefs=[first])
+        turn.task(mode='ANALYSIS', goal='改为明细', intent={'grouping': None})
+        self.assertIsNone(turn.state.get('selectedGroupingCaptureRefs'))
+        self.assertTrue(all(not item['required'] for item in grouping_requirements(turn)))
+        turn.task(mode='ANALYSIS', goal='按分类一分析', groupingCaptureRefs=[first])
+        turn.task(mode='ANALYSIS', goal='改为分类二', intent={'grouping': '分类二'})
+        self.assertEqual([item['captureRef'] for item in grouping_requirements(turn) if item['required']], [second])
 
     def test_two_required_groupings_are_not_satisfied_by_only_one(self):
         turn = self.turn()

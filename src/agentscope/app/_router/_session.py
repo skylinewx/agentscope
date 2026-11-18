@@ -240,9 +240,10 @@ async def list_sessions(
     # only ever sees their own runs of a shared agent.
     await access.resolve_agent(user_id, agent_id)
 
-    sessions = await storage.list_sessions(user_id, agent_id)
+    summaries = await storage.list_session_summaries(user_id, agent_id)
     views: list[SessionView] = []
-    for session in sessions:
+    for summary in summaries:
+        session = summary.session
         team_detail = None
         if session.team_id:
             team_record = await storage.get_team(user_id, session.team_id)
@@ -260,7 +261,7 @@ async def list_sessions(
         session_status = (
             SessionStatus.RUNNING
             if is_running
-            else SessionService.derive_parked_status(session.state.context)
+            else SessionStatus(summary.parked_status)
         )
         views.append(
             SessionView(

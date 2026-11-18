@@ -1,18 +1,22 @@
 import type { Msg } from '@agentscope-ai/agentscope/message';
 import { Check, ChevronRight, Loader2, Square, TriangleAlert } from 'lucide-react';
-import { useRef, useState, type ReactNode } from 'react';
+import { useEffect, useRef, useState, type ReactNode } from 'react';
 
+import { ProgressNarrative } from './ProgressNarrative';
+import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from '@/components/ui/collapsible';
 import { useTranslation } from '@/i18n/useI18n';
+import { progressSteps } from '@/lib/agent-progress';
 import type { ReplyPresentation } from '@/lib/reply-presentation';
 
-/** One disclosure for the entire reply; explicit user choices outlive streaming. */
+/** Public narratives stay visible; legacy raw process details retain disclosure. */
 export function ReplyProcess({
 	message,
 	presentation,
 	elapsed,
 	running,
+	disconnected = false,
 	steps,
 	details,
 }: {
@@ -20,22 +24,37 @@ export function ReplyProcess({
 	presentation: ReplyPresentation;
 	elapsed: string;
 	running: boolean;
+	disconnected?: boolean;
 	steps: ReactNode[];
 	details: ReactNode;
 }) {
 	const { t } = useTranslation();
+	const narratives = progressSteps(message);
 	const [manualOpen, setManualOpen] = useState<boolean | null>(null);
 	const [manualDetailsOpen, setManualDetailsOpen] = useState<boolean | null>(null);
 	const trigger = useRef<HTMLButtonElement>(null);
+	const content = useRef<HTMLDivElement>(null);
 	const open = manualOpen ?? running;
-	const detailsOpen = manualDetailsOpen ?? running;
+	const detailsOpen = manualDetailsOpen ?? (running && narratives.length === 0);
+	const finished = !!message.finished_at && !running && !disconnected && !presentation.pending;
+	useEffect(() => {
+		if (!finished || narratives.length > 0) return;
+		// Reading during generation must not pin a completed reply open. Reset
+		// once on completion, so users can still reopen it afterwards.
+		if (content.current?.contains(document.activeElement)) {
+			trigger.current?.focus({ preventScroll: true });
+		}
+		setManualOpen(null);
+		setManualDetailsOpen(null);
+	}, [finished, narratives.length]);
 	const failed = message.finished_reason === 'error';
 	const interrupted = message.finished_reason === 'interrupted';
 	const limited = message.finished_reason === 'exceed_max_iters';
 	const Icon =
-		failed || limited ? TriangleAlert : interrupted ? Square : running ? Loader2 : Check;
+		disconnected || failed || limited ? TriangleAlert : interrupted ? Square : running ? Loader2 : Check;
 	let title: string;
-	if (presentation.pending) title = t(`replyProcess.${presentation.pending}`);
+	if (disconnected) title = t('replyProcess.disconnected');
+	else if (presentation.pending) title = t(`replyProcess.${presentation.pending}`);
 	else if (running) title = t('replyProcess.running');
 	else if (failed) title = t('replyProcess.failed');
 	else if (interrupted) title = t('replyProcess.interrupted');
@@ -86,6 +105,36 @@ export function ReplyProcess({
 	const keepDetailsReading = () => {
 		if (running && manualDetailsOpen === null) setManualDetailsOpen(true);
 	};
+	const detailDisclosure = (
+		<Collapsible open={detailsOpen} onOpenChange={changeDetailsOpen}>
+			<CollapsibleTrigger asChild>
+				<Button variant="ghost" type="button" data-testid="reply-process-details-summary"
+					className="h-auto justify-start p-0 whitespace-normal group flex max-w-full flex-wrap items-center gap-1 py-2 text-left text-xs text-muted-foreground hover:text-foreground">
+					<ChevronRight aria-hidden="true" className="size-3 shrink-0 group-data-[state=open]:rotate-90" />
+					{t('replyProcess.details')}
+					<span>{t('replyProcess.counts', { thoughts: presentation.thinkingCount, tools: presentation.toolCount })}</span>
+				</Button>
+			</CollapsibleTrigger>
+			<CollapsibleContent data-testid="reply-process-details-content" className="space-y-3 pt-2 pb-3"
+				onPointerDownCapture={keepDetailsReading} onFocusCapture={keepDetailsReading} onWheelCapture={keepDetailsReading}>
+				{details}
+			</CollapsibleContent>
+		</Collapsible>
+	);
+
+	if (narratives.length > 0) {
+		return <section data-testid="reply-process" className="min-w-0">
+			<Badge variant="secondary" data-testid="reply-process-summary" role="status"
+				className="h-auto max-w-full flex-wrap gap-1.5 py-1 text-sm whitespace-normal">
+				<Icon aria-hidden="true" className={running && !presentation.pending ? 'animate-spin motion-reduce:animate-none' : ''} />
+				{title}<span className="whitespace-nowrap tabular-nums">· {elapsed}</span>
+			</Badge>
+			<div data-testid="reply-process-content" className="space-y-5 pt-3">
+				{narratives.map((step) => <ProgressNarrative key={step.id} step={step} />)}
+				{detailDisclosure}
+			</div>
+		</section>;
+	}
 
 	return (
 		<Collapsible open={open} onOpenChange={changeOpen} data-testid="reply-process">
@@ -110,6 +159,7 @@ export function ReplyProcess({
 				</Button>
 			</CollapsibleTrigger>
 			<CollapsibleContent
+				ref={content}
 				onPointerDownCapture={keepReading}
 				onFocusCapture={keepReading}
 				onWheelCapture={keepReading}
@@ -130,37 +180,7 @@ export function ReplyProcess({
 							))}
 						</ol>
 					)}
-					<Collapsible open={detailsOpen} onOpenChange={changeDetailsOpen}>
-						<CollapsibleTrigger asChild>
-							<Button
-								variant="ghost"
-								type="button"
-								data-testid="reply-process-details-summary"
-								className="h-auto justify-start p-0 whitespace-normal group flex max-w-full flex-wrap items-center gap-1 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
-							>
-								<ChevronRight
-									aria-hidden="true"
-									className="size-3 shrink-0 group-data-[state=open]:rotate-90"
-								/>
-								{t('replyProcess.details')}
-								<span>
-									{t('replyProcess.counts', {
-										thoughts: presentation.thinkingCount,
-										tools: presentation.toolCount,
-									})}
-								</span>
-							</Button>
-						</CollapsibleTrigger>
-						<CollapsibleContent
-							data-testid="reply-process-details-content"
-							className="space-y-3 pt-2 pb-3"
-							onPointerDownCapture={keepDetailsReading}
-							onFocusCapture={keepDetailsReading}
-							onWheelCapture={keepDetailsReading}
-						>
-							{details}
-						</CollapsibleContent>
-					</Collapsible>
+					{detailDisclosure}
 					<Button
 						variant="ghost"
 						size="xs"

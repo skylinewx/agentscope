@@ -71,7 +71,7 @@ class ActionTests(ActionCase):
         built = await self.next_build(values=("2",), snapshot="new-snapshot")
         plan = [{"kind": "RECHECK", "previousFindingRef": self.ref + "#" + self.artifact["findings"][0]["findingId"],
                  "factRefs": [self.store.get_analysis(OWNER, built["analysisRef"])["facts"][0]["factId"]]}]
-        result = await self.service.publish(built["analysisRef"], [], [], "publish-next", built["baseRevision"], findingPlan=plan)
+        result = await self.service.publish(built["analysisRef"], [], [], "publish-next",  findingPlan=plan)
         run = self.store.get_action_run(OWNER, self.run)
         self.assertEqual(run["status"], "COMPLETED")
         self.assertEqual(run["resultAnalysisRef"], result["analysisRef"])
@@ -81,7 +81,7 @@ class ActionTests(ActionCase):
         self.assertEqual(canonical(self.store.get_analysis(OWNER, self.ref)), old_bytes)
         self.assertEqual(self.delivery.report(self.ref, report["exportRef"])["html"], old_html)
         self.assertEqual(self.delivery.view(self.path)["actionRuns"][0]["resultAnalysisRef"], result["analysisRef"])
-        retry = await self.service.publish(built["analysisRef"], [], [], "publish-next", built["baseRevision"], findingPlan=plan)
+        retry = await self.service.publish(built["analysisRef"], [], [], "publish-next",  findingPlan=plan)
         self.assertEqual(retry["analysisRef"], result["analysisRef"])
         self.assertEqual((await self.start())["actionRun"]["status"], "COMPLETED")
         current_plan = current["plan"]
@@ -93,7 +93,7 @@ class ActionTests(ActionCase):
         unit_action = next(a for a in self.artifact["actions"] if a["goalType"] == "CONFIRM_UNIT")
         await self.start(action=unit_action)
         built = await self.next_build(unit=None)
-        await self.service.publish(built["analysisRef"], [], [], "publish-next", built["baseRevision"])
+        await self.service.publish(built["analysisRef"], [], [], "publish-next")
         run = self.store.get_action_run(OWNER, self.run)
         self.assertEqual(run["status"], "PARTIAL")
         self.assertEqual(run["diagnostics"][-1]["code"], "UNIT_STILL_MISSING")
@@ -175,7 +175,7 @@ class ActionTests(ActionCase):
         built = await self.next_build()
         self.service.actions.finish("CANCELLED", "USER_INTERRUPTED")
         with self.assertRaises(AnalysisError):
-            await self.service.publish(built["analysisRef"], [], [], "after-cancel", built["baseRevision"])
+            await self.service.publish(built["analysisRef"], [], [], "after-cancel")
         self.assertEqual(self.store.get_analysis(OWNER, built["analysisRef"])["publicationState"], "DRAFT")
         self.assertEqual(self.store.get_action_run(OWNER, self.run)["status"], "CANCELLED")
         await self.start(key="new-user-request", turn="user-turn-2")
@@ -189,7 +189,7 @@ class ActionTests(ActionCase):
         await self.initial()
         await self.start()
         built = await self.next_build()
-        await self.service.publish(built["analysisRef"], [], [], "publish-next", built["baseRevision"])
+        await self.service.publish(built["analysisRef"], [], [], "publish-next")
         backup = self.root / "backup"
         backup.mkdir()
         with closing(sqlite3.connect(self.store.database)) as source, closing(sqlite3.connect(backup / "analysis.sqlite3")) as target:

@@ -69,9 +69,11 @@ svg text { font-family: inherit; font-size: 14px; fill: var(--muted); }
 .note { font-size: 12px; margin-top: 12px; }
 .table-wrap { overflow-x: auto; margin-top: 14px; }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
-th, td { text-align: right; padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
 th { color: var(--muted); font-size: 12px; font-weight: 500; background: #fafbfc; }
-th:first-child, td:first-child, .text { text-align: left; }
+th.text, td.text { text-align: left; }
+th.number, td.number { text-align: right; }
+th.ordinal, td.ordinal { text-align: center; }
 tbody tr:last-child td { border-bottom: 0; }
 tbody tr:hover { background: #f8fafc; }
 .sources { margin-top: var(--gap); padding: 16px 20px; border-left: 3px solid #c4d5e9; background: #edf2f7; border-radius: 0 9px 9px 0; }

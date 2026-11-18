@@ -27,7 +27,7 @@ class CapabilityTests(ActionCase):
     async def test_omitted_plans_never_infer_negative_unit_gaps_or_actions(self):
         draft = await self.draft(unit=None)
         self.assertEqual((await self.service.inspect("findings", draft["analysisRef"]))["items"], [])
-        await self.service.publish(draft["analysisRef"], [], [], "no-plan", 0)
+        await self.service.publish(draft["analysisRef"], [], [], "no-plan")
         artifact = self.store.get_analysis(OWNER, draft["analysisRef"])
         self.assertEqual(artifact["findings"], [])
         self.assertEqual(artifact["actions"], [])
@@ -41,7 +41,7 @@ class CapabilityTests(ActionCase):
             self.assertEqual(findings[0]["factRefs"], [self.facts(draft)[index]["factId"]])
             self.assertEqual(findings[0]["support"], "SUPPORTED")
             self.assertEqual(findings[0]["explanations"][0]["missingEvidence"], [])
-        await self.service.publish(draft["analysisRef"], [], [], "positive", 0, findingPlan=plan)
+        await self.service.publish(draft["analysisRef"], [], [], "positive",  findingPlan=plan)
         artifact = self.store.get_analysis(OWNER, draft["analysisRef"])
         self.assertEqual(artifact["findings"][0]["findingId"], findings[0]["findingId"])
         self.assertEqual(artifact["actions"], [])
@@ -52,7 +52,7 @@ class CapabilityTests(ActionCase):
         action = {"findingRefs": [findings[0]["findingId"]], "check": "VERIFY_VALUE",
             "goal": "核对传感器校准后的读数", "requiredEvidence": ["同一位置新的仪器读数和核验"],
             "expectedDecision": "判断读数条件是否仍成立", "priorityBasis": "用户本轮首先关注该传感器"}
-        await self.service.publish(draft["analysisRef"], [], [], "sensor", 0, findingPlan=plan, actionPlan=[action])
+        await self.service.publish(draft["analysisRef"], [], [], "sensor",  findingPlan=plan, actionPlan=[action])
         artifact = self.store.get_analysis(OWNER, draft["analysisRef"])
         self.assertEqual(len(artifact["actions"]), 1)
         actual = artifact["actions"][0]
@@ -68,12 +68,12 @@ class CapabilityTests(ActionCase):
                   "requiredEvidence": ["新读数"], "expectedDecision": "确认结果", "priorityBasis": "用户选择"}
         for change in ({"availability": "AVAILABLE"}, {"completed": True}, {"scopeId": "forged"}, {"capabilityRefs": ["forged"]}, {"findingRefs": ["forged"]}, {"goal": "  "}):
             with self.subTest(change=change), self.assertRaises(AnalysisError):
-                await self.service.publish(draft["analysisRef"], [], [], "bad", 0, findingPlan=plan, actionPlan=[{**action, **change}])
+                await self.service.publish(draft["analysisRef"], [], [], "bad",  findingPlan=plan, actionPlan=[{**action, **change}])
         self.assertEqual(self.store.get_analysis(OWNER, draft["analysisRef"])["publicationState"], "DRAFT")
 
     async def test_explicit_view_plan_does_not_add_statistics_or_charts(self):
         draft = await self.draft(operations=[{"id": "count", "operator": "COUNT"}, {"id": "rank", "operator": "RANK"}])
-        await self.service.publish(draft["analysisRef"], [], [], "table-only", 0)
+        await self.service.publish(draft["analysisRef"], [], [], "table-only")
         document = self.delivery.view(self.delivery.ensure(draft["analysisRef"])["path"])
         self.assertEqual(document["metrics"], [])
         self.assertIsNone(comparison(document))
@@ -87,7 +87,7 @@ class CapabilityTests(ActionCase):
     async def test_requested_scalar_metric_does_not_add_count_or_ranking(self):
         draft = await self.draft()
         view = {"viewId": "one-reading", "scopeId": draft["scope"]["scopeId"], "type": "METRIC", "valueRefs": [self.facts(draft)[2]["factId"]]}
-        await self.service.publish(draft["analysisRef"], [], [view], "metric", 0)
+        await self.service.publish(draft["analysisRef"], [], [view], "metric")
         document = self.delivery.view(self.delivery.ensure(draft["analysisRef"])["path"])
         self.assertEqual([m["display"] for m in document["metrics"]], ["12"])
         self.assertIsNone(comparison(document))
@@ -96,7 +96,7 @@ class CapabilityTests(ActionCase):
     async def test_rank_uses_only_explicitly_selected_inputs(self):
         draft = await self.draft(operations=[{"id": "rank-one", "operator": "RANK", "select": {"objectId": "object-2"}}])
         views = [{"viewId": "one", "scopeId": draft["scope"]["scopeId"], "type": "BAR_RANK", "valueRefs": [draft["derivedValues"][0]["derivedId"]]}]
-        await self.service.publish(draft["analysisRef"], [], views, "rank-one", 0)
+        await self.service.publish(draft["analysisRef"], [], views, "rank-one")
         view = self.delivery.view(self.delivery.ensure(draft["analysisRef"])["path"])
         self.assertEqual(comparison(view)["rowKeys"], [view["rows"][0]["rowKey"]])
         self.assertEqual(view["metrics"], [])
@@ -105,7 +105,7 @@ class CapabilityTests(ActionCase):
         draft = await self.draft(values=tuple(str(i) for i in range(201)))
         views = [{"viewId": "too-many", "scopeId": draft["scope"]["scopeId"], "type": "METRIC", "valueRefs": [f["factId"] for f in self.facts(draft)]}]
         with self.assertRaises(AnalysisError) as failure:
-            await self.service.publish(draft["analysisRef"], [], views, "too-many", 0)
+            await self.service.publish(draft["analysisRef"], [], views, "too-many")
         self.assertEqual(failure.exception.code, "VIEW_LIMIT")
         self.assertEqual(self.store.get_analysis(OWNER, draft["analysisRef"])["publicationState"], "DRAFT")
 
@@ -121,14 +121,14 @@ class CapabilityTests(ActionCase):
     async def test_positive_condition_recheck_is_explicit_and_generic(self):
         original = await self.draft(values=("2",), tag="old-positive")
         plan, old = await self.preview(original, "positive")
-        await self.service.publish(original["analysisRef"], [], [], "old", 0, findingPlan=plan)
+        await self.service.publish(original["analysisRef"], [], [], "old",  findingPlan=plan)
         before = canonical(self.store.get_analysis(OWNER, original["analysisRef"]))
         new = await self.draft(values=("0",), tag="new-zero", base=original["analysisRef"])
         self.assertEqual((await self.service.inspect("findings", new["analysisRef"]))["items"], [])
         plan = [{"kind": "RECHECK", "previousFindingRef": original["analysisRef"] + "#" + old[0]["findingId"], "factRefs": [self.facts(new)[0]["factId"]]}]
         findings = await self.service.inspect("findings", new["analysisRef"], findingPlan=plan)
         self.assertEqual(findings["items"][0]["support"], "CONTRADICTED")
-        await self.service.publish(new["analysisRef"], [], [], "new", new["baseRevision"], findingPlan=plan)
+        await self.service.publish(new["analysisRef"], [], [], "new",  findingPlan=plan)
         self.assertEqual(canonical(self.store.get_analysis(OWNER, original["analysisRef"])), before)
 
     async def test_unknown_or_forged_check_fails_and_plans_participate_in_idempotency(self):
@@ -138,15 +138,15 @@ class CapabilityTests(ActionCase):
                 await self.service.inspect("findings", draft["analysisRef"], findingPlan=plan)
         positive, _ = await self.preview(draft, "positive")
         negative, _ = await self.preview(draft, "negative")
-        result = await self.service.publish(draft["analysisRef"], [], [], "key", 0, findingPlan=positive)
-        self.assertEqual((await self.service.publish(draft["analysisRef"], [], [], "key", 0, findingPlan=positive))["analysisRef"], result["analysisRef"])
+        result = await self.service.publish(draft["analysisRef"], [], [], "key",  findingPlan=positive)
+        self.assertEqual((await self.service.publish(draft["analysisRef"], [], [], "key",  findingPlan=positive))["analysisRef"], result["analysisRef"])
         with self.assertRaises(AnalysisError) as failure:
-            await self.service.publish(draft["analysisRef"], [], [], "key", 0, findingPlan=negative)
+            await self.service.publish(draft["analysisRef"], [], [], "key",  findingPlan=negative)
         self.assertEqual(failure.exception.code, "REQUEST_CONFLICT")
 
     async def test_projection_requires_explicit_current_policy(self):
         draft = await self.draft()
-        await self.service.publish(draft["analysisRef"], [], [], "publish", 0)
+        await self.service.publish(draft["analysisRef"], [], [], "publish")
         artifact = self.store.get_analysis(OWNER, draft["analysisRef"])
         artifact.pop("presentationPolicy")
         before = canonical(artifact)

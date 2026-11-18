@@ -29,7 +29,7 @@ class ReportSkillTests(IsolatedAsyncioTestCase):
                                                 OWNER.session_id, self.workspace, self.config)
 
     async def test_skill_capability_matrix(self):
-        shared = {'AnalysisTask', 'QueryResultRead', 'AnalysisBuild', 'AnalysisInspect', 'AnalysisPublish'}
+        shared = {'AnalysisTask', 'QueryResultRead', 'AnalysisBuild', 'AnalysisPython', 'AnalysisInspect', 'AnalysisPublish'}
         all_tools = shared | {'AnalysisFollowUp', 'AnalysisRenderReport'}
         cases = [(names, all_tools) for names in ((), ('budget-ontology-mcp-v2',), ('data-analysis',),
                                                  ('report-generation',), ('renamed-method', 'renamed-report'))]
@@ -58,7 +58,7 @@ class ReportSkillTests(IsolatedAsyncioTestCase):
             {'viewId': 'values', 'scopeId': scope_id, 'type': 'BAR_VALUES', 'valueRefs': refs},
             {'viewId': 'details', 'scopeId': scope_id, 'type': 'TABLE', 'valueRefs': refs, 'collapsed': True},
         ]
-        published = await service.publish(result['analysisRef'], [], views, 'report-publish', result['baseRevision'])
+        published = await service.publish(result['analysisRef'], [], views, 'report-publish')
         exported = await service.render_report(result['analysisRef'], 'report-html')
         self.assertTrue(published['delivery']['registered'])
         self.assertTrue(exported['registered'])

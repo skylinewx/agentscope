@@ -3,6 +3,9 @@
 """The Redis storage implementation."""
 
 import warnings
+import asyncio
+import logging
+from time import perf_counter
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from typing import Any, TYPE_CHECKING, Self
@@ -10,6 +13,7 @@ from typing import Any, TYPE_CHECKING, Self
 from pydantic import BaseModel
 
 from ._base import StorageBase
+from ._model._message_queue import MessageQueueRecord
 from ._model._session import _origin_kwargs
 from ._model import (
     AgentRecord,
@@ -71,6 +75,9 @@ class RedisStorage(StorageBase):
         )
         agent: str = "agentscope:user:{user_id}:agent:{agent_id}"
         session: str = "agentscope:user:{user_id}:session:{session_id}"
+        session_summary: str = "agentscope:user:{user_id}:session:{session_id}:summary"
+        message_queue: str = "agentscope:user:{user_id}:message_queue:{session_id}"
+        message_queue_index: str = "agentscope:message_queues"
         mcp: str = "agentscope:user:{user_id}:mcp:{mcp_id}"
         skill: str = "agentscope:user:{user_id}:skill:{skill_id}"
 
@@ -210,6 +217,97 @@ class RedisStorage(StorageBase):
         await self._client.set(key, value)
         await self._refresh_key_ttl(key)
 
+    async def _read(self, operation, execute):
+        """Only idempotent reads retry once; no mutation is replayed here."""
+        from ._errors import is_storage_unavailable, StorageTemporarilyUnavailable
+        started = perf_counter()
+        for attempt in range(2):
+            try:
+                return await execute()
+            except Exception as error:
+                if not is_storage_unavailable(error):
+                    raise
+                logging.getLogger(__name__).warning('会话存储读取暂时失败 操作=%s 次数=%d 耗时毫秒=%.2f 错误类型=%s',
+                    operation, attempt + 1, (perf_counter() - started) * 1000, type(error).__name__)
+                if attempt:
+                    raise StorageTemporarilyUnavailable(operation) from error
+                await asyncio.sleep(0.1)
+
+    def _summary_key(self, user_id, session_id):
+        return self._key(self.key_config.session_summary, user_id=user_id, session_id=session_id)
+
+    async def _write_session(self, key, record):
+        from ._session_summary import SessionSummary
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.set(key, record.model_dump_json(), ex=self.key_ttl)
+            pipe.set(self._summary_key(record.user_id, record.id),
+                     SessionSummary.from_record(record).model_dump_json(), ex=self.key_ttl)
+            await pipe.execute()
+
+    async def _backfill_session_summary(self, user_id, session_id):
+        """Lazily backfill older records under WATCH; never replace newer summaries."""
+        from ._session_summary import SessionSummary
+        key = self._key(self.key_config.session, user_id=user_id, session_id=session_id)
+        for _ in range(3):
+            async with self._client.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        return None
+                    record = await asyncio.to_thread(SessionRecord.model_validate_json, raw)
+                    if record.user_id != user_id:
+                        return None
+                    ttl = await pipe.pttl(key)
+                    if ttl == -2 or ttl == 0:
+                        return None
+                    summary = SessionSummary.from_record(record)
+                    pipe.multi()
+                    pipe.set(self._summary_key(user_id, session_id), summary.model_dump_json(),
+                             **({'px': ttl} if ttl > 0 else {}))
+                    await pipe.execute()
+                    return summary
+                except _watch_error():
+                    continue
+        from ._errors import StorageTemporarilyUnavailable
+        raise StorageTemporarilyUnavailable('会话摘要在并发更新，请重试读取。')
+
+    async def list_session_summaries(self, user_id: str, agent_id: str):
+        from ._session_summary import SessionSummary
+        from ._agent_defaults import resolve_defaults
+        started = perf_counter()
+        index = self._key(self.key_config.session_index, user_id=user_id, agent_id=agent_id)
+        ids = sorted(await self._read('session_summary_index', lambda: self._client.smembers(index)))
+        summaries, loaded_bytes, backfilled = [], 0, 0
+        for offset in range(0, len(ids), 50):
+            batch = ids[offset:offset + 50]
+            async def read_batch():
+                async with self._client.pipeline(transaction=False) as pipe:
+                    for session_id in batch:
+                        pipe.exists(self._key(self.key_config.session, user_id=user_id, session_id=session_id))
+                        pipe.get(self._summary_key(user_id, session_id))
+                    return await pipe.execute()
+            values = await self._read('session_summaries', read_batch)
+            for index, session_id in enumerate(batch):
+                exists, raw = values[index * 2:index * 2 + 2]
+                if not exists:
+                    continue
+                if raw:
+                    loaded_bytes += len(raw.encode('utf-8') if isinstance(raw, str) else raw)
+                    summary = SessionSummary.model_validate_json(raw)
+                else:
+                    summary = await self._backfill_session_summary(user_id, session_id)
+                    backfilled += 1
+                if summary and summary.session.user_id == user_id and summary.session.agent_id == agent_id:
+                    summaries.append(summary)
+        agent = await self.resolve_session_agent(user_id, agent_id)
+        for summary in summaries:
+            summary.session = resolve_defaults(summary.session, agent)
+        summaries.sort(key=lambda item: item.session.created_at, reverse=True)
+        logging.getLogger(__name__).info('会话列表摘要 数量=%d 摘要字节=%d 旧记录补建=%d 耗时毫秒=%.2f',
+            len(summaries), loaded_bytes, backfilled, (perf_counter() - started) * 1000)
+        return summaries
+
     async def _refresh_key_ttl(self, key: str) -> None:
         """Apply the sliding TTL to a key, if configured."""
         if self.key_ttl is not None:
@@ -234,13 +332,17 @@ class RedisStorage(StorageBase):
         if self._external_pool is not None:
             pool = self._external_pool
         else:
+            from redis.backoff import NoBackoff
+            from redis.retry import Retry
+            options = {'socket_connect_timeout': 3, 'socket_timeout': 5,
+                       'retry': Retry(NoBackoff(), 0), **self._kwargs}
             self._owned_pool = aioredis.ConnectionPool(
                 host=self._host,
                 port=self._port,
                 db=self._db,
                 password=self._password,
                 decode_responses=True,
-                **self._kwargs,
+                **options,
             )
             pool = self._owned_pool
 
@@ -294,10 +396,25 @@ class RedisStorage(StorageBase):
                         raise KeyError(key)
                     mutate(record)
                     record.updated_at = datetime.now()
+                    ttl_ms = await pipe.pttl(key) if record_cls is SessionRecord else None
                     pipe.multi()
                     pipe.set(key, record.model_dump_json(), keepttl=True)
+                    if record_cls is SessionRecord:
+                        from ._session_summary import SessionSummary
+                        ttl_options = ({'ex': self.key_ttl} if self.key_ttl is not None else
+                                       {'px': ttl_ms} if ttl_ms and ttl_ms > 0 else {})
+                        pipe.set(self._summary_key(user_id, record.id),
+                                 SessionSummary.from_record(record).model_dump_json(), **ttl_options)
                     if self.key_ttl is not None:
                         pipe.expire(key, self.key_ttl)
+                    if record_cls is MessageQueueRecord:
+                        # Pending input must not expire with optional session
+                        # cache TTLs. Update the recovery index in this same CAS.
+                        pipe.persist(key)
+                        if record.items or record.activity != "idle":
+                            pipe.sadd(self.key_config.message_queue_index, key)
+                        else:
+                            pipe.srem(self.key_config.message_queue_index, key)
                     await pipe.execute()
                     return record
                 except _watch_error():
@@ -333,6 +450,35 @@ class RedisStorage(StorageBase):
             user_id=user_id,
             agent_id=agent_id,
         )
+
+    async def get_message_queue(self, user_id: str, session_id: str) -> MessageQueueRecord | None:
+        key = self._key(self.key_config.message_queue, user_id=user_id, session_id=session_id)
+        raw = await self._client.get(key)
+        record = MessageQueueRecord.model_validate_json(raw) if raw else None
+        return record if record is not None and record.user_id == user_id else None
+
+    async def mutate_message_queue(self, initial: MessageQueueRecord, mutate: Callable) -> MessageQueueRecord:
+        key = self._key(self.key_config.message_queue, user_id=initial.user_id, session_id=initial.id)
+        # Index and creation commit together, so a restart cannot hide a queue.
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.set(key, initial.model_dump_json(), nx=True)
+            pipe.sadd(self.key_config.message_queue_index, key)
+            await pipe.execute()
+        return await self._mutate_record(key, MessageQueueRecord, mutate, user_id=initial.user_id, agent_id=initial.agent_id)
+
+    async def list_message_queues(self) -> list[MessageQueueRecord]:
+        keys = await self._client.smembers(self.key_config.message_queue_index)
+        if not keys:
+            return []
+        values = await self._client.mget(list(keys))
+        return [record for raw in values if raw and ((record := MessageQueueRecord.model_validate_json(raw)).items or record.activity != "idle")]
+
+    async def delete_message_queue(self, user_id: str, session_id: str) -> None:
+        key = self._key(self.key_config.message_queue, user_id=user_id, session_id=session_id)
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.delete(key)
+            pipe.srem(self.key_config.message_queue_index, key)
+            await pipe.execute()
 
     async def _generate_credential_name(
         self,
@@ -978,7 +1124,7 @@ class RedisStorage(StorageBase):
                 if state is not None:
                     record.state = state
                 record.updated_at = datetime.now()
-                await self._set_with_ttl(key, record.model_dump_json())
+                await self._write_session(key, record)
                 return record
 
         # Use the caller-provided ``session_id`` when given so a
@@ -1015,7 +1161,7 @@ class RedisStorage(StorageBase):
             user_id=user_id,
             agent_id=agent_id,
         )
-        await self._set_with_ttl(key, record.model_dump_json())
+        await self._write_session(key, record)
         await self._client.sadd(index_key, record.id)
 
         if isinstance(record.origin, ScheduleOrigin):
@@ -1108,11 +1254,11 @@ class RedisStorage(StorageBase):
             user_id=user_id,
             session_id=session_id,
         )
-        raw = await self._client.get(key)
+        raw = await self._read('get_session', lambda: self._client.get(key))
         if not raw:
             return None
-        record = SessionRecord.model_validate_json(raw)
-        if agent_id and record.agent_id != agent_id:
+        record = await asyncio.to_thread(SessionRecord.model_validate_json, raw)
+        if record.user_id != user_id or (agent_id and record.agent_id != agent_id):
             return None
         from ._agent_defaults import resolve_defaults
         if record.config.inherited_fields:
@@ -1192,9 +1338,10 @@ class RedisStorage(StorageBase):
             user_id=user_id,
             session_id=session_id,
         )
-        await self._client.delete(key)
+        await self._client.delete(key, self._summary_key(user_id, session_id))
         await self._client.srem(index_key, session_id)
         await self._client.delete(msg_key, msg_index_key)
+        await self.delete_message_queue(user_id, session_id)
 
         if isinstance(record.origin, ScheduleOrigin):
             schedule_session_key = self._key(

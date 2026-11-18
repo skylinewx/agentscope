@@ -15,7 +15,7 @@ class PreviewRecoveryTests(PresentationCase):
         self.original = self.store.get_analysis(OWNER, self.ref)
         refs = [f['factId'] for f in self.original['facts']]
         base = {'scopeId': built['scope']['scopeId'], 'valueRefs': refs}
-        return {'analysisRef': self.ref, 'expectedBaseRevision': 0, 'requestKey': 'preview', 'claims': [],
+        return {'analysisRef': self.ref, 'requestKey': 'preview', 'claims': [],
                 'presentation': {'labels': [{'valueRef': refs[0], 'role': 'measure', 'label': '指标简称'}]},
                 'viewPlan': [{**base, 'viewId':'bar','type':'BAR_VALUES','orderRef':'derived_order'},
                              {**base, 'viewId':'table','type':'TABLE'}]}
@@ -28,10 +28,10 @@ class PreviewRecoveryTests(PresentationCase):
         self.assertEqual(self.store.get_analysis(OWNER, self.ref), self.original)
         self.assertIsNone(self.store.get_presentation(OWNER, 'delivery', self.ref))
         self.assertNotIn('document', result)
-        preview = await self.service.publish(self.ref, requestKey='preview2', expectedBaseRevision=0, previewOnly=True,
+        preview = await self.service.publish(self.ref, requestKey='preview2',  previewOnly=True,
             repairRef=result['repairRef'], repairs=[{'op':'add','path':'/viewPlan/1/orderRef','value':'derived_order'}])
         self.assertNotIn('PAIRED_ORDER_DIFFERS', [w['code'] for w in preview['diagnostics']['warnings']])
-        published = await self.service.publish(self.ref, requestKey='publish', expectedBaseRevision=0, repairRef=preview['repairRef'], repairs=[])
+        published = await self.service.publish(self.ref, requestKey='publish',  repairRef=preview['repairRef'], repairs=[])
         saved = self.store.get_analysis(OWNER, self.ref)
         self.assertEqual(saved['facts'], self.original['facts'])
         self.assertEqual(saved['presentation'], req['presentation'])
@@ -47,7 +47,7 @@ class PreviewRecoveryTests(PresentationCase):
         error = json.loads(response.content[0].text)['error']
         self.assertEqual(len(error['details']['issues']), 3)
         self.assertEqual(self.store.get_analysis(OWNER, self.ref), self.original)
-        repaired = await tool.call(analysisRef=self.ref, expectedBaseRevision=0, requestKey='fixed', previewOnly=True,
+        repaired = await tool.call(analysisRef=self.ref, requestKey='fixed', previewOnly=True,
             repairRef=error['details']['repairRef'], repairs=[
                 {'op':'remove','path':'/presentation/showUnit'},
                 {'op':'add','path':'/viewPlan/1/viewId','value':'table'},
@@ -58,7 +58,7 @@ class PreviewRecoveryTests(PresentationCase):
         req = await self.request()
         result = await self.service.publish(**req, previewOnly=True)
         with self.assertRaises(AnalysisError):
-            await self.service.publish(self.ref, requestKey='bad', expectedBaseRevision=0, repairRef=result['repairRef'],
+            await self.service.publish(self.ref, requestKey='bad',  repairRef=result['repairRef'],
                 repairs=[{'op':'replace','path':'/facts/0/value','value':'999'}])
         async def denied(): raise AnalysisError('ACCESS_DENIED', 'denied')
         self.service.authorize = denied

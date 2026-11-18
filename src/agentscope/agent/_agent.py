@@ -6,6 +6,7 @@ import json
 import inspect
 import re
 import warnings
+from time import perf_counter
 
 from asyncio import Queue
 from copy import deepcopy
@@ -229,6 +230,9 @@ class Agent:
         ]
         self._acting_middlewares = [
             _ for _ in middlewares if _.is_implemented("on_acting")
+        ]
+        self._tool_attempt_middlewares = [
+            _ for _ in middlewares if _.is_implemented("on_tool_attempt")
         ]
         self._model_call_middlewares = [
             _ for _ in middlewares if _.is_implemented("on_model_call")
@@ -2440,10 +2444,55 @@ class Agent:
             )
         return await self._engine.check_permission(tool, tool_input)
 
-    async def _execute_tool_call(
+    async def _execute_tool_call(self, tool_call, kept_rules=None):
+        """Observe the complete entry boundary, including rejected inputs."""
+        started = perf_counter()
+        attempt = {'attemptId': _generate_id(), 'callId': tool_call.id,
+                   'toolName': tool_call.name, 'phase': 'VALIDATION', 'status': 'running'}
+        settled = False
+
+        async def notify(event):
+            snapshot = {**attempt, 'event': event,
+                        'elapsedMs': round((perf_counter() - started) * 1000, 2)}
+            for middleware in self._tool_attempt_middlewares:
+                try:
+                    await middleware.on_tool_attempt(self, deepcopy(snapshot))
+                except Exception:
+                    logger.warning('工具调用观测失败，保留原执行结果', exc_info=True)
+
+        await notify('START')
+        try:
+            async for event in self._execute_tool_call_impl(tool_call, kept_rules, attempt):
+                if isinstance(event, ToolResultEndEvent):
+                    attempt['status'] = ('background' if event.metadata.get('backgroundToolCallId')
+                                         else getattr(event.state, 'value', event.state))
+                    settled = True
+                elif isinstance(event, RequireUserConfirmEvent):
+                    attempt['status'] = 'waiting_permission'
+                    settled = True
+                elif isinstance(event, RequireExternalExecutionEvent):
+                    attempt['status'] = 'waiting_external'
+                    settled = True
+                if settled:
+                    await notify('END')
+                yield event
+        except asyncio.CancelledError:
+            attempt['status'] = 'interrupted'
+            raise
+        except Exception:
+            attempt['status'] = 'error'
+            raise
+        finally:
+            if not settled:
+                if attempt['status'] == 'running':
+                    attempt['status'] = 'deferred'
+                await notify('END')
+
+    async def _execute_tool_call_impl(
         self,
         tool_call: ToolCallBlock,
         kept_rules: list[PermissionRule] | None = None,
+        attempt: dict | None = None,
     ) -> AsyncGenerator[
         RequireUserConfirmEvent
         | RequireExternalExecutionEvent
@@ -2490,6 +2539,7 @@ class Agent:
         #  - if failed, directly return the error message to the agent
         #  - if success, continue to permission checking and tool execution
         # ===================================================================
+        validation_started = perf_counter()
         try:
             # Check if the tool is available
             tool = await self.toolkit.check_tool_available(
@@ -2519,6 +2569,8 @@ class Agent:
         #  - tool not available
         #  - input parsing failure
         except AgentOrientedException as e:
+            if attempt is not None:
+                attempt['validationMs'] = round((perf_counter() - validation_started) * 1000, 2)
             async for evt in self._handle_error_tool_call(
                 tool_call,
                 e.message,
@@ -2531,11 +2583,16 @@ class Agent:
         # ===================================================================
         # Step 2: Check permission by toolkit and permission engine
         # ===================================================================
+        if attempt is not None:
+            attempt.update(phase='PERMISSION', validationMs=round((perf_counter() - validation_started) * 1000, 2))
+        permission_started = perf_counter()
         decision = await self._check_permission(
             tool_call,
             tool,
             parsed_input,
         )
+        if attempt is not None:
+            attempt['permissionMs'] = round((perf_counter() - permission_started) * 1000, 2)
 
         # ===================================================================
         # Step 3: Handle the permission and execute the tool call if allowed
@@ -2604,6 +2661,8 @@ class Agent:
         # Case 3: Allowed by the permission system, execute the tool call and
         #  yield the events
         if decision.behavior == PermissionBehavior.ALLOW:
+            if attempt is not None:
+                attempt['phase'] = 'EXECUTION'
             self._update_tool_call_state(
                 tool_call.id,
                 ToolCallState.ALLOWED,

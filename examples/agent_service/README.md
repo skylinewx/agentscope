@@ -97,6 +97,11 @@ Users sign in with their username and password, without entering an address.
 `AGENTSCOPE_COOKIE_SECURE` 覆盖 Cookie 的 Secure 属性。密码不返回浏览器，
 配置文件已被 Git 忽略。所有服务进程应使用相同的配置和 Redis。
 
+会话采用滚动续期：默认连续 12 小时没有有效请求才过期。通过身份、来源及
+CSRF 校验的请求会同步延长 Redis 会话和浏览器 Cookie，包括队列轮询和
+登录状态检查，因此页面保持打开且正常请求时会持续保持登录。公开接口、
+服务端内部检查和流式心跳不会续期；已退出、过期或撤销的会话不能续活。
+
 使用 `admin` 登录后，从侧栏进入“用户管理”，可搜索、分页、新增、编辑、
 启用/禁用、删除用户及重置密码。普通用户从“个人账户”修改自己的密码或
 退出登录。admin 账号不能在页面中删除、禁用、重命名或重置密码；修改
@@ -136,6 +141,48 @@ Users sign in with their username and password, without entering an address.
 
 SDK 的 `create_app()` 通过可选 `auth_service` 接入认证；本示例始终启用。
 嵌入者若未配置该参数，仍需自行提供可信身份边界。
+
+## 女娲门户单点登录
+
+女娲 URL App 在用户已经登录门户后申请一张一次性 `ticket`，并把它附在目标地址上。
+AgentScope 不把这张票据当作自己的会话，也不调用 `/nvwa-user/v1/user/current`。
+
+页面打开后，前端把地址上的 `ticket` 交给 `GET /sso/nvwa`。服务端再用请求头
+`authorization-ticket` 调用女娲：
+
+```http
+GET {nvwa.base_url}/nvwa/getLoginContext
+authorization-ticket: <ticket>
+```
+
+成功响应里的登录人位于 `context.contextUser`：`name` 是用户名，`fullname` 是显示名。
+服务端按该用户建立 AgentScope 自己的会话。此后刷新页面使用这份会话，不再提交
+同一张票据。票据只能验一次；从门户菜单重新打开会颁发新票据。同一张已经失败的
+票据不会自动重试。
+
+在 `service-config.local.json` 中增加 `nvwa` 段，格式见
+`service-config.example.json`：
+
+```json
+{
+  "nvwa": {
+    "base_url": "http://127.0.0.1:8080",
+    "auth_mode": "auto",
+    "user_info_path": "/nvwa/getLoginContext",
+    "timeout_seconds": 10
+  }
+}
+```
+
+`base_url` 是女娲服务地址，不要带末尾斜杠。`auth_mode` 为 `auto` 时，URL App
+的短期票据走上面的登录上下文接口。`bearer` 只用于已经持有女娲会话令牌
+（`token` 或 `nv_t`）的调用，令牌放在 `Authorization` 头。`ticket_post` 会向
+`validate_path` 提交 JSON，URL App 的票据不要使用这个模式。未配置 `base_url`
+时，`GET /sso/nvwa` 返回 503。
+
+门户页面所在来源（协议、主机和端口）必须写入 `auth.allowed_origins`。
+嵌入路径如果不是站点根路径，同时设置 `auth.cookie_path`，与前端
+`VITE_PUBLIC_BASE_PATH` 一致。
 
 ## MCP / Skill 中心直接管理
 
@@ -341,6 +388,46 @@ pnpm --dir examples/web_ui/frontend build
 ```
 
 测试使用 fakeredis、内存 SQLite 和临时工作空间，不读取生产密钥、不调用付费模型。
+
+## 分析首次图文交付与宿主页面检查
+
+分析、公式构成和分布构成查询使用 `AnalysisTask(mode="ANALYSIS", delivery="DOCUMENT")`，
+第一次回答就交付适合问题的图形、解读、明细或关系页面。普通单值、筛选和排序查询保留
+`DIRECT/TEXT`。`ANALYSIS/TEXT` 会返回 `INVALID_DELIVERY_MODE`；显式 `DIRECT/DOCUMENT`
+同样需要完成页面发布。只改变展示时复用已保存的事实和计算，沿用已确认的报告模板。
+
+宿主可直接检查冻结页面，无需把用户 Cookie 复制到 Playwright，也无需跳转后端预览地址。
+在服务所用 Python 环境中安装：
+
+```text
+python -m pip install -r requirements-analysis-render.txt
+python -m playwright install chromium
+```
+
+Linux 部署可使用 `python -m playwright install --with-deps chromium` 安装浏览器及系统依赖；
+以实际运行服务的账号安装和验证。当前 Windows 已验证，Linux 仍需部署环境验证。
+在 `analysis-config.local.json` 中配置：
+
+```json
+"rendering": {
+  "mode": "local",
+  "widths": [420, 900],
+  "webUiUrl": "http://localhost:5173"
+}
+```
+
+`webUiUrl` 改为部署的 Web UI 源地址。无头检查使用隔离上下文、`sandbox="allow-scripts"`
+和冻结的内联资源，阻断网络请求。同一内容摘要复用宽窄两档测量，页面改变后重新检查；
+脚本错误仍阻断发布。未安装依赖或检查失败明确保留未检查状态，不伪造通过结果。
+需要独立渲染服务时使用 `mode="external"`，地址和凭据继续从 `ANALYSIS_RENDER_URL`、
+`ANALYSIS_RENDER_TOKEN` 读取；`widths` 优先于 `ANALYSIS_RENDER_WIDTHS`。
+
+性能信息分为取数、构建、渲染和最终审查；`REPLY_END.metadata.analysisPerformance` 汇总工具
+次数、错误、复用和耗时。同一用户轮内只复用同连接、同参数、成功完成的预算只读执行；
+部分结果、失败结果、后台续取、新用户问题及明确后续核验均继续执行来源协议。
+
+可选真实浏览器回归：设置 `RUN_ANALYSIS_BROWSER_TESTS=1` 后运行 `analysis_local_render_test`。
+默认测试环境未安装浏览器时跳过这两项，不能将跳过记为视觉验收。
 
 ## What Next
 

@@ -36,7 +36,7 @@ class PresentationRevisionTests(PresentationCase):
     plan = helpers.ModelPresentationTests.plan
 
     async def publish_plan(self, plans, presentation=None):
-        result=await self.service.publish(self.ref,[],plans,'publish-revision',0,presentation=presentation)
+        result=await self.service.publish(self.ref,[],plans,'publish-revision',presentation=presentation)
         self.assertTrue(result['delivery']['registered'])
         document=self.delivery.view(result['delivery']['path'])
         return document,render(document),result

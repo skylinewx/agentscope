@@ -52,7 +52,7 @@ class ReviewFixTests(PresentationCase):
                   'valueRefs': [f['factId'] for f in artifact['facts']]},
                  {'viewId': 'rank-chart', 'scopeId': built['scope']['scopeId'], 'type': 'BAR_RANK', 'valueRefs': ['derived_rank']},
                  {'viewId': 'sum-metric', 'scopeId': built['scope']['scopeId'], 'type': 'METRIC', 'valueRefs': ['derived_sum']}]
-        await self.service.publish(built['analysisRef'], [], views, 'rule-publish', 0)
+        await self.service.publish(built['analysisRef'], [], views, 'rule-publish')
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
         full = project(artifact, registry)
         filtered = project(artifact, registry, {'topN': 2})
@@ -167,7 +167,7 @@ class ReviewFixTests(PresentationCase):
         self.assertEqual(built['scope']['coverage'], 'UNKNOWN')  # One source cannot prove both populations.
         views = [{'viewId': 'details', 'scopeId': built['scope']['scopeId'], 'type': 'TABLE',
                   'valueRefs': [f['factId'] for f in artifact['facts']]}]
-        await self.service.publish(built['analysisRef'], [], views, 'publish', 0)
+        await self.service.publish(built['analysisRef'], [], views, 'publish')
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
         document = project(artifact, self.rules)
         self.assertEqual(document['objectCount'], 2)

@@ -1,5 +1,6 @@
 """Source-qualified analysis members; original source IDs remain unchanged."""
 from copy import deepcopy
+import re
 
 from .models import AnalysisError, digest
 from .sources import combined_context
@@ -9,20 +10,25 @@ def member_ref(namespace, object_id):
     return 'member_' + digest([namespace, object_id])[:24]
 
 
-def catalog(registry, capture, dimension=None):
+def catalog(registry, capture, dimension=None, *, grid_selection=None):
     adapter = registry.for_capture(capture)
     dimension = dimension or adapter.options.get('memberDimension', 'recordId')
     namespace = adapter.member_namespace(capture, dimension)
-    result = adapter.catalog(capture)
+    result = (adapter.catalog(capture, grid_selection=grid_selection)
+              if adapter.adapter_id == 'budget-v2' else adapter.catalog(capture))
     for fact in result:
         dimensions = {**fact.get('effectiveDimensions', {}), **fact.get('dimensions', {})}
         raw = fact.get('objectId', dimensions.get(dimension))
-        if namespace is not None and isinstance(raw, str) and raw:
+        typed_group = (fact.get('batchId') and dimension in fact.get('propertyDimensions', [])
+                       and (raw is None or type(raw) is bool))
+        if namespace is not None and (isinstance(raw, str) and raw or typed_group):
             fact.update(sourceObjectId=raw, memberRef=member_ref(namespace, raw))
     return result
 
 
 def adapt(registry, captures, selections, scope, max_facts):
+    from .batch_scope import resolve_members
+    scope = resolve_members(registry, captures, selections, scope, max_facts)
     dimension = scope.get('memberDimension', 'recordId')
     groups, namespaces, candidates = {}, {}, {}
     for ref, capture in captures.items():
@@ -35,7 +41,11 @@ def adapt(registry, captures, selections, scope, max_facts):
         key = digest([adapter.snapshot(), namespace])
         groups.setdefault(key, {'adapter': adapter, 'namespace': ns, 'captures': {}})['captures'][ref] = capture
         rows = catalog(registry, capture, dimension)
-        ids = {f['sourceObjectId'] for f in rows if f.get('sourceObjectId')}
+        if adapter.adapter_id == 'budget-v2' and capture.get('gridFiles'):
+            for selection in selections:
+                if selection.get('captureRef') == ref and selection.get('cellKeys'):
+                    rows.extend(catalog(registry, capture, dimension, grid_selection=selection))
+        ids = {f['sourceObjectId'] for f in rows if f.get('memberRef')}
         ids.update(row['key'] for row in adapter.entities(capture) if isinstance(row.get('key'), str) and row['key'])
         for raw in ids:
             mid = member_ref(namespace, raw)
@@ -45,9 +55,21 @@ def adapt(registry, captures, selections, scope, max_facts):
             or any(not isinstance(v, str) or not v for v in members + references)
             or len(set(members + references)) != len(members + references)):
         raise AnalysisError('INVALID_SCOPE', '主体与比较对象须为互不重叠、无重复的成员标识。')
-    qualified = len(namespaces) > 1 or any(value in candidates for value in members + references)
+    excluded_values = [item.get('objectId') for item in scope.get('excludedMembers', [])]
+    qualified = len(namespaces) > 1 or any(isinstance(value, str) and value in candidates
+                                         for value in members + references + excluded_values)
     if not namespaces:
         raise AnalysisError('EMPTY_SELECTION', '需要选择实际捕获的成员数据，核验回执不提供成员。')
+    # 已签发引用是宿主身份，拼写错误不能退化成一个新的业务 key。
+    for field, values in (('members', members), ('referenceMembers', references)):
+        for index, value in enumerate(values):
+            if (re.fullmatch(r'member_[0-9a-f]{24}', value) and value not in candidates
+                    and not any(candidate['sourceObjectId'] == value for candidate in candidates.values())):
+                raise AnalysisError('UNKNOWN_MEMBER_REFERENCE', '成员引用未在本次来源中找到；使用实际引用或省略批量 members 自动生成。',
+                                    {'path': f'/scope/{field}/{index}', 'memberRef': value,
+                                     'availableMembers': list(candidates.values())[:10],
+                                     'candidateCount': len(candidates),
+                                     'nextInspect': {'section': 'inventory', 'memberDimension': dimension}})
     if not qualified:
         member_captures = {ref: capture for group in groups.values() for ref, capture in group['captures'].items()}
         result = registry._adapt_unscoped(member_captures, selections, scope, max_facts)
@@ -124,7 +146,8 @@ def adapt(registry, captures, selections, scope, max_facts):
                 missing.update(objectId=member_ref(namespaces[ns], raw), sourceObjectId=raw)
             period_coverage.append(item)
         results.append(result)
-        if primary_namespaces == {ns} and local.get('population'):
+        if primary_namespaces == {ns} and (local.get('population')
+                or result['scope'].get('populationBasis') == 'BUDGET_QUERY_RESULT'):
             population_complete = result['scope'].get('populationComplete', False)
         for fact in result['facts']:
             if not fact.get('captureRefs'):
@@ -146,12 +169,14 @@ def adapt(registry, captures, selections, scope, max_facts):
     if len(facts) > max_facts:
         raise AnalysisError('FACT_LIMIT', '汇编事实超过上限。')
     pages_complete = bool(results) and all(r['scope'].get('sourcePagesComplete', False) for r in results)
-    selected_complete = pages_complete and observed == primary | reference
+    selected_complete = (observed == primary | reference
+                         and all(result['scope'].get('selectedDataComplete', False) for result in results))
     contexts = {c['sourceContextId']: c for r in results for c in r['sourceContexts']}
     coverage = 'COMPLETE' if population_complete and selected_complete else 'UNKNOWN' if selected_complete else 'PARTIAL'
     return {'facts': facts, 'sourceContexts': list(contexts.values()), 'context': combined_context(list(contexts.values())),
             'scope': {**normalized, 'scopeId': 'scope_' + digest(scope)[:24], 'coverage': coverage,
                       'populationComplete': population_complete,
+                      'sourceScopes': [item for result in results for item in result['scope'].get('sourceScopes', [])],
                       'selectedDataComplete': selected_complete, 'sourcePagesComplete': pages_complete,
                       'periodCoverage': period_coverage,
                       'observedMembers': sorted(observed & primary), 'pendingMembers': sorted(primary - observed),

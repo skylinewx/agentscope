@@ -273,9 +273,11 @@ export function ChatViewport({
 		msgs,
 		loading: messagesLoading,
 		historyError,
+		connectionNotice,
 		reloadHistory,
 		phase,
 		send,
+		messageQueue,
 		onUserConfirm,
 		onSubagentConfirm,
 		subagentHitl,
@@ -929,6 +931,7 @@ export function ChatViewport({
 									msgs={msgs}
 									loading={messagesLoading}
 									historyError={historyError}
+									connectionNotice={connectionNotice}
 									onReloadHistory={reloadHistory}
 									agentId={agentId}
 									sessionId={sessionId}
@@ -944,6 +947,7 @@ export function ChatViewport({
 										historyError !== null
 									}
 									onSend={send}
+									messageQueue={messageQueue}
 									onUserConfirm={onUserConfirm}
 									onInterrupt={interrupt}
 									voiceState={realtimeVoice.state}

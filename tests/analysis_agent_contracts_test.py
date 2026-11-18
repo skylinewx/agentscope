@@ -123,7 +123,7 @@ class InspectionRecoveryTests(PresentationCase):
         reason = '一个对象的下级数值未取得，汇总核对尚未完成。'
         doc = {'title': '已取得的结果', 'html': '<html><head></head><body><p>{{v}}</p><p>{{analysisPartialReason}}</p></body></html>',
                'bindings': [{'key': 'v', 'valueRef': self.fact}]}
-        preview = await self.service.publish(self.ref, requestKey='preview', expectedBaseRevision=0,
+        preview = await self.service.publish(self.ref, requestKey='preview',
             document=doc, partialReason=reason, previewOnly=True, renderCheckUnavailableReason='本单元测试不调用浏览器')
         complete = preview['summary']['completion']
         self.assertEqual(complete['state'], 'INCOMPLETE')

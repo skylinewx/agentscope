@@ -162,6 +162,29 @@ class DeepSeekChatModel(ChatModelBase):
 
         return (openai.BadRequestError,)
 
+    def _get_thinking_config(self, extra_body: dict) -> dict:
+        """合并模型配置和单次请求覆盖，统一判断实际的思考模式。"""
+        return {
+            "type": (
+                "enabled" if self.parameters.thinking_enable else "disabled"
+            ),
+            **extra_body.get("thinking", {}),
+        }
+
+    def _get_structured_output_strategies(
+        self,
+        **kwargs: Any,
+    ) -> tuple[tuple[str, dict, ToolChoice | None], ...]:
+        """思考模式直接使用 auto，返回结果仍由基类按原 Schema 校验。"""
+        strategies = super()._get_structured_output_strategies(**kwargs)
+        thinking = self._get_thinking_config(kwargs.get("extra_body") or {})
+        if thinking["type"] == "enabled":
+            # DeepSeek 思考模式不支持强制指定工具，跳过必然返回 400 的请求。
+            return tuple(
+                strategy for strategy in strategies if strategy[0] != "forced"
+            )
+        return strategies
+
     async def _call_api(
         self,
         model_name: str,
@@ -212,17 +235,11 @@ class DeepSeekChatModel(ChatModelBase):
 
         kwargs.update(generate_kwargs)
 
-        thinking_type = (
-            "enabled" if self.parameters.thinking_enable else "disabled"
-        )
         # Build a new dict so the caller's extra_body is never mutated
         extra_body = kwargs.get("extra_body") or {}
         kwargs["extra_body"] = {
             **extra_body,
-            "thinking": {
-                "type": thinking_type,
-                **extra_body.get("thinking", {}),
-            },
+            "thinking": self._get_thinking_config(extra_body),
         }
 
         fmt_tools, fmt_tool_choice = self._format_tools(tools, tool_choice)

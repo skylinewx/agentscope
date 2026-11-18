@@ -51,6 +51,48 @@ def budget_source_context(capture, receipt):
 FAILED = {"FAILED", "ERROR", "DENIED", "INTERRUPTED", "IN_PROGRESS", "CANCELLED"}
 
 
+def batch_query_context(capture, receipt):
+    """保留请求范围及预算实际执行范围，不能把元数据枚举当成预算授权范围。"""
+    # 失败回执可能只有部分字段；诊断整理不能掩盖原始来源异常。
+    def mapping(value):
+        return value if isinstance(value, dict) else {}
+
+    def objects(value):
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+    data = mapping(receipt.get('data'))
+    results = {step.get('stepId'): step for step in objects(data.get('stepResults')) if isinstance(step.get('stepId'), str)}
+    queries = []
+    for step in objects(mapping(mapping(capture.get('request')).get('plan')).get('steps')):
+        if step.get('operation') != 'BATCH_DATA_QUERY':
+            continue
+        query = {key: value for key, value in mapping(step.get('batchQuery')).items()
+                 if key in ('metrics', 'batchDimensions', 'periodRequest', 'resultWhere', 'aggregation', 'having', 'orderBy')}
+        tables = []
+        step_id = step.get('id')
+        result = results.get(step_id, {}) if isinstance(step_id, str) else {}
+        for table in objects(result.get('batchResults')):
+            data = mapping(table.get('data'))
+            metric_contexts = []
+            for index, metric in enumerate(objects(table.get('metrics'))):
+                context = {key: metric[key] for key in ('name', 'measureCode', 'selectedDimensions', 'context', 'dimensionModels',
+                           'taskName', 'formName', 'selectionObservationId', 'selectionCellKey') if key in metric}
+                if metric.get('selectionObservationId') and metric.get('selectionCellKey'):
+                    # 已定位观察保存了原表外条件；不能再混入与 observationId 互斥的 periodRequest/refresh。
+                    context['reuseSelection'] = {'observationId': metric['selectionObservationId'],
+                                                 'cellKey': metric['selectionCellKey']}
+                    period = mapping(metric.get('context')).get('period')
+                    if period:
+                        context['reuseSelection']['periodCode'] = period
+                metric_contexts.append(context)
+            tables.append({**{key: table[key] for key in ('batchId', 'disposition', 'message', 'resolvedScope') if key in table},
+                           'budTaskId': mapping(table.get('request')).get('budTaskId'),
+                           'metricContexts': metric_contexts,
+                           **{key: data[key] for key in ('resolvedPeriods', 'rangeSummary', 'aggregationSummary', 'rowCount') if key in data}})
+        queries.append({'stepId': step.get('id'), 'requestedScope': query, 'results': tables})
+    return queries
+
+
 def _incomplete_details(capture: dict, receipt: dict | None = None) -> dict:
     if receipt is None:
         try:
@@ -66,7 +108,8 @@ def _incomplete_details(capture: dict, receipt: dict | None = None) -> dict:
     source_error = receipt.get("error")
     if isinstance(source_error, dict):
         details["sourceError"] = {key: source_error[key] for key in
-                                  ("code", "category", "retryable", "recoveryAction") if key in source_error}
+                                  ("code", "category", "message", "details", "retryable", "recoveryAction") if key in source_error}
+    details['batchQueries'] = batch_query_context(capture, receipt)
     failures = []
     data = receipt.get("data")
     data = data if isinstance(data, dict) else {}
@@ -170,11 +213,18 @@ def validate_form_request(capture, receipt, step_id, form):
     if not binding or binding not in bindings:
         raise AnalysisError("BINDING_UNPROVEN", "表结果绑定未由原请求或已返回的上游步骤证明。")
     observation = runtime.get("observation") or {}
-    if query.get("observationId") and query["observationId"] != observation.get("observationId"):
+    upgraded = (step.get('operation') == 'FORM_VIEW_QUERY'
+                and observation.get('entryType') == 'INPUT_VO'
+                and query.get('observationId') in form.get('visitedObservationIds', [])
+                and observation.get('observationId') in form.get('visitedObservationIds', []))
+    if query.get("observationId") and query["observationId"] != observation.get("observationId") and not upgraded:
         raise AnalysisError("OBSERVATION_CONFLICT", "返回的观察与原请求不一致。")
     page = form.get("page")
     if page and (page.get("observationId") != observation.get("observationId") or page.get("contentDigest") != observation.get("contentDigest")):
         raise AnalysisError("OBSERVATION_CONFLICT", "数据页与已声明观察不一致。")
+    from ..grid_selection import resolved_form_query, validate_selection
+    query = resolved_form_query(query, receipt, step_id)
+    validate_selection(form, query, upgraded=upgraded)
     return context, observation
 
 
@@ -201,13 +251,27 @@ def cell_value(cell, number_format=None):
         return None, "FAILED" if exc.code != "NOT_NUMERIC" else "NOT_APPLICABLE", exc.code
 
 
-def catalog(capture):
+def catalog(capture, *, grid_selection=None):
     receipt = receipt_from_capture(capture)
     from ..identity import dimension_models
     items = []
     for step_id, form in form_rows(receipt):
+        # 文件有独立读取入口。目录和最终核对不展开全部文件内容。
+        if form.get('file') and grid_selection is None:
+            continue
         context = (form.get("runtime") or {}).get("context") or {}
         cells = (form.get("page") or {}).get("cells", form.get("cells", []))
+        if form.get('file'):
+            observation = (form.get('runtime') or {}).get('observation', {})
+            if step_id != grid_selection['stepId'] or (grid_selection.get('observationId')
+                    and observation.get('observationId') != grid_selection['observationId']):
+                continue
+            from ..grid_files import captured_cells
+            wanted = set(grid_selection.get('cellKeys', []))
+            # 表内依赖已由本体提取；仅构建时读本题所选文件，不把文件塞回模型目录。
+            if grid_selection.get('includeFormulaDependencies'):
+                wanted.update((form.get('formulaGraph') or {}).get('cellKeys', []))
+            cells = [cell for cell in captured_cells(capture, form) if cell.get('key') in wanted]
         for cell in cells:
             value, state, precision = cell_value(cell, capture.get("numberFormat"))
             oid = (form.get("runtime") or {}).get("observation", {}).get("observationId")
@@ -226,14 +290,21 @@ def catalog(capture):
                           "period": cell.get('dimensions', {}).get('DATATIME', context.get('period')),
                           "executionPeriod": context.get('period'), "periodResolution": context.get('periodResolution'),
                           "cellKey": cell.get("key"), "row": cell.get("row"), "column": cell.get("column"),
-                          "headers": cell.get("headers", []), "measureCode": cell.get("measureCode"),
+                          "headers": cell.get("headers", []), "modelCode": cell.get("modelCode"), "measureCode": cell.get("measureCode"),
                           "dimensions": cell.get("dimensions", {}), "displayValue": cell.get("displayValue"),
                           "unit": cell.get("unit"), "value": value, "valueState": state, "precision": precision,
-                          "formula": cell.get("formula"), "cellAddress": source_address(cell, cells)})
+                          "formula": cell.get("formula"), "cellAddress": source_address(cell, cells),
+                          "formulaStructure": cell.get("formulaStructure"),
+                          "formulaTarget": cell.get('key') in (form.get('formulaGraph') or {}).get('targetKeys', [])})
+    from .budget_batch import catalog as batch_catalog
+    items.extend(batch_catalog(capture))
     return items
 
 
 def source_address(cell, cells):
+    if isinstance(cell.get('formulaStructure'), dict):
+        # 新协议已在本体侧确认地址；显式未解析时不能再次猜测坐标。
+        return cell['formulaStructure'].get('address')
     # Budget Grid2 reserves row/column zero for indexes. Its formula service
     # converts grid (r,c) to POI CellAddress(r-1,c-1); positive (1,1) is A1.
     # Explicit source index labels take precedence for expanded grids.
@@ -258,12 +329,10 @@ def source_address(cell, cells):
     return None
 
 
-def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict, max_facts: int) -> dict:
-    if not selections:
-        raise AnalysisError("EMPTY_SELECTION", "需要选择实际捕获的对象和单元格。")
-    receipts = {ref: receipt_from_capture(value) for ref, value in captures.items()}
-    # Resume requests intentionally contain no plan. Recover only through the
-    # server's exact continuationOf/resumeRef link and a captured original request.
+def resolve_form_requests(captures, receipts=None):
+    """沿服务端续查链恢复查询计划，供数值、结构及文件入口共用；不改写原始回执。"""
+    receipts = receipts if receipts is not None else {ref: receipt_from_capture(value) for ref, value in captures.items()}
+    # 只认可真实上游执行和同一来源/上下文；不能按相似步骤、机构或表样猜计划。
     effective = {}
     def linked(ref):
         path, visiting = [], set()
@@ -288,9 +357,69 @@ def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict
             current = parents[0]
         for child, parent in reversed(path):
             capture = captures[child]
+            if 'plan' in capture['request'] and capture['request']['plan'] != effective[parent]['request'].get('plan'):
+                raise AnalysisError("RESUME_UNPROVEN", "续查不能替换已捕获原请求的查询计划。")
             effective[child] = {**capture, 'request': {**effective[parent]['request'], **capture['request']}}
         return effective[ref]
-    captures = {ref: linked(ref) for ref in captures}
+    return {ref: linked(ref) for ref in captures}
+
+
+def stored_form_chain(store, owner, capture):
+    """只加载当前会话内服务端指向的续查上游，普通输入无须搜索。"""
+    if not capture['request'].get('resumeRef'):
+        return {capture['captureRef']: capture}
+    candidates = {capture['captureRef']: capture}
+    summaries, offset = {}, 0
+    while offset is not None:
+        page = store.list_captures(owner, offset=offset, limit=store.limits.page_size)
+        for item in page['items']:
+            execution = (item.get('receiptSummary') or {}).get('executionId')
+            if execution:
+                summaries.setdefault(execution, []).append(item['captureRef'])
+        offset = page['nextOffset']
+    pending = [capture]
+    while pending:
+        child = pending.pop()
+        for reference in summaries.get(child['request'].get('resumeRef'), []):
+            if reference not in candidates:
+                parent = store.get_capture(owner, reference)
+                # 后续共享校验还会验证 querySession、上下文及 continuationOf。
+                if all(child.get(key) == parent.get(key) for key in
+                       ('resourceId', 'originalToolName', 'serverName', 'connectionFingerprint')):
+                    candidates[reference] = parent
+                    pending.append(parent)
+    return candidates
+
+
+def stored_form_request(store, owner, capture):
+    if not capture['request'].get('resumeRef'):
+        return capture
+    return resolve_form_requests(stored_form_chain(store, owner, capture))[capture['captureRef']]
+
+
+def selected_form(capture, receipt, selection):
+    """按步骤、表样、时期和观察定位显式单元格选择器，要求恰好命中一次。"""
+    forms = []
+    for step_id, form in form_rows(receipt):
+        runtime = form.get('runtime') or {}
+        context = runtime.get('context') or {}
+        identifiers = {'observationId': (runtime.get('observation') or {}).get('observationId'),
+                       'bindingRef': (context.get('target') or {}).get('formBindingKey'), 'executionPeriod': context.get('period')}
+        if step_id == selection.get('stepId') and all(not selection.get(key) or selection[key] == value
+                                                      for key, value in identifiers.items()):
+            forms.append((step_id, form))
+    if len(forms) != 1:
+        raise AnalysisError("AMBIGUOUS_FORM", "表结果无法唯一定位，请指定实际步骤、绑定、执行时期或观察标识。")
+    step_id, form = forms[0]
+    context, observation = validate_form_request(capture, receipt, step_id, form)
+    return step_id, form, context, observation
+
+
+def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request: dict, max_facts: int) -> dict:
+    if not selections:
+        raise AnalysisError("EMPTY_SELECTION", "需要选择实际捕获的对象和单元格。")
+    receipts = {ref: receipt_from_capture(value) for ref, value in captures.items()}
+    captures = resolve_form_requests(captures, receipts)
     from ..identity import dimension_models, names_for
     from ..actions import source_identity
     labels = {}
@@ -344,40 +473,52 @@ def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict
         if ref not in captures:
             raise AnalysisError("UNKNOWN_CAPTURE", "选择器引用了未纳入本次分析的输入。")
         capture, receipt = captures[ref], receipts[ref]
-        forms = [(sid, form) for sid, form in form_rows(receipt) if sid == selection.get("stepId")]
-        if selection.get("bindingRef"):
-            forms = [(sid, form) for sid, form in forms if (form.get("runtime") or {}).get("context", {}).get("target", {}).get("formBindingKey") == selection["bindingRef"]]
-        if selection.get('executionPeriod'):
-            forms = [(sid, form) for sid, form in forms if (form.get('runtime') or {}).get('context', {}).get('period') == selection['executionPeriod']]
-        if selection.get('observationId'):
-            forms = [(sid, form) for sid, form in forms if (form.get('runtime') or {}).get('observation', {}).get('observationId') == selection['observationId']]
-        if len(forms) != 1:
-            raise AnalysisError("AMBIGUOUS_FORM", "表结果无法唯一定位，请指定实际步骤、绑定、执行时期或观察标识。")
-        sid, form = forms[0]
-        context, observation = validate_form_request(capture, receipt, sid, form)
+        sid, form, context, observation = selected_form(capture, receipt, selection)
         progress = period_execution(capture, receipt, sid, context)
         if not observation.get("observationId"):
             raise AnalysisError("MISSING_OBSERVATION", "该结果没有可用的运行观察。")
         oid = observation["observationId"]
-        observation_key = (source_contexts[ref]['sourceContextId'], oid)
+        observation_key = (source_contexts[ref]['sourceContextId'], oid, (form.get('selection') or {}).get('contentDigest'))
         selected_observations.add(observation_key)
         page = form.get("page")
         if page:
             pages[observation_key].append({**page, "receiptComplete": receipt.get("completeness", {}).get("enumerationExhausted") is True})
         else:
             pages[observation_key].append({"targeted": True, "receiptComplete": receipt.get("completeness", {}).get("enumerationExhausted") is True})
-        cells = page.get("cells", []) if page else form.get("cells", [])
+        from ..grid_files import captured_cells
+        cells = captured_cells(capture, form)
         keys = selection.get("cellKeys", [])
         if not keys or len(keys) != len(set(keys)):
             raise AnalysisError("INVALID_SELECTOR", "选择器需要无重复的实际 cellKeys。")
-        matched = {c["key"]: c for c in cells if c.get("key") in keys}
+        if form.get('file'):
+            requested_rows = {key.split(':')[0] for key in keys}
+            requested_columns = {key.split(':')[-1] for key in keys}
+            chosen = set(keys)
+            index_cells, matched = [], {}
+            for cell in cells:
+                if cell.get('key') in chosen:
+                    matched[cell['key']] = cell
+                if (cell.get('mapType') == 'ROW_INDEX' and str(cell.get('row')) in requested_rows
+                        or cell.get('mapType') == 'COL_INDEX' and str(cell.get('column')) in requested_columns):
+                    index_cells.append(cell)
+            cells = [*matched.values(), *index_cells]
+        else:
+            matched = {c["key"]: c for c in cells if c.get("key") in keys}
         if set(keys) != set(matched):
-            raise AnalysisError("CELL_NOT_CAPTURED", "尚未完整捕获所选单元格，请补页或检查定位。")
+            raise AnalysisError("CELL_NOT_CAPTURED", "尚未完整捕获所选单元格，请补页或检查定位；不要按连续行号补造 cellKeys 或因此删除本题主体。",
+                                {'captureRef': ref, 'stepId': sid, 'observationId': oid,
+                                 'missingCellKeys': sorted(set(keys) - set(matched)),
+                                 'capturedSelectionKeys': sorted(matched),
+                                 'selectionRead': {'section': 'selectors', 'captureRef': ref}})
         for key in keys:
             cell = matched[key]
             effective = {**context.get("effectiveDimensions", {}), **cell.get("dimensions", {})}
-            query = _step_request(capture, sid)[0].get("formQuery", {})
-            for request_field, cell_field in (("cellKey", "key"), ("measureCode", "measureCode")):
+            # 完整表页包含目标以外的公式依赖。运行条件已由 validate_form_request 校验；
+            # 目标约束只约束定位结果，不能错误地把每个同表依赖都限定成目标科目。
+            graph = form.get('formulaGraph') or {}
+            dependency = key in graph.get('cellKeys', []) and key not in graph.get('targetKeys', [])
+            query = {} if page or form.get('file') or dependency else _step_request(capture, sid)[0].get("formQuery", {})
+            for request_field, cell_field in (("cellKey", "key"), ("measureCode", "measureCode"), ("modelCode", "modelCode")):
                 if query.get(request_field) is not None and cell.get(cell_field) != query[request_field]:
                     raise AnalysisError("REQUEST_TARGET_MISMATCH", "定位单元格与原请求的指标或坐标不一致。")
             if query.get('expression') is not None and cell.get('expression') != query['expression']:
@@ -423,7 +564,9 @@ def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict
                     "cellKey": key, "row": cell.get("row"), "column": cell.get("column"),
                     "cellAddress": source_address(cell, cells),
                     "measureCode": cell.get("measureCode"), "headers": cell.get("headers") or [c["displayValue"] for c in cells if c.get("row") == cell.get("row") and c.get("displayValue") and cell_value(c, capture.get("numberFormat"))[1] == "NOT_APPLICABLE"],
-                    "dimensions": effective, "period": effective.get("DATATIME", context.get("period")),
+                    "dimensions": effective, "dimensionModels": dimension_models(form),
+                    "formContext": json_values(context),
+                    "period": effective.get("DATATIME", context.get("period")),
                     "executionPeriod": context.get('period'), "periodResolution": context.get('periodResolution'),
                     "periodPlanId": progress['planId'] if progress else None,
                     "periodWorkIndex": progress['workIndex'] if progress else None,
@@ -432,7 +575,12 @@ def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict
                     "value": value, "valueState": state, "precision": precision,
                     "unit": cell.get("unit"), "scale": "1" if cell.get("unit") else None,
                     "scaleBasis": "source_unit_label" if cell.get("unit") else None,
-                    "formula": cell.get("formula"), "readAt": form.get("readAt"),
+                    "formula": cell.get("formula"), "formulaStructure": cell.get("formulaStructure"),
+                    "formulaTarget": key in graph.get('targetKeys', []), "readAt": form.get("readAt"),
+                    "entryType": observation.get("entryType"),
+                    "expression": cell.get("expression"),
+                    "formulaStatus": ('CAPTURED' if cell.get('formula') else 'NOT_CONFIGURED'
+                                      if observation.get('entryType') == 'INPUT_VO' else 'NOT_CAPTURED'),
                     "evidenceIds": [e["evidenceId"] for e in receipt.get("evidence", []) if e.get("kind") == "FORM_RUNTIME" and e.get("fact", {}).get("observation", {}).get("observationId") == oid]}
             if fid in facts_by_observation:
                 previous = facts_by_observation[fid]
@@ -465,15 +613,18 @@ def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict
     for ref, receipt in receipts.items():
         for sid, form in form_rows(receipt):
             oid = (form.get("runtime") or {}).get("observation", {}).get("observationId")
-            observation_key = (source_contexts[ref]['sourceContextId'], oid)
+            observation_key = (source_contexts[ref]['sourceContextId'], oid, (form.get('selection') or {}).get('contentDigest'))
             if observation_key not in selected_observations:
                 continue
             validate_form_request(captures[ref], receipt, sid, form)
             progress = period_execution(captures[ref], receipt, sid, (form.get('runtime') or {}).get('context'))
             page = form.get("page")
-            pages[observation_key].append({**(page or {"targeted": True}),
+            selected_scope = form.get('selection')
+            pages[observation_key].append({**({"targeted": True} if selected_scope else page or {"targeted": True}),
                                "periodPlan": progress is not None,
-                               "receiptComplete": progress['periodFinished'] if progress else receipt.get("completeness", {}).get("enumerationExhausted") is True})
+                               "receiptComplete": (progress['periodFinished'] if progress else receipt.get("completeness", {}).get("enumerationExhausted") is True)
+                                    and (not form.get('file') or form.get('coverage') == 'COMPLETE')
+                                    and (not selected_scope or selected_scope.get('complete') is True)})
     pages_complete = True
     if len(facts) > max_facts:
         raise AnalysisError("FACT_LIMIT", "包含未查询对象后的事实数量超过本次上限。")
@@ -535,9 +686,13 @@ def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict
                                  'extraMembers': sorted(set(scope_members) - set(members))})
         population_complete = rows_complete(source, population.get('stepId'), step)
     observed_primary = observed_members & set(scope_members)
-    coverage = "COMPLETE" if population_complete and pages_complete and observed_primary == set(scope_members) else "PARTIAL" if observed_primary != set(scope_members) or not pages_complete else "UNKNOWN"
+    # 表页接收进度与本次选中的事实范围分别记录。未选中的表尾不影响已捕获单元格；
+    # 多期查询仍须完成所请求的时期，全集枚举仍由 population 单独证明。
+    selected_complete = all(item['selectedDataComplete'] for item in periods) and observed_members == selected_members
+    primary_complete = observed_primary == set(scope_members) and all(item['selectedDataComplete'] for item in periods)
+    coverage = "COMPLETE" if population_complete and primary_complete else "PARTIAL" if not primary_complete else "UNKNOWN"
     return {"facts": facts, "scope": {**scope_request, "scopeId": "scope_" + digest(scope_request)[:24],
-            "coverage": coverage, "populationComplete": population_complete, "selectedDataComplete": pages_complete and observed_members == selected_members,
+            "coverage": coverage, "populationComplete": population_complete, "selectedDataComplete": selected_complete,
             "sourcePagesComplete": pages_complete,
             "periodCoverage": periods,
             "observedMembers": sorted(observed_primary), "pendingMembers": sorted(set(scope_members) - observed_members),
@@ -550,6 +705,40 @@ def adapt(captures: dict[str, dict], selections: list[dict], scope_request: dict
 
 def fact_id(context_id, observation_id, cell_key):
     return 'fact_' + digest({'sourceContextId': context_id, 'observation': observation_id, 'cell': cell_key})[:24]
+
+
+def adapt(captures, selections, scope_request, max_facts):
+    """按真实来源形状分派；表格结果与网格事实可共同参与同一分析。"""
+    from .budget_batch import adapt as adapt_batch
+    table_selections = [selection for selection in selections if 'batchId' in selection]
+    form_selections = [selection for selection in selections if 'batchId' not in selection]
+    if not table_selections:
+        return adapt_forms(captures, selections, scope_request, max_facts)
+    if not form_selections:
+        return adapt_batch(captures, selections, scope_request, max_facts)
+    results = [adapt_forms(captures, form_selections, scope_request, max_facts),
+               adapt_batch(captures, table_selections, scope_request, max_facts)]
+    facts = [fact for result in results for fact in result['facts'] if fact.get('captureRefs')]
+    members, references = set(scope_request['members']), set(scope_request.get('referenceMembers', []))
+    observed = {fact['objectId'] for fact in facts}
+    for member in sorted((members | references) - observed):
+        facts.append({'factId': 'missing_' + digest(member)[:24], 'objectId': member,
+                      'value': None, 'valueState': 'NOT_QUERIED', 'captureRefs': [], 'unit': None, 'scale': None})
+    if len(facts) > max_facts:
+        raise AnalysisError('FACT_LIMIT', '汇编后的事实数量超过上限。')
+    contexts = {context['sourceContextId']: context for result in results for context in result['sourceContexts']}
+    complete = all(result['scope']['sourcePagesComplete'] for result in results)
+    population = any(result['scope']['populationComplete'] for result in results)
+    selected_complete = all(result['scope']['selectedDataComplete'] for result in results) and observed == members | references
+    return {'facts': facts, 'sourceContexts': list(contexts.values()), 'context': combined_context(list(contexts.values())),
+            'scope': {**scope_request, 'scopeId': 'scope_' + digest(scope_request)[:24],
+                      'coverage': 'COMPLETE' if population and selected_complete else 'PARTIAL' if not selected_complete else 'UNKNOWN',
+                      'populationComplete': population, 'selectedDataComplete': selected_complete,
+                      'sourcePagesComplete': complete, 'semanticCompleteness': 'UNVERIFIED',
+                      'observedMembers': sorted(members & observed), 'pendingMembers': sorted(members - observed),
+                      'observedReferenceMembers': sorted(references & observed), 'pendingReferenceMembers': sorted(references - observed),
+                      'periodCoverage': [item for result in results for item in result['scope'].get('periodCoverage', [])],
+                      'excludedMembers': scope_request.get('excludedMembers', [])}}
 
 
 class BudgetV2Adapter(SourceAdapter):
@@ -594,7 +783,8 @@ class BudgetV2Adapter(SourceAdapter):
 
     def selectors(self, capture):
         from .budget_discovery import selectors
-        return selectors(capture)
+        from .budget_batch import selectors as batch_selectors
+        return selectors(capture) + batch_selectors(capture)
 
     def rows(self, capture, step_id):
         from .budget_discovery import selected_rows
@@ -613,15 +803,25 @@ class BudgetV2Adapter(SourceAdapter):
         from .budget_relations import captured_relations
         return captured_relations(captures)
 
+    def relation_diagnostics(self, captures):
+        from .budget_relations import captured_relations
+        diagnostics = []
+        captured_relations(captures, diagnostics)
+        return diagnostics
+
     def verify(self, facts, captures, verifier_refs=None):
         from .budget_verification import verification
         return verification(facts, captures, verifier_refs)
 
     def receipt_info(self, capture):
         receipt = receipt_from_capture(capture)
+        from ..grid_files import file_summary
         return {'context': receipt.get('context'), 'querySessionId': receipt.get('querySessionId'),
+                'status': receipt.get('status'), 'error': receipt.get('error'),
                 'branches': receipt.get('branches', []), 'completeness': receipt.get('completeness'),
-                'evidenceIds': [e.get('evidenceId') for e in receipt.get('evidence', [])], 'resumeRef': receipt.get('resumeRef')}
+                'evidenceIds': [e.get('evidenceId') for e in receipt.get('evidence', [])], 'resumeRef': receipt.get('resumeRef'),
+                'batchQueries': batch_query_context(capture, receipt), 'gridFiles': file_summary(capture),
+                'gridFileErrors': capture.get('gridFileErrors', [])}
 
     def member_namespace(self, capture, dimension):
         if capture.get('originalToolName') == 'validate_evidence':

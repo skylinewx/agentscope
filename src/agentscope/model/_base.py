@@ -124,6 +124,28 @@ class ChatModelBase:
         """
         return {}
 
+    def _get_structured_output_strategies(
+        self,
+        **kwargs: Any,
+    ) -> tuple[tuple[str, dict, ToolChoice | None], ...]:
+        """Return call-local strategies, ordered by provider preference.
+
+        Providers can omit strategies incompatible with the effective request
+        configuration. Every strategy uses the same schema validation.
+        """
+        forced_choice = ToolChoice(mode="generate_structured_output")
+        disable_kwargs = self._get_disable_thinking_kwargs()
+        return (
+            ("forced", {}, forced_choice),
+            ("auto", {}, ToolChoice(mode="auto")),
+            *(
+                (("no_think", disable_kwargs, forced_choice),)
+                if disable_kwargs
+                else ()
+            ),
+            ("none", {}, None),
+        )
+
     @classmethod
     def _get_structured_output_fallback_exceptions(
         cls,
@@ -492,7 +514,8 @@ class ChatModelBase:
         ``_get_structured_output_fallback_exceptions()`` (e.g. a provider
         rejecting a forced ``tool_choice`` while thinking is enabled) moves
         on to the next strategy; any other error is raised immediately. The
-        strategies are immutable and local to each call:
+        strategies are immutable and local to each call. The default order
+        below can be narrowed by the provider for the effective request:
 
         - ``forced``: current config + forced ``tool_choice``
         - ``auto``: current config + ``auto`` ``tool_choice``
@@ -521,21 +544,7 @@ class ChatModelBase:
 
         user_tool_choice = kwargs.pop("tool_choice", None)
         if user_tool_choice is None:
-            forced_tc = ToolChoice(mode="generate_structured_output")
-            disable_kwargs = self._get_disable_thinking_kwargs()
-            # (name, extra `_call_api` kwargs, tool_choice), best first.
-            # The no-think strategy only applies when the provider can
-            # toggle it.
-            strategies = (
-                ("forced", {}, forced_tc),
-                ("auto", {}, ToolChoice(mode="auto")),
-                *(
-                    (("no_think", disable_kwargs, forced_tc),)
-                    if disable_kwargs
-                    else ()
-                ),
-                ("none", {}, None),
-            )
+            strategies = self._get_structured_output_strategies(**kwargs)
         else:
             strategies = (("explicit", {}, user_tool_choice),)
 
@@ -547,7 +556,9 @@ class ChatModelBase:
         )
         first_error: Exception | None = None
         last_error: Exception | None = None
-        for name, extra_kwargs, tool_choice in strategies:
+        for strategy_index, (name, extra_kwargs, tool_choice) in enumerate(
+            strategies
+        ):
             # Overlay disable-thinking kwargs; a nested `extra_body` is
             # merged rather than overwritten so caller keys survive.
             merged = {**kwargs, **extra_kwargs}
@@ -564,7 +575,7 @@ class ChatModelBase:
                         tool_choice=tool_choice,
                         **merged,
                     )
-                    if name not in ("forced", "explicit"):
+                    if strategy_index > 0:
                         logger.info(
                             "Structured output for %s: using fallback "
                             "strategy '%s'.",
@@ -626,7 +637,7 @@ class ChatModelBase:
         tool_choice: ToolChoice | None = None,
         **kwargs: Any,
     ) -> StructuredResponse:
-        """Run a single structured-output attempt via a forced tool call.
+        """Run a single structured-output attempt via a tool call.
 
         Constructs a ``generate_structured_output`` tool, asks the LLM to
         call it (via ``tool_choice``), and validates the returned

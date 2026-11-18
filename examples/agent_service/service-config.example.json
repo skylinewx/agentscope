@@ -9,6 +9,18 @@
     "admin_password": "CHANGE_ME",
     "session_ttl_seconds": 43200,
     "cookie_secure": false,
-    "allowed_origins": []
+    "allowed_origins": [
+      "http://10.2.9.103:9000",
+      "http://10.2.9.103:9080"
+    ],
+    "cookie_path": "/agentscope"
+  },
+  "nvwa": {
+    "base_url": "http://10.2.9.103:8080",
+    "auth_mode": "auto",
+    "user_info_path": "/nvwa/getLoginContext",
+    "validate_path": "/nvwa-certification/v1/ticket/resolve",
+    "timeout_seconds": 10
   }
 }
+

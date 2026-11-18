@@ -7,10 +7,11 @@ from starlette.types import ASGIApp, Scope, Receive, Send, Message
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 from starlette.requests import Request as StarletteRequest
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 
 from ._branding import BrandingSettings
 from ._service import public_user, AuthService
+from ..._logging import logger
 
 Username = Annotated[
     str, Field(min_length=1, max_length=64, pattern=r"^[\w.@-]+$")
@@ -75,6 +76,31 @@ def administrator(user: dict[str, Any] = Depends(current)) -> dict[str, Any]:
     return user
 
 
+def set_session_cookie(
+    response: Response, service: AuthService, token: str
+) -> None:
+    """Login and sliding renewal use the same cookie policy."""
+    response.set_cookie(
+        service.cookie_name,
+        token,
+        httponly=True,
+        secure=service.settings.cookie_secure,
+        samesite="lax",
+        path=service.settings.cookie_path or "/",
+        max_age=service.settings.session_ttl_seconds,
+    )
+
+
+def safe_next_path(next_path: str | None, default: str = "/chat") -> str:
+    """Allow only same-origin relative redirects."""
+    if not next_path:
+        return default
+    value = next_path.strip()
+    if not value.startswith("/") or value.startswith("//") or "://" in value:
+        return default
+    return value
+
+
 def auth_router(service: AuthService) -> APIRouter:
     router = APIRouter(tags=["authentication"])
 
@@ -100,16 +126,91 @@ def auth_router(service: AuthService) -> APIRouter:
             body.password.get_secret_value(),
             request.client.host if request.client else "unknown",
         )
-        response.set_cookie(
-            service.cookie_name,
-            token,
-            httponly=True,
-            secure=service.settings.cookie_secure,
-            samesite="lax",
-            path="/",
-            max_age=service.settings.session_ttl_seconds,
-        )
+        set_session_cookie(response, service, token)
         return {"user": public_user(user), "csrf_token": session["csrf_token"]}
+
+    @router.get("/sso/nvwa")
+    async def sso_nvwa(
+        request: Request,
+        ticket: str | None = Query(default=None),
+        nv_t: str | None = Query(default=None),
+        token: str | None = Query(default=None),
+        next: str | None = Query(default=None),  # noqa: A002
+    ) -> RedirectResponse:
+        if service.nvwa_settings is None:
+            raise HTTPException(503, "未配置女娲换票。")
+        # URL App：ticket=短期票；token/nv_t=会话令牌。身份只来自女娲验票。
+        session_token = None
+        for value in (token, nv_t):
+            if isinstance(value, str) and value.strip():
+                session_token = value.strip()
+                break
+        short_ticket = (
+            ticket.strip() if isinstance(ticket, str) and ticket.strip() else None
+        )
+        if not session_token and not short_ticket:
+            raise HTTPException(400, "缺少 ticket / token / nv_t。")
+        from ._nvwa_ticket import resolve_ticket
+
+        nvwa_user = None
+        resolve_error = None
+        if session_token:
+            try:
+                nvwa_user = await resolve_ticket(
+                    service.nvwa_settings,
+                    session_token,
+                    prefer="bearer",
+                )
+            except ValueError as exc:
+                resolve_error = str(exc)
+        if nvwa_user is None and short_ticket and short_ticket != session_token:
+            try:
+                nvwa_user = await resolve_ticket(
+                    service.nvwa_settings,
+                    short_ticket,
+                    prefer="auto",
+                )
+                resolve_error = None
+            except ValueError as exc:
+                resolve_error = str(exc)
+        if nvwa_user is None:
+            raise HTTPException(401, resolve_error or "验票失败。")
+        user = await service.ensure_sso_user(
+            nvwa_user.username, nvwa_user.display_name
+        )
+        # JIT: copy usable model credentials + create an isolated default
+        # agent under this user only (other Nuwa users cannot see it).
+        storage = getattr(request.app.state, "storage", None)
+        if storage is not None:
+            try:
+                from ._sso_bootstrap import provision_sso_user
+
+                await provision_sso_user(storage, user)
+            except Exception:  # noqa: BLE001 — never block SSO on provision failure
+                pass
+        session_token, _session, _user = await service.create_session_for_user(
+            user
+        )
+        target = safe_next_path(next)
+        # Cross-site iframe blocks Set-Cookie. Do NOT 302 to /sso/nvwa/handoff:
+        # under Vite `/api` proxy that Location drops the `/api` prefix and the
+        # SPA swallows the page. Return handoff HTML on this same response.
+        html = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8"/><title>SSO</title></head>
+<body><p>正在进入…</p>
+<script>
+(function () {{
+  try {{
+    sessionStorage.setItem("agentscope_session", {session_token!r});
+    sessionStorage.setItem("agentscope_embed", "1");
+  }} catch (e) {{}}
+  location.replace({target!r});
+}})();
+</script></body></html>"""
+        response = Response(content=html, media_type="text/html; charset=utf-8")
+        set_session_cookie(response, service, session_token)
+        response.headers["Cache-Control"] = "no-store"
+        return response
 
     @router.get("/auth/me")
     async def me(
@@ -124,11 +225,12 @@ def auth_router(service: AuthService) -> APIRouter:
     async def logout(
         request: Request,
         response: Response,
-        _: dict[str, Any] = Depends(current),
+        user: dict[str, Any] = Depends(current),
     ) -> None:
         await service.store.delete_session(
             request.cookies[service.cookie_name]
         )
+        logger.info("Login revoked: reason=logout user_id=%s", user["id"])
         response.delete_cookie(
             service.cookie_name,
             path="/",
@@ -239,6 +341,7 @@ class AuthMiddleware:
         request = StarletteRequest(scope)
         started = False
         completed = False
+        renewal_cookie: bytes | None = None
 
         async def outgoing(message: Message) -> None:
             nonlocal started, completed
@@ -252,6 +355,8 @@ class AuthMiddleware:
                 message["headers"] = headers + [
                     (b"cache-control", b"no-store")
                 ]
+                if renewal_cookie is not None and message["status"] != 401:
+                    message["headers"].append((b"set-cookie", renewal_cookie))
             elif message["type"] == "http.response.body" and not message.get(
                 "more_body", False
             ):
@@ -279,7 +384,13 @@ class AuthMiddleware:
                 ):
                     raise HTTPException(415, "登录请求必须使用 JSON。")
                 return await self.app(scope, receive, outgoing)
+            if path == "/sso/nvwa" and scope["method"] == "GET":
+                return await self.app(scope, receive, outgoing)
             token = request.cookies.get(self.service.cookie_name)
+            if not token:
+                # Third-party iframe fallback: frontend sends session from sessionStorage.
+                header = request.headers.get("x-agentscope-session", "").strip()
+                token = header or None
             identity = await self.service.authenticate(token)
             if identity is None:
                 raise HTTPException(401, "登录已失效，请重新登录。")
@@ -293,6 +404,21 @@ class AuthMiddleware:
                 session["csrf_token"].encode("utf-8"),
             ):
                 raise HTTPException(403, "请求校验失败，请刷新页面。")
+            # Only incoming, authenticated requests count as activity. Keep
+            # guard_request's periodic checks read-only, and never overwrite
+            # logout's cookie deletion or renew credentials being replaced.
+            if path not in {"/auth/logout", "/auth/password"}:
+                identity = await self.service.renew_session(token)
+                if identity is None:
+                    raise HTTPException(401, "登录已失效，请重新登录。")
+                session, user = identity
+                cookie_response = Response()
+                set_session_cookie(cookie_response, self.service, token)
+                renewal_cookie = next(
+                    value
+                    for name, value in cookie_response.raw_headers
+                    if name == b"set-cookie"
+                )
             scope.setdefault("state", {}).update(
                 auth_user=user, auth_session=session
             )
@@ -320,3 +446,13 @@ class AuthMiddleware:
                         "more_body": False,
                     }
                 )
+        except Exception as exc:
+            # Auth reads also use Redis, but a storage outage does not revoke the cookie.
+            from ..storage._errors import is_storage_unavailable, unavailable_detail
+            if not is_storage_unavailable(exc):
+                raise
+            if not started:
+                await JSONResponse({'detail': unavailable_detail()}, status_code=503,
+                                   headers={'Cache-Control': 'no-store', 'Retry-After': '1'})(scope, receive, send)
+            elif not completed:
+                await send({'type': 'http.response.body', 'body': b'', 'more_body': False})

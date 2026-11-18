@@ -21,6 +21,7 @@ from pydantic import (
 from ._builtin import ResetTools, SkillViewer
 from ._base import ToolBase
 from ._response import ToolResponse, ToolChunk
+from ._failure import tool_failure, failure_text
 from ..skill import SkillLoaderBase, Skill
 from ._types import RegisteredTool
 from .._utils._common import _describe_exception, _json_loads_with_repair
@@ -59,6 +60,7 @@ Read linked text resources with `{{ skill_viewer }}` using the skill name and `r
 <skill>
 <name>{{ skill.name }}</name>
 <description>{{ skill.description }}</description>
+<read_arguments>{{ {"skill": skill.name} | tojson }}</read_arguments>
 <dir>{{ skill.dir }}</dir>
 </skill>{% endfor %}
 </agent-skills>
@@ -343,14 +345,16 @@ class Toolkit:
                 )
 
         except mcp.shared.exceptions.McpError as e:
+            diagnostic = tool_failure(e, tool_call, read_only=tool_func.is_read_only)
             chunk = ToolChunk(
                 content=[
                     TextBlock(
                         type="text",
-                        text=f"Error occurred when calling MCP tool: {e}",
+                        text=failure_text(diagnostic),
                     ),
                 ],
                 state=ToolResultState.ERROR,
+                metadata={'toolFailure': diagnostic},
             )
             yield chunk
             tool_response.append_chunk(chunk)
@@ -361,14 +365,16 @@ class Toolkit:
                 raise e from None
 
             # The exceptions should be handled by the agent
+            diagnostic = tool_failure(e, tool_call, read_only=tool_func.is_read_only)
             chunk = ToolChunk(
                 content=[
                     TextBlock(
                         type="text",
-                        text=str(e),
+                        text=failure_text(diagnostic),
                     ),
                 ],
                 state=ToolResultState.ERROR,
+                metadata={'toolFailure': diagnostic},
             )
             yield chunk
             tool_response.append_chunk(chunk)

@@ -54,7 +54,9 @@ interface ProcessedFile {
 
 interface TextInputProps {
 	draftScope?: string;
-	onSend: (blocks: ContentBlock[]) => void;
+	onSend: (blocks: ContentBlock[]) => void | Promise<void>;
+	/** Enter can enqueue while the primary action remains Stop. */
+	allowQueue?: boolean;
 	placeholder?: string;
 	autoComplete?: (input: string) => string | null;
 	disabled?: boolean;
@@ -143,6 +145,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 	(
 		{
 			onSend,
+			allowQueue = false,
 			placeholder,
 			autoComplete,
 			disabled = false,
@@ -167,6 +170,10 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 		const [pendingDraft, setPendingDraft] = useState<string | null>(null);
 		const setValue = (next: string) => { writeDraft(draftScope, next); setValueState(next); };
 		const [files, setFiles] = useState<ProcessedFile[]>([]);
+		const submitting = useRef(false);
+		const [sending, setSending] = useState(false);
+		const valueRef = useRef(value);
+		valueRef.current = value;
 		const [isFocused, setIsFocused] = useState(false);
 		const textareaRef = useRef<HTMLTextAreaElement>(null);
 		const fileInputRef = useRef<HTMLInputElement>(null);
@@ -239,14 +246,12 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 			// Enter to send message, Shift+Enter for new line
 			if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
 				e.preventDefault();
-				handleSend();
+				void handleSend();
 			}
 		};
 
-		const handleSend = () => {
-			// ``phase`` is guarded here rather than only on the button, since Enter
-			// calls this directly and would otherwise send during a running reply.
-			if (phase !== 'idle' || !value.trim() || disabled || hasProcessing) return;
+		const handleSend = async () => {
+			if ((!allowQueue && phase !== 'idle') || (!value.trim() && !files.some((f) => f.status === 'done')) || disabled || hasProcessing || submitting.current) return;
 
 			const blocks: ContentBlock[] = [];
 
@@ -269,9 +274,14 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 				}
 			});
 
-			onSend?.(blocks);
-			setValue('');
-			setFiles([]);
+			submitting.current = true;
+			setSending(true);
+			try {
+				await onSend(blocks);
+				if (valueRef.current === value) setValue('');
+				setFiles((current) => current.filter((file) => !files.includes(file)));
+			} catch { /* The caller reports failure; keep text and attachments for retry. */ }
+			finally { submitting.current = false; setSending(false); }
 		};
 
 		/**
@@ -321,11 +331,11 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 					onClick: onInterrupt,
 				};
 			}
-			if (value.trim()) {
+			if (value.trim() || files.some((f) => f.status === 'done')) {
 				return {
 					icon: ArrowUp,
 					tooltip: t('textInput.send'),
-					disabled: disabled || hasProcessing,
+					disabled: disabled || hasProcessing || sending,
 					variant: 'default',
 					onClick: handleSend,
 				};
@@ -502,6 +512,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 								onFocus={() => setIsFocused(true)}
 								onBlur={() => setIsFocused(false)}
 								placeholder={defaultPlaceholder}
+								aria-label={defaultPlaceholder}
 								disabled={disabled}
 								rows={1}
 								className="block w-full resize-none rounded-md border-0 bg-transparent px-3 text-sm outline-none placeholder:text-muted-foreground focus:outline-none disabled:cursor-not-allowed disabled:opacity-50"
@@ -555,6 +566,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 										variant="ghost"
 										size="icon-lg"
 										onClick={() => fileInputRef.current?.click()}
+										aria-label={t('textInput.attach')}
 										disabled={attachDisabled}
 										className="shrink-0 rounded-full"
 									>
@@ -574,6 +586,7 @@ export const TextInput = forwardRef<TextInputRef, TextInputProps>(
 									<Button
 										type="button"
 										variant={actionButton.variant}
+										aria-label={actionButton.tooltip}
 										onClick={actionButton.onClick}
 										disabled={actionButton.disabled}
 										size="icon-lg"

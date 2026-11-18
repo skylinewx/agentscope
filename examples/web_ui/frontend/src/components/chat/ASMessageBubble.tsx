@@ -25,6 +25,7 @@ import * as mime from 'mime-types';
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 
 import { DeliveredAnalysisPathsContext } from './AnalysisDeliveryContext';
+import { ExecutionProgress } from './ExecutionProgress';
 import { ModelFailureDetails } from './ModelFailureDetails';
 import { ReplyProcess } from './ReplyProcess';
 import { renderToolCall } from './tool-renderers';
@@ -50,9 +51,10 @@ import {
 	CollapsibleContent,
 	CollapsibleTrigger,
 } from '@/components/ui/collapsible.tsx';
-import { Message, MessageFooter, MessageContent } from '@/components/ui/message';
+import { Message, MessageFooter, MessageContent, MessageTime } from '@/components/ui/message';
 import { useAudioBlock, useReplayController } from '@/context/AudioContext';
 import { useTranslation } from '@/i18n/useI18n';
+import { progressSteps } from '@/lib/agent-progress';
 import { finalAnalysisDeliveries, registeredAnalyses } from '@/lib/analysis-deliveries';
 import { replyErrorKey } from '@/lib/reply-diagnostics';
 import { presentReply } from '@/lib/reply-presentation';
@@ -401,6 +403,10 @@ interface MessageBubbleProps {
 	agentId?: string | null;
 	sessionId?: string | null;
 	message: Msg;
+	/** Current background wait after reconciling subsequent completion notices. */
+	backgroundWaiting: boolean;
+	/** The live transport is unavailable; execution status is unknown. */
+	connectionLost?: boolean;
 	onUserConfirm: (
 		toolCallBlock: ToolCallBlock,
 		confirm: boolean,
@@ -426,11 +432,13 @@ interface MessageBubbleProps {
  * When `content` is empty and the message is still running, the bubble
  * body is omitted entirely so only the bottom status row renders.
  */
-function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubbleProps) {
+function ASMessageBubbleComponent({ message, agentId, sessionId, backgroundWaiting, connectionLost = false }: MessageBubbleProps) {
 	const isUser = message.role === 'user';
-	const { t } = useTranslation();
+	const { t, i18n } = useTranslation();
 
-	const isRunning = !message.finished_at;
+	// 执行段已结束但后台仍在工作时，用户这一轮查询尚未结束。
+	const disconnected = !!connectionLost && (!message.finished_at || !!backgroundWaiting);
+	const isRunning = !disconnected && (!message.finished_at || !!backgroundWaiting);
 	const hasUsage =
 		!!message.usage &&
 		((message.usage.input_tokens ?? 0) > 0 || (message.usage.output_tokens ?? 0) > 0);
@@ -451,7 +459,7 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 		(b): b is DataBlock => b.type === 'data' && b.source.media_type.split('/')[0] === 'audio',
 	);
 
-	const presentation = useMemo(() => presentReply(message), [message]);
+	const presentation = useMemo(() => presentReply(message, backgroundWaiting), [message, backgroundWaiting]);
 	const analysisDeliveries = useMemo(
 		() => (agentId && sessionId ? registeredAnalyses(message) : []),
 		[message, agentId, sessionId],
@@ -460,8 +468,9 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 	// Suppress standalone model links for every registered revision, including
 	// superseded ones, so Markdown cannot reintroduce a second final card.
 	const deliveredPaths = useMemo(() => analysisDeliveries.map((item) => item.path), [analysisDeliveries]);
-	const hasProcess = !isUser && presentation.process.length > 0;
+	const hasProcess = !isUser && (presentation.process.length > 0 || progressSteps(message).length > 0);
 	const blocks = groupToolCalls(presentation.answer);
+	const attachments = blocks.filter((block) => block.type === 'data');
 
 	// What the copy button hands over — the prose of the message, without
 	// the tool calls and attachments around it.
@@ -471,7 +480,7 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 		.join('\n\n');
 
 	const startMs = new Date(message.created_at).getTime();
-	const endMs = isRunning ? now : new Date(message.finished_at!).getTime();
+	const endMs = isRunning || disconnected ? now : new Date(message.finished_at!).getTime();
 	const elapsedSeconds = Math.max(0, (endMs - startMs) / 1000);
 	const elapsedText = formatTime(elapsedSeconds);
 
@@ -485,6 +494,7 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 							presentation={presentation}
 							elapsed={elapsedText}
 							running={isRunning}
+							disconnected={disconnected}
 							steps={presentation.steps.map((block) => (
 								<ASBlock
 									key={block.id}
@@ -507,10 +517,12 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 							))}
 						/>
 					)}
-					{presentation.pending && (
-						<p role="status" className="text-sm text-muted-foreground">
-							{t(`replyProcess.${presentation.pending}Notice`)}
-						</p>
+					{presentation.pending && !disconnected && (
+						<div className="text-sm text-muted-foreground">
+							{presentation.pending === 'external'
+                                ? <ExecutionProgress message={message} background />
+                                : t(`replyProcess.${presentation.pending}Notice`)}
+						</div>
 					)}
 					{blocks
 						.filter((block) => block.type !== 'data')
@@ -534,7 +546,7 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 								workspace={{ agentId, sessionId }}
 							/>
 						))}
-					{message.finished_reason === ReplyFinishedReason.ERROR && (
+					{message.finished_reason === ReplyFinishedReason.ERROR && !(message.metadata?.presentation as { terminal_summary?: boolean } | undefined)?.terminal_summary && (
 						<Alert
 							variant="destructive"
 							className="m-2 w-[calc(100%-1rem)] border-red-200 bg-red-50 text-destructive dark:border-red-900 dark:bg-red-950 dark:text-red-50"
@@ -564,10 +576,9 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 								{t('replyProcess.noAnswer')}
 							</p>
 						)}
-					<AttachmentGroup className="max-w-full">
-						{blocks
-							.filter((block) => block.type === 'data')
-							.map((block, index) => (
+					{attachments.length > 0 && (
+						<AttachmentGroup className="max-w-full">
+							{attachments.map((block, index) => (
 								<ASBlock
 									agentId={agentId}
 									sessionId={sessionId}
@@ -575,22 +586,24 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 									key={index}
 								/>
 							))}
-					</AttachmentGroup>
+						</AttachmentGroup>
+					)}
 					{message.role === 'user' ? (
-						plainText && (
-							<MessageFooter>
-								<CopyButton text={plainText} />
-							</MessageFooter>
-						)
+						<MessageFooter className="-mt-1.5 gap-1 px-1">
+							<MessageTime dateTime={message.created_at} locale={i18n.resolvedLanguage || i18n.language} />
+							{plainText && <CopyButton text={plainText} />}
+						</MessageFooter>
 					) : (
-						<MessageFooter className="gap-1 font-mono">
+						<MessageFooter className="-mt-1.5 flex-wrap gap-1 font-mono">
 							{(!hasProcess || hasUsage || audioBlocks.length > 0) && (
 								<Badge
 									variant="secondary"
-									aria-label={isRunning ? t('messageBubble.running') : undefined}
+									aria-label={disconnected ? t('replyProcess.disconnected') : isRunning ? t('messageBubble.running') : undefined}
 								>
 									{!hasProcess &&
-										(isRunning ? (
+										(disconnected ? (
+											<TriangleAlert data-icon="inline-start" />
+										) : isRunning ? (
 											<Loader2
 												data-icon="inline-start"
 												className="animate-spin"
@@ -600,7 +613,7 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 										))}
 									{!hasProcess && (
 										<span className="tabular-nums tracking-tighter">
-											{elapsedText}
+											{disconnected ? t('replyProcess.disconnected') : elapsedText}
 										</span>
 									)}
 									{hasUsage && (
@@ -620,6 +633,7 @@ function ASMessageBubbleComponent({ message, agentId, sessionId }: MessageBubble
 									))}
 								</Badge>
 							)}
+							<MessageTime dateTime={message.created_at} locale={i18n.resolvedLanguage || i18n.language} />
 							{plainText && <CopyButton text={plainText} />}
 						</MessageFooter>
 					)}

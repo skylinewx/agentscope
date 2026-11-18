@@ -1,4 +1,16 @@
 {
+	"queue": {
+		"editConflict": "消息已在其他窗口更改。草稿仍保留，可复制后取消并重新编辑。",
+		"title": "消息队列", "pause": "暂停", "resume": "继续", "collapse": "收起队列", "expand": "展开队列",
+		"edit": "编辑消息", "delete": "删除消息", "deleted": "已从队列删除", "undo": "撤销",
+		"save": "保存", "cancel": "取消", "editing": "正在编辑，保存或取消后继续队列",
+		"paused_manual": "队列已暂停，当前任务继续执行", "paused_stopped": "当前任务已停止，点击继续执行剩余消息",
+		"paused_error": "上一条执行失败，队列已暂停", "paused_interrupted": "任务意外中断，队列已暂停，请检查上一条结果后继续",
+		"waiting_permission": "等待当前任务的确认", "waiting_external": "等待当前任务的外部结果", "waiting_background": "等待当前任务的后台工具完成",
+		"showMore": "展开其余 {{count}} 条", "showLess": "收起更多消息", "syncError": "队列暂时无法同步，正在重连…",
+		"attachments": "{{count}} 个附件", "attachment": "附件 {{index}}", "removeAttachment": "移除附件",
+		"inputPlaceholder": "输入消息，Enter 加入队列…"
+	},
 	"markdownLinks": {
 		"title": "打开外部链接？",
 		"description": "即将离开当前页面并打开以下地址。",
@@ -166,6 +178,7 @@
 		"yesWithRule": "是，且该次对话中都允许 {{toolName}} 执行 {{ruleContent}}"
 	},
 	"replyProcess": {
+		"disconnected": "连接已断开",
 		"running": "正在处理",
 		"completed": "已完成思考与处理",
 		"tools": "完成 {{count}} 次工具调用",
@@ -228,6 +241,21 @@
 		"copy": "复制"
 	},
 	"chat": {
+		"execution": {
+			"SENDING": "正在发送…",
+			"PREPARING": "已收到，正在准备…",
+			"WORKSPACE": "正在加载工作区…",
+			"CONTEXT": "正在准备会话上下文…",
+			"TOOLS": "正在加载工具与分析能力…",
+			"MODEL": "正在准备模型…",
+			"READY": "正在等待模型响应…",
+			"RESPONDING": "正在处理…",
+			"FAILED": "准备失败，请查看错误信息。",
+			"EXECUTING": "正在执行后台任务，结果返回后会自动继续。",
+			"PUBLISHING": "正在核对并生成分析页面…",
+			"CALCULATING": "正在运行数据分析…",
+			"elapsed": "已等待 {{seconds}} 秒"
+		},
 		"inputPlaceholder": "输入消息...",
 		"confirmToolCall": "允许此操作？",
 		"subagentConfirmTitle": "{{name}} 请求确认",
@@ -236,6 +264,14 @@
 		"historyLoadFailed": "暂时无法读取会话内容",
 		"historyLoadFailedDescription": "请重新加载。读取失败不会删除已保存的会话内容。",
 		"reloadHistory": "重新加载",
+		"connection": {
+			"reconnecting": "连接已断开，正在重连",
+			"reconnectingDescription": "正在恢复会话并确认执行状态，请稍候。",
+			"interrupted": "上一条问题未完成回复",
+			"interruptedDescription": "当前任务已停止，已保存的记录仍然保留。请重新发送问题。",
+			"failed": "无法连接此会话",
+			"failedDescription": "请检查登录状态和会话访问权限，再重新加载。"
+		},
 		"maxItersExceeded": {
 			"title": "已达到最大迭代次数",
 			"description": "输入新消息可继续对话，或点击继续以完成当前任务。",
@@ -1095,6 +1131,7 @@
 		"password": "密码",
 		"login": "登录",
 		"loggingIn": "正在登录…",
+		"sessionInvalid": "登录已失效，请重新登录后继续。",
 		"contactAdmin": "没有账号或忘记密码？请联系系统管理员。",
 		"unreachable": "暂时无法连接服务，请检查网络或联系管理员。",
 		"failed": "操作失败，请重试。",

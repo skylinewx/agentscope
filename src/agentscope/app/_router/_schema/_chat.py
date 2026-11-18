@@ -38,7 +38,7 @@ class ChatTriggerResponse(BaseModel):
 
     status: str = Field(
         default="started",
-        description='Always ``"started"`` when the trigger succeeded.',
+        description='``"started"`` for immediate execution, ``"queued"`` when waiting.',
     )
     session_id: str = Field(
         description="Echo of the session id the run was started for.",

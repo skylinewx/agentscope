@@ -20,7 +20,7 @@ class SourceChartTests(PresentationCase):
                       "valueRefs": [f["factId"] for f in draft["facts"] if f["valueState"] == "PRESENT"]}]
         self.plan[0]['description'] = '来源数值比较'
         self.plan.append({'viewId':'details','scopeId':draft['scope']['scopeId'],'type':'TABLE','valueRefs':[f['factId'] for f in draft['facts']]})
-        result = await self.service.publish(self.ref, [], self.plan, "source-publish", 0)
+        result = await self.service.publish(self.ref, [], self.plan, "source-publish")
         self.assertTrue(result["delivery"]["registered"])
         self.path = result["delivery"]["path"]
         self.artifact = self.store.get_analysis(OWNER, self.ref)
@@ -38,7 +38,7 @@ class SourceChartTests(PresentationCase):
         export = self.delivery.render_report(self.ref, "source-report")
         html = self.delivery.report(self.ref, export["exportRef"])["html"]
         self.assertEqual(html.count('<svg '), 1)
-        self.assertIn('content="business-reference-1"', html)
+        self.assertIn('content="business-reference-2"', html)
         self.assertIn("来源原值分布", html)
         for row in view["rows"]:
             self.assertIn(row["display"], html)

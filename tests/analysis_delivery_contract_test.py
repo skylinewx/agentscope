@@ -54,15 +54,22 @@ class TargetCompletionTests(TestCase):
         base = self.fixture()
         for index, fact in enumerate(base['facts']):
             fact.update(objectId='object-'+str(index), objectModelCode='member-model', bindingRef='binding',
-                        cellKey='2:1', measureCode='amount', period='period', dimensions={'account':'metric'},
+                        cellKey='2:1', measureCode='amount', period='period',
+                        dimensions={'account': 'metric', 'member': str(index)},
+                        dimensionModels={'member': 'member-model'},
                         sourceOrigins=['origin'], context={'sourceId':'source','schemaHash':'schema','snapshotId':'old'})
         updated = deepcopy(base)
         updated['facts'][1].update(factId='fresh-second', value='300', context={**base['facts'][1]['context'],'snapshotId':'new'})
         updated['plan']['workPlan'][0]['targetRefs'] = ['first','fresh-second']
         _, updated['plan']['workPlan'] = continue_plan(base, {}, updated['plan']['workPlan'])
         validate_target_continuity(base, updated)
-        for change in ({'objectId':'other'}, {'period':'another'}, {'measureCode':'other'}, {'bindingRef':'other'},
-                       {'dimensions':{'account':'another'}}, {'objectModelCode':'another'}, {'sourceOrigins':['other']},
+        # 分析粒度会改变 objectId；完整来源位置不变时仍是同一目标。
+        updated['facts'][1]['objectId'] = 'different-analysis-grain'
+        validate_target_continuity(base, updated)
+        for change in ({'period':'another'}, {'measureCode':'other'}, {'bindingRef':'other'},
+                       {'dimensions':{'account':'another', 'member': '1'}},
+                       {'dimensions':{'account':'metric', 'member': '0'}},
+                       {'dimensionModels':{'member':'another'}}, {'sourceOrigins':['other']},
                        {'context':{'sourceId':'other','schemaHash':'schema'}}):
             invalid=deepcopy(updated);invalid['facts'][1].update(change)
             with self.subTest(change=change), self.assertRaises(AnalysisError):validate_target_continuity(base, invalid)
@@ -89,20 +96,17 @@ class DeliveryContractTests(PresentationCase):
         self.assertEqual(recovery['sourceSortOperation'], {'id': 'order', 'operator': 'SORT'})
         self.assertEqual(self.artifact['plan']['operations'][0]['operator'], 'RANK')
 
-    async def test_wrong_preview_base_has_executable_recovery_with_all_content_preserved(self):
+    async def test_preview_uses_server_version_and_preserves_all_content(self):
         await self.setup_values()
         doc = self.doc('原有简称 {{value}}')
-        with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(self.built['analysisRef'], expectedBaseRevision=self.artifact['revision'],
-                                       requestKey='wrong', document=doc, previewOnly=True)
-        error = caught.exception
-        self.assertEqual(error.code, 'PREVIEW_SCOPE')
-        self.assertEqual(error.details['nextAction'], 'RETRY_PREVIEW')
-        corrected = await self.service.publish(**error.details['retryPreview'])
-        self.assertTrue(corrected['previewOnly'])
-        request = self.store.get_publication_proposal(OWNER, corrected['repairRef'])
+        preview = await self.service.publish(self.built['analysisRef'],
+                                            requestKey='automatic-version', document=doc, previewOnly=True)
+        self.assertTrue(preview['previewOnly'])
+        self.assertNotIn('expectedBaseRevision', preview['confirmPublish'])
+        self.assertNotIn('baseRevision', self.built)
+        request = self.store.get_publication_proposal(OWNER, preview['repairRef'])
         self.assertEqual(request['document'], doc)
-        self.assertEqual(request['expectedBaseRevision'], self.built['baseRevision'])
+        self.assertNotIn('expectedBaseRevision', request)
         self.assertEqual(self.store.get_analysis(OWNER, self.built['analysisRef']), self.artifact)
 
     async def test_declared_sort_cannot_be_replaced_with_manually_arranged_scalar_bindings(self):
@@ -115,7 +119,7 @@ class DeliveryContractTests(PresentationCase):
 
     async def test_partial_free_document_discloses_reason_without_forcing_markup(self):
         await self.setup_values(work=[{'taskId': 'unfinished', 'title': '尚缺的关系', 'kind': 'RELATION', 'refs': []}])
-        args = {'analysisRef': self.built['analysisRef'], 'expectedBaseRevision': 0, 'previewOnly': True,
+        args = {'analysisRef': self.built['analysisRef'], 'previewOnly': True,
                 'partialReason': '来源暂不可用 <补查>', 'requestKey': 'partial'}
         with self.assertRaises(AnalysisError) as caught: await self.service.publish(**args, document=self.doc())
         self.assertEqual(caught.exception.code, 'PARTIAL_RESULT_UNDISCLOSED')

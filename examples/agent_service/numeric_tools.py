@@ -14,6 +14,10 @@ from agentscope.permission import PermissionBehavior, PermissionDecision
 from agentscope.tool import ToolBase, ToolChunk
 
 from analysis_extension.models import AnalysisError, canonical, decimal_text, decimal_value
+from analysis_extension.arithmetic_contract import (
+    ARITHMETIC_FUNCTIONS, ARITHMETIC_SYNTAX, MAX_ARITHMETIC_INPUTS,
+    MAX_EXPRESSION_LENGTH, function_arguments, parse_arithmetic,
+)
 from analysis_extension.tools import array, obj
 
 TEXT = {"type": "string", "minLength": 1, "maxLength": 1024}
@@ -28,22 +32,15 @@ def _number(value):
 
 
 def calculate(expression, variables=None, decimalPlaces=None):
-    if not isinstance(expression, str) or not expression.strip() or len(expression) > 4096:
-        raise AnalysisError("INVALID_EXPRESSION", "计算表达式须为 1 至 4096 个字符。")
     variables = {} if variables is None else variables
-    if (not isinstance(variables, dict) or len(variables) > 200 or any(
+    if (not isinstance(variables, dict) or len(variables) > MAX_ARITHMETIC_INPUTS or any(
             not isinstance(k, str) or not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]{0,63}', k)
-            or k in ('sum', 'min', 'max', 'abs') for k in variables)):
-        raise AnalysisError("INVALID_VARIABLES", "变量须使用互不重复的名称，最多 200 个。")
+            or k in ARITHMETIC_FUNCTIONS for k in variables)):
+        raise AnalysisError("INVALID_VARIABLES", f"变量须使用互不重复的名称，最多 {MAX_ARITHMETIC_INPUTS} 个。")
     if decimalPlaces is not None and (type(decimalPlaces) is not int or not 0 <= decimalPlaces <= 16):
         raise AnalysisError("INVALID_PRECISION", "小数位数须在 0 至 16 之间。")
     values = {key: Fraction(_number(value)) for key, value in variables.items()}
-    try:
-        tree = ast.parse(expression.strip(), mode='eval')
-    except (SyntaxError, ValueError, RecursionError) as exc:
-        raise AnalysisError("INVALID_EXPRESSION", "表达式语法不正确。") from exc
-    if sum(1 for _ in ast.walk(tree)) > 400:
-        raise AnalysisError("CALCULATION_LIMIT", "表达式过于复杂，请分步计算。")
+    tree = parse_arithmetic(expression)
 
     def evaluate(node, depth=0):
         if depth > 40:
@@ -62,16 +59,12 @@ def calculate(expression, variables=None, decimalPlaces=None):
             elif isinstance(node.op, ast.Mult): result = left * right
             elif not right: raise AnalysisError("ZERO_DENOMINATOR", "分母不能为零。")
             else: result = left / right
-        elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
-              and node.func.id in ('sum', 'min', 'max', 'abs') and not node.keywords
-              and 1 <= len(node.args) <= 200):
-            items = [child(arg) for arg in node.args]
-            if node.func.id == 'abs' and len(items) != 1:
-                raise AnalysisError("INVALID_EXPRESSION", "abs 只接受一个数值。")
+        elif isinstance(node, ast.Call):
+            items = [child(arg) for arg in function_arguments(node)]
             result = {'sum': lambda: sum(items, Fraction(0)), 'min': lambda: min(items),
                       'max': lambda: max(items), 'abs': lambda: abs(items[0])}[node.func.id]()
         else:
-            raise AnalysisError("INVALID_EXPRESSION", "仅支持数值、已声明变量、四则运算以及 sum/min/max/abs。")
+            raise AnalysisError("INVALID_EXPRESSION", ARITHMETIC_SYNTAX)
         if max(result.numerator.bit_length(), result.denominator.bit_length()) > 4096:
             raise AnalysisError("CALCULATION_LIMIT", "计算超出数值容量，请缩小范围。")
         return result
@@ -168,9 +161,9 @@ class _NumericTool(ToolBase):
 
 class Calculate(_NumericTool):
     name = "Calculate"
-    description = "通用精确十进制计算，无须分析 Skill 或 AnalysisBuild。expression 使用四则运算、变量及 sum/min/max/abs；variables 的数值使用原始十进制字符串。有限小数默认精确输出；无限小数需指定 decimalPlaces，按 HALF_UP 舍入并返回 rounded。仅执行算术，不确认业务可加性、单位或汇总口径；业务合计按适用规则或用户明确采用的分析预期判断。"
-    input_schema = obj({"expression": {"type": "string", "minLength": 1, "maxLength": 4096},
-                        "variables": {"type": "object", "additionalProperties": DECIMAL, "maxProperties": 200},
+    description = "通用精确十进制计算，无须分析 Skill 或 AnalysisBuild。" + ARITHMETIC_SYNTAX + f" variables 最多 {MAX_ARITHMETIC_INPUTS} 个，数值使用原始十进制字符串。有限小数默认精确输出；无限小数需指定 decimalPlaces，按 HALF_UP 舍入并返回 rounded。仅执行算术，不确认业务可加性、单位或汇总口径。"
+    input_schema = obj({"expression": {"type": "string", "minLength": 1, "maxLength": MAX_EXPRESSION_LENGTH},
+                        "variables": {"type": "object", "additionalProperties": DECIMAL, "maxProperties": MAX_ARITHMETIC_INPUTS},
                         "decimalPlaces": {"type": "integer", "minimum": 0, "maximum": 16}}, ['expression'])
     operation = staticmethod(calculate)
 
@@ -191,4 +184,4 @@ class NumericToolsMiddleware(MiddlewareBase):
         return [Calculate(), SortRecords()]
 
     async def on_system_prompt(self, agent, current_prompt):
-        return current_prompt + "\n\n通用数值工具：查询中的排序使用 SortRecords，计算使用 Calculate；不因调用它们而启动分析。数值按来源原始精度传入，按工具结果组织回答。排序前获取本轮所需完整范围；纯算术结果不等于业务汇总成立。"
+        return current_prompt + "\n\n通用数值工具：首次取数需要排序时使用来源接口的排序参数；已按要求排序的完整结果直接复用。已有完整结果仅调整顺序时使用一次 SortRecords；分析派生结果复用 SORT/DESCRIBE 的顺序。普通查询中的精确计算使用 Calculate，不因此启动分析。已经进入分析或报告时，统计、占比、排序及公式核对优先在同一次 AnalysisBuild 中使用原生算子；已返回的统计及公式结果直接复用，不先抄值逐项 Calculate 再 Build 重算。宿主未提供的必要计算才选择其他可用计算能力。数值按来源原始精度传入，按工具结果组织回答。排序前获取本轮所需完整范围；纯算术结果不等于业务汇总成立。"

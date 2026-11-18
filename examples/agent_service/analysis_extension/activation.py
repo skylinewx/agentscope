@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .models import AnalysisError
 
-CONFIG_FIELDS = frozenset({"schemaVersion", "activation", "capabilities", "sources", "numberFormats", "rules", "findingRules", "limits"})
+CONFIG_FIELDS = frozenset({"schemaVersion", "activation", "capabilities", "sources", "numberFormats", "rules", "findingRules", "limits", "rendering"})
 
 
 def validate_config(config):
@@ -21,6 +21,8 @@ def validate_config(config):
     if (not isinstance(capabilities, dict) or set(capabilities) - {"analysis", "reports"}
             or any(type(value) is not bool for value in capabilities.values())):
         raise AnalysisError("INVALID_CONFIG", "capabilities 仅接受 analysis、reports 布尔开关。")
+    from .render_client import validate_rendering
+    validate_rendering(config.get('rendering', {}))
     return config
 
 

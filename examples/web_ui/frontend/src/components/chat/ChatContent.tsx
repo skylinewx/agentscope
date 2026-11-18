@@ -1,3 +1,4 @@
+import { ExecutionProgress } from './ExecutionProgress';
 import { ReplyFinishedReason } from '@agentscope-ai/agentscope/event';
 import {
 	type ContentBlock,
@@ -9,6 +10,7 @@ import { GitBranch, TriangleAlert } from 'lucide-react';
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 
 import { AnalysisDraftContext } from './AnalysisDraftContext';
+import { MessageQueue } from './MessageQueue';
 import { Button } from '../ui/button';
 import { DiffStats } from './tool-renderers/_shared';
 import type { GitStatus } from '@/api';
@@ -29,11 +31,12 @@ import {
 	MessageScrollerViewport,
 } from '@/components/ui/message-scroller.tsx';
 import { Spinner } from '@/components/ui/spinner';
-import type { ReplyPhase } from '@/hooks/useMessages';
+import type { MessageQueueController } from '@/hooks/useMessageQueue';
+import type { ConnectionNotice, ReplyPhase } from '@/hooks/useMessages';
 import { useTranslation } from '@/i18n/useI18n';
 import { draftScope } from '@/lib/analysis-draft';
 import type { RealtimeConnectionState } from '@/lib/browserWebRTCTransport';
-import { pendingCalls } from '@/lib/reply-presentation';
+import { backgroundWaitStates, groupReplyMessages, pendingCalls } from '@/lib/reply-presentation';
 import { cn } from '@/lib/utils';
 
 /** How long a load may run before it is worth showing a spinner. */
@@ -73,6 +76,7 @@ interface ChatContentProps {
 	loading?: boolean;
 	/** A failed persisted-history read must not show the new-session greeting. */
 	historyError?: Error | null;
+	connectionNotice?: ConnectionNotice;
 	onReloadHistory?: () => void;
 	/**
 	 * Reply lifecycle phase from ``useMessages`` — forwarded to
@@ -81,7 +85,8 @@ interface ChatContentProps {
 	 */
 	phase: ReplyPhase;
 	disabled: boolean;
-	onSend: (content: ContentBlock[]) => void;
+	onSend: (content: ContentBlock[]) => void | Promise<void>;
+	messageQueue?: MessageQueueController;
 	onUserConfirm: (
 		toolCall: ToolCallBlock,
 		confirm: boolean,
@@ -125,10 +130,12 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	msgs,
 	loading = false,
 	historyError = null,
+	connectionNotice = null,
 	onReloadHistory,
 	phase,
 	disabled,
 	onSend,
+	messageQueue,
 	onUserConfirm,
 	autoComplete,
 	className,
@@ -153,6 +160,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	// Treating "no messages yet" as empty would flash the greeting over
 	// every session that does have history.
 	const isEmpty = !loading && !historyError && msgs.length === 0;
+	const connectionLost = connectionNotice === 'reconnecting' || connectionNotice === 'failed';
 
 	// A spinner that appears and vanishes inside a couple of frames reads
 	// as a flicker, not as feedback — so hold it back until the load has
@@ -175,6 +183,8 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 				.map((tc) => ({ replyId: message.id, toolCall: tc })),
 		);
 	}, [msgs]);
+	const backgroundWaiting = useMemo(() => backgroundWaitStates(msgs), [msgs]);
+	const replyGroups = useMemo(() => groupReplyMessages(msgs), [msgs]);
 
 	// On an empty session the prompt and the input centre together, so every box
 	// down to the message list shrinks to its content instead of filling.
@@ -233,15 +243,15 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 						<MessageScroller>
 							<MessageScrollerViewport>
 								<MessageScrollerContent>
-									{msgs.map((message, index) => {
-										const previous = msgs[index - 1];
+									{replyGroups.map(({ key, message }, index) => {
+										const previous = replyGroups[index - 1]?.message;
 										const at = new Date(message.created_at);
 										const previousAt = previous
 											? new Date(previous.finished_at ?? previous.created_at)
 											: at;
 										return (
 											<MessageScrollerItem
-												key={`${inputScope}:${message.id}`}
+												key={`${inputScope}:${key}`}
 												messageId={message.id}
 											>
 												{at.getTime() - previousAt.getTime() >
@@ -263,11 +273,16 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 													agentId={agentId}
 													sessionId={sessionId}
 													message={message}
+													connectionLost={connectionLost}
+													backgroundWaiting={backgroundWaiting.get(message.id) ?? false}
 													onUserConfirm={onUserConfirm}
 												/>
 											</MessageScrollerItem>
 										);
 									})}
+                                    {phase === 'streaming' && !connectionLost && msgs.at(-1)?.role === 'user' && (
+                                        <ExecutionProgress message={msgs.at(-1)!} />
+                                    )}
 									{msgs.length > 0 &&
 										msgs[msgs.length - 1].finished_reason ===
 											ReplyFinishedReason.EXCEED_MAX_ITERS &&
@@ -316,6 +331,20 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 
 				{loading ? null : (
 					<div className="relative min-w-full max-w-full w-full">
+						{connectionNotice && !historyError && (
+							<Alert className="mb-2" data-testid="chat-connection-notice">
+								<TriangleAlert />
+								<AlertTitle>{t(`chat.connection.${connectionNotice}`)}</AlertTitle>
+								<AlertDescription>{t(`chat.connection.${connectionNotice}Description`)}</AlertDescription>
+								{connectionLost && onReloadHistory && (
+									<AlertAction>
+										<Button variant="outline" size="sm" onClick={onReloadHistory}>
+											{t('chat.reloadHistory')}
+										</Button>
+									</AlertAction>
+								)}
+							</Alert>
+						)}
 						<FlipCard
 							visible={toConfirmedToolCalls.length > 0 || footerSlot !== null}
 							className="absolute bottom-full left-0 right-0 mb-2 z-50"
@@ -342,13 +371,16 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 				    28 + the 4px padding. Matching them is what keeps the two
 				    edges parallel — a plain rectangle here would show the
 				    pill's corners cutting into it. */}
+						{messageQueue && <MessageQueue key={`queue:${inputScope}`} controller={messageQueue} disabled={connectionLost || disabled} />}
 						<TextInput
-							key={inputScope}
+							key={`input:${inputScope}`}
 							ref={inputRef}
 							draftScope={inputScope}
 							className="min-w-full max-w-full w-full rounded-[32px] bg-muted p-1"
 							onSend={onSend}
-							disabled={disabled}
+							allowQueue={!!messageQueue?.state}
+							placeholder={messageQueue?.state && (phase !== 'idle' || !!messageQueue.state.items.length) ? t('queue.inputPlaceholder') : undefined}
+							disabled={disabled || connectionLost}
 							autoComplete={autoComplete}
 							allowedInputTypes={allowedInputTypes}
 							fileProcessor={fileProcessor}

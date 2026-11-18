@@ -9,6 +9,38 @@ import httpx
 from .models import AnalysisError
 
 
+def validate_rendering(config):
+    """渲染入口由宿主配置，模型只能提交已经冻结的页面。"""
+    if (not isinstance(config, dict) or set(config) - {'mode', 'widths', 'webUiUrl'}
+            or config.get('mode', 'external') not in ('external', 'local')):
+        raise AnalysisError('INVALID_RENDER_CONFIG', 'rendering 使用 mode、widths、webUiUrl；mode 为 local 或 external。')
+    widths = config.get('widths', [420, 900])
+    if (not isinstance(widths, list) or not 2 <= len(widths) <= 4
+            or any(type(width) is not int or not 320 <= width <= 2400 for width in widths)
+            or len(set(widths)) != len(widths)):
+        raise AnalysisError('INVALID_RENDER_CONFIG', '页面检查需要两个至四个不同的有效视口宽度。')
+    if 'webUiUrl' in config:
+        try:
+            if not isinstance(config['webUiUrl'], str):
+                raise ValueError('Web UI origin must be text')
+            target = urlsplit(config['webUiUrl'])
+            target.port
+            valid = (target.scheme in ('http', 'https') and target.hostname and not target.username
+                     and not target.password and not target.query and not target.fragment and target.path in ('', '/'))
+        except (TypeError, ValueError):
+            valid = False
+        if not valid:
+            raise AnalysisError('INVALID_RENDER_CONFIG', 'webUiUrl 使用 Web UI 的完整源地址，不包含用户信息或路径。')
+
+
+def configured_checker(config):
+    validate_rendering(config)
+    if config.get('mode') == 'local':
+        from .local_render import LocalRenderChecker
+        return LocalRenderChecker(config.get('widths', [420, 900]))
+    return RenderChecker.from_environment(config.get('widths'))
+
+
 class RenderChecker:
     def __init__(self, url, token, widths=(420, 900)):
         try:
@@ -25,12 +57,13 @@ class RenderChecker:
         self.url, self.token, self.widths = url.rstrip('/'), token, list(widths)
 
     @classmethod
-    def from_environment(cls):
+    def from_environment(cls, widths=None):
         url = os.environ.get('ANALYSIS_RENDER_URL')
         if not url: return None
-        try: widths = json.loads(os.environ.get('ANALYSIS_RENDER_WIDTHS', '[420,900]'))
-        except ValueError as exc:
-            raise AnalysisError('INVALID_RENDER_CONFIG', 'ANALYSIS_RENDER_WIDTHS 须为宽度数组。') from exc
+        if widths is None:
+            try: widths = json.loads(os.environ.get('ANALYSIS_RENDER_WIDTHS', '[420,900]'))
+            except ValueError as exc:
+                raise AnalysisError('INVALID_RENDER_CONFIG', 'ANALYSIS_RENDER_WIDTHS 须为宽度数组。') from exc
         if not isinstance(widths, list):
             raise AnalysisError('INVALID_RENDER_CONFIG', 'ANALYSIS_RENDER_WIDTHS 须为宽度数组。')
         return cls(url, os.environ.get('ANALYSIS_RENDER_TOKEN', ''), widths)

@@ -1,4 +1,4 @@
-import type { Msg } from '@agentscope-ai/agentscope/message';
+import type { ContentBlock, Msg, ToolResultBlock } from '@agentscope-ai/agentscope/message';
 
 import { isCompletionRevision } from './reply-presentation.ts';
 import { analysisPath } from './workspace-analysis.ts';
@@ -12,13 +12,49 @@ function jsonObject(value: unknown): Record<string, unknown> | null {
 	try { return object(JSON.parse(value)); } catch { return null; }
 }
 
+/** 后台工具通过宿主通知交付结果；还原回执，复用同步发布的身份和完成状态校验。 */
+function backgroundAnalysisResult(
+	block: ContentBlock,
+	pending: ReadonlyMap<string, ToolResultBlock>,
+	turnKey: unknown,
+): ToolResultBlock | null {
+	if (block.type !== 'hint') return null;
+	const source = jsonObject(block.source);
+	if (source?.label !== 'tool_output' || source.backgroundState !== 'success' ||
+		typeof source.backgroundToolCallId !== 'string' ||
+		!['AnalysisPublish', 'AnalysisInspect'].includes(String(source.backgroundToolName))) return null;
+	const placeholder = pending.get(source.backgroundToolCallId);
+	if (!placeholder || placeholder.name !== source.backgroundToolName) return null;
+	const metadata = object(source.toolResponseMetadata);
+	if (typeof turnKey === 'string' && typeof metadata?.analysisTurnKey === 'string' &&
+		metadata.analysisTurnKey !== turnKey) return null;
+	// 只解开 ToolOffloadMiddleware 的确切通知封装；不从模型文字、链接或任意提示中提取 JSON。
+	if (!Array.isArray(block.hint) || block.hint.length !== 1 || block.hint[0].type !== 'text') return null;
+	const prefix = `<system-notification>Tool '${placeholder.name}' running in background ` +
+		`(id=${placeholder.id}) has finished (state=success).\n\nResult:\n\n`;
+	const suffix = '</system-notification>';
+	const text = block.hint[0].text;
+	if (!text.startsWith(prefix) || !text.endsWith(suffix)) return null;
+	return {
+		...placeholder,
+		metadata: metadata ?? {},
+		output: [{ ...block.hint[0], text: text.slice(prefix.length, -suffix.length) }],
+	};
+}
+
 /** Actual delivery receipts, independent of whether the model repeats their links. */
 export function registeredAnalyses(message: Msg): RegisteredAnalysis[] {
 	if (message.role !== 'assistant') return [];
 	const calls = new Map(message.content.filter((block) => block.type === 'tool_call').map((block) => [block.id, block]));
+	const pending = new Map(message.content
+		.filter((block): block is ToolResultBlock => block.type === 'tool_result' && block.state === 'success' &&
+			object(block.metadata)?.backgroundToolCallId === block.id)
+		.map((block) => [block.id, block]));
+	const turnKey = object(object(message.metadata)?.analysisCompletion)?.turnKey;
 	const delivered = new Map<string, RegisteredAnalysis>();
-	for (const block of message.content) {
-		if (block.type !== 'tool_result' || block.state !== 'success') continue;
+	for (const content of message.content) {
+		const block = content.type === 'tool_result' ? content : backgroundAnalysisResult(content, pending, turnKey);
+		if (!block || block.state !== 'success') continue;
 		const call = calls.get(block.id);
 		if (!call || call.name !== block.name || !['AnalysisPublish', 'AnalysisInspect'].includes(call.name)) continue;
 		const input = jsonObject(call.input);
@@ -76,7 +112,7 @@ export function finalAnalysisDeliveries(
 			? deliveries.filter((item) => item.analysisRef === completion.analysisRef)
 			: [];
 	}
-	if (completion?.status === 'INCOMPLETE' || completion?.status === 'BLOCKED' ||
+	if (completion?.status === 'WAITING' || completion?.status === 'INCOMPLETE' || completion?.status === 'BLOCKED' ||
 		message.content.some(isCompletionRevision)) return [];
 	// Preserve completed old conversations and independent deliveries without
 	// this host protocol. A rejection hint alone is never evidence of approval.

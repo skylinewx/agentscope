@@ -16,9 +16,11 @@ export interface AuthSession {
 }
 
 let session: AuthSession | null = null;
+let notice: 'sessionInvalid' | null = null;
 let controller = new AbortController();
 const listeners = new Set<() => void>();
 export const getAuth = () => session;
+export const getAuthNotice = () => notice;
 export const getAuthSignal = () => controller.signal;
 export const getCsrfToken = () => session?.csrf_token ?? '';
 export const subscribeAuth = (listener: () => void) => {
@@ -28,7 +30,7 @@ export const subscribeAuth = (listener: () => void) => {
 	};
 };
 
-export function setAuth(value: AuthSession | null, broadcast = false) {
+export function setAuth(value: AuthSession | null, broadcast = false, nextNotice: typeof notice = null) {
 	if (session?.user.id !== value?.user.id || session?.csrf_token !== value?.csrf_token) {
 		controller.abort();
 		controller = new AbortController();
@@ -37,6 +39,7 @@ export function setAuth(value: AuthSession | null, broadcast = false) {
 		localStorage.removeItem('chat_last_session');
 	}
 	session = value;
+	notice = value ? null : nextNotice;
 	localStorage.removeItem('server_url');
 	localStorage.removeItem('username');
 	listeners.forEach((listener) => listener());
@@ -45,5 +48,5 @@ export function setAuth(value: AuthSession | null, broadcast = false) {
 }
 
 export function handleUnauthorized(status: number) {
-	if (status === 401 && session) setAuth(null, true);
+	if (status === 401 && session) setAuth(null, true, 'sessionInvalid');
 }

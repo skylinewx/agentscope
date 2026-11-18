@@ -24,7 +24,7 @@ class ReviewTests(ActionCase):
         with patch('analysis_extension.findings.FINDING_VERSION', '1.0.0'):
             built = await self.service.build(refs, selections, scope, [], 'old-host-draft')
         with self.assertRaises(AnalysisError) as failure:
-            await self.service.publish(built['analysisRef'], [], [], 'new-host-publish', 0)
+            await self.service.publish(built['analysisRef'], [], [], 'new-host-publish')
         self.assertEqual(failure.exception.code, 'UNSUPPORTED_VERSION')
         with self.assertRaises(AnalysisError):
             self.store.get_analysis(OWNER, built['analysisRef'])
@@ -96,7 +96,7 @@ class ReviewTests(ActionCase):
         with self.assertRaises(AnalysisError):
             await self.service.inspect("findings", built["analysisRef"])
         with self.assertRaises(AnalysisError) as failure:
-            await self.service.publish(built["analysisRef"], [], [], "changed-rule", 0)
+            await self.service.publish(built["analysisRef"], [], [], "changed-rule")
         self.assertEqual(failure.exception.code, "RULE_VERSION_UNAVAILABLE")
         self.assertEqual(self.store.get_analysis(OWNER, built["analysisRef"])["publicationState"], "DRAFT")
 
@@ -115,7 +115,7 @@ class ReviewTests(ActionCase):
         for ref in refs:
             self.service.actions.capture(ref, "success")
         built = await self.service.build(refs, selections, scope, operations, "changed-formula", self.ref, self.run)
-        await self.service.publish(built["analysisRef"], [], [], "changed-formula-publish", built["baseRevision"])
+        await self.service.publish(built["analysisRef"], [], [], "changed-formula-publish")
         run = self.store.get_action_run(OWNER, self.run)
         self.assertEqual(run["status"], "PARTIAL")
         self.assertEqual(run["diagnostics"][-1]["code"], "FORMULA_RULE_CHANGED")
@@ -129,7 +129,7 @@ class ReviewTests(ActionCase):
         hypotheses = [{"findingId": findings["items"][0]["findingId"], "statement": "待核查原因 " + str(i),
             "missingEvidence": ["合成待补资料" * 150] * 20} for i in range(30)]
         with self.assertRaises(AnalysisError) as failure:
-            await self.service.publish(built["analysisRef"], [], [], "oversize-findings", built["baseRevision"], hypotheses=hypotheses, findingPlan=plan)
+            await self.service.publish(built["analysisRef"], [], [], "oversize-findings",  hypotheses=hypotheses, findingPlan=plan)
         self.assertEqual(failure.exception.code, "VIEW_TOO_LARGE")
         self.assertEqual(self.store.get_analysis(OWNER, built["analysisRef"])["publicationState"], "DRAFT")
         self.assertEqual(self.store.get_action_run(OWNER, self.run)["status"], "RUNNING")
@@ -160,7 +160,7 @@ class ReviewTests(ActionCase):
         scope = deepcopy(self.artifact["plan"]["scope"])
         scope["population"]["captureRef"] = refs[0]
         built = await self.service.build(refs, selections, scope, [], "fresh-verify", self.ref, self.run)
-        await self.service.publish(built["analysisRef"], [], [], "fresh-verify-publish", built["baseRevision"])
+        await self.service.publish(built["analysisRef"], [], [], "fresh-verify-publish")
         self.assertEqual(self.store.get_action_run(OWNER, self.run)["status"], "COMPLETED")
 
     async def test_verification_not_captured_in_this_run_cannot_complete_new_values(self):
@@ -170,7 +170,7 @@ class ReviewTests(ActionCase):
         self.service.actions.capture(refs[0], "success")
         built = await self.service.build(refs, selections, scope, [], "uncaptured-verify", self.ref, self.run)
         self.assertEqual(built["receiptVerification"], "UNVERIFIED")
-        await self.service.publish(built["analysisRef"], [], [], "uncaptured-verify-publish", built["baseRevision"])
+        await self.service.publish(built["analysisRef"], [], [], "uncaptured-verify-publish")
         self.assertEqual(self.store.get_action_run(OWNER, self.run)["status"], "PARTIAL")
 
     async def test_connection_change_mid_run_requires_a_new_plan(self):

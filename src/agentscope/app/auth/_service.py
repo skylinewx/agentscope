@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from typing import Any, Coroutine, NoReturn, Self, TYPE_CHECKING
 
 from ._store import RedisAuthStore
+from ..._logging import logger
 
 if TYPE_CHECKING:
     from ._http import NewUser
@@ -199,15 +200,32 @@ class AuthService:
         await self.store.save_session(
             token, session, self.settings.session_ttl_seconds
         )
+        logger.info(
+            "Login accepted: user_id=%s idle_timeout_seconds=%s",
+            user["id"],
+            self.settings.session_ttl_seconds,
+        )
         return token, session, user
 
     async def authenticate(
         self, token: str | None
     ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Validate only; server-side stream monitors must not renew sessions."""
         if not token or len(token) > 256:
+            logger.info(
+                "Authentication rejected: reason=%s",
+                "missing_cookie" if not token else "invalid_cookie",
+            )
             return None
         session = await self.store.session(token)
-        if not session or session["expires_at"] <= time.time():
+        if not session:
+            logger.info("Authentication rejected: reason=missing_session")
+            return None
+        if session["expires_at"] <= time.time():
+            logger.info(
+                "Authentication rejected: reason=expired user_id=%s",
+                session["user_id"],
+            )
             return None
         user = await self.store.user(session["user_id"])
         if (
@@ -215,8 +233,25 @@ class AuthService:
             or user["status"] != "active"
             or user["auth_version"] != session["auth_version"]
         ):
+            logger.info(
+                "Authentication rejected: reason=account_changed user_id=%s",
+                session["user_id"],
+            )
             return None
         return session, user
+
+    async def renew_session(
+        self, token: str
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Renew only after the incoming request passes origin/CSRF checks."""
+        identity = await self.store.renew_session(
+            token, self.settings.session_ttl_seconds
+        )
+        if identity is None:
+            logger.info(
+                "Authentication rejected: reason=session_changed_before_renewal"
+            )
+        return identity
 
     async def is_active(self, user_id: str) -> bool:
         user = await self.store.user(user_id)

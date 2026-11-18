@@ -82,10 +82,11 @@ class AnalysisChatPersistenceTest(TestCase):
                         model.set_responses(responses)
                         return model
 
-                    ends = []
+                    ends, published_events = [], []
                     original_publish = _chat.publish_session_event
 
                     async def publish(bus, session, event):
+                        published_events.append(deepcopy(event))
                         if event.get('type') == 'REPLY_END':
                             ends.append(deepcopy(event))
                         return await original_publish(bus, session, event)
@@ -99,9 +100,19 @@ class AnalysisChatPersistenceTest(TestCase):
                                               params={'agent_id': 'shared'}, headers=app.headers)
                     self.assertEqual(response.status_code, 200, response.text)
                     history = response.json()['messages'][-1]
+                    expected_answer = ['Corrected answer'] if scenario == 'repaired' else ['Final answer'] if scenario == 'first_pass' else []
+                    if scenario == 'rejected':
+                        expected_answer = ['本次处理尚未完成。现有结果仍有未完成的计算或证据核对，暂不能作为最终结论。']
+                        self.assertTrue(history['metadata']['presentation']['terminal_summary'])
+                    self.assertEqual([block['text'] for block in history['content'] if block['type'] == 'text'], expected_answer)
+                    self.assertEqual(''.join(event.get('delta', '') for event in published_events
+                                            if event['type'] == 'TEXT_BLOCK_DELTA'), ''.join(expected_answer))
                     self.assertEqual(history['metadata'], ends[-1]['metadata'])
                     self.assertEqual(history['finished_reason'], ends[-1]['finished_reason'])
                     completion = history['metadata'].get('analysisCompletion')
+                    if completion is not None:
+                        self.assertRegex(completion['turnKey'], r'^[0-9a-f]{64}$')
+                        completion = {key: value for key, value in completion.items() if key != 'turnKey'}
                     if scenario in ('interrupted', 'iteration_limit'):
                         self.assertEqual(completion['status'], 'INCOMPLETE')
                         self.assertEqual(completion['reason'],

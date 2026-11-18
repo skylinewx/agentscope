@@ -35,7 +35,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
             ops if ops is not None else [{"id": "count", "operator": "COUNT"}, {"id": "order", "operator": "SORT"}], key, base)
 
     async def publish(self, draft, key="publish", claims=None, views=None):
-        return await self.service.publish(draft["analysisRef"], claims or [], views or [], key, draft["baseRevision"])
+        return await self.service.publish(draft["analysisRef"], claims or [], views or [], key)
 
     async def test_idempotent_build_publish_restart(self):
         draft = await self.build()
@@ -59,7 +59,7 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         published = await self.publish(await self.build())
         drafts = [await self.build("v" + str(i), published["analysisRef"]) for i in range(2)]
         await self.publish(drafts[0], "publish-v2")
-        with self.assertRaisesRegex(AnalysisError, "基础版本"):
+        with self.assertRaisesRegex(AnalysisError, "更新的发布结果"):
             await self.publish(drafts[1], "publish-v3")
 
     async def test_concurrent_publish_only_one_wins(self):
@@ -196,7 +196,8 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         second["response"]["content"][0]["text"] = json.dumps(receipt)
         gap = self.store.capture(OWNER, second)
         data = adapt({r: self.store.get_capture(OWNER, r) for r in (first, gap)}, selectors, scope, 100)
-        self.assertEqual(data["scope"]["coverage"], "PARTIAL")
+        self.assertTrue(data['scope']['selectedDataComplete'])
+        self.assertFalse(data['scope']['sourcePagesComplete'])
 
     async def test_protocol_rejects_number_instead_of_exact_string(self):
         from analysis_extension.protocol import validate_artifact
@@ -204,8 +205,11 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         artifact = self.store.get_analysis(OWNER, draft["analysisRef"])
         validate_artifact(artifact)
         artifact["facts"][0]["value"] = 100.0
-        with self.assertRaisesRegex(AnalysisError, "协议版本"):
+        with self.assertRaises(AnalysisError) as caught:
             validate_artifact(artifact)
+        self.assertEqual(caught.exception.code, 'INVALID_ARTIFACT')
+        self.assertEqual(caught.exception.details['issues'][0]['path'], '/facts/0/value')
+        self.assertFalse(caught.exception.details['requiresSourceQuery'])
 
     async def test_resume_requires_captured_original_and_server_link(self):
         import json

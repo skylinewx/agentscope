@@ -9,7 +9,7 @@ REPAIR_FIELDS = {'document', 'claims', 'viewPlan', 'presentation', 'workRefs', '
 REPAIR_REASONS = {
     'invalid edit': '每项须提供 op、绝对 path；add/replace 须有 value，remove 不传 value。',
     'invalid pointer escape': '路径仅支持 JSON Pointer 的 ~0 和 ~1 转义。',
-    'read-only field': '只能修改发布内容，不能修改事实、分析身份或基础版本。',
+    'read-only field': '只能修改发布内容，不能修改事实或分析身份；版本由服务管理。',
     'invalid array index': '数组位置须为无前导零的非负整数；仅 add 的末段可用 - 追加。',
     'append requires add': '数组末段 - 仅用于 add 追加；replace/remove 须指定已有数字下标。',
     'index out of range': '数组下标越界；add 最多使用当前长度，其余操作须指向已有项。',
@@ -17,6 +17,29 @@ REPAIR_REASONS = {
     'missing field': '路径指向的字段不存在；添加新字段使用 add，且父路径必须已经存在。',
     'use replace for an existing field': '字段已经存在，请使用 replace。',
 }
+
+
+def recovery_details(code, details):
+    """按失败阶段给出恢复动作；缺证据、版本冲突不指示模型改报告文字。"""
+    details = dict(details)
+    requires_build = details.get('requiresBuild') is True or any(
+        item.get('requiresBuild') is True for item in details.get('issues', []))
+    if code in ('FORMULA_DATA_REQUIRED', 'GROUPING_RESULT_REQUIRED', 'SELECTED_DATA_INCOMPLETE', 'EVIDENCE_INVALID'):
+        requires_build = True
+    details['requiresBuild'] = requires_build
+    if code == 'VERSION_CONFLICT':
+        if details.get('nextAction') == 'RETRY_PREVIEW':
+            details['repairHint'] = '沿用已保存的页面重新预览，宿主接续同一分析的数据摘要版本；无需重新取数、计算或改写页面。'
+        else:
+            details['nextAction'] = 'REBUILD_FROM_LATEST_PUBLISHED'
+            details['repairHint'] = '已有新的发布结果。基于 latestPublishedAnalysisRef 续建并保留仍适用的页面内容，再预览发布；不要修改旧版本号强行确认，也不要反复改写文字。'
+    elif requires_build:
+        details['nextAction'] = 'BUILD_WITH_REQUIRED_INPUTS'
+        details['repairHint'] = '先按缺失对象和引用核对分析范围及已有捕获，补入必要证据或计算后重新 Build，再复用页面内容预览；仅修改报告文字不能解决此错误。'
+    else:
+        details.setdefault('nextAction', 'REPAIR_SAVED_PROPOSAL')
+        details.setdefault('repairHint', '按 issues/path 局部修复：再次调用 AnalysisPublish，使用 repairRef 和 repairs；保留未修改的图表、数据与说明，无需重新取数。')
+    return details
 
 
 def repair_fields(request):
@@ -32,7 +55,22 @@ def repair_request(saved, analysis_ref, repairs):
     if not isinstance(repairs, list) or not 0 <= len(repairs) <= 100:
         raise AnalysisError('INVALID_REPAIR', 'repairs 最多 100 项；空列表表示原样提交已校验的预览。')
     request = deepcopy(saved)
+    text_edits = [(index, edit) for index, edit in enumerate(repairs)
+                  if isinstance(edit, dict) and edit.get('op') == 'replaceText']
+    if text_edits:
+        # 文字补丁与整页替换不能混用，避免顺序改变匹配基准。其他字段仍按原契约处理。
+        if any(isinstance(edit, dict) and edit.get('op') != 'replaceText'
+               and edit.get('path') in ('/document', '/document/html', '/document/path') for edit in repairs):
+            raise AnalysisError('INVALID_REPAIR', '同批不能同时替换整页和修正文本文字。')
+        from .document_repair import apply_text_repairs
+        document = request.get('document') or {}
+        source = document.get('html')
+        binding_keys = {binding['key'] for binding in document.get('bindings', [])}
+        repaired = apply_text_repairs(source, text_edits, binding_keys)
+        request['document']['html'] = repaired
     for index, edit in enumerate(repairs):
+        if isinstance(edit, dict) and edit.get('op') == 'replaceText':
+            continue
         try:
             if (not isinstance(edit, dict) or set(edit) - {'op', 'path', 'value'}
                     or edit.get('op') not in ('replace', 'remove', 'add')
@@ -47,6 +85,14 @@ def repair_request(saved, analysis_ref, repairs):
             parts = [p.replace('~1', '/').replace('~0', '~') for p in parts]
             if parts[0] not in REPAIR_FIELDS:
                 raise ValueError('read-only field')
+            if parts == ['document'] and edit['op'] == 'replace' and isinstance(edit.get('value'), dict):
+                # 页面内容更新沿用未修改的数据绑定。调用者显式传空数组仍可删除绑定。
+                replacement = deepcopy(edit['value'])
+                previous = request.get('document') or {}
+                for field in ('bindings', 'datasets'):
+                    if field not in replacement and field in previous:
+                        replacement[field] = deepcopy(previous[field])
+                edit = {**edit, 'value': replacement}
             parent = request
             for part in parts[:-1]:
                 if isinstance(parent, list):
@@ -84,7 +130,7 @@ def repair_request(saved, analysis_ref, repairs):
                                 {'path': f'/repairs/{index}', 'targetPath': edit.get('path') if isinstance(edit, dict) else None,
                                  'reason': reason if reason in REPAIR_REASONS else 'invalid path', 'hint': hint,
                                  **({'suggestedEdit': corrected[0]} if corrected else {})}) from exc
-    if not {'analysisRef', 'expectedBaseRevision'} <= request.keys() or (not request.get('document') and not {'claims','viewPlan'} <= request.keys()):
+    if 'analysisRef' not in request or (not request.get('document') and not {'claims','viewPlan'} <= request.keys()):
         raise AnalysisError('INVALID_REPAIR', '不能移除发布身份或全部展示内容。')
     return request
 
@@ -169,7 +215,7 @@ def schema_issues(request):
     if isinstance(request, dict) and 'arguments' in request:
         return [{'code': 'INVALID_PUBLICATION', 'path': '/arguments', 'validator': 'additionalProperties',
                  'message': '工具参数直接放在顶层 JSON 对象中，不再包一层 arguments；不能传字符串化的整份参数。',
-                 'requiredFields': ['analysisRef', 'expectedBaseRevision', 'requestKey'],
+                 'requiredFields': ['analysisRef', 'requestKey'],
                  'hint': '首次用 document（自由页面）或 claims+viewPlan（显式组件）；局部修复用 repairRef+repairs。检查阶段均带 previewOnly=true。'}]
     issues = []
     if isinstance(request, dict) and 'repairRef' in request:

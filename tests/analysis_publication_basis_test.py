@@ -15,7 +15,7 @@ class FormulaPublicationBasisTests(TestCase):
     def artifact(self, **options):
         facts = chain()
         scope = {'scopeId': 'scope', 'coverage': 'UNKNOWN'}
-        values = calculate(facts, scope, [{'id': 'f', 'operator': 'FORMULA_CHECK', 'inputRefs': ['root']}], RuleRegistry())
+        values = calculate(facts, scope, [{'id': 'f', 'operator': 'FORMULA_CHECK', 'inputRefs': ['root'], 'checkScope': 'RECURSIVE'}], RuleRegistry())
         return {'facts': facts, 'derivedValues': values, 'scope': scope, 'technicalDetails': False,
                 'presentation': {}, 'viewPlan': [{'viewId': 'path', 'scopeId': 'scope', 'type': 'WATERFALL',
                     'valueRefs': ['derived_f'], 'nodeRefs': ['subtotal', 'root'], 'showChecks': False, **options}]}
@@ -76,10 +76,10 @@ class PresentationRecoveryTests(PresentationCase):
         presentation = {'labels': [{'valueRef': refs[0], 'role': 'measure', 'label': '结果简称'},
                                   {'valueRef': refs[1], 'role': 'object', 'label': '对象简称'}]}
         view = {'viewId': 'values', 'scopeId': first['scope']['scopeId'], 'type': 'TABLE', 'valueRefs': refs}
-        preview = await self.service.publish(first['analysisRef'], [], [view], 'preview', first['baseRevision'],
+        preview = await self.service.publish(first['analysisRef'], [], [view], 'preview',
                                              presentation=presentation, previewOnly=True)
         self.assertEqual(preview['summary']['presentation'], presentation)
-        published = await self.service.publish(first['analysisRef'], requestKey='publish', expectedBaseRevision=first['baseRevision'],
+        published = await self.service.publish(first['analysisRef'], requestKey='publish',
                                                repairRef=preview['repairRef'], repairs=[])
         inspected = await self.service.inspect(section='summary', analysisRef=first['analysisRef'])
         self.assertEqual(published['summary']['presentation'], presentation)
@@ -89,7 +89,7 @@ class PresentationRecoveryTests(PresentationCase):
         # Reuse is explicit and does not make Build impose old titles or layouts.
         self.assertEqual(self.store.get_analysis(OWNER, second['analysisRef']).get('presentation', {}), {})
         view['scopeId'] = second['scope']['scopeId']
-        released = await self.service.publish(second['analysisRef'], [], [view], 'republish', second['baseRevision'], presentation=recovered)
+        released = await self.service.publish(second['analysisRef'], [], [view], 'republish',  presentation=recovered)
         document = self.delivery.view(released['delivery']['path'])
         self.assertEqual(document['tables'][0]['columns'][0]['label'], '结果简称')
         self.assertEqual(document['tables'][0]['rows'][1]['label'], '对象简称')

@@ -9,6 +9,9 @@
 		"build:frontend": "pnpm --filter frontend build",
 		"build:backend": "pnpm --filter backend build",
 		"build": "pnpm build:frontend && pnpm build:backend",
+		"start:frontend": "pnpm --filter frontend preview --port 5173 --strictPort",
+		"start:backend": "pnpm --filter backend start",
+		"start": "concurrently --kill-others-on-fail \"pnpm start:frontend\" \"pnpm start:backend\"",
 		"format": "prettier --write . && pnpm --filter frontend lint:fix",
 		"format:check": "prettier --check . && pnpm --filter frontend lint",
 		"prepare": "husky"

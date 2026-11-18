@@ -7,11 +7,11 @@ by the run are published to the message bus and delivered to the
 frontend via the long-lived ``GET /sessions/{sid}/stream`` SSE
 connection provided by the session router.
 
-Two trigger paths, deliberately asymmetric:
+Trigger paths:
 
-- **New user message(s)** are spawned directly into the
-  :class:`ChatRunRegistry`. The registry's single-run-per-session rule
-  surfaces as a 409, which is exactly the desired double-submit guard.
+- **Single user messages** start immediately when idle, or join the
+  durable session FIFO behind existing work. Batch inputs and explicit
+  continuations retain the direct-run API for integrations.
 - **HITL results** (``UserConfirmResultEvent`` /
   ``ExternalExecutionResultEvent``) are *enqueued* onto the shared
   run-trigger queue and drained by the single
@@ -38,6 +38,7 @@ from .._service import (
 from ..message_bus import MessageBus, MessageBusKeys
 from .._bus_ops import enqueue_run_trigger
 from ...event import UserConfirmResultEvent, ExternalExecutionResultEvent
+from ...message import Msg
 
 chat_router = APIRouter(
     prefix="/chat",
@@ -136,7 +137,27 @@ async def chat(
         return ChatTriggerResponse(status="started", session_id=run_session_id)
 
     # ------------------------------------------------------------------
-    # New user message(s) / None — spawn directly. The registry's
+    # Admit idle input directly under the run lock. Busy sessions retain FIFO
+    # order even when an older tab or API client thinks they are idle.
+    queue_service = getattr(chat_service, "message_queue_service", None)
+    if (
+        queue_service is not None
+        and isinstance(request.input, Msg)
+        and request.input.role == "user"
+    ):
+        try:
+            disposition = await queue_service.submit(
+                user_id, request.agent_id, request.session_id, request.input,
+            )
+            return ChatTriggerResponse(
+                status=disposition, session_id=request.session_id,
+            )
+        except NotImplementedError:
+            # Existing integrations with custom storage can keep using chat
+            # without implementing the optional queue storage interface.
+            pass
+
+    # Batch inputs / None — spawn directly. The registry's
     # single-run-per-session rule is the desired double-submit guard.
     # ------------------------------------------------------------------
     try:

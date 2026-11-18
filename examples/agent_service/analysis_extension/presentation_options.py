@@ -102,6 +102,9 @@ def prepare_views(artifact):
         return {role: {ref: by_identity[identity(ref, role)] for ref in refs if identity(ref, role) in by_identity}
                 for role in ('object', 'measure')}
     shared = expand(artifact.get('presentation', {}).get('labels', []), '/presentation/labels')
+    from .identity import display_names
+    defaults = display_names(artifact['facts'], artifact['scope'].get('memberDimension'))
+    shared['object'] = {**defaults, **shared['object']}
     for index, view in enumerate(artifact['viewPlan']):
         view['_sharedLabelLookup'] = shared
         role = 'object' if view['type'] in ('BAR_VALUES', 'BAR_RANK', 'HIERARCHY') else 'measure'

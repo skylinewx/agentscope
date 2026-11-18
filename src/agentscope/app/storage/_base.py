@@ -31,10 +31,31 @@ from ...credential import CredentialBase
 from ...message import Msg
 from ...sop import SOPPhase, SOPRunState
 from ...state import AgentState
+from ._model._message_queue import MessageQueueRecord
 
 
 class StorageBase(ABC):
     """The storage abstract base class."""
+
+    async def list_session_summaries(self, user_id: str, agent_id: str):
+        """Read sidebar projections without changing the internal full-record API."""
+        from ._session_summary import SessionSummary
+        return [SessionSummary.from_record(record) for record in await self.list_sessions(user_id, agent_id)]
+
+    async def get_message_queue(self, user_id: str, session_id: str) -> MessageQueueRecord | None:
+        """Read a durable queue. Custom backends may opt out of this feature."""
+        return None
+
+    async def mutate_message_queue(self, initial: MessageQueueRecord, mutate: Callable) -> MessageQueueRecord:
+        """Create if absent, then atomically mutate the latest queue."""
+        raise NotImplementedError("This storage does not support message queues.")
+
+    async def list_message_queues(self) -> list[MessageQueueRecord]:
+        """Queues to reconcile after restart (including unfinished claims)."""
+        return []
+
+    async def delete_message_queue(self, user_id: str, session_id: str) -> None:
+        """Remove the queue when its owning session is deleted."""
 
     def bind_session_agent_resolver(
         self,

@@ -111,7 +111,8 @@ def period_coverage(facts, captures, receipts, source_contexts):
                     and not pending_work and any(g['planFinished'] for g in plan_groups))
         complete &= finished
         result.append({'sourceContextId': key[0], 'planId': key[1], 'workIndex': key[2],
-                       'resolution': group['resolution'], 'complete': finished, 'pendingPeriods': pending,
+                       'resolution': group['resolution'], 'complete': finished,
+                       'selectedDataComplete': not missing_count, 'pendingPeriods': pending,
                        'pendingWorkIndexes': pending_work,
                        'missingMemberPeriods': missing, 'missingMemberPeriodCount': missing_count,
                        'missingMemberPeriodsTruncated': missing_count > len(missing), 'periodStatuses': group['statuses']})

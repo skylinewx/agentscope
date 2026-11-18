@@ -57,6 +57,45 @@ class ReliabilityTests(PresentationCase):
         # Ownership and corrupt storage remain hard errors, not skipped receipts.
         with self.assertRaises(AnalysisError): self.store.get_capture(Owner('other','agent','session'),source)
 
+    async def test_direct_traversal_default_depth_and_empty_group_keep_evidence(self):
+        source, _, _ = self.source()
+        explicit = self.traversal(keys=())
+        capture = deepcopy(self.store.get_capture(OWNER, explicit))
+        capture['request'].pop('traversalMaximumDepth')
+        omitted = self.store.capture(OWNER, capture)
+        relations = captured_relations({ref: self.store.get_capture(OWNER, ref) for ref in (source, omitted)})
+        self.assertEqual(len(relations), 1)
+        self.assertEqual(relations[0]['childIds'], [])
+        self.assertTrue(relations[0]['complete'])
+        receipt = receipt_from_capture(capture)
+        receipt['data']['maximumDepth'] = 2
+        self.store.capture(OWNER, reply(capture, receipt))
+        inspected = await self.service.inspect(section='relations')
+        self.assertIn('RELATION_CONTRACT_MISMATCH', [item['code'] for item in inspected['diagnostics']['items']])
+
+    async def test_plan_list_roots_and_empty_groups_preserve_exactness(self):
+        capture, _, _ = fixture()
+        receipt = receipt_from_capture(capture)
+        capture['request']['plan'] = {'steps': [
+            {'id': 'roots', 'operation': 'LIST_INSTANCES', 'modelCode': 'category'},
+            {'id': 'children', 'operation': 'TRAVERSE_RELATION', 'inputs': ['roots'],
+             'capabilityId': 'category-members', 'traversalScope': 'DIRECT'}], 'outputStepIds': ['children']}
+        receipt['data']['stepResults'] = [
+            {'stepId': 'roots', 'exactness': 'EXACT', 'rows': [
+                {'resourceIri': 'iri:one', 'key': 'one', 'modelCode': 'category'},
+                {'resourceIri': 'iri:two', 'key': 'two', 'modelCode': 'category'}]},
+            {'stepId': 'children', 'exactness': 'EXACT', 'rows': [
+                {'resourceIri': 'iri:member', 'key': 'member', 'modelCode': 'unit',
+                 'rootResourceIri': 'iri:one', 'depth': 1}]}]
+        ref = self.store.capture(OWNER, reply(capture, receipt))
+        relations = captured_relations({ref: self.store.get_capture(OWNER, ref)})
+        self.assertEqual({item['parentId']: item['childIds'] for item in relations}, {'one': ['member'], 'two': []})
+        self.assertTrue(all(item['complete'] for item in relations))
+        receipt['completeness']['enumerationExhausted'] = False
+        partial = self.store.capture(OWNER, reply(capture, receipt))
+        relations = captured_relations({partial: self.store.get_capture(OWNER, partial)})
+        self.assertTrue(all(not item['complete'] for item in relations))
+
     async def test_exact_selectors_root_rows_and_invalid_steps(self):
         source,_,_=self.source(); ref=self.traversal()
         result=await self.service.inspect(section='selectors',captureRef=ref)
@@ -169,10 +208,10 @@ class ReliabilityTests(PresentationCase):
         result=await self.service.build([ref],selections,scope,[],'report')
         view={'viewId':'members','scopeId':result['scope']['scopeId'],'type':'TABLE','valueRefs':[f['factId'] for f in facts[1:]]}
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(result['analysisRef'],[],[view],'incomplete',0)
+            await self.service.publish(result['analysisRef'],[],[view],'incomplete')
         self.assertEqual(caught.exception.code,'REPORT_TOPIC_UNREPRESENTED')
         view['valueRefs']=[f['factId'] for f in facts]
-        await self.service.publish(result['analysisRef'],[],[view],'complete',0)
+        await self.service.publish(result['analysisRef'],[],[view],'complete')
         results=await self.service.inspect(section='results')
         self.assertEqual(results['total'],2)
         self.assertEqual(results['items'][-1]['reportTopics'][0]['title'],'总体')

@@ -55,6 +55,11 @@ class Limits:
     max_selections: int = 1000
     max_operations: int = 100
     page_size: int = 100
+    max_review_attempts: int = 3
+    review_budget_seconds: int = 180
+    max_analysis_repairs: int = 4
+    repair_budget_seconds: int = 300
+    max_query_retries: int = 1
 
     def __post_init__(self):
         if any(type(x) is not int or x <= 0 for x in asdict(self).values()):

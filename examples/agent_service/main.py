@@ -24,6 +24,7 @@ from agentscope.rag import ApproxTokenChunker, QdrantStore
 from agentscope.workspace import WorkspaceBase
 
 from service_config import auth_settings, redis_settings
+from business_instructions import WORKSPACE_INSTRUCTIONS
 
 service_dir = os.path.dirname(os.path.abspath(__file__))
 config_path = os.path.join(service_dir, "service-config.local.json")
@@ -72,6 +73,7 @@ app = create_app(
     #     port=6379,
     # ),
     workspace_manager=LocalWorkspaceManager(
+        instructions=WORKSPACE_INSTRUCTIONS,
         basedir=os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
             "workspaces",

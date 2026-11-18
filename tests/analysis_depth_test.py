@@ -251,7 +251,7 @@ class SynthesisServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('RECONCILE',protocols['operators']); self.assertIn('ARITHMETIC',protocols['operators'])
         Draft202012Validator(AnalysisInspect.input_schema).validate({'section':'inventory','memberDimension':'dimension','search':'收入'})
         validator=Draft202012Validator(AnalysisPublish.input_schema)
-        validator.validate({'analysisRef':'a','requestKey':'p','expectedBaseRevision':0,'claims':[
+        validator.validate({'analysisRef':'a','requestKey':'p','claims':[
             {'claimId':'c','scopeId':'s','kind':'computed','parts':[{'valueRef':'v','field':'childSum','format':{'grouping':True,'decimalPlaces':2}}]}],
             'viewPlan':[{'viewId':'h','scopeId':'s','type':'HIERARCHY','valueRefs':['p','c'],'relationRef':'r','comparisonRef':'d',
                         'labels':[{'valueRef':'p','label':'父级'}],'numberFormat':{'grouping':True}}]})

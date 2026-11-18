@@ -43,8 +43,10 @@ class CaptureTest(IsolatedAsyncioTestCase):
         self.owner = Owner("u", "a", "s")
         self.allowed = AsyncMock()
 
-    def make_tool(self, text, delay=0, resource_id="registered-budget"):
+    def make_tool(self, text, delay=0, resource_id="registered-budget", sent=None):
         async def call_tool(*args, **kwargs):
+            if sent is not None:
+                sent.append((args, kwargs))
             await asyncio.sleep(delay)
             return mcp.types.CallToolResult(content=[mcp.types.TextContent(type="text", text=text)])
         inner = MCPTool("not-a-hardcoded-prefix", mcp.types.Tool(name="execute_semantic_plan", inputSchema={
@@ -62,9 +64,105 @@ class CaptureTest(IsolatedAsyncioTestCase):
             toolkit=Toolkit(tools=[tool]), middlewares=[ToolOffloadMiddleware(manager, bus, "u", "a", timeout_secs=timeout), CaptureMiddleware(capture)])
         return agent, manager
 
+    async def test_host_request_id_reaches_actual_mcp_and_saved_receipt(self):
+        sent = []
+        tool = self.make_tool('{"contractVersion":"2.0","data":{}}', sent=sent)
+        agent, _ = self.agent(tool)
+        submitted = {'contractVersion': '2.0', 'requestId': 'model-placeholder', 'year': 2026}
+        call = ToolCallBlock(id='host-id-call', name=tool.name, input=json.dumps(submitted))
+        events = [event async for event in agent._acting(call)]
+        response = next(event for event in events if isinstance(event, ToolResponse))
+        saved = self.store.get_capture(self.owner, response.metadata['analysisCaptureRef'])
+        args, kwargs = sent[0]
+        actual = kwargs.get('arguments', args[1] if len(args) > 1 else None)
+        self.assertIsNotNone(actual)
+        self.assertEqual(actual, saved['request'])
+        self.assertTrue(actual['requestId'].startswith('host_'))
+        self.assertEqual(json.loads(saved['submittedRequestText']), submitted)
+
+    async def test_malformed_model_arguments_return_tool_error_without_aborting_turn(self):
+        from agentscope.message import ToolResultState
+        sent = []
+        tool = self.make_tool('{"contractVersion":"2.0","data":{}}', sent=sent)
+        agent, _ = self.agent(tool)
+        for payload in ('{"querySessionId": unquoted-identifier}', '[]', 'null'):
+            call = ToolCallBlock(id='bad-json', name=tool.name, input=payload)
+            events = [event async for event in agent._acting(call)]
+            response = next(event for event in events if isinstance(event, ToolResponse))
+            self.assertEqual(response.state, ToolResultState.ERROR)
+            self.assertEqual(json.loads(response.content[0].text)['error']['code'], 'INVALID_JSON')
+            self.assertNotIn('analysisCaptureRef', response.metadata)
+        self.assertEqual(sent, [])
+        # 同一工具在修正参数后仍可正常执行，错误没有中止会话或伪造来源回执。
+        await self.invoke(agent, tool)
+        self.assertEqual(len(sent), 1)
+
+    async def test_successful_identical_query_reuses_capture_only_in_same_turn(self):
+        sent, cache = [], {}
+        receipt = json.dumps({'contractVersion': '2.0', 'status': 'SUCCEEDED', 'data': {
+            'rowCount': 1, 'columns': [{'name': 'amount', 'label': '费用', 'type': 'DECIMAL_STRING', 'unit': '元'}],
+            'rows': [['123456789.1200']]}})
+        tool = self.make_tool(receipt, sent=sent)
+        agent = SimpleNamespace(toolkit=SimpleNamespace(get_tool=AsyncMock(return_value=tool)))
+        capture = ReceiptCapture(self.store, self.owner, frozenset({'registered-budget'}), self.allowed)
+        capture.turn_key_provider = lambda: 'turn-one'
+        capture.query_cache_provider = lambda: cache
+        async def execute(**kwargs):
+            sent.append(kwargs['tool_call'].input)
+            from agentscope.message import TextBlock
+            yield ToolResponse(content=[TextBlock(text=receipt)])
+        async def query(call_id, year=2026):
+            call = ToolCallBlock(id=call_id, name=tool.name,
+                                input=json.dumps({'contractVersion': '2.0', 'requestId': call_id, 'year': year}))
+            return [item async for item in capture.run(agent, {'tool_call': call}, execute)]
+        first = (await query('first'))[0]
+        reused = (await query('second'))[0]
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(first.metadata['analysisCaptureRef'], reused.metadata['analysisCaptureRef'])
+        self.assertTrue(reused.metadata['queryPerformance']['reused'])
+        self.assertEqual(first.metadata['public_progress'], reused.metadata['public_progress'])
+        fact = first.metadata['public_progress']['facts'][1]
+        self.assertEqual(fact['value'], '123456789.1200')
+        self.assertEqual(fact['sourceId'], first.metadata['analysisCaptureRef'])
+        await query('changed', 2025)
+        self.assertEqual(len(sent), 2)
+        capture.turn_key_provider = lambda: 'turn-two'
+        await query('new-turn')
+        self.assertEqual(len(sent), 3)
+        self.assertGreaterEqual(self.allowed.await_count, 4)
+
     async def invoke(self, agent, tool):
         call = ToolCallBlock(id="original-call", name=tool.name, input='{"contractVersion":"2.0"}')
         return [event async for event in agent._acting(call)]
+
+    async def test_partial_failed_or_revoked_query_is_never_reused(self):
+        from agentscope.message import TextBlock
+        from analysis_extension.models import AnalysisError
+        cache, calls = {}, []
+        tool = self.make_tool('{}')
+        agent = SimpleNamespace(toolkit=SimpleNamespace(get_tool=AsyncMock(return_value=tool)))
+        capture = ReceiptCapture(self.store, self.owner, frozenset({'registered-budget'}), self.allowed)
+        capture.turn_key_provider = lambda: 'one'
+        capture.query_cache_provider = lambda: cache
+        status = 'PARTIAL'
+        async def execute(**kwargs):
+            calls.append(status)
+            yield ToolResponse(content=[TextBlock(text=json.dumps({'contractVersion': '2.0', 'status': status, 'data': {}}))])
+        async def query():
+            call = ToolCallBlock(id='same-call', name=tool.name, input='{"contractVersion":"2.0"}')
+            return [item async for item in capture.run(agent, {'tool_call': call}, execute)]
+        for status in ('PARTIAL', 'FAILED'):
+            await query()
+            await query()
+            self.assertEqual(cache, {})
+        status = 'SUCCEEDED'
+        await query()
+        self.assertEqual(len(calls), 5)
+        self.assertEqual(len(cache), 1)
+        self.allowed.side_effect = AnalysisError('ACCESS_DENIED', '已撤销访问')
+        with self.assertRaises(AnalysisError):
+            await query()
+        self.assertEqual(len(calls), 5)
 
     async def test_large_final_response_captured_without_float_roundtrip(self):
         text = '{"contractVersion":"2.0","data":{"value":123456789012345678.123456789,"padding":"' + "预算" * 300000 + '"}}'

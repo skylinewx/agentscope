@@ -99,6 +99,8 @@ def evaluate(document, observations):
 
 def summary(records, unavailable_reason=None):
     widths = {r['viewport']['width'] for r in records}
+    # 实测正文仅供服务端业务核对，不随每次工具返回重复整页文字。
+    records = [{key: value for key, value in record.items() if key != 'hostRenderedText'} for record in records]
     return {'performed': bool(records), 'status': 'NOT_CHECKED' if not records else
             'ERRORS' if any(r['blocking'] for r in records) else
             'REVIEW_REQUIRED' if any(r['status'] == 'REVIEW_REQUIRED' for r in records) else 'MEASURED',
@@ -108,8 +110,17 @@ def summary(records, unavailable_reason=None):
             **({'unavailableReason': unavailable_reason} if unavailable_reason else {})}
 
 
-def require_publication_checks(document, records, unavailable_reason=None):
+def require_publication_checks(document, records, unavailable_reason=None, requirements=None):
     checks = summary(records, unavailable_reason)
+    # 响应式布局可在窄屏简化图形；完整覆盖须在至少一个实测宽度保留，
+    # 每个宽度自身的比例、脚本与顺序错误仍由下面的 blocking 检查阻断。
+    missing = {kind: count for kind, count in (requirements or {}).items() if count > 0 and
+               (not records or all(record.get('numericChecks', {}).get(kind, {}).get('measured', 0) < count
+                                   for record in records))}
+    if missing:
+        raise AnalysisError('DOCUMENT_CHECK_COVERAGE_LOST', '当前页面减少了同一数据已声明的数值图形检查覆盖，不能通过删除标记绕过错误。',
+                            {'path': '/document/html', 'requiredNumericCoverage': missing, 'requiresBuild': False,
+                             'hint': '在实际图形元素上保留值绑定及比例尺标记，修复几何后重新预览；NOT_DECLARED 不表示检查通过。'})
     if any(r['blocking'] for r in records):
         raise AnalysisError('DOCUMENT_RENDER_ERRORS', '当前页面存在已测到的脚本、排序、计数、图形尺寸或线性比例错误，修正后重新检查。',
                             {'path': '/document/html', 'renderChecks': checks, 'requiresBuild': False})

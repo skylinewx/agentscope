@@ -153,9 +153,9 @@ class SourceRegistry:
         from .member_scopes import adapt
         return adapt(self, captures, selections, scope, max_facts)
 
-    def catalog(self, capture, member_dimension=None):
+    def catalog(self, capture, member_dimension=None, *, grid_selection=None):
         from .member_scopes import catalog
-        return catalog(self, capture, member_dimension)
+        return catalog(self, capture, member_dimension, grid_selection=grid_selection)
 
     def _adapt_unscoped(self, captures, selections, scope, max_facts):
         groups = self.groups(captures)
@@ -196,7 +196,7 @@ class SourceRegistry:
             if capture is None:
                 raise AnalysisError("UNKNOWN_POPULATION", "范围来源未纳入本次捕获。")
             population_complete = self.for_capture(capture).population(capture, population, scope["members"])
-        selected_complete = complete and observed == members | reference
+        selected_complete = all(result['scope'].get('selectedDataComplete', False) for result in results) and observed == members | reference
         coverage = "COMPLETE" if population_complete and selected_complete else "PARTIAL" if not selected_complete else "UNKNOWN"
         return {"facts": facts, "sourceContexts": list(contexts.values()), "context": combined_context(list(contexts.values())),
                 "scope": {**scope, "scopeId": "scope_" + digest(scope)[:24], "coverage": coverage,

@@ -21,7 +21,7 @@ class ExpressionTests(ActionCase):
         return draft, self.store.get_analysis(OWNER, draft['analysisRef'])
 
     async def publish_views(self, draft, views, claims=None):
-        result = await self.service.publish(draft['analysisRef'], claims or [], views, 'publish-' + draft['analysisRef'], draft['baseRevision'])
+        result = await self.service.publish(draft['analysisRef'], claims or [], views, 'publish-' + draft['analysisRef'])
         return self.delivery.view(result['delivery']['path'])
 
     async def test_narrative_preserves_model_text_order_dates_and_bound_values(self):
@@ -112,7 +112,7 @@ class ExpressionTests(ActionCase):
         for plans in ([plan,{**plan,'viewId':'duplicate'}], [{**plan,'valueRefs':['unknown']}], [{**plan,'field':'positive'}]):
             with self.assertRaises(AnalysisError): validate_views(artifact, plans)
         self.assertFalse(list(Draft202012Validator(AnalysisPublish.input_schema).iter_errors({
-            'analysisRef':draft['analysisRef'],'claims':[], 'viewPlan':[plan], 'requestKey':'schema','expectedBaseRevision':0})))
+            'analysisRef':draft['analysisRef'],'claims':[], 'viewPlan':[plan], 'requestKey':'schema'})))
 
     def formula_capture(self, tag, missing=False, changed=False, extra=False, mismatch=False):
         base, selectors, scope = mixed_fixture(self.store, 1)
@@ -163,7 +163,7 @@ class ExpressionTests(ActionCase):
         findings = (await self.service.inspect('findings',draft['analysisRef'],findingPlan=plan))['items']
         action = {'findingRefs':[findings[0]['findingId']], 'check':'VERIFY_COMPOSITION', 'goal':'继续核对本次表内公式',
                   'requiredEvidence':['同一目标和依赖的新来源及核验'], 'expectedDecision':'区分一致、差额和断点', 'priorityBasis':'用户指定'}
-        result = await self.service.publish(draft['analysisRef'], [], [], 'publish-' + tag, draft['baseRevision'],findingPlan=plan,actionPlan=[action])
+        result = await self.service.publish(draft['analysisRef'], [], [], 'publish-' + tag, findingPlan=plan,actionPlan=[action])
         artifact = self.store.get_analysis(OWNER,draft['analysisRef'])
         actual = artifact['actions'][0]
         self.assertEqual(actual['availability'],'AVAILABLE')
@@ -177,7 +177,7 @@ class ExpressionTests(ActionCase):
     async def test_source_formula_followup_completes_with_fresh_matching_evidence(self):
         old, _, run, path = await self.formula_action()
         new = await self.formula_draft('new',action_run=run,base=old['analysisRef'])
-        await self.service.publish(new['analysisRef'],[],[],'publish-new',new['baseRevision'])
+        await self.service.publish(new['analysisRef'],[],[],'publish-new')
         actual = self.store.get_action_run(OWNER,run)
         self.assertEqual((actual['status'],actual['diagnostics'][-1]['code']),('COMPLETED','FORMULA_CHECKED_MATCH'))
         self.assertIn('一致',self.delivery.view(path)['actionRuns'][0]['resultNote'])
@@ -185,7 +185,7 @@ class ExpressionTests(ActionCase):
     async def test_source_formula_followup_completes_check_but_reports_difference(self):
         old, _, run, path = await self.formula_action()
         new = await self.formula_draft('new',action_run=run,base=old['analysisRef'],mismatch=True)
-        await self.service.publish(new['analysisRef'],[],[],'publish-new',new['baseRevision'])
+        await self.service.publish(new['analysisRef'],[],[],'publish-new')
         actual = self.store.get_action_run(OWNER,run)
         self.assertEqual((actual['status'],actual['diagnostics'][-1]['code']),('COMPLETED','FORMULA_CHECKED_WITH_DIFFERENCE'))
         self.assertIn('不代表公式一致',self.delivery.view(path)['actionRuns'][0]['resultNote'])
@@ -193,7 +193,7 @@ class ExpressionTests(ActionCase):
     async def test_source_formula_followup_can_add_only_reachable_missing_dependencies(self):
         old, _, run, _ = await self.formula_action(missing=True)
         new = await self.formula_draft('new',action_run=run,base=old['analysisRef'])
-        await self.service.publish(new['analysisRef'],[],[],'publish-new',new['baseRevision'])
+        await self.service.publish(new['analysisRef'],[],[],'publish-new')
         self.assertEqual(self.store.get_action_run(OWNER,run)['status'],'COMPLETED')
 
     async def test_source_formula_followup_rejects_changed_formula(self):
@@ -212,12 +212,12 @@ class ExpressionTests(ActionCase):
     async def test_source_formula_requires_actual_target_check_not_just_new_values(self):
         old, _, run, _ = await self.formula_action()
         new = await self.formula_draft('new',action_run=run,base=old['analysisRef'],operations=[])
-        await self.service.publish(new['analysisRef'],[],[],'publish-new',new['baseRevision'])
+        await self.service.publish(new['analysisRef'],[],[],'publish-new')
         actual = self.store.get_action_run(OWNER,run)
         self.assertEqual((actual['status'],actual['diagnostics'][-1]['code']),('PARTIAL','FORMULA_EVIDENCE_REQUIRED'))
 
     async def test_source_formula_remaining_dependency_gap_cannot_complete(self):
         old, _, run, _ = await self.formula_action(missing=True)
         new = await self.formula_draft('new',action_run=run,base=old['analysisRef'],missing=True)
-        await self.service.publish(new['analysisRef'],[],[],'publish-new',new['baseRevision'])
+        await self.service.publish(new['analysisRef'],[],[],'publish-new')
         self.assertEqual(self.store.get_action_run(OWNER,run)['status'],'PARTIAL')

@@ -75,7 +75,7 @@ class CloseoutTests(unittest.IsolatedAsyncioTestCase):
         if chart:
             plans.append({'viewId': 'values', 'scopeId': scope, 'type': 'BAR_VALUES',
                           'valueRefs': [f['factId'] for f in facts if f['cellKey'] == '2:1']})
-        published = await self.service.publish(self.ref, [{'claimId':'calculation','scopeId':scope,'kind':'computed','parts':[{'valueRef':'derived_formula'}]}], plans, 'publish', built['baseRevision'])
+        published = await self.service.publish(self.ref, [{'claimId':'calculation','scopeId':scope,'kind':'computed','parts':[{'valueRef':'derived_formula'}]}], plans, 'publish')
         if not published['delivery']['registered']: self.delivery.ensure(self.ref)
         self.assertTrue(published['delivery']['registered'], published['delivery'])
         self.artifact = self.store.get_analysis(OWNER, self.ref)
@@ -191,7 +191,7 @@ class CloseoutTests(unittest.IsolatedAsyncioTestCase):
         scope['population']['captureRef'] = ref
         built = await self.service.build([ref], selectors, scope, [], 'missing-names')
         with self.assertRaises(AnalysisError) as error:
-            await self.service.publish(built['analysisRef'], [], [], 'missing-publish', 0)
+            await self.service.publish(built['analysisRef'], [], [], 'missing-publish')
         self.assertEqual(error.exception.code, 'OBJECT_LABEL_REQUIRED')
 
     async def test_parent_child_sum_and_difference_require_rule_and_keep_input_scope(self):
@@ -212,7 +212,7 @@ class CloseoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([v['value'] for v in values[1:]], ['90', '10'])
         plan = [{'viewId': 'reconciliation', 'scopeId': built['scope']['scopeId'], 'type': 'TABLE',
                  'title': '一级汇总核对', 'valueRefs': ['derived_children', 'derived_gap']}]
-        published = await self.service.publish(built['analysisRef'], [], plan, 'reconciliation', 0)
+        published = await self.service.publish(built['analysisRef'], [], plan, 'reconciliation')
         self.assertTrue(published['delivery']['registered'])
         view = self.delivery.view(published['delivery']['path'])
         self.assertEqual([t['columns'][0]['label'] for t in view['tables'] if t['kind'] == 'calculation'], ['合计', '差额'])
@@ -226,7 +226,7 @@ class CloseoutTests(unittest.IsolatedAsyncioTestCase):
         refs = [value['derivedId'] for value in built['derivedValues']]
         plan = [{'viewId': f'table{i}', 'scopeId': built['scope']['scopeId'], 'type': 'TABLE', 'valueRefs': refs} for i in range(2)]
         with self.assertRaises(AnalysisError) as error:
-            await self.service.publish(built['analysisRef'], [], plan, 'too-many-groups', 0)
+            await self.service.publish(built['analysisRef'], [], plan, 'too-many-groups')
         self.assertEqual(error.exception.code, 'TABLE_LIMIT')
         self.assertEqual(self.store.get_analysis(OWNER, built['analysisRef'])['publicationState'], 'DRAFT')
 
@@ -241,7 +241,8 @@ class CloseoutTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('object-0', html)
         self.assertNotIn('未注明', html)
         current = Path(__file__).parents[1] / 'examples/agent_service/analysis_extension/report.css'
-        self.assertEqual(hashlib.sha256((current.read_text('utf-8').split('/* Authorized scoped changes:')[0].rstrip()+'\n').replace('.summary p { margin-top: 12px; }','.summary p { margin-top: 12px; max-width: 80ch; }').replace('\n','\r\n').encode()).hexdigest(), '7992f9a9cf9c145b3c2171606d621c62c64161d9ec483dea55d40c7f2396a7c7')
+        # 基线包含用户已确认的财务列对齐；分析交付修复不能改动模板主体。
+        self.assertEqual(hashlib.sha256((current.read_text('utf-8').split('/* Authorized scoped changes:')[0].rstrip()+'\n').replace('.summary p { margin-top: 12px; }','.summary p { margin-top: 12px; max-width: 80ch; }').replace('\n','\r\n').encode()).hexdigest(), '23209c169594b0ea4ad7e089db7e09a563a11a0b1d518147215049b4af1abc24')
 
 
 class FormulaParserTests(unittest.TestCase):

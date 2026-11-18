@@ -55,6 +55,16 @@ also restores that preference. Imports and selections synchronize across tabs.
 
 Run the appearance and theme-import checks with `pnpm test:appearance`.
 
+## 女娲门户嵌入
+
+门户通过 URL App 打开本页面时，地址上会带一次性 `ticket`。前端只把这张票据
+交给后端 `GET /api/sso/nvwa`，不在浏览器里保存票据，也不直接请求女娲。
+验票和会话由 agent service 完成，配置见
+`examples/agent_service/README.md` 的「女娲门户单点登录」。
+
+从菜单重新打开会带一张新票据。同一张已经提交过的票据不会再次发送。验票成功后
+刷新页面使用 AgentScope 自己的登录会话。
+
 ## 智能体管理
 
 侧栏的「智能体管理」打开 `/agents`，可以新建、搜索、配置、复制和删除智能体。

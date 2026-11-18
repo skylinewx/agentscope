@@ -168,12 +168,34 @@ def trace_formula(facts, target_ref):
     if target_ref not in known:
         raise AnalysisError('UNKNOWN_VALUE', '公式目标必须引用本次分析的来源事实。')
     target = known[target_ref]
-    same_table = [f for f in facts if all(f.get(k) == target.get(k) for k in ('observationId', 'bindingRef', 'objectId', 'sourceOrigins', 'context', 'sourceContextId'))]
+    from .identity import same_form_observation
+    same_table = [fact for fact in facts if same_form_observation(fact, target)]
     addresses = {}
     for fact in same_table:
         if fact.get('cellAddress'):
             addresses.setdefault(fact['cellAddress'], []).append(fact)
     nodes, pending, active, complete, checked = [], [], set(), {}, set()
+
+    def source_value(fact):
+        if fact.get('valueState') == 'NO_VALUE' and fact.get('value') is None and fact.get('precision') != 'display_only':
+            raise AnalysisError('FORMULA_SOURCE_VALUE_MISSING', '来源已读取，该单元格为空，不能按零复算。',
+                                {'factRef': fact['factId']})
+        if fact.get('valueState') != 'PRESENT' or fact.get('precision') == 'display_only':
+            raise AnalysisError('FORMULA_VALUE_UNAVAILABLE', '公式引用包含缺值、冲突或仅有显示精度的单元格。')
+        if (fact.get('unit'), fact.get('scale')) != (target.get('unit'), target.get('scale')):
+            raise AnalysisError('FORMULA_UNIT_CONFLICT', '表内公式项的单位或缩放标注不一致。')
+        return decimal_value(fact['value'])
+
+    def formula_source(fact):
+        structure = fact.get('formulaStructure')
+        if not isinstance(structure, dict):
+            return source_expression(fact.get('formula'))
+        status = structure.get('status')
+        if status == 'SOURCE_VALUE':
+            return None
+        if status in ('PARSED', 'EXTERNAL_REFERENCE'):
+            return structure.get('expression')
+        raise AnalysisError('FORMULA_UNSUPPORTED', structure.get('issue') or '来源公式结构未完整解析。')
 
     def visit(fact, depth=0):
         fid = fact['factId']
@@ -185,20 +207,18 @@ def trace_formula(facts, target_ref):
         checked.add(fid); active.add(fid)
         node = {'factRef': fid, 'objectLabel': fact.get('objectLabel', ''), 'headers': fact.get('headers', []),
                 'cellKey': fact.get('cellKey'), 'address': fact.get('cellAddress'), 'expression': None,
-                'dependencies': [], 'observed': fact.get('value'), 'recalculated': None, 'difference': None,
+                'dependencies': [], 'observed': fact.get('value'), 'valueState': fact.get('valueState'),
+                'recalculated': None, 'difference': None,
                 'status': 'BLOCKED', 'diagnostics': [],
                 'localCheck': {'status': 'BLOCKED', 'value': None, 'difference': None},
                 'propagatedDifference': None, 'differenceOriginRefs': []}
         nodes.append(node)
         try:
-            if fact.get('valueState') != 'PRESENT' or fact.get('precision') == 'display_only':
-                raise AnalysisError('FORMULA_VALUE_UNAVAILABLE', '公式引用包含缺值、冲突或仅有显示精度的单元格。')
-            if (fact.get('unit'), fact.get('scale')) != (target.get('unit'), target.get('scale')):
-                raise AnalysisError('FORMULA_UNIT_CONFLICT', '表内公式项的单位或缩放标注不一致。')
-            observed = decimal_value(fact['value'])
-            source = source_expression(fact.get('formula'))
+            # 先读取结构，再核对数值。空值节点仍有可读的公式及后续依赖。
+            source = formula_source(fact)
             node['expression'] = source
             if not source:
+                observed = source_value(fact)
                 node['status'] = 'SOURCE_VALUE'
                 node['localCheck']['status'] = 'NOT_APPLICABLE'
                 complete[fid] = observed
@@ -210,7 +230,9 @@ def trace_formula(facts, target_ref):
                     # This operator traces the current table. A dependency whose
                     # own formula leaves the table is a captured-value boundary,
                     # not a fabricated zero or an evaluated external formula.
-                    node.update(status='SOURCE_VALUE', boundary='EXTERNAL_REFERENCE', numericRole='INCLUDED_SOURCE_VALUE')
+                    node.update(boundary='EXTERNAL_REFERENCE')
+                    observed = source_value(fact)
+                    node.update(status='SOURCE_VALUE', numericRole='INCLUDED_SOURCE_VALUE')
                     node['localCheck']['status'] = 'NOT_APPLICABLE'
                     complete[fid] = observed
                     return observed
@@ -229,20 +251,35 @@ def trace_formula(facts, target_ref):
             # as a mismatch in this node's own equation.
             if not missing:
                 try:
-                    local_values = {}
+                    local_values, null_refs = {}, []
                     for dep in node['dependencies']:
                         child = known[dep['factRef']]
+                        # 读完所有直接输入的状态，避免第一个 null 掩盖后续冲突或未读数据。
+                        if child.get('valueState') == 'NO_VALUE' and child.get('value') is None and child.get('precision') != 'display_only':
+                            null_refs.append(child['factId'])
+                            continue
                         if child.get('valueState') != 'PRESENT' or child.get('precision') == 'display_only':
                             raise AnalysisError('FORMULA_VALUE_UNAVAILABLE', '本层公式输入数值不可用。')
                         if (child.get('unit'), child.get('scale')) != (target.get('unit'), target.get('scale')):
                             raise AnalysisError('FORMULA_UNIT_CONFLICT', '本层公式输入的单位或缩放不一致。')
                         local_values[dep['address']] = decimal_value(child['value'])
+                    if null_refs:
+                        # 输入 null 不能掩盖目标自身的冲突或显示精度问题。
+                        if fact.get('valueState') != 'NO_VALUE' or fact.get('precision') == 'display_only':
+                            source_value(fact)
+                        raise AnalysisError('FORMULA_SOURCE_VALUE_MISSING', '必要输入已读取，其中存在来源空值，无法完整复算。',
+                                            {'factRefs': null_refs})
                     local_result = expression.evaluate(local_values.__getitem__)
+                    node['localCheck']['value'] = decimal_text(local_result)
+                    observed = source_value(fact)
                     local_difference = precise_sum([observed, local_result.copy_negate()])
                     node['localCheck'] = {'status': 'MATCH' if local_difference == 0 else 'MISMATCH',
                                           'value': decimal_text(local_result), 'difference': decimal_text(local_difference)}
                 except AnalysisError as exc:
                     node['localCheck']['diagnostic'] = exc.as_dict()
+                    if exc.code == 'FORMULA_SOURCE_VALUE_MISSING':
+                        node['localCheck']['executionStatus'] = 'COMPLETED'
+                        node['localCheck']['completionReason'] = 'SOURCE_VALUE_MISSING'
             values = {}; child_failed = False
             for dependency in node['dependencies']:
                 if dependency['factRef'] is None: continue
@@ -255,6 +292,8 @@ def trace_formula(facts, target_ref):
             if child_failed:
                 raise AnalysisError('FORMULA_DEPENDENCY_BLOCKED', '下层公式仍有断点，本层不能视为完整复算。')
             result = expression.evaluate(values.__getitem__)
+            node['recalculated'] = decimal_text(result)
+            observed = source_value(fact)
             difference = precise_sum([observed, result.copy_negate()])
             node.update(recalculated=decimal_text(result), difference=decimal_text(difference), status='MATCH' if difference == 0 else 'MISMATCH')
             if node['localCheck']['value'] is not None:
@@ -288,7 +327,27 @@ def trace_formula(facts, target_ref):
             'local': comparison(n['observed'], n['localCheck']['value'], 'source', 'immediate_inputs_calculation'),
             'recursive': comparison(n['observed'], n['recalculated'], 'source', 'recursive_calculation')}
     blockers = [{'factRef': n['factRef'], **d} for n in nodes for d in n['diagnostics']]
+    structural_codes = {'FORMULA_CYCLE', 'FORMULA_LIMIT', 'FORMULA_UNSUPPORTED', 'FORMULA_AMBIGUOUS',
+                        'FORMULA_DEPENDENCY_MISSING', 'FORMULA_EXTERNAL_REFERENCE'}
+    structure_complete = not pending and not any(item.get('code') in structural_codes for item in blockers)
+    null_boundary = (state == 'BLOCKED' and structure_complete and bool(nodes[0]['expression'])
+                     and any(item.get('code') == 'FORMULA_SOURCE_VALUE_MISSING' for item in blockers)
+                     and all((node['localCheck'].get('diagnostic') or {}).get('code')
+                             in (None, 'FORMULA_SOURCE_VALUE_MISSING') for node in nodes)
+                     and all(item.get('code') in ('FORMULA_SOURCE_VALUE_MISSING', 'FORMULA_DEPENDENCY_BLOCKED')
+                             for item in blockers))
     recovery = None
+    formula_status = target.get('formulaStatus', 'NOT_CAPTURED')
+    if state == 'NO_FORMULA' and formula_status != 'NOT_CONFIGURED':
+        # 批量定位时的表外机构可能只是探测用机构；补公式必须改用当前结果行的实际机构。
+        dimensions = dict(target.get('formContext', {}).get('effectiveDimensions', target.get('effectiveDimensions', {})))
+        dimensions.update({key: value for key, value in target.get('dimensions', {}).items() if key in dimensions})
+        recovery = {'targetFactRef': target_ref, 'nextAction': 'LOAD_FORM_DATA_AND_FORMULAS',
+                    'bindingRef': target.get('bindingRef'),
+                    'period': target.get('period') if target.get('batchId') else target.get('executionPeriod', target.get('period')),
+                    'dimensions': dimensions,
+                    'targetDimensions': target.get('dimensions', {}),
+                    'hint': '当前输入未取得公式，不能判断来源无公式。按原任务、机构、时期执行 FORM_VIEW_QUERY 取得 INPUT_VO，读取实际依赖并重建分析；批量金额仅用于对照。'}
     if state == 'BLOCKED':
         recovery = {
             'targetFactRef': target_ref,
@@ -297,10 +356,15 @@ def trace_formula(facts, target_ref):
             'pendingDependencyCount': len(pending), 'pendingDependencies': pending[:10],
             'hint': '按目标 factRef 读取 formulas 的节点与依赖页。缺失地址先检查同一来源、对象、观察中已捕获但未选入的单元格；仍缺失再按来源能力补取。循环、歧义、范围边界或不支持表达式保留具体断点，不猜公式或补零。',
         }
-    return {'targetFactRef': target_ref, 'status': state,
-            'executionStatus': 'BLOCKED' if state == 'BLOCKED' else 'COMPLETED',
+        if null_boundary:
+            recovery.update(nextAction='EXPLAIN_SOURCE_NULL',
+                            hint='必要依赖均已读取，来源空值使完整复算不可用。保留原值和公式结构说明限制，不补零，不重复取数。')
+    return {'targetFactRef': target_ref, 'status': state, 'structureComplete': structure_complete,
+            'executionStatus': 'BLOCKED' if state == 'BLOCKED' and not null_boundary else 'COMPLETED',
+            **({'completionReason': 'SOURCE_VALUE_MISSING'} if null_boundary else {}),
             'sourceConsistency': state if state in ('MATCH', 'MISMATCH') else 'NOT_CHECKED',
-            'applicabilityStatus': ('NO_CAPTURED_FORMULA' if state == 'NO_FORMULA'
+            'applicabilityStatus': ('FORMULA_NOT_CONFIGURED' if state == 'NO_FORMULA' and formula_status == 'NOT_CONFIGURED'
+                                    else 'NO_CAPTURED_FORMULA' if state == 'NO_FORMULA'
                                     else 'CAPTURED_FORMULA' if nodes[0]['expression']
                                     else 'UNDETERMINED'),
             'recovery': recovery,

@@ -92,6 +92,13 @@ class AnalysisDelivery:
             if os.path.exists(temporary):
                 os.unlink(temporary)
 
+    def save_edit_source(self, html):
+        """提供批量文字修正后的最新源文件，避免后续整页编辑覆盖已修正内容。"""
+        content = html.encode('utf-8')
+        relative = 'analysis/drafts/' + hashlib.sha256(content).hexdigest() + '.html'
+        self._write(relative, content)
+        return {'path': relative, 'purpose': '当前冻结页面的编辑源，后续整页修改以此为准；不是成品交付链接。'}
+
     def _artifact(self, ref):
         manifest_path(ref)
         artifact = self.store.get_analysis(self.owner, ref)

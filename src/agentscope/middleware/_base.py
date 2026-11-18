@@ -121,6 +121,17 @@ class MiddlewareBase:  # pylint: disable=unused-argument
         )
         yield  # pylint: disable=unreachable
 
+    async def on_tool_attempt(self, agent: "Agent", attempt: dict) -> None:
+        """Observe START/END of validation, permission and tool dispatch.
+
+        This notification cannot replace execution or change permissions.
+        ``attempt`` is a detached snapshot; it contains identifiers, phase,
+        status and durations, never raw tool arguments or business output.
+        END may describe waiting for approval/external execution instead of
+        completion. Background execution is measured separately by on_acting.
+        """
+        raise RuntimeError(f"{type(self).__name__} does not implement on_tool_attempt")
+
     async def on_acting(
         self,
         agent: "Agent",

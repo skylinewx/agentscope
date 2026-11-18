@@ -12,6 +12,7 @@ from ._knowledge_base import knowledge_base_router
 from ._mcp import mcp_router
 from ._schedule import schedule_router
 from ._session import session_router
+from ._message_queue import message_queue_router
 from ._skill import skill_router
 from ._sop import sop_router
 from ._model import model_router
@@ -35,6 +36,7 @@ __all__ = [
     "mcp_router",
     "schedule_router",
     "session_router",
+    "message_queue_router",
     "skill_router",
     "sop_router",
     "workspace_router",

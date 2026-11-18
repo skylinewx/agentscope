@@ -193,6 +193,14 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         )
         app.state.chat_service = chat_service
 
+        from ._service._message_queue import MessageQueueService
+        message_queue_service = await stack.enter_async_context(MessageQueueService(
+            storage, message_bus, chat_service, chat_run_registry,
+            resource_access_service, auth_service,
+        ))
+        app.state.message_queue_service = message_queue_service
+        chat_service.message_queue_service = message_queue_service
+
         app.state.realtime_service = RealtimeService(
             resource_service=resource_service,
             storage=storage,

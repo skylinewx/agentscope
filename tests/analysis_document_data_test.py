@@ -24,8 +24,8 @@ class DocumentDataTests(PresentationCase):
         self.assertTrue(all(row['unit'] == '' for row in dataset['rows']))
         self.assertEqual(compiled['bindingCount'], 0)
         self.assertEqual(compiled['datasetCount'], 1)
-        self.assertEqual(schema_issues({'analysisRef':built['analysisRef'],'document':doc,'requestKey':'p','expectedBaseRevision':0}), [])
-        preview = await self.service.publish(analysisRef=built['analysisRef'],document=doc,requestKey='preview',expectedBaseRevision=0,previewOnly=True,
+        self.assertEqual(schema_issues({'analysisRef':built['analysisRef'],'document':doc,'requestKey':'p'}), [])
+        preview = await self.service.publish(analysisRef=built['analysisRef'],document=doc,requestKey='preview',previewOnly=True,
                                              renderCheckUnavailableReason='离线数据集合契约测试未启动浏览器，实际视觉效果未验证。')
         self.assertEqual(schema_issues(preview['confirmPublish']), [])
         bad = {**preview['confirmPublish'], 'workRefs': []}
@@ -39,7 +39,8 @@ class DocumentDataTests(PresentationCase):
                        'unit':'','valueState':'PRESENT','value':raw}
                  for ref, name, raw in [('root','结果','5'),('a','输入甲','10'),('b','输入乙','3')]}
         node = {'factRef':'root','expression':expression,'dependencies':[{'address':'A1','factRef':'a'},{'address':'B1','factRef':'b'}],
-                'observed':'5','recalculated':'8','difference':'-3','localCheck':{'value':'9','difference':'-4'},
+                'observed':'5','recalculated':'8','difference':'-3','status':'MISMATCH',
+                'localCheck':{'value':'9','difference':'-4','status':'MISMATCH'},
                 'propagatedDifference':'1','differenceOriginRefs':['a']}
         value = {'derivedId':'derived_formula','operator':'FORMULA_CHECK','calculationValidation':'PASS',
                  'formulaTrace':{'targetFactRef':'root','nodes':[node]}}

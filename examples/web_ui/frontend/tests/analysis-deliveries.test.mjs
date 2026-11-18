@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { finalAnalysisDeliveries, latestAnalysisRevisions, registeredAnalyses } from '../src/lib/analysis-deliveries.ts';
-import { applyReplyPresentation, presentReply } from '../src/lib/reply-presentation.ts';
+import { applyReplyPresentation, groupReplyMessages, presentReply } from '../src/lib/reply-presentation.ts';
 
 const id = 'ana_0123456789abcdef0123456789abcdef';
 const path = `./analysis/${id}/revisions/4/analysis.json`;
@@ -14,6 +14,16 @@ const message = (content = [call, result], extra = {}) => ({ role: 'assistant', 
 const output = (value) => ({ ...result, output: [{ type: 'text', text: JSON.stringify(value) }] });
 const expected = [{ analysisRef, path }];
 const rejected = { type: 'hint', source: JSON.stringify({ label: 'System', sublabel: 'Completion check' }), hint: '修正' };
+
+// 与 ToolOffloadMiddleware 保存的宿主通知格式一致；后台占位结果本身不是发布回执。
+function background(value = response, metadata = result.metadata, name = call.name, callId = call.id) {
+  return [
+    { ...result, id: callId, name, metadata: { backgroundToolCallId: callId }, output: [{ type: 'text', text: '后台执行中' }] },
+    { type: 'hint', source: JSON.stringify({ label: 'tool_output', backgroundToolCallId: callId,
+      backgroundState: 'success', backgroundToolName: name, toolResponseMetadata: metadata }),
+      hint: [{ type: 'text', text: `<system-notification>Tool '${name}' running in background (id=${callId}) has finished (state=success).\n\nResult:\n\n${JSON.stringify(value)}</system-notification>` }] },
+  ];
+}
 
 function publication(analysisId, revision, callId) {
   const ref = `${analysisId}:${revision}`, target = `./analysis/${analysisId}/revisions/${revision}/analysis.json`;
@@ -217,4 +227,86 @@ test('an explicit delivery inspection can restore the card but ordinary inspecti
   assert.deepEqual(registeredAnalyses(message([inspectCall, inspectResult])), expected);
   assert.deepEqual(registeredAnalyses(message([{ ...inspectCall, input: { section: 'facts' } }, inspectResult])), []);
   assert.deepEqual(registeredAnalyses(message([{ ...inspectCall, input: { section: 'delivery', analysisRef: `${id}:5` } }, inspectResult])), []);
+});
+
+test('background publish is registered after continuation and reload, without a model link', () => {
+  const turnKey = 'user-turn';
+  const [placeholder, notification] = background(response, { ...result.metadata, analysisTurnKey: turnKey });
+  const waiting = message([call, placeholder], { id: 'waiting', name: 'agent', finished_reason: 'completed',
+    metadata: { analysisCompletion: { status: 'WAITING', turnKey, pendingToolCallIds: [call.id] } } });
+  assert.deepEqual(registeredAnalyses(waiting), []);
+  const continued = message([notification], { id: 'continued', name: 'agent', finished_reason: 'completed',
+    metadata: { analysisCompletion: { status: 'READY', turnKey, semanticReview: 'PASS', analysisRef } } });
+  const before = structuredClone([waiting, continued]);
+  for (const segments of [[waiting, continued], JSON.parse(JSON.stringify([waiting, continued]))]) {
+    const grouped = groupReplyMessages(segments);
+    assert.equal(grouped.length, 1);
+    assert.deepEqual(registeredAnalyses(grouped[0].message), expected);
+    assert.deepEqual(finalAnalysisDeliveries(grouped[0].message), expected);
+    assert.deepEqual(finalAnalysisDeliveries({ ...grouped[0].message, finished_reason: null }), []);
+  }
+  assert.deepEqual([waiting, continued], before, 'Do not rewrite saved messages');
+});
+
+test('background and synchronous deliveries share deduplication and final completion gating', () => {
+  const m = message([call, ...background(), result, ...background(), { type: 'text', text: `[查看结果](${path})` }],
+    { finished_reason: 'completed', metadata: { analysisCompletion: { status: 'READY', analysisRef, semanticReview: 'PASS' } } });
+  assert.deepEqual(registeredAnalyses(m), expected);
+  assert.deepEqual(finalAnalysisDeliveries(m), expected);
+  for (const semanticReview of ['REVISE', 'NOT_REVIEWED']) {
+    assert.deepEqual(finalAnalysisDeliveries({ ...m, metadata: { analysisCompletion: { status: 'READY', analysisRef, semanticReview } } }), []);
+  }
+  for (const status of ['WAITING', 'INCOMPLETE', 'BLOCKED']) {
+    const pending = { ...m, metadata: { analysisCompletion: { status, analysisRef, semanticReview: 'PASS' } } };
+    assert.deepEqual(finalAnalysisDeliveries(pending), []);
+  }
+});
+
+test('background delivery inspection restores a receipt without treating ordinary inspection as delivery', () => {
+  const inspectCall = { ...call, name: 'AnalysisInspect', input: { section: 'delivery', analysisRef } };
+  const results = background(delivery, result.metadata, 'AnalysisInspect');
+  assert.deepEqual(registeredAnalyses(message([inspectCall, ...results])), expected);
+  assert.deepEqual(registeredAnalyses(message([{ ...inspectCall, input: { section: 'facts', analysisRef } }, ...results])), []);
+});
+
+test('background preview, failed execution and malformed notifications cannot register cards', () => {
+  for (const value of [{ ...response, previewOnly: true }, { ...response, publicationState: 'DRAFT' },
+    { ...response, error: { code: 'FAILED' } }, { ...response, delivery: { ...delivery, registered: false } }]) {
+    assert.deepEqual(registeredAnalyses(message([call, ...background(value)])), []);
+  }
+  const [placeholder, notification] = background();
+  const source = JSON.parse(notification.source);
+  for (const state of ['error', 'cancelled', 'denied', 'running']) {
+    assert.deepEqual(registeredAnalyses(message([call, placeholder,
+      { ...notification, source: JSON.stringify({ ...source, backgroundState: state }) }])), []);
+  }
+  for (const hint of [notification.hint[0].text, [{ type: 'text', text: JSON.stringify(response) }],
+    [{ type: 'text', text: notification.hint[0].text.replace('id=publish', 'id=another') }],
+    [{ type: 'text', text: notification.hint[0].text.replace('</system-notification>', '') }],
+    [...notification.hint, { type: 'text', text: 'another result' }]]) {
+    assert.deepEqual(registeredAnalyses(message([call, placeholder, { ...notification, hint }])), []);
+  }
+});
+
+test('background receipts must match a built-in call, offload acknowledgement and turn identity', () => {
+  const [placeholder, notification] = background();
+  const source = JSON.parse(notification.source);
+  for (const content of [[placeholder, notification], [call, notification], [call, result, notification],
+    [{ ...call, name: 'Read' }, placeholder, notification],
+    [call, { ...placeholder, state: 'error' }, notification],
+    [call, { ...placeholder, name: 'Read' }, notification],
+    [call, { ...placeholder, metadata: { backgroundToolCallId: 'another' } }, notification],
+    [call, placeholder, { type: 'text', text: notification.hint[0].text }]]) {
+    const actual = registeredAnalyses(message(content));
+    // The ordinary successful result in this case remains valid, independently of the stray hint.
+    assert.deepEqual(actual, content.includes(result) ? expected : []);
+  }
+  for (const changed of [{ label: 'model' }, { backgroundToolCallId: 'another' }, { backgroundToolName: 'Read' },
+    { toolResponseMetadata: {} }, { toolResponseMetadata: { process_summary: { kind: 'analysis', id: 'another' } } }]) {
+    assert.deepEqual(registeredAnalyses(message([call, placeholder,
+      { ...notification, source: JSON.stringify({ ...source, ...changed }) }])), []);
+  }
+  const wrongTurn = message([call, ...background(response, { ...result.metadata, analysisTurnKey: 'old-turn' })],
+    { metadata: { analysisCompletion: { turnKey: 'current-turn' } } });
+  assert.deepEqual(registeredAnalyses(wrongTurn), []);
 });

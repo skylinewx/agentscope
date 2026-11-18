@@ -18,6 +18,7 @@ Each non-empty drain must also yield one ``HintBlockEvent`` per hint so
 the SSE stream renders them.
 """
 import uuid
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any, AsyncGenerator, Callable
@@ -210,6 +211,7 @@ def _make_agent(
             session_id=session_id,
             reply_id=reply_id,
             context=context,
+            middle_context={},
         ),
     )
 
@@ -270,6 +272,16 @@ class TestInboxMiddlewareEmptyInbox(IsolatedAsyncioTestCase):
 
 class TestInboxMiddlewareInjection(IsolatedAsyncioTestCase):
     """Branch coverage for the three injection cases."""
+
+    async def test_background_wait_clears_only_when_matching_notice_is_consumed(self):
+        bus = _FakeBus()
+        agent = _make_agent(name='A', session_id='s', reply_id='reply', context=[])
+        agent.state.middle_context['background_tools_v1'] = {'one': {}, 'other': {}}
+        _push_hint(bus, 's', HintBlock(hint='source failed', source=json.dumps({
+            'label': 'tool_output', 'backgroundToolCallId': 'one', 'backgroundState': 'error'})))
+        await _drain(InboxMiddleware(bus).on_reasoning(agent, {}, _noop_next_handler))
+        self.assertEqual(agent.state.middle_context['background_tools_v1'], {'other': {}})
+        self.assertIn('source failed', agent.state.context[-1].content[-1].hint)
 
     async def test_extends_into_last_assistant_msg_from_same_agent(
         self,

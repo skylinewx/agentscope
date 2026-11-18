@@ -10,7 +10,7 @@ import re
 
 from .models import AnalysisError, digest
 from .formatting import number_text, validate_number_format
-from .validation import selected_value
+from .validation import selected_value, executable_field, value_reference_details
 
 DOCUMENT_VERSION = 'free-html-1'
 MAX_SOURCE_BYTES = 512 * 1024
@@ -157,11 +157,16 @@ def compile_document(artifact, document):
         if not isinstance(ref, str) or ref not in known:
             fail('INVALID_VALUE_REF', '绑定必须引用当前版本的事实或计算结果。', path+'/valueRef')
         item = known[ref]
-        if item.get('calculationValidation', 'PASS') != 'PASS':
-            fail('UNSUPPORTED_CLAIM', '该计算未通过执行条件检查，不能作为展示数字。', path+'/valueRef')
+        if not executable_field(item, binding.get('field'), binding.get('nodeRef')):
+            fail('UNSUPPORTED_CLAIM', '所选字段尚无可用数值；请核对本层与逐层计算口径。', path,
+                 **value_reference_details(item, binding.get('field'), binding.get('nodeRef')))
         try:
             if 'format' in binding: validate_number_format(binding['format'])
             raw = selected_value(item, binding.get('field'), binding.get('nodeRef'))
+            # 来源空值仍按空展示；计算字段缺值不能悄悄变成“相差 元”。
+            if raw is None and 'derivedId' in item:
+                fail('INVALID_VALUE_REF', '所选计算字段没有可展示的标量数值。', path,
+                     **value_reference_details(item, binding.get('field'), binding.get('nodeRef')))
             formatted = '' if raw is None else (raw if binding.get('field') == 'unit' else number_text(raw, binding.get('format'), grouping=True))
         except AnalysisError as exc:
             raise AnalysisError(exc.code, str(exc), {**(exc.details or {}), 'path': path}) from exc
@@ -177,6 +182,10 @@ def compile_document(artifact, document):
                         'basis': {'kind': 'SOURCE' if 'factId' in item else 'CALCULATED',
                                   'operator': item.get('operator'), 'field': binding.get('field', 'value'),
                                   'targetFactRef': subject.get('factId')}}
+        if item.get('operator') == 'DESCRIBE':
+            field = binding.get('field', 'value')
+            payload[key]['unit'] = '项' if field in item['counts'] else '%' if field == 'topShare' else item.get('unit') or ''
+            payload[key]['valueState'] = 'PRESENT' if raw is not None else 'NO_VALUE'
         refs.add(ref)
     used = set(SLOT.findall(source))
     partial = artifact.get('partialReason')
@@ -193,7 +202,9 @@ def compile_document(artifact, document):
     updates = {item['taskId']: item['refs'] for item in artifact.get('workRefs', [])}
     for task in artifact.get('plan', {}).get('workPlan', []):
         if task['kind'] != 'COMPUTATION': continue
-        for ref in updates.get(task['taskId'], task['refs']):
+        for reference in updates.get(task['taskId'], task['refs']):
+            from .scalar_references import reference_id
+            ref = reference_id(reference)
             value = known.get(ref, {})
             if (value.get('operator') in ('SORT', 'RANK') and value.get('calculationValidation') == 'PASS'
                     and ref not in dataset_refs):

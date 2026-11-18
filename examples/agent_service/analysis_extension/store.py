@@ -44,11 +44,25 @@ class AnalysisStore:
                 CREATE TABLE IF NOT EXISTS document_checks(owner TEXT NOT NULL, analysis TEXT NOT NULL,
                     content TEXT NOT NULL, width INTEGER NOT NULL, digest TEXT NOT NULL, checked REAL NOT NULL,
                     PRIMARY KEY(owner,analysis,content,width));
+                CREATE TABLE IF NOT EXISTS document_check_requirements(owner TEXT NOT NULL, aid TEXT NOT NULL,
+                    data TEXT NOT NULL, kind TEXT NOT NULL, declared INTEGER NOT NULL,
+                    PRIMARY KEY(owner,aid,data,kind));
                 CREATE TABLE IF NOT EXISTS action_runs(ref TEXT PRIMARY KEY, owner TEXT NOT NULL,
                     action TEXT NOT NULL, origin TEXT NOT NULL, data TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS action_runs_owner ON action_runs(owner,origin);
+                CREATE TABLE IF NOT EXISTS python_runs(owner TEXT NOT NULL, ref TEXT NOT NULL,
+                    digest TEXT NOT NULL, PRIMARY KEY(owner,ref));
+                CREATE TABLE IF NOT EXISTS semantic_reviews(owner TEXT NOT NULL, key TEXT NOT NULL,
+                    digest TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(owner,key));
+                CREATE TABLE IF NOT EXISTS turn_progress(owner TEXT NOT NULL, turn_key TEXT NOT NULL,
+                    data TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(owner,turn_key));
+                CREATE TABLE IF NOT EXISTS native_results(owner TEXT NOT NULL, ref TEXT NOT NULL,
+                    turn_key TEXT NOT NULL, sequence INTEGER NOT NULL, digest TEXT NOT NULL, created REAL NOT NULL,
+                    PRIMARY KEY(owner,ref));
+                CREATE INDEX IF NOT EXISTS native_results_turn ON native_results(owner,turn_key,sequence);
                 CREATE TABLE IF NOT EXISTS action_events(id INTEGER PRIMARY KEY AUTOINCREMENT,
                     run TEXT NOT NULL, owner TEXT NOT NULL, status TEXT NOT NULL, code TEXT NOT NULL, at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS maintenance_runs(name TEXT PRIMARY KEY, completed REAL NOT NULL);
             """)
 
     def _connect(self):
@@ -140,6 +154,69 @@ class AnalysisStore:
         with closing(self._connect()) as db:
             return self._request(db, owner, phase, key, request_digest)
 
+    def get_semantic_review(self, owner, key):
+        """按当前会话和审查材料摘要复用结果，不依赖后台调用所在实例的内存。"""
+        cutoff = time.time() - self.limits.retention_seconds
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT digest FROM semantic_reviews WHERE owner=? AND key=? AND created>=?",
+                             (owner.key, key, cutoff)).fetchone()
+        return self._read(row['digest']) if row else None
+
+    def turn_progress(self, owner, turn_key, update=None):
+        """同一用户问题共用执行进度；后台续跑、实例重建不重置统计与补做次数。"""
+        with self._transaction() as db:
+            row = db.execute('SELECT data FROM turn_progress WHERE owner=? AND turn_key=?',
+                             (owner.key, turn_key)).fetchone()
+            progress = json.loads(row['data']) if row else {}
+            if update is not None:
+                update(progress)
+                db.execute('INSERT OR REPLACE INTO turn_progress VALUES(?,?,?,?)',
+                           (owner.key, turn_key, json.dumps(progress, ensure_ascii=False, allow_nan=False), time.time()))
+        return progress
+
+    def save_native_result(self, owner, turn_key, sequence, call, response, elapsed_ms):
+        """保存原生分析工具的真实回执；通知只携带索引，不承担结果真实性。"""
+        ref = 'native_' + digest([owner.key, turn_key, call.id])
+        record = {'turnKey': turn_key, 'sequence': sequence, 'toolCallId': call.id,
+                  'toolName': call.name, 'input': call.input, 'response': response.model_dump(mode='json'),
+                  'elapsedMs': elapsed_ms}
+        with self._transaction() as db:
+            existing = db.execute('SELECT digest FROM native_results WHERE owner=? AND ref=?',
+                                  (owner.key, ref)).fetchone()
+            if not existing:
+                blob = self._put(db, record)
+                db.execute('INSERT INTO native_results VALUES(?,?,?,?,?,?)',
+                           (owner.key, ref, turn_key, sequence, blob, time.time()))
+        return ref
+
+    def native_results(self, owner, turn_key, ref=None):
+        """按发起顺序恢复本轮回执，严格限定用户、智能体、会话和当前问题。"""
+        with closing(self._connect()) as db:
+            sql = 'SELECT ref,digest FROM native_results WHERE owner=? AND turn_key=?'
+            params = [owner.key, turn_key]
+            if ref is not None:
+                sql += ' AND ref=?'
+                params.append(ref)
+            rows = db.execute(sql + ' ORDER BY sequence', params).fetchall()
+        return [{**self._read(row['digest']), 'receiptRef': row['ref']} for row in rows]
+
+    def save_semantic_review(self, owner, key, verdict):
+        """只登记已完成且通过结构校验的审查；超时和执行失败不写成通过。"""
+        with self._transaction() as db:
+            existing = db.execute("SELECT digest,created FROM semantic_reviews WHERE owner=? AND key=?",
+                                  (owner.key, key)).fetchone()
+            if existing and existing['created'] >= time.time() - self.limits.retention_seconds:
+                # 并发审查同一材料时以首个完整结果为准，避免相同内容来回通过、驳回。
+                return self._read(existing['digest'])
+            blob = self._put(db, verdict)
+            db.execute("INSERT OR REPLACE INTO semantic_reviews VALUES(?,?,?,?)",
+                       (owner.key, key, blob, time.time()))
+            # 同会话只保留最近材料，内容文件由统一清理逻辑处理。
+            db.execute("DELETE FROM semantic_reviews WHERE owner=? AND key NOT IN "
+                       "(SELECT key FROM semantic_reviews WHERE owner=? ORDER BY created DESC LIMIT 128)",
+                       (owner.key, owner.key))
+        return verdict
+
     def get_capture(self, owner: Owner, ref: str) -> dict:
         with closing(self._connect()) as db:
             row = db.execute("SELECT digest FROM captures WHERE ref=? AND owner=?", (ref, owner.key)).fetchone()
@@ -147,12 +224,13 @@ class AnalysisStore:
             raise AnalysisError("NOT_FOUND", "当前会话没有该输入引用。")
         return self._read(row["digest"])
 
-    def list_captures(self, owner: Owner, offset=0, limit=100) -> dict:
+    def list_captures(self, owner: Owner, offset=0, limit=100, *, newest_first=False) -> dict:
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= self.limits.page_size:
             raise AnalysisError("INVALID_PAGE", "分页参数超出范围。")
         with closing(self._connect()) as db:
             total = db.execute("SELECT COUNT(*) FROM captures WHERE owner=?", (owner.key,)).fetchone()[0]
-            rows = db.execute("SELECT ref,digest FROM captures WHERE owner=? ORDER BY created,ref LIMIT ? OFFSET ?", (owner.key, limit, offset)).fetchall()
+            order = 'created DESC, rowid DESC' if newest_first else 'created,ref'
+            rows = db.execute(f"SELECT ref,digest FROM captures WHERE owner=? ORDER BY {order} LIMIT ? OFFSET ?", (owner.key, limit, offset)).fetchall()
         items = []
         for row in rows:
             value = self._read(row["digest"])
@@ -188,6 +266,104 @@ class AnalysisStore:
         validate_artifact(artifact)
         return artifact
 
+    def save_python_run(self, owner, ref, record):
+        """执行状态独立留存；失败和取消不创建可交付的分析版本。"""
+        with self._transaction() as db:
+            for value in record.get('fileInputs', []):
+                if value.get('provenance') == 'BUDGET_FORM':
+                    capture_ref = value.get('captureRef')
+                    if not db.execute('SELECT 1 FROM captures WHERE ref=? AND owner=?', (capture_ref, owner.key)).fetchone():
+                        raise AnalysisError('NOT_FOUND', '网格执行引用了本会话以外的输入。')
+                    db.execute('INSERT OR IGNORE INTO pins VALUES(?,?)', (ref, capture_ref))
+            blob = self._put(db, {**record, **owner.fields()})
+            db.execute('INSERT INTO python_runs VALUES(?,?,?) ON CONFLICT(owner,ref) DO UPDATE SET digest=excluded.digest',
+                       (owner.key, ref, blob))
+
+    def get_python_run(self, owner, ref):
+        with closing(self._connect()) as db:
+            row = db.execute('SELECT digest FROM python_runs WHERE owner=? AND ref=?', (owner.key, ref)).fetchone()
+        if not row:
+            raise AnalysisError('NOT_FOUND', '当前会话没有该 Python 执行记录。')
+        return self._read(row['digest'])
+
+    def complete_python_request(self, owner, key, request_digest, run_ref):
+        """文件独立分析也有幂等完成记录；失败运行仍可通过执行标识读取。"""
+        with self._transaction() as db:
+            existing = self._request(db, owner, 'python', key, request_digest)
+            if existing:
+                return existing
+            db.execute('INSERT INTO requests VALUES(?,?,?,?,?)', (owner.key, 'python', key, request_digest, run_ref))
+        return run_ref
+
+    def _analysis_head(self, db, owner, aid):
+        """读取同一会话、同一分析的最新发布版本。"""
+        return db.execute("SELECT a.* FROM heads h JOIN analyses a ON a.owner=h.owner "
+                          "AND a.aid=h.aid AND a.revision=h.revision WHERE h.owner=? AND h.aid=?",
+                          (owner.key, aid)).fetchone()
+
+    def _summary_continues(self, db, owner, base, head):
+        """仅允许越过自身证据的自动数据摘要，不覆盖另一份已完成的分析。"""
+        if head is None:
+            return False
+        summary = self._read(head['digest'])
+        if summary.get('hostSummary', {}).get('content') != 'SOURCE_FACTS_ONLY':
+            return False
+        source_ref = summary.get('baseAnalysisRef')
+        source = db.execute("SELECT * FROM analyses WHERE owner=? AND aid=? AND ref=?",
+                            (owner.key, base['aid'], source_ref)).fetchone()
+        if source is None:
+            return False
+        from .closeout_content import evidence_digest
+        if evidence_digest(summary) != evidence_digest(self._read(source['digest'])):
+            return False
+        # 摘要的原草稿必须是本次续建的自身或祖先。仅共享更早祖先的另一分支不算。
+        current, visited = base, set()
+        while current is not None and current['ref'] not in visited:
+            if current['ref'] == source_ref:
+                return True
+            visited.add(current['ref'])
+            parent = self._read(current['digest']).get('baseAnalysisRef')
+            current = db.execute("SELECT * FROM analyses WHERE owner=? AND aid=? AND ref=?",
+                                 (owner.key, base['aid'], parent)).fetchone()
+        return False
+
+    def _version_conflict(self, db, owner, row, head):
+        resumable = self._summary_continues(db, owner, row, head)
+        return AnalysisError('VERSION_CONFLICT', '已有更新的发布结果，请基于最新内容继续修改；服务自动生成下一版。', {
+            'analysisRef': row['ref'],
+            'currentRevision': head['revision'] if head else 0,
+            'latestPublishedAnalysisRef': head['ref'] if head else None,
+            'requiresBuild': not resumable,
+            'nextAction': 'RETRY_PREVIEW' if resumable else 'REBUILD_FROM_LATEST_PUBLISHED',
+        })
+
+    def _continuation_revision(self, db, owner, base):
+        revision = base['revision'] if base['state'] == 'PUBLISHED' else base['base']
+        head = self._analysis_head(db, owner, base['aid'])
+        if revision == (head['revision'] if head else 0):
+            return revision
+        if self._summary_continues(db, owner, base, head):
+            return head['revision']
+        raise self._version_conflict(db, owner, base, head)
+
+    def continuation_revision(self, owner: Owner, ref: str) -> int:
+        """构建或预览前检查续建基准，避免完成计算和模型审查后才发现冲突。"""
+        with closing(self._connect()) as db:
+            base = db.execute("SELECT * FROM analyses WHERE owner=? AND ref=?", (owner.key, ref)).fetchone()
+            if base is None:
+                raise AnalysisError('NOT_FOUND', '当前会话没有该分析引用。')
+            return self._continuation_revision(db, owner, base)
+
+    def check_publication_base(self, owner: Owner, ref: str, expected_base: int):
+        """正式发布仍要求精确版本匹配；预检查不替代事务中的并发检查。"""
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT * FROM analyses WHERE owner=? AND ref=?", (owner.key, ref)).fetchone()
+            if row is None:
+                raise AnalysisError('NOT_FOUND', '当前会话没有该分析引用。')
+            head = self._analysis_head(db, owner, row['aid'])
+            if type(expected_base) is not int or expected_base != row['base'] or expected_base != (head['revision'] if head else 0):
+                raise self._version_conflict(db, owner, row, head)
+
     def build(self, owner: Owner, request: dict, artifact: dict, key: str, base_ref: str | None) -> dict:
         request_digest = digest(request)
         with self._transaction() as db:
@@ -200,13 +376,18 @@ class AnalysisStore:
                     raise AnalysisError("INVALID_BASE", "重建必须引用本会话实际存在的分析草稿或已发布版本。")
                 validate_artifact(self._read(base["digest"]))
                 aid = base['aid']
-                base_revision = base['revision'] if base['state'] == 'PUBLISHED' else base['base']
+                base_revision = self._continuation_revision(db, owner, base)
                 revision = db.execute("SELECT MAX(revision)+1 FROM analyses WHERE owner=? AND aid=?", (owner.key, aid)).fetchone()[0]
             else:
                 aid, base_revision, revision = "ana_" + uuid.uuid4().hex, 0, 1
             ref = f"{aid}:{revision}"
             result = {**artifact, **owner.fields(), "analysisId": aid, "analysisRef": ref,
                       "revision": revision, "baseRevision": base_revision, "createdAt": now(), "publicationState": "DRAFT"}
+            # 血缘取自本次已校验的基准，不继承复制对象中的过期父引用。
+            if base_ref:
+                result['baseAnalysisRef'] = base_ref
+            else:
+                result.pop('baseAnalysisRef', None)
             validate_artifact(result)
             blob = self._put(db, result)
             for capture_ref in result["captureRefs"]:
@@ -228,10 +409,10 @@ class AnalysisStore:
                 raise AnalysisError("NOT_FOUND", "当前会话没有该分析引用。")
             if row["state"] != "DRAFT":
                 raise AnalysisError("IMMUTABLE_VERSION", "已发布版本不可覆盖，请使用原请求重试或创建新版本。")
-            head = db.execute("SELECT revision FROM heads WHERE owner=? AND aid=?", (owner.key, row["aid"])).fetchone()
-            current = head[0] if head else 0
+            head = self._analysis_head(db, owner, row['aid'])
+            current = head['revision'] if head else 0
             if type(expected_base) is not int or expected_base != row["base"] or current != expected_base:
-                raise AnalysisError("VERSION_CONFLICT", "基础版本已变化，请重新创建分析版本。")
+                raise self._version_conflict(db, owner, row, head)
             # Do not trust a caller to change identity or numerical facts on publish.
             original = self._read(row["digest"])
             for field in set(original) - {"claims", "viewPlan", "findings", "actions", "technicalDetails"}:
@@ -365,6 +546,8 @@ class AnalysisStore:
         return self._read(row['digest'])
 
     def save_document_check(self, owner, analysis_ref, record):
+        artifact = self.get_analysis(owner, analysis_ref)
+        data_key = digest([artifact['inputDigest'], artifact['facts'], artifact['derivedValues']])
         with self._transaction() as db:
             row = db.execute('SELECT state FROM analyses WHERE owner=? AND ref=?', (owner.key, analysis_ref)).fetchone()
             if not row or row['state'] != 'DRAFT':
@@ -373,6 +556,12 @@ class AnalysisStore:
             db.execute('INSERT INTO document_checks VALUES(?,?,?,?,?,?) ON CONFLICT(owner,analysis,content,width) '
                        'DO UPDATE SET digest=excluded.digest,checked=excluded.checked',
                        (owner.key, analysis_ref, record['contentDigest'], record['viewport']['width'], blob, time.time()))
+            # 内容摘要变化和检查历史裁剪不能抹除既有数值图形检查义务。
+            # 展示修订沿用数据时共享此记录；新的数据集合独立计算覆盖范围。
+            for kind, checks in record.get('numericChecks', {}).items():
+                db.execute('INSERT INTO document_check_requirements VALUES(?,?,?,?,?) '
+                           'ON CONFLICT(owner,aid,data,kind) DO UPDATE SET declared=MAX(declared,excluded.declared)',
+                           (owner.key, artifact['analysisId'], data_key, kind, checks['declared']))
             # Bounded viewport history; obsolete digests cannot validate a new document.
             db.execute('DELETE FROM document_checks WHERE owner=? AND analysis=? AND rowid NOT IN '
                        '(SELECT rowid FROM document_checks WHERE owner=? AND analysis=? ORDER BY checked DESC LIMIT 8)',
@@ -384,6 +573,15 @@ class AnalysisStore:
             rows = db.execute('SELECT digest FROM document_checks WHERE owner=? AND analysis=? AND content=? ORDER BY width',
                               (owner.key, analysis_ref, content_digest)).fetchall()
         return [self._read(row['digest']) for row in rows]
+
+    def document_check_requirements(self, owner, analysis_ref):
+        """同一分析数据的既有检查覆盖；保留在有限预览历史之外。"""
+        artifact = self.get_analysis(owner, analysis_ref)
+        data_key = digest([artifact['inputDigest'], artifact['facts'], artifact['derivedValues']])
+        with closing(self._connect()) as db:
+            rows = db.execute('SELECT kind,declared FROM document_check_requirements WHERE owner=? AND aid=? AND data=?',
+                              (owner.key, artifact['analysisId'], data_key)).fetchall()
+        return {row['kind']: row['declared'] for row in rows}
 
     def register_presentation(self, owner, kind, ref, analysis_ref, payload):
         with self._transaction() as db:
@@ -409,16 +607,46 @@ class AnalysisStore:
         """Remove only old, unpinned extension objects; never published inputs."""
         cutoff = (time.time() if timestamp is None else timestamp) - self.limits.retention_seconds
         with self._transaction() as db:
-            deleted = db.execute("DELETE FROM captures WHERE created<? AND ref NOT IN (SELECT capture FROM pins)", (cutoff,)).rowcount
-            retained = {r[0] for r in db.execute("SELECT digest FROM captures UNION SELECT digest FROM analyses UNION SELECT digest FROM presentations UNION SELECT digest FROM publication_proposals UNION SELECT digest FROM document_checks")}
-            removed = 0
-            for path in self.blobs.iterdir():
-                if path.is_symlink() or path.resolve().parent != self.blobs.resolve():
-                    continue
-                if path.is_file() and path.stat().st_mtime < cutoff and path.stem not in retained:
-                    # Only our hashed JSON and mkstemp prefix, never unrelated files.
-                    if (path.suffix == ".json" and len(path.stem) == 64 and all(c in "0123456789abcdef" for c in path.stem)) or path.name.startswith("pending-"):
-                        path.unlink()
-                        db.execute("DELETE FROM blobs WHERE digest=?", (path.stem,))
-                        removed += 1
-        return {"capturesRemoved": deleted, "blobsRemoved": removed}
+            return self._collect_expired(db, cutoff)
+
+    def collect_expired_if_due(self, interval_seconds=300, timestamp=None):
+        """同一存储按间隔维护，跨会话和进程共享完成时间，恢复执行不重复扫描。"""
+        current = time.time() if timestamp is None else timestamp
+        with self._transaction() as db:
+            row = db.execute("SELECT completed FROM maintenance_runs WHERE name='expiry'").fetchone()
+            if row and 0 <= current - row['completed'] < interval_seconds:
+                return {'performed': False, 'reason': 'NOT_DUE', 'lastCompletedAt': row['completed']}
+            # 与清理共用事务；失败回滚，不把失败登记成已完成或无限延后重试。
+            result = self._collect_expired(db, current - self.limits.retention_seconds)
+            completed = time.time() if timestamp is None else timestamp
+            db.execute("INSERT INTO maintenance_runs VALUES('expiry',?) "
+                       "ON CONFLICT(name) DO UPDATE SET completed=excluded.completed", (completed,))
+            return {'performed': True, 'completedAt': completed, **result}
+
+    def _collect_expired(self, db, cutoff):
+        """调用者持有事务，避免清理与新建引用之间出现删除竞态。"""
+        deleted = db.execute("DELETE FROM captures WHERE created<? AND ref NOT IN (SELECT capture FROM pins)", (cutoff,)).rowcount
+        db.execute("DELETE FROM semantic_reviews WHERE created<?", (cutoff,))
+        db.execute('DELETE FROM native_results WHERE created<?', (cutoff,))
+        db.execute('DELETE FROM turn_progress WHERE updated<?', (cutoff,))
+        retained = {r[0] for r in db.execute("SELECT digest FROM captures UNION SELECT digest FROM analyses UNION SELECT digest FROM presentations UNION SELECT digest FROM publication_proposals UNION SELECT digest FROM document_checks UNION SELECT digest FROM python_runs UNION SELECT digest FROM semantic_reviews UNION SELECT digest FROM native_results")}
+        removed = 0
+        blob_root = self.blobs.resolve()
+        for path in self.blobs.iterdir():
+            # 仍被引用的对象不能删除，先跳过可避免每轮对全部历史文件重复做文件系统检查。
+            if path.stem in retained:
+                continue
+            owned_file = ((path.suffix == '.json' and len(path.stem) == 64
+                           and all(char in '0123456789abcdef' for char in path.stem))
+                          or path.name.startswith('pending-'))
+            if not owned_file:
+                continue
+            if path.is_symlink() or path.resolve().parent != blob_root:
+                continue
+            if path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+                db.execute("DELETE FROM blobs WHERE digest=?", (path.stem,))
+                removed += 1
+        from .grid_files import collect_expired_files
+        grid_removed = collect_expired_files(self, db, cutoff)
+        return {"capturesRemoved": deleted, "blobsRemoved": removed, "gridFilesRemoved": grid_removed}

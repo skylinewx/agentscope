@@ -23,6 +23,7 @@ import {
 	defaultValuesFromSchema,
 	type SchemaFormValue,
 } from '@/components/form/SchemaForm';
+import { SkillVersion } from '@/components/hub/SkillVersion';
 import { Button } from '@/components/ui/button';
 import {
 	Dialog,
@@ -171,6 +172,7 @@ export function ResourceBindings({
 			{allIds.map((id) => {
 				const record = rows.find((r) => r.id === id);
 				const binding = bindings[id] as SkillResourceBinding | undefined;
+				const skill = kind === 'skill' ? (record as SkillView | undefined) : undefined;
 				return (
 					<div
 						key={id}
@@ -198,11 +200,26 @@ export function ResourceBindings({
 							</p>
 						)}
 						<div className="flex flex-wrap items-center gap-2">
-							<span className="mr-auto text-xs text-muted-foreground">
-								{kind === 'skill' && binding
-									? `绑定版本：${binding.version || '保存时绑定当前版本'}`
-									: `资源版本：${record?.version || '未指定'}`}
-							</span>
+							{kind === 'skill' ? (
+								<SkillVersion
+									className="mr-auto"
+									version={
+										binding
+											? binding.version || '保存时绑定当前版本'
+											: skill?.version || '未指定'
+									}
+									versionLabel={binding ? '绑定版本' : '资源版本'}
+									updatedAt={
+										binding?.artifact_id
+											? (binding.version_updated_at ?? null)
+											: (skill?.version_updated_at ?? null)
+									}
+								/>
+							) : (
+								<span className="mr-auto text-xs text-muted-foreground">
+									资源版本：{record?.version || '未指定'}
+								</span>
+							)}
 							{record &&
 								kind === 'skill' &&
 								binding?.artifact_id &&

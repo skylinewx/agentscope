@@ -82,4 +82,33 @@ function MessageFooter({ className, ...props }: React.ComponentProps<'div'>) {
 	);
 }
 
-export { MessageGroup, Message, MessageAvatar, MessageContent, MessageFooter, MessageHeader };
+/** Reveal the local time on message hover/focus; keep it visible on touch devices. */
+function MessageTime({
+	dateTime,
+	locale,
+	className,
+	...props
+}: Omit<React.ComponentProps<'time'>, 'dateTime'> & { dateTime: string; locale?: string }) {
+	const date = new Date(dateTime);
+	if (!Number.isFinite(date.getTime())) return null;
+	const fullDate = new Intl.DateTimeFormat(locale, {
+		dateStyle: 'medium', timeStyle: 'medium', hour12: false,
+	}).format(date);
+	return (
+		<time
+			data-slot="message-time"
+			dateTime={date.toISOString()}
+			title={fullDate}
+			aria-label={fullDate}
+			className={cn(
+				'shrink-0 text-xs font-normal tabular-nums text-muted-foreground opacity-0 group-hover/message:opacity-100 group-focus-within/message:opacity-100 [@media(hover:none)]:opacity-100',
+				className,
+			)}
+			{...props}
+		>
+			{new Intl.DateTimeFormat(locale, { hour: '2-digit', minute: '2-digit', hour12: false }).format(date)}
+		</time>
+	);
+}
+
+export { MessageGroup, Message, MessageAvatar, MessageContent, MessageFooter, MessageHeader, MessageTime };

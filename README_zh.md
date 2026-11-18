@@ -244,6 +244,15 @@ pnpm install
 pnpm dev
 ```
 
+Windows 本地环境已安装依赖后，可以直接双击项目根目录的
+[`restart-agentscope.cmd`](restart-agentscope.cmd) 一键编译并重启前后端。
+脚本先执行 `pnpm build`，完成前端类型检查、打包和 Node 后端编译；
+编译失败时中止重启，保留原服务进程。成功后重启 Python 后端，使用 Vite
+preview 在 5173 端口运行前端构建产物，并运行 Node 后端的 `dist/index.js`。
+启动检查通过后自动打开 Web UI；端口被其他程序占用时会报错。
+Redis 等中间件需自行准备，脚本不负责启动或修复中间件。
+运行日志保存在 `.cache/agentscope/`，失败时窗口会保留错误信息和日志路径。
+命令行使用 `restart-agentscope.cmd -NoBrowser` 可跳过自动打开浏览器。
 
 
 ## 贡献

@@ -1,7 +1,11 @@
 """Skill-driven example-service integration; re-read policy per runtime."""
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
+from time import perf_counter
+
+from agentscope._logging import logger
 
 from .activation import load_config, resolve_activation, selected_resource_ids
 from .engine import RuleRegistry
@@ -34,12 +38,19 @@ async def create_analysis_middlewares(app, user_id, agent_id, session_id, worksp
     if root.is_relative_to(workspace_path):
         raise AnalysisError("UNSAFE_STORE", "分析存储不能位于模型工作区内。")
     store = AnalysisStore(root, Limits(**config.get("limits", {})))
-    store.collect_expired()
+    cleanup_started = perf_counter()
+    # 文件维护属于阻塞 I/O，不能阻塞其他会话、进度事件和 Redis 心跳。
+    removed = await asyncio.to_thread(store.collect_expired_if_due)
+    logger.info('分析存储维护 会话=%s 耗时毫秒=%.2f 结果=%s', session_id,
+                (perf_counter() - cleanup_started) * 1000, removed)
     rules = RuleRegistry(config.get("rules", {}))
     sources = default_sources(config.get('sources'))
     delivery = AnalysisDelivery(store, owner, workspace_path, rules,
                                 activation.reports, activation.cards, activation.actions)
+    from .render_client import configured_checker
     return [AnalysisMiddleware(store, owner, resource_ids, authorize,
             rules, config.get("numberFormats", {}), activation.skill_versions,
             delivery=delivery,
-            actions_enabled=activation.actions, finding_rules=config.get("findingRules", {}), sources=sources)]
+            actions_enabled=activation.actions, finding_rules=config.get("findingRules", {}), sources=sources,
+            render_checker=configured_checker(config.get('rendering', {})),
+            web_ui_url=config.get('rendering', {}).get('webUiUrl'))]

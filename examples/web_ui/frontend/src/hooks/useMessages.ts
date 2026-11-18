@@ -15,7 +15,11 @@ import { useState, useCallback, useRef, useEffect } from 'react';
 
 import { sessionApi, takeFreshlyCreated } from '@/api';
 import { chatApi } from '@/api';
+import { getAuthSignal } from '@/api/auth-state';
+import { ApiError } from '@/api/client';
 import { useAudioManager } from '@/context/AudioContext';
+import { useMessageQueue } from '@/hooks/useMessageQueue';
+import { applyAgentProgress, readAgentProgress } from '@/lib/agent-progress';
 import { applyReplyPresentation, pendingCalls } from '@/lib/reply-presentation';
 
 /**
@@ -66,6 +70,22 @@ const hitlKey = (e: { worker_session_id: string; reply_id: string }) =>
  *   event never arrives (dropped SSE frame, backend bug, etc.).
  */
 export type ReplyPhase = 'idle' | 'streaming' | 'interrupting';
+
+export type ConnectionNotice = 'reconnecting' | 'interrupted' | 'failed' | null;
+
+/** A session switch or logout must also cancel an outstanding retry delay. */
+function waitForReconnect(signal: AbortSignal, delay: number): Promise<void> {
+	return new Promise((resolve) => {
+		const finish = () => {
+			clearTimeout(timer);
+			signal.removeEventListener('abort', finish);
+			resolve();
+		};
+		const timer = setTimeout(finish, delay);
+		signal.addEventListener('abort', finish, { once: true });
+		if (signal.aborted) finish();
+	});
+}
 
 /** Safety fallback: force phase back to idle if REPLY_END is not seen. */
 const INTERRUPT_TIMEOUT_MS = 10_000;
@@ -134,6 +154,13 @@ export function useMessages(
 	},
 ) {
 	const [msgs, setMsgs] = useState<Msg[]>([]);
+	const messageQueue = useMessageQueue(agentId, sessionId);
+	const queueState = messageQueue.state;
+	const refreshQueue = messageQueue.refresh;
+	const submitQueued = messageQueue.submit;
+	const queueUnavailable = !messageQueue.state && messageQueue.error instanceof ApiError && messageQueue.error.status === 404;
+	const refreshQueueRef = useRef(messageQueue.refresh);
+	useEffect(() => { refreshQueueRef.current = messageQueue.refresh; }, [messageQueue.refresh]);
 	// The (agent, session) pair `msgs` actually belongs to. Loading is
 	// derived from it rather than set inside the fetch effect: an effect
 	// runs *after* the render that changed `sessionId`, so a flag it owns
@@ -142,6 +169,7 @@ export function useMessages(
 	const [loadedKey, setLoadedKey] = useState<string | null>(null);
 	const [phase, setPhase] = useState<ReplyPhase>('idle');
 	const [error, setError] = useState<Error | null>(null);
+	const [connectionNotice, setConnectionNotice] = useState<ConnectionNotice>(null);
 	// A failed history read is distinct from an empty conversation or a stream error.
 	const [historyError, setHistoryError] = useState<Error | null>(null);
 	const [historyAttempt, setHistoryAttempt] = useState(0);
@@ -153,6 +181,9 @@ export function useMessages(
 	const [subagentHitl, setSubagentHitl] = useState<SubagentHitlEntry[]>([]);
 
 	const msgsRef = useRef<Msg[]>([]);
+	const confirmedUserIds = useRef(new Set<string>());
+	const sendAttempt = useRef<{ key: string; signature: string; message: Msg } | null>(null);
+	const sendingDirect = useRef<string | null>(null);
 	const currentReplyRef = useRef<Msg | null>(null);
 	const abortRef = useRef<AbortController | null>(null);
 	const rafRef = useRef<number | null>(null);
@@ -188,7 +219,34 @@ export function useMessages(
 			// reply content — route them to callbacks and skip appendEvent.
 			if (event.type === EventType.CUSTOM) {
 				const custom = event as CustomEvent;
-				if (custom.name === 'team_updated') {
+				if (custom.name === 'agent_progress') {
+					const replyId = readAgentProgress(custom.value)?.replyId;
+					const reply = msgsRef.current.find((message) => message.id === replyId);
+					if (reply && applyAgentProgress(reply, event)) {
+						const updated = { ...reply };
+						msgsRef.current = msgsRef.current.map((message) => message === reply ? updated : message);
+						if (currentReplyRef.current?.id === reply.id) currentReplyRef.current = updated;
+						scheduleUpdate();
+					}
+				} else if (custom.name === 'message_queue_updated') {
+					void refreshQueueRef.current();
+				} else if (custom.name === 'queued_message_started') {
+					const message = (custom.value as { message: Msg }).message;
+					confirmedUserIds.current.add(message.id);
+					if (!msgsRef.current.some((existing) => existing.id === message.id)) {
+						msgsRef.current = [...msgsRef.current, message];
+						scheduleUpdate();
+					}
+					setConnectionNotice(null);
+					setPhase('streaming');
+				} else if (custom.name === 'execution_progress') {
+                    const progress = custom.value as { messageId?: string; stage?: string };
+                    if (progress.messageId && typeof progress.stage === 'string') {
+                        msgsRef.current = msgsRef.current.map((message) => message.id === progress.messageId
+                            ? { ...message, metadata: { ...message.metadata, executionProgress: progress } } : message);
+                        scheduleUpdate();
+                    }
+                } else if (custom.name === 'team_updated') {
 					optionsRef.current?.onTeamUpdated?.();
 				} else if (custom.name === 'state_updated' && custom.value) {
 					optionsRef.current?.onStateUpdated?.(custom.value as Record<string, unknown>);
@@ -211,6 +269,7 @@ export function useMessages(
 				return;
 			}
 			if (event.type === EventType.REPLY_START) {
+				setConnectionNotice(null);
 				const e = event as ReplyStartEvent;
 				// A continuation (the run resuming after a confirmation or an
 				// external execution result) re-emits REPLY_START with the
@@ -227,8 +286,8 @@ export function useMessages(
 					audioManager?.stopAllPlayback();
 					const msg =
 						e.role === 'user'
-							? UserMsg({ id: e.reply_id, name: e.name, content: [] })
-							: AssistantMsg({ id: e.reply_id, name: e.name, content: [] });
+							? UserMsg({ id: e.reply_id, name: e.name, content: [], created_at: e.created_at })
+							: AssistantMsg({ id: e.reply_id, name: e.name, content: [], created_at: e.created_at });
 					msgsRef.current = [...msgsRef.current, msg];
 					currentReplyRef.current = msg;
 				}
@@ -304,9 +363,11 @@ export function useMessages(
 	useEffect(() => {
 		setLoadedKey(null);
 		msgsRef.current = [];
+		confirmedUserIds.current = new Set();
 		currentReplyRef.current = null;
 		setMsgs([]);
 		setError(null);
+		setConnectionNotice(null);
 		setHistoryError(null);
 		clearInterruptTimer();
 		setPhase('idle');
@@ -316,51 +377,45 @@ export function useMessages(
 		if (!agentId || !sessionId) return;
 
 		const controller = new AbortController();
+		const signal = AbortSignal.any([controller.signal, getAuthSignal()]);
 		abortRef.current = controller;
-		let cancelled = false;
+
+		// Rebuild from the persisted snapshot AND its cursor before each new
+		// subscription. Reusing partial live messages would append replayed
+		// deltas twice, and keeping the old phase would strand crashed replies.
+		const readHistory = async (reconnecting = false) => {
+			const { messages, is_running, event_cursor } = await sessionApi.messages(
+				sessionId, agentId, undefined,
+				{ signal, silent: reconnecting, timeoutMs: 15_000 },
+			);
+			if (signal.aborted) return null;
+			const tail = messages.at(-1);
+			const pending = hasPendingToolCall(tail);
+			msgsRef.current = messages;
+			confirmedUserIds.current = new Set(messages.filter((message) => message.role === 'user').map((message) => message.id));
+			currentReplyRef.current = pending ? tail! : null;
+			clearInterruptTimer();
+			setPhase(is_running || pending ? 'streaming' : 'idle');
+			setSubagentHitl([]); // Pending cards are replayed by the new stream.
+			setMsgs([...messages]);
+			return { cursor: event_cursor, interrupted: !is_running && !pending && tail?.role === 'user' };
+		};
 
 		(async () => {
 			let eventCursor: string | null = null;
+			let interrupted = false;
 			// 1. Fetch persisted history — unless this tab just created the
 			// session, in which case there is provably none.
 			if (takeFreshlyCreated(sessionId)) {
-				if (!cancelled) setLoadedKey(`${agentId}:${sessionId}`);
+				if (!signal.aborted) setLoadedKey(`${agentId}:${sessionId}`);
 			} else {
 				try {
-					const { messages, is_running, event_cursor } = await sessionApi.messages(
-						sessionId,
-						agentId,
-					);
-					if (cancelled) return;
-					eventCursor = event_cursor;
-					msgsRef.current = messages;
-					// If a reply is in flight (running on a worker) OR the
-					// tail msg is parked on a pending tool_call (awaiting
-					// user confirmation / external execution), initialise the
-					// phase to ``streaming`` so the interrupt button is
-					// available immediately — otherwise a fresh page load
-					// while parked leaves the UI stuck on ``idle`` with no
-					// way to abort.
-					const tail = messages[messages.length - 1];
-					if (is_running || hasPendingToolCall(tail)) {
-						setPhase('streaming');
-						if (hasPendingToolCall(tail)) {
-							// Prime the ref so continuation events (which
-							// arrive without a fresh REPLY_START) apply to
-							// the right msg.
-							currentReplyRef.current = tail ?? null;
-						}
-					}
-					// Published synchronously, not through `scheduleUpdate`:
-					// its requestAnimationFrame batching exists for
-					// high-frequency streaming deltas, and deferring here
-					// would let `loadedKey` below clear `loading` a frame
-					// before the messages land — painting the empty-session
-					// greeting over a conversation that does have history.
-					// Both setters now land in the same React batch.
-					setMsgs([...msgsRef.current]);
+					const snapshot = await readHistory();
+					if (signal.aborted) return;
+					eventCursor = snapshot!.cursor;
+					interrupted = snapshot!.interrupted;
 				} catch (e) {
-					if (!cancelled) {
+					if (!signal.aborted) {
 						setError(e as Error);
 						setHistoryError(e as Error);
 					}
@@ -370,62 +425,129 @@ export function useMessages(
 					// an error surfaces through `historyError`, and leaving
 					// `loading` stuck on would hide it behind a spinner
 					// forever.
-					if (!cancelled) setLoadedKey(`${agentId}:${sessionId}`);
+					if (!signal.aborted) setLoadedKey(`${agentId}:${sessionId}`);
 				}
 			}
 
-			// 2. Open SSE long connection for live events
-			try {
-				for await (const event of sessionApi.streamEvents(
-					sessionId,
-					agentId,
-					controller.signal,
-					eventCursor,
-				)) {
-					if (cancelled) break;
-					processEvent(event);
-				}
-			} catch (e) {
-				if ((e as Error).name !== 'AbortError' && !cancelled) {
+			// 2. Recover both rejected reads and a clean EOF. Retry only reads:
+			// replaying POST /chat would execute the user's request twice.
+			let reconnecting = false;
+			let attempts = 0;
+			while (!signal.aborted) {
+				try {
+					if (reconnecting) {
+						const snapshot = await readHistory(true);
+						if (signal.aborted) return;
+						eventCursor = snapshot!.cursor;
+						interrupted = snapshot!.interrupted;
+					}
+					for await (const event of sessionApi.streamEvents(
+						sessionId, agentId, signal, eventCursor,
+						() => {
+							if (signal.aborted) return;
+							setError(null);
+							setConnectionNotice(interrupted ? 'interrupted' : null);
+						},
+					)) {
+						if (signal.aborted) return;
+						attempts = 0;
+						processEvent(event);
+					}
+					if (signal.aborted) return;
+					throw new Error('Session stream disconnected.');
+				} catch (e) {
+					if (signal.aborted) return;
 					setError(e as Error);
+					clearInterruptTimer();
+					if (e instanceof ApiError && [401, 403, 404].includes(e.status)) {
+						setConnectionNotice('failed');
+						setPhase('idle');
+						return;
+					}
+					setConnectionNotice('reconnecting');
 				}
+				reconnecting = true;
+				await waitForReconnect(signal, Math.min(1000 * 2 ** Math.min(attempts++, 4), 10_000));
 			}
 		})();
 
 		return () => {
-			cancelled = true;
 			controller.abort();
 			abortRef.current = null;
 			clearInterruptTimer();
+			if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+			rafRef.current = null;
 		};
 	}, [agentId, sessionId, historyAttempt, scheduleUpdate, processEvent, audioManager, clearInterruptTimer]);
 
 	/**
-	 * Send a user message. Appends the message to the local list
-	 * optimistically, then fires a ``POST /chat/`` trigger. Events
-	 * arrive via the already-open SSE connection.
+	 * Idle messages use /chat immediately; only busy/backlogged conversations
+	 * use the waiting queue. The server rechecks admission across tabs.
 	 *
 	 * @param content - The message content blocks.
 	 */
 	const send = useCallback(
 		async (content: ContentBlock[]) => {
-			if (!agentId || !sessionId) return;
-
-			const userMsg = UserMsg({ name: 'user', content });
-			msgsRef.current = [...msgsRef.current, userMsg];
-			scheduleUpdate();
-
+			if (!agentId || !sessionId || connectionNotice === 'reconnecting' || connectionNotice === 'failed') throw new Error('Session is not connected.');
+			const key = `${agentId}:${sessionId}`;
+			const signal = abortRef.current?.signal;
+			const authSignal = getAuthSignal();
+			const current = () => !signal?.aborted && !authSignal.aborted;
+			// Keep the same ID across an ambiguous failure, including a retry
+			// which now sees the first submission running on the server.
+			const signature = JSON.stringify(content, (field, value) => ['id', 'created_at', 'finished_at'].includes(field) ? undefined : value);
+			if (sendAttempt.current?.key !== key || sendAttempt.current.signature !== signature) {
+				sendAttempt.current = { key, signature, message: UserMsg({ name: 'user', content }) };
+			}
+			const attempt = sendAttempt.current;
+			const message = attempt.message;
+			const queue = queueState;
+			const busy = sendingDirect.current === key || phase !== 'idle' || !!(queue && (
+				queue.activity !== 'idle' || queue.items.length || queue.editing_id || (queue.paused && queue.pause_reason === 'manual')
+			));
+			const direct = queueUnavailable || !busy;
+			const removeOptimistic = () => {
+				if (!current() || confirmedUserIds.current.has(message.id)) return;
+				msgsRef.current = msgsRef.current.filter((existing) => existing.id !== message.id);
+				scheduleUpdate();
+			};
+			setConnectionNotice(null);
 			try {
-				await chatApi.trigger({
-					agent_id: agentId,
-					session_id: sessionId,
-					input: userMsg,
-				});
+				if (direct) {
+					sendingDirect.current = key;
+					if (!msgsRef.current.some((existing) => existing.id === message.id)) msgsRef.current = [...msgsRef.current, { ...message, metadata: { ...message.metadata, executionProgress: { stage: 'SENDING' } } }];
+					scheduleUpdate();
+					setPhase('streaming');
+					try {
+						const result = await chatApi.trigger({ agent_id: agentId, session_id: sessionId, input: message });
+						if (result.status === 'queued') removeOptimistic();
+                        else if (current()) {
+                            msgsRef.current = msgsRef.current.map((item) => item.id === message.id &&
+                                (!item.metadata?.executionProgress || (item.metadata.executionProgress as {stage?: string}).stage === 'SENDING')
+                                ? { ...item, metadata: { ...item.metadata, executionProgress: { stage: 'PREPARING' } } } : item);
+                            scheduleUpdate();
+                        }
+						if (current() && !queueUnavailable) void refreshQueue();
+					} catch (e) {
+						removeOptimistic();
+						if (current()) {
+							if (!confirmedUserIds.current.has(message.id)) setPhase('idle');
+							if (!queueUnavailable) void refreshQueue();
+						}
+						throw e;
+					} finally {
+						if (sendingDirect.current === key) sendingDirect.current = null;
+					}
+				} else {
+					await submitQueued(message);
+				}
+				if (sendAttempt.current === attempt) sendAttempt.current = null;
 			} catch (e) {
-				setError(e as Error);
+				if (current()) setError(e as Error);
+				throw e;
 			}
 		},
-		[agentId, sessionId, scheduleUpdate],
+		[agentId, sessionId, submitQueued, connectionNotice, queueUnavailable, scheduleUpdate, phase, queueState, refreshQueue],
 	);
 
 	/**
@@ -599,8 +721,10 @@ export function useMessages(
 	return {
 		msgs: ownsConversation ? msgs : [],
 		loading,
-		phase: ownsConversation ? phase : ('idle' as ReplyPhase),
+		phase: ownsConversation ? (phase === 'idle' && messageQueue.state && messageQueue.state.activity !== 'idle' ? 'streaming' as ReplyPhase : phase) : ('idle' as ReplyPhase),
+		messageQueue,
 		error: ownsConversation ? error : null,
+		connectionNotice: ownsConversation ? connectionNotice : null,
 		historyError: ownsConversation ? historyError : null,
 		reloadHistory,
 		send,

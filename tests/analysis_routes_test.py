@@ -20,7 +20,7 @@ class RouteTests(PresentationCase):
         built=await self.service.build([ref],selections,scope,[],'draft-preview')
         draft=self.store.get_analysis(OWNER,built['analysisRef'])
         request={'analysisRef':built['analysisRef'],'claims':[],'viewPlan':[{'viewId':'v','type':'TABLE','scopeId':draft['scope']['scopeId'],'valueRefs':[f['factId'] for f in draft['facts']]}],
-                 'expectedBaseRevision':0,'requestKey':'preview-route','previewOnly':True}
+                 'requestKey':'preview-route','previewOnly':True}
         result=await self.service.publish(**request)
         params={**self.params,'preview_ref':result['repairRef']}
         for format in ('html','json'):
@@ -39,7 +39,7 @@ class RouteTests(PresentationCase):
         bad=await self.client.get('/workspace/analyses/preview',params={**params,'preview_ref':caught.exception.details['repairRef']},headers=self.headers)
         self.assertEqual(bad.status_code,409)
         self.assertEqual(bad.json()['detail']['code'],'INVALID_PUBLICATION')
-        await self.service.publish(built['analysisRef'],requestKey='final-route',expectedBaseRevision=0,repairRef=result['repairRef'],repairs=[])
+        await self.service.publish(built['analysisRef'],requestKey='final-route',repairRef=result['repairRef'],repairs=[])
         stale=await self.client.get('/workspace/analyses/preview',params=params,headers=self.headers)
         self.assertEqual(stale.status_code,409)
 
@@ -142,7 +142,7 @@ class RouteTests(PresentationCase):
         cap,selections,scope=saved_fixture(self.store,('42','-5','0'))
         built=await self.service.build([cap],selections,scope,[],'free-route-build')
         artifact=self.store.get_analysis(OWNER,built['analysisRef'])
-        preview=await self.service.publish(built['analysisRef'],requestKey='free-route-preview',expectedBaseRevision=0,previewOnly=True,
+        preview=await self.service.publish(built['analysisRef'],requestKey='free-route-preview',previewOnly=True,
             document={'title':'自由页面','html':'<html><head></head><body><p>{{x}}</p><script>document.body.dataset.ready="yes"</script></body></html>',
                       'bindings':[{'key':'x','valueRef':artifact['facts'][0]['factId']}]})
         query={**self.params,'preview_ref':preview['repairRef']}
@@ -170,7 +170,7 @@ class RouteTests(PresentationCase):
         checked=await self.client.post('/workspace/analyses/preview-check',params=self.params,headers=self.headers,
                                        json={**body,'measurements':narrow})
         self.assertEqual(checked.status_code,200,checked.text)
-        published=await self.service.publish(built['analysisRef'],requestKey='free-route-publish',expectedBaseRevision=0,repairRef=preview['repairRef'],repairs=[])
+        published=await self.service.publish(built['analysisRef'],requestKey='free-route-publish',repairRef=preview['repairRef'],repairs=[])
         self.assertTrue(published['delivery']['registered'])
         export=await self.client.post('/workspace/analyses/render-report',params=self.params,headers=self.headers,json={'analysisRef':built['analysisRef'],'requestKey':'free-route-export'})
         self.assertEqual(export.status_code,200,export.text)

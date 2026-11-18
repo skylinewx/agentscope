@@ -262,7 +262,7 @@ class ToolOffloadMiddlewareTest(IsolatedAsyncioTestCase):
                     },
                 ],
                 "state": "success",
-                "metadata": {},
+                "metadata": {"backgroundToolCallId": "call_slow"},
                 "id": "call_slow",
             },
         )
@@ -318,7 +318,7 @@ class ToolOffloadMiddlewareTest(IsolatedAsyncioTestCase):
                 "id": AnyString(),
                 "created_at": AnyString(),
                 "finished_at": AnyString(),
-                "source": '{"label": "tool_output", "sublabel": "slow_tool · '
+                "source": '{"label": "tool_output", "backgroundToolCallId": "call_bg", "backgroundState": "success", "backgroundToolName": "slow_tool", "toolResponseMetadata": {}, "sublabel": "slow_tool · '
                 'call_bg"}',
                 "hint": [
                     {
@@ -334,6 +334,53 @@ class ToolOffloadMiddlewareTest(IsolatedAsyncioTestCase):
         hint_text = hint_dict["hint"][0]["text"]
         self.assertIn("SlowTool finished", hint_text)
         self.assertIn("<system-notification>", hint_text)
+        # Finished is not consumed: the end guard must still wait for Inbox.
+        self.assertIn('call_bg', agent.state.middle_context['background_tools_v1'])
+
+    async def test_duplicate_pending_request_is_not_executed_again(self):
+        agent, _ = self._make_agent(Toolkit(tools=[SlowTool()]), timeout_secs=0.01)
+        first = ToolCallBlock(id='one', name='slow_tool', input='{"delay": 0.2}')
+        duplicate = ToolCallBlock(id='two', name='slow_tool', input='{"delay":0.2}')
+        _ = [item async for item in agent._acting(first)]
+        results = [item async for item in agent._acting(duplicate)]
+        self.assertEqual(len(self.bg_manager.tasks), 1)
+        response = next(item for item in results if isinstance(item, ToolResponse))
+        self.assertEqual(str(response.state), 'error')
+        self.assertIn('同一工具请求', response.content[0].text)
+        await asyncio.sleep(0.25)
+
+    async def test_background_exception_delivers_terminal_error(self):
+        agent, middleware = self._make_agent(Toolkit(tools=[SlowTool()]), timeout_secs=0.01)
+        async def broken(**kwargs):
+            await asyncio.sleep(0.04)
+            raise ValueError('synthetic source failure')
+            yield  # pragma: no cover
+        call = ToolCallBlock(id='broken', name='slow_tool', input='{"delay":0.04}')
+        _ = [item async for item in middleware.on_acting(agent, {'tool_call': call}, broken)]
+        await asyncio.sleep(0.08)
+        notices = [entry.args[1] for entry in middleware._message_bus.queue_push.call_args_list
+                   if entry.args[0] == MessageBusKeys.inbox(agent.state.session_id)]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(json.loads(notices[0]['source'])['backgroundState'], 'error')
+        self.assertIn('synthetic source failure', str(notices[0]['hint']))
+
+    async def test_background_exception_group_keeps_root_and_execution_id(self):
+        agent, middleware = self._make_agent(Toolkit(tools=[SlowTool()]), timeout_secs=0.01)
+
+        async def broken(**kwargs):
+            await asyncio.sleep(0.04)
+            raise ExceptionGroup('TaskGroup', [TimeoutError('source timeout')])
+            yield  # pragma: no cover
+
+        call = ToolCallBlock(id='grouped-call', name='slow_tool', input='{"requestId":"grouped-request"}')
+        _ = [item async for item in middleware.on_acting(agent, {'tool_call': call}, broken)]
+        await asyncio.sleep(0.08)
+        notices = [entry.args[1] for entry in middleware._message_bus.queue_push.call_args_list
+                   if entry.args[0] == MessageBusKeys.inbox(agent.state.session_id)]
+        self.assertEqual(len(notices), 1)
+        self.assertEqual(json.loads(notices[0]['source'])['backgroundState'], 'error')
+        for expected in ('TimeoutError', 'grouped-call', 'grouped-request', 'RETRY'):
+            self.assertIn(expected, str(notices[0]['hint']))
 
     async def test_background_task_triggers_wakeup_on_completion(
         self,

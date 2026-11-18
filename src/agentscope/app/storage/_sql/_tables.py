@@ -30,6 +30,7 @@ from typing import Any, ClassVar
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -186,6 +187,16 @@ class SessionRow(_JsonRecordMixin):
         "source": "origin.type",
         "source_schedule_id": "origin.schedule_id",
     }
+
+
+class MessageQueueRow(_JsonRecordMixin):
+    """Pending user inputs, isolated from session state/config writes."""
+
+    __tablename__ = "message_queues"
+    user_id: Mapped[str] = mapped_column(String(_ID_LEN), nullable=False, index=True)
+    agent_id: Mapped[str] = mapped_column(String(_ID_LEN), nullable=False)
+    has_work: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    _indexed_fields = ("user_id", "agent_id")
 
 
 class SOPRow(_JsonRecordMixin):

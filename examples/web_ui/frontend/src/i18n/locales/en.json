@@ -1,4 +1,16 @@
 {
+	"queue": {
+		"editConflict": "This message changed in another window. Your draft is preserved; copy it, cancel, and edit again.",
+		"title": "Message queue", "pause": "Pause", "resume": "Resume", "collapse": "Collapse queue", "expand": "Expand queue",
+		"edit": "Edit message", "delete": "Delete message", "deleted": "Removed from queue", "undo": "Undo",
+		"save": "Save", "cancel": "Cancel", "editing": "Editing — save or cancel to continue the queue",
+		"paused_manual": "Queue paused; the current task continues", "paused_stopped": "Task stopped. Resume to run the remaining messages",
+		"paused_error": "The previous task failed. Queue paused", "paused_interrupted": "Task interrupted unexpectedly. Check the previous result before resuming",
+		"waiting_permission": "Waiting for confirmation on the current task", "waiting_external": "Waiting for the current task’s external result", "waiting_background": "Waiting for the current task’s background tools",
+		"showMore": "Show {{count}} more", "showLess": "Show fewer messages", "syncError": "Queue sync unavailable. Reconnecting…",
+		"attachments": "{{count}} attachments", "attachment": "Attachment {{index}}", "removeAttachment": "Remove attachment",
+		"inputPlaceholder": "Type a message, Enter to queue…"
+	},
 	"markdownLinks": {
 		"title": "Open external link?",
 		"description": "You are about to open the following address.",
@@ -166,6 +178,7 @@
 		"yesWithRule": "Yes, and allow {{toolName}} to execute {{ruleContent}} for this session"
 	},
 	"replyProcess": {
+		"disconnected": "Connection lost",
 		"running": "Working",
 		"completed": "Processing completed",
 		"tools": "Completed {{count}} tool calls",
@@ -228,6 +241,21 @@
 		"copy": "Copy"
 	},
 	"chat": {
+		"execution": {
+			"SENDING": "Sending…",
+			"PREPARING": "Received. Preparing…",
+			"WORKSPACE": "Loading workspace…",
+			"CONTEXT": "Preparing conversation context…",
+			"TOOLS": "Loading tools and analysis capabilities…",
+			"MODEL": "Preparing model…",
+			"READY": "Waiting for model response…",
+			"RESPONDING": "Processing…",
+			"FAILED": "Preparation failed. See error details.",
+			"EXECUTING": "Background task running. Results will resume this response.",
+			"PUBLISHING": "Checking and preparing the analysis page…",
+			"CALCULATING": "Running data analysis…",
+			"elapsed": "Waiting {{seconds}}s"
+		},
 		"inputPlaceholder": "Type a message...",
 		"confirmToolCall": "Allow this action?",
 		"subagentConfirmTitle": "{{name}} requests confirmation",
@@ -236,6 +264,14 @@
 		"historyLoadFailed": "Unable to load this conversation",
 		"historyLoadFailedDescription": "Please reload. A failed read does not delete saved conversation content.",
 		"reloadHistory": "Reload conversation",
+		"connection": {
+			"reconnecting": "Connection lost. Reconnecting…",
+			"reconnectingDescription": "Restoring the conversation and checking whether the reply is still running.",
+			"interrupted": "The last question has no completed reply",
+			"interruptedDescription": "The task is no longer running. Saved messages are preserved. Please send your question again.",
+			"failed": "Unable to connect to this conversation",
+			"failedDescription": "Check your sign-in status and access to this conversation, then reload."
+		},
 		"maxItersExceeded": {
 			"title": "Reached the iteration limit",
 			"description": "Send a new message to keep going, or continue the current task.",
@@ -1095,6 +1131,7 @@
 		"password": "Password",
 		"login": "Sign in",
 		"loggingIn": "Signing in…",
+		"sessionInvalid": "Your session is no longer valid. Sign in again to continue.",
 		"contactAdmin": "Need an account or a password reset? Contact your administrator.",
 		"unreachable": "Cannot reach the service. Check your network or contact the administrator.",
 		"failed": "Operation failed. Please try again.",

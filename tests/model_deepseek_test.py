@@ -9,14 +9,19 @@ Tests cover both non-streaming and streaming modes, verifying that:
 """
 
 from typing import Any
+import asyncio
+from copy import deepcopy
 import hashlib
 import json
 import unittest
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, MagicMock
 
+from pydantic import BaseModel, Field
+
 from utils import AnyString
 
+from agentscope.exception import StructuredOutputError
 from agentscope.message import (
     AssistantMsg,
     DataBlock,
@@ -767,6 +772,263 @@ class TestDeepSeekStream(IsolatedAsyncioTestCase):
         self.assertEqual(responses[-1].usage.input_tokens, 100)
         self.assertEqual(responses[-1].usage.output_tokens, 20)
         self.assertEqual(responses[-1].usage.cache_input_tokens, 50)
+
+
+class _StructuredReply(BaseModel):
+    """A schema whose constraints must survive tool-choice selection."""
+
+    value: int = Field(ge=1, strict=True)
+
+
+class TestDeepSeekStructuredOutput(IsolatedAsyncioTestCase):
+    """Exercise strategy selection through the SDK request and validation."""
+
+    async def asyncSetUp(self) -> None:
+        self.model = _make_model()
+        self.addAsyncCleanup(self.model.client.close)
+        self.model.parameters.thinking_enable = True
+        self.messages = [UserMsg("user", "Return a positive value.")]
+        self.schema = _StructuredReply.model_json_schema()
+        self.mock_create = AsyncMock(
+            return_value=self._completion({"value": 1})
+        )
+        self.model.client.chat.completions.create = self.mock_create
+
+    @staticmethod
+    def _completion(content: dict) -> MagicMock:
+        """Return tool arguments without mocking the structured parser."""
+        return _mock_completion(
+            tool_calls=[
+                {
+                    "id": "structured-1",
+                    "name": "generate_structured_output",
+                    "arguments": json.dumps(content),
+                },
+            ],
+        )
+
+    def _request_strategies(self) -> list[tuple[str, str | None]]:
+        """Read the actual thinking switch and tool choice sent to the SDK."""
+        strategies = []
+        for call in self.mock_create.await_args_list:
+            request = call.kwargs
+            choice = request.get("tool_choice")
+            if isinstance(choice, dict):
+                choice = choice["function"]["name"]
+            strategies.append(
+                (request["extra_body"]["thinking"]["type"], choice)
+            )
+        return strategies
+
+    async def test_thinking_starts_with_auto_and_keeps_schema(self) -> None:
+        """A valid thinking response needs only one provider request."""
+        result = await self.model.generate_structured_output(
+            self.messages,
+            self.schema,
+        )
+
+        self.mock_create.assert_awaited_once()
+        request = self.mock_create.await_args.kwargs
+        self.assertEqual(request["tool_choice"], "auto")
+        self.assertEqual(request["extra_body"]["thinking"]["type"], "enabled")
+        self.assertEqual(
+            request["tools"][0]["function"]["parameters"], self.schema
+        )
+        self.assertEqual(result.content, {"value": 1})
+
+    async def test_disabled_thinking_keeps_forced_choice(self) -> None:
+        """Non-thinking requests retain the existing forced-tool strategy."""
+        self.model.parameters.thinking_enable = False
+
+        await self.model.generate_structured_output(self.messages, self.schema)
+
+        self.mock_create.assert_awaited_once()
+        request = self.mock_create.await_args.kwargs
+        self.assertEqual(
+            request["tool_choice"],
+            {
+                "type": "function",
+                "function": {"name": "generate_structured_output"},
+            },
+        )
+        self.assertEqual(request["extra_body"]["thinking"]["type"], "disabled")
+
+    async def test_thinking_override_is_request_local(self) -> None:
+        """Concurrent overrides agree with the wire request without mutation."""
+        for configured_thinking in (True, False):
+            with self.subTest(configured_thinking=configured_thinking):
+                self.model.parameters.thinking_enable = configured_thinking
+                self.mock_create.reset_mock()
+                bodies = [
+                    {"custom": "first", "thinking": {"type": "enabled"}},
+                    {"custom": "second", "thinking": {"type": "disabled"}},
+                    {"custom": "third", "thinking": {"budget_tokens": 1024}},
+                ]
+                original_bodies = deepcopy(bodies)
+
+                await asyncio.gather(
+                    *(
+                        self.model.generate_structured_output(
+                            self.messages,
+                            self.schema,
+                            extra_body=body,
+                        )
+                        for body in bodies
+                    ),
+                )
+
+                self.assertEqual(self.mock_create.await_count, 3)
+                for call in self.mock_create.await_args_list:
+                    request = call.kwargs
+                    if request["extra_body"]["thinking"]["type"] == "enabled":
+                        self.assertEqual(request["tool_choice"], "auto")
+                    else:
+                        self.assertEqual(
+                            request["tool_choice"]["function"]["name"],
+                            "generate_structured_output",
+                        )
+                self.assertEqual(bodies, original_bodies)
+                self.assertEqual(
+                    self.model.parameters.thinking_enable,
+                    configured_thinking,
+                )
+
+    async def test_explicit_tool_choice_is_preserved(self) -> None:
+        """An explicit caller choice still bypasses the default strategy."""
+        await self.model.generate_structured_output(
+            self.messages,
+            self.schema,
+            tool_choice=ToolChoice(mode="generate_structured_output"),
+        )
+
+        self.mock_create.assert_awaited_once()
+        self.assertEqual(
+            self.mock_create.await_args.kwargs["tool_choice"]["function"][
+                "name"
+            ],
+            "generate_structured_output",
+        )
+
+    async def test_invalid_schema_is_rejected_for_all_strategies(self) -> None:
+        """Both JSON Schema and Pydantic constraints remain mandatory."""
+        for schema in (self.schema, _StructuredReply):
+            with self.subTest(schema_type=type(schema).__name__):
+                self.mock_create.reset_mock()
+                self.mock_create.return_value = self._completion({"value": 0})
+
+                with self.assertRaises(StructuredOutputError):
+                    await self.model.generate_structured_output(
+                        self.messages,
+                        schema,
+                    )
+
+                self.assertEqual(
+                    self._request_strategies(),
+                    [
+                        ("enabled", "auto"),
+                        ("disabled", "generate_structured_output"),
+                        ("enabled", None),
+                    ],
+                )
+
+    async def test_valid_fallback_does_not_change_next_call(self) -> None:
+        """Fallbacks still validate and never reintroduce thinking + forced."""
+        self.mock_create.side_effect = [
+            self._completion({}),
+            self._completion({"value": 2}),
+            self._completion({"value": 3}),
+        ]
+
+        first = await self.model.generate_structured_output(
+            self.messages,
+            _StructuredReply,
+        )
+        second = await self.model.generate_structured_output(
+            self.messages,
+            _StructuredReply,
+        )
+
+        self.assertEqual(
+            (first.content, second.content), ({"value": 2}, {"value": 3})
+        )
+        self.assertEqual(
+            self._request_strategies(),
+            [
+                ("enabled", "auto"),
+                ("disabled", "generate_structured_output"),
+                ("enabled", "auto"),
+            ],
+        )
+
+    async def test_plain_text_does_not_bypass_schema(self) -> None:
+        """Auto permits text on the wire, but structured output still rejects it."""
+        self.mock_create.return_value = _mock_completion(text='{"value": 1}')
+
+        with self.assertRaises(StructuredOutputError):
+            await self.model.generate_structured_output(
+                self.messages, self.schema
+            )
+
+        self.assertEqual(self.mock_create.await_count, 3)
+
+    async def test_transient_retry_stays_on_auto(self) -> None:
+        """Transient failures use the existing retry budget with auto unchanged."""
+        import httpx
+        import openai
+
+        self.model.max_retries = 1
+        self.model.retry_delay = 0
+        self.mock_create.side_effect = [
+            openai.APITimeoutError(
+                request=httpx.Request("POST", "https://example.test")
+            ),
+            self._completion({"value": 1}),
+        ]
+
+        result = await self.model.generate_structured_output(
+            self.messages, self.schema
+        )
+
+        self.assertEqual(result.content, {"value": 1})
+        self.assertEqual(
+            [
+                call.kwargs["tool_choice"]
+                for call in self.mock_create.await_args_list
+            ],
+            ["auto", "auto"],
+        )
+
+    async def test_streaming_auto_still_validates_tool_arguments(self) -> None:
+        """The real stream parser and structured validator remain in the path."""
+        self.model.stream = True
+        self.mock_create.return_value = _MockAsyncStream(
+            [
+                _make_stream_chunk(
+                    tool_calls=[
+                        _make_tool_call_delta(
+                            0,
+                            tc_id="structured-1",
+                            name="generate_structured_output",
+                            arguments='{"value":',
+                        ),
+                    ],
+                ),
+                _make_stream_chunk(
+                    tool_calls=[_make_tool_call_delta(0, arguments="1}")],
+                ),
+            ],
+        )
+
+        result = await self.model.generate_structured_output(
+            self.messages,
+            _StructuredReply,
+        )
+
+        self.mock_create.assert_awaited_once()
+        self.assertEqual(
+            self.mock_create.await_args.kwargs["tool_choice"], "auto"
+        )
+        self.assertEqual(result.content, {"value": 1})
 
 
 class TestDeepSeekModelParameters(unittest.TestCase):

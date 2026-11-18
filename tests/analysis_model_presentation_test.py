@@ -41,7 +41,7 @@ class ModelPresentationTests(PresentationCase):
         return {'viewId':kind, 'scopeId':self.sid, 'type':kind, 'valueRefs':self.refs, **options}
 
     async def release(self, plans, claims=None, technical=False):
-        self.result = await self.service.publish(self.ref, claims or [], plans, 'publish', 0, technicalDetails=technical)
+        self.result = await self.service.publish(self.ref, claims or [], plans, 'publish',  technicalDetails=technical)
         self.assertTrue(self.result['delivery']['registered'])
         self.view = self.delivery.view(self.result['delivery']['path'])
         export = self.delivery.render_report(self.ref, 'report')
@@ -136,7 +136,7 @@ class ModelPresentationTests(PresentationCase):
         self.assertGreater(len(view['sources']), 0)
         self.assertIn('B1-C1', self.html)
         with self.assertRaises(AnalysisError):
-            await self.service.publish(self.ref, [], [self.plan('TABLE', valueRefs=['derived_formula'])], 'publish', 0, technicalDetails=False)
+            await self.service.publish(self.ref, [], [self.plan('TABLE', valueRefs=['derived_formula'])], 'publish',  technicalDetails=False)
 
     async def test_invalid_presentation_options_fail_before_publication(self):
         await self.build(formula=True)

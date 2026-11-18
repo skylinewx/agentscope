@@ -1,4 +1,4 @@
-import { Loader2, Palette } from 'lucide-react';
+import { Loader2, Palette, TriangleAlert } from 'lucide-react';
 import { useState } from 'react';
 
 import { authApi } from '@/api/auth';
@@ -6,6 +6,7 @@ import { setAuth } from '@/api/auth-state';
 import { ApiError } from '@/api/client';
 import { AppearanceDialog } from '@/components/appearance/AppearanceSettings';
 import { AgentScopeLogo } from '@/components/brand/AgentScopeLogo';
+import { Alert, AlertDescription } from '@/components/ui/alert';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -14,7 +15,7 @@ import { useBranding } from '@/context/branding';
 import { useTranslation } from '@/i18n/useI18n';
 import { DEFAULT_BRANDING } from '@/lib/branding';
 
-export function SetupPage() {
+export function SetupPage({ sessionInvalid = false }: { sessionInvalid?: boolean }) {
 	const { t } = useTranslation();
 	const { data: branding = DEFAULT_BRANDING } = useBranding();
 	const [username, setUsername] = useState('');
@@ -60,6 +61,12 @@ export function SetupPage() {
 					<CardDescription>{t('auth.loginDescription')}</CardDescription>
 				</CardHeader>
 				<CardContent>
+					{sessionInvalid && (
+						<Alert className="mb-5">
+							<TriangleAlert />
+							<AlertDescription>{t('auth.sessionInvalid')}</AlertDescription>
+						</Alert>
+					)}
 					<form onSubmit={submit} className="space-y-5">
 						<div className="space-y-2">
 							<Label htmlFor="login-username">{t('auth.username')}</Label>

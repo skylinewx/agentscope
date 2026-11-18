@@ -36,12 +36,12 @@ class CoverageTests(IsolatedAsyncioTestCase):
             ('sum-table', [{'viewId': 't', 'scopeId': sid, 'type': 'TABLE', 'valueRefs': ['derived_sum']}]),
         ]:
             with self.subTest(name=name), self.assertRaises(AnalysisError) as error:
-                await self.service.publish(built['analysisRef'], [], views, name, built['baseRevision'])
+                await self.service.publish(built['analysisRef'], [], views, name)
             self.assertEqual(error.exception.code, 'REPORT_TOPIC_UNREPRESENTED')
             self.assertEqual(set(error.exception.details['missingFactRefs']), set(self.refs))
         result = await self.service.publish(built['analysisRef'], [], [
             {'viewId': 'details', 'scopeId': sid, 'type': 'TABLE', 'valueRefs': self.refs, 'orderRef': 'derived_order', 'collapsed': True}
-        ], 'complete', built['baseRevision'])
+        ], 'complete')
         self.assertTrue(result['summary']['represented']['topics'][0]['represented'])
         self.assertEqual(len(result['summary']['represented']['objectIds']), 3)
 
@@ -54,9 +54,9 @@ class CoverageTests(IsolatedAsyncioTestCase):
         built = await self.service.build([cap], selections, scope, [], 'wide')
         view = {'viewId': 'bars', 'scopeId': built['scope']['scopeId'], 'type': 'BAR_VALUES', 'valueRefs': refs}
         with self.assertRaises(AnalysisError) as error:
-            await self.service.publish(built['analysisRef'], [], [view], 'wide-bad', built['baseRevision'])
+            await self.service.publish(built['analysisRef'], [], [view], 'wide-bad')
         self.assertEqual(len(error.exception.details['missingFactRefs']), 2)
-        result = await self.service.publish(built['analysisRef'], [], [view, {**view, 'viewId': 'details', 'type': 'TABLE', 'collapsed': True}], 'wide-ok', built['baseRevision'])
+        result = await self.service.publish(built['analysisRef'], [], [view, {**view, 'viewId': 'details', 'type': 'TABLE', 'collapsed': True}], 'wide-ok')
         self.assertTrue(result['summary']['represented']['topics'][0]['represented'])
 
     async def test_work_plan_is_bound_to_real_results_and_idempotency(self):
@@ -76,7 +76,7 @@ class CoverageTests(IsolatedAsyncioTestCase):
         with self.assertRaises(AnalysisError) as error:
             await self.service.publish(built['analysisRef'], [], [{
                 'viewId':'empty-table', 'scopeId':built['scope']['scopeId'], 'type':'TABLE',
-                'valueRefs':['derived_order'], 'descriptionParts':parts}], 'empty-caption', built['baseRevision'],
+                'valueRefs':['derived_order'], 'descriptionParts':parts}], 'empty-caption',
                 presentation={'groups':[{'groupId':'unused','title':'未显示的组','descriptionParts':parts}]})
         self.assertEqual(error.exception.code, 'REPORT_TOPIC_UNREPRESENTED')
 

@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/table';
 import { useTranslation } from '@/i18n/useI18n';
 import { tablePage, type TableOrder } from '@/lib/analysis-table-state';
+import { financialColumnAlignment } from '@/lib/financial-table-alignment';
 import type { AnalysisTable } from '@/lib/workspace-analysis';
 
 export function AnalysisTables({ tables }: { tables: AnalysisTable[] }) {
@@ -36,6 +37,10 @@ function AnalysisTableCard({ table }: { table: AnalysisTable }) {
 	const [size, setSize] = useState(table.pageSize);
 	const [order, setOrder] = useState<TableOrder>({ columnKey: null, direction: 'published' });
 	const { rows: visibleRows, page, pages } = tablePage(table, order, selectedPage, size);
+	// 本组件的数据列来自金额/计算事实；列名称仍可明确表达排名或标识。
+	const alignments = Object.fromEntries(table.columns.map((column) => [
+		column.key, financialColumnAlignment({ label: column.label, dataType: 'DECIMAL_STRING' }),
+	]));
 	const hasNotes = table.rows.some(
 		(row) =>
 			row.note ||
@@ -70,7 +75,8 @@ function AnalysisTableCard({ table }: { table: AnalysisTable }) {
 								<TableHead
 									key={column.key}
 									scope="col"
-									className="whitespace-normal min-w-36 p-2 text-right"
+									className="whitespace-normal min-w-36 p-2"
+									style={{ textAlign: alignments[column.key] }}
 									aria-sort={
 										table.kind !== 'values'
 											? undefined
@@ -86,7 +92,10 @@ function AnalysisTableCard({ table }: { table: AnalysisTable }) {
 										<Button
 											variant="ghost"
 											type="button"
-											className="h-auto w-full justify-end whitespace-normal px-1 py-2 text-right font-medium"
+											className="h-auto w-full whitespace-normal px-1 py-2 font-medium"
+											style={{ textAlign: alignments[column.key], justifyContent: {
+												left: 'flex-start', right: 'flex-end', center: 'center',
+											}[alignments[column.key]] }}
 											aria-label={`${column.label} ${t('analysis.sort')}`}
 											onClick={() => {
 												setPage(0);
@@ -156,7 +165,8 @@ function AnalysisTableCard({ table }: { table: AnalysisTable }) {
 									return (
 										<TableCell
 											key={column.key}
-											className="whitespace-normal break-words p-2 text-right align-top tabular-nums"
+											className="whitespace-normal break-words p-2 align-top tabular-nums"
+											style={{ textAlign: alignments[column.key] }}
 										>
 											{cell?.display ?? '—'}
 											{cell?.unit && cell.unit !== column.unit
@@ -166,7 +176,7 @@ function AnalysisTableCard({ table }: { table: AnalysisTable }) {
 									);
 								})}
 								{hasNotes && (
-									<TableCell className="whitespace-normal break-words p-2 align-top text-xs leading-5">
+									<TableCell className="whitespace-normal break-words p-2 text-left align-top text-xs leading-5">
 										{[
 											row.note,
 											...table.columns.map((column) => {

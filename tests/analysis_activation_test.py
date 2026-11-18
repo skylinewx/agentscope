@@ -47,7 +47,7 @@ class AutoActivationTests(IsolatedAsyncioTestCase):
         self.assertEqual(len(result), 1, "A selected analysis Skill should assemble without an agent whitelist")
         middleware = result[0]
         self.assertEqual([t.name for t in await middleware.list_tools()],
-            ["AnalysisTask", "QueryResultRead", "AnalysisBuild", "AnalysisInspect", "AnalysisPublish", "AnalysisFollowUp", "AnalysisRenderReport"])
+            ["AnalysisTask", "QueryResultRead", "AnalysisBuild", "AnalysisPython", "AnalysisInspect", "AnalysisPublish", "AnalysisFollowUp", "AnalysisRenderReport"])
         self.assertTrue(middleware.service.delivery.cards_enabled)
         self.assertTrue(middleware.service.delivery.allow_reports)
         self.assertEqual(middleware.service.skill_versions, {"data-analysis": "installed-v1"})

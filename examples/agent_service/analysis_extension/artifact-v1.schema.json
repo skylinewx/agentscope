@@ -800,11 +800,24 @@
             }
           },
           "else": {
-            "properties": {
-              "executionStatus": {
-                "const": "BLOCKED"
+            "oneOf": [
+              {
+                "properties": {
+                  "executionStatus": {"const": "BLOCKED"}
+                }
+              },
+              {
+                "required": ["operator", "executionStatus", "completionReason", "valueState", "value", "sourceConsistency"],
+                "properties": {
+                  "executionStatus": {"const": "COMPLETED"},
+                  "operator": {"const": "FORMULA_CHECK"},
+                  "completionReason": {"const": "SOURCE_VALUE_MISSING"},
+                  "valueState": {"const": "NO_VALUE"},
+                  "value": {"type": "null"},
+                  "sourceConsistency": {"const": "NOT_CHECKED"}
+                }
               }
-            }
+            ]
           }
         }
       ]

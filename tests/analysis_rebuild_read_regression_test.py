@@ -123,19 +123,19 @@ class RebuildTests(IsolatedAsyncioTestCase):
         rebuilt = await self.service.build(*next_args, baseAnalysisRef=first['analysisRef'], workPlan=[])
         self.assertEqual(rebuilt['scope']['population'], self.scope['population'])
         self.assertEqual(rebuilt['completion']['pendingTaskIds'], ['compute'])
-        self.assertEqual(rebuilt['baseRevision'], 0)
+        self.assertEqual(rebuilt['revision'], 2)
         self.assertEqual(rebuilt['analysisRef'].split(':')[0], first['analysisRef'].split(':')[0])
         replay = await self.service.build(*next_args, baseAnalysisRef=first['analysisRef'], workPlan=[])
         self.assertEqual(replay['analysisRef'], rebuilt['analysisRef'])
         with self.assertRaises(AnalysisError) as error:
-            await self.service.publish(rebuilt['analysisRef'], [], [], 'incomplete', 0)
+            await self.service.publish(rebuilt['analysisRef'], [], [], 'incomplete')
         self.assertEqual(error.exception.code, 'INCOMPLETE_WORK_PLAN')
-        published = await self.service.publish(rebuilt['analysisRef'], [], [], 'complete', 0,
+        published = await self.service.publish(rebuilt['analysisRef'], [], [], 'complete',
                                               workRefs=[{'taskId': 'compute', 'refs': ['derived_sum']}])
         self.assertEqual(published['summary']['completion']['state'], 'READY')
         third = await self.service.build([self.cap], self.selections, self.scope, self.ops, 'third', baseAnalysisRef=rebuilt['analysisRef'])
         self.assertEqual(third['completion']['state'], 'READY')
-        self.assertEqual(third['baseRevision'], 2)
+        self.assertEqual(third['revision'], 3)
         self.assertEqual(self.store.get_analysis(OWNER, first['analysisRef'])['plan']['workPlan'], self.plan)
 
     async def test_scope_change_cannot_silently_drop_population_or_cross_owner(self):
@@ -149,12 +149,32 @@ class RebuildTests(IsolatedAsyncioTestCase):
         with self.assertRaises(AnalysisError):
             await other.build([self.cap], self.selections, self.scope, [], 'foreign', baseAnalysisRef=first['analysisRef'])
 
-    async def test_removing_needed_operation_does_not_reuse_old_computation(self):
+    async def test_omitting_operation_retains_valid_computation_for_unchanged_facts(self):
         first = await self.service.build([self.cap], self.selections, self.scope, self.ops, 'first',
                                         workPlan=[{**self.plan[0], 'refs': ['derived_sum']}])
-        with self.assertRaises(AnalysisError) as error:
-            await self.service.build([self.cap], self.selections, self.scope, [], 'no-operation', baseAnalysisRef=first['analysisRef'])
-        self.assertEqual(error.exception.code, 'INVALID_WORK_REF')
+        next_result = await self.service.build([self.cap], self.selections, self.scope, [], 'reuse-operation', baseAnalysisRef=first['analysisRef'])
+        # 模型回执可只返回未变化摘要；冻结计算必须完整且逐值保持。
+        previous_artifact = self.store.get_analysis(OWNER, first['analysisRef'])
+        next_artifact = self.store.get_analysis(OWNER, next_result['analysisRef'])
+        self.assertEqual(next_artifact['derivedValues'], previous_artifact['derivedValues'])
+        self.assertEqual(next_result['derivedValues'][0]['value'], first['derivedValues'][0]['value'])
+        self.assertTrue(next_result['derivedValues'][0]['unchanged'])
+        self.assertEqual(next_result['completion']['state'], 'READY')
+
+    async def test_changed_facts_recalculate_preserved_plan_without_reusing_old_value(self):
+        first = await self.service.build([self.cap], self.selections, self.scope, self.ops, 'first',
+                                        workPlan=[{**self.plan[0], 'refs': ['derived_sum']}])
+        changed_cap, changed_selections, changed_scope = saved_fixture(self.store, ('900', '800', '700'))
+        rebuilt = await self.service.build([changed_cap], changed_selections, changed_scope, [], 'no-operation', baseAnalysisRef=first['analysisRef'])
+        value = rebuilt['derivedValues'][0]
+        # 来源事实 ID 没变时重新计算当前值；新观察改变 ID 时保留受阻任务，
+        # 不能默默带入旧数值，也不再报未知工作项而丢掉计算计划。
+        if value['calculationValidation'] == 'PASS':
+            self.assertEqual(value['value'], '2400')
+        else:
+            self.assertIsNone(value['value'])
+            self.assertEqual(value['diagnostics'][0]['code'], 'UNKNOWN_VALUE')
+            self.assertEqual(rebuilt['completion']['state'], 'INCOMPLETE')
 
 
 class FormulaLabelTests(IsolatedAsyncioTestCase):

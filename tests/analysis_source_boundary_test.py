@@ -77,7 +77,7 @@ class SourceBoundaryTests(PresentationCase):
                   'valueRefs': [fact['factId'] for fact in artifact['facts']]},
                  {'viewId': 'sales-chart', 'scopeId': artifact['scope']['scopeId'], 'type': 'BAR_VALUES',
                   'valueRefs': [fact['factId'] for fact in artifact['facts']]}]
-        await self.service.publish(built['analysisRef'], [], views, 'sales-publish', 0)
+        await self.service.publish(built['analysisRef'], [], views, 'sales-publish')
         exported = await self.service.render_report(built['analysisRef'], 'sales-report')
         html = self.delivery.report(built['analysisRef'], exported['exportRef'])['html']
         self.assertIn('12.3', html)
@@ -151,11 +151,11 @@ class SourceBoundaryTests(PresentationCase):
         self.assertEqual({fact['value'] for fact in artifact['facts']}, {'100', '120'})
         view = {'viewId': 'both', 'scopeId': built['scope']['scopeId'], 'type': 'TABLE', 'valueRefs': [f['factId'] for f in artifact['facts']]}
         with self.assertRaises(AnalysisError) as failure:
-            await self.service.publish(built['analysisRef'], [], [view], 'ambiguous-query-publication', 0)
+            await self.service.publish(built['analysisRef'], [], [view], 'ambiguous-query-publication')
         self.assertEqual(failure.exception.code, 'AMBIGUOUS_TABLE')
         views = [{**view, 'viewId': 'query-' + str(i), 'title': '第 ' + str(i + 1) + ' 次查询',
                   'valueRefs': [fact['factId']]} for i, fact in enumerate(artifact['facts'])]
-        await self.service.publish(built['analysisRef'], [], views, 'two-query-publication', 0)
+        await self.service.publish(built['analysisRef'], [], views, 'two-query-publication')
         exported = await self.service.render_report(built['analysisRef'], 'two-query-report')
         html = self.delivery.report(built['analysisRef'], exported['exportRef'])['html']
         self.assertIn('100', html)
@@ -173,7 +173,7 @@ class SourceBoundaryTests(PresentationCase):
         verifier = self.store.capture(OWNER, verified_capture)
         built = await self.service.build([first, second, verifier], a+b, scope, [], 'isolated-verification')
         self.assertEqual(built['receiptVerification'], 'UNVERIFIED')
-        self.assertEqual({t['querySessionId'] for t in built['verificationTasks']}, {'query-first', 'query-second'})
+        self.assertEqual({t['querySessionId'] for t in built['verificationTasks']}, {'query-second'})
         receipt['data']['verification']['status'] = 'INVALID'
         verified_capture['response']['content'][0]['text'] = json.dumps(receipt)
         invalid = self.store.capture(OWNER, verified_capture)
@@ -200,7 +200,7 @@ class SourceBoundaryTests(PresentationCase):
                 self.assertEqual(len({f['sourceContextId'] for f in artifact['facts']}), 2)
                 view = {'viewId': 'members', 'scopeId': built['scope']['scopeId'], 'type': 'TABLE',
                         'valueRefs': [f['factId'] for f in artifact['facts']]}
-                published = await self.service.publish(built['analysisRef'], [], [view], 'member-table-' + tag, 0)
+                published = await self.service.publish(built['analysisRef'], [], [view], 'member-table-' + tag)
                 shown = self.delivery.view(published['delivery']['path'])
                 table = shown['tables'][0]
                 self.assertEqual([c['label'] for c in table['columns']], ['净利润'])

@@ -62,14 +62,16 @@ class BudgetAdapterTest(TestCase):
         with self.assertRaises(AnalysisError):
             adapt({"replace": capture, "other": clone}, selections, scope, 50000)
 
-    def test_unfinished_page_never_complete(self):
+    def test_unfinished_grid_does_not_invalidate_selected_captured_cells(self):
         capture, selections, scope = fixture()
         receipt = json.loads(capture["response"]["content"][0]["text"])
         page = receipt["data"]["stepResults"][1]["formResults"][0]["page"]
         page["observationExhausted"], page["nextCursor"] = False, "opaque-next"
         capture["response"]["content"][0]["text"] = json.dumps(receipt)
         result = adapt({"replace": capture}, selections, scope, 50000)
-        self.assertEqual(result["scope"]["coverage"], "PARTIAL")
+        self.assertTrue(result['scope']['selectedDataComplete'])
+        self.assertFalse(result['scope']['sourcePagesComplete'])
+        self.assertEqual(result['scope']['coverage'], 'COMPLETE')
 
     def test_wrong_cell_period_does_not_borrow_form_period(self):
         capture, selections, scope = fixture()

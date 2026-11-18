@@ -1,6 +1,22 @@
 """Fill the approved detail-card component with grouped business table data."""
 from html import escape
+import re
 from .formatting import inline_markup
+
+
+def column_class(label):
+    """本组件数据列均为数值事实；排名、序号按财务表格惯例居中。"""
+    title = re.sub(r'[（(][^()（）]*[)）]\s*$', '', label.strip()).strip()
+    if (re.search(r'(序号|行号|排名|名次|位次)$', title)
+            or re.search(r'(^|\s)(rank|ranking)$', title, re.I)
+            or re.fullmatch(r'(row\s*(no\.?|number)|serial\s*(no\.?|number)|no\.?|#)', title, re.I)):
+        return 'ordinal'
+    if (re.search(r'(编码|代码|编号|名称|说明|备注|描述)$', title)
+            or title in ('年度', '年份', '月份', '日期', '时期', '期间', '单位', '机构', '项目', '科目', '板块')
+            or re.search(r'(^|[\s_])(code|id|name|description|remarks?|notes?)$', title, re.I)
+            or title.lower() in ('year', 'month', 'date', 'period')):
+        return 'text'
+    return 'number'
 
 
 def render_details(document, indexes=None, grouped=False):
@@ -13,7 +29,7 @@ def render_details(document, indexes=None, grouped=False):
         headers = '<th scope="col" class="text">' + ('项目' if table['kind'] != 'values' else '名称') + '</th>'
         for column in table['columns']:
             title = column['label'] + ('（' + column['unit'] + '）' if column['unit'] else '')
-            headers += '<th scope="col">' + escape(title) + '</th>'
+            headers += '<th scope="col" class="' + column_class(column['label']) + '">' + escape(title) + '</th>'
         if notes: headers += '<th scope="col" class="text">说明</th>'
         rows = []
         for row in table['rows']:
@@ -24,7 +40,7 @@ def render_details(document, indexes=None, grouped=False):
                 shown_value = value['display'] if value else '—'
                 if value and value['unit'] and value['unit'] != column['unit']:
                     shown_value += ' ' + value['unit']
-                cells += '<td class="number"' + (' data-row-key="' + escape(value['rowKey'], quote=True) + '"' if value else '') + '>' + escape(shown_value) + '</td>'
+                cells += '<td class="' + column_class(column['label']) + '"' + (' data-row-key="' + escape(value['rowKey'], quote=True) + '"' if value else '') + '>' + escape(shown_value) + '</td>'
                 if value and value.get('state') not in ('', '已取得'):
                     explanations.append(column['label'] + '：' + value['state'])
                 elif value is None:

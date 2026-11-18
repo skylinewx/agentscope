@@ -21,6 +21,15 @@ def validate_policy(policy):
     return policy
 
 
+def member_dimensions(facts, scope):
+    """取得当前操作内的共同真实粒度；混合粒度不自动合并为一个口径。"""
+    grains = {tuple(sorted(fact.get('grain', []))) for fact in facts}
+    dimensions = set(next(iter(grains))) if len(grains) == 1 else set()
+    if scope.get('memberDimension') != 'PER_INPUT_GRAIN':
+        dimensions.add(scope.get('memberDimension'))
+    return dimensions
+
+
 def check(facts, scope, same_metric=True, varying_dimensions=(), policy=None):
     policy = policy or {}
     # A registered list bounds applicability even when this particular input
@@ -57,6 +66,9 @@ def check(facts, scope, same_metric=True, varying_dimensions=(), policy=None):
     if (binding_conflict or metric_conflict) and not signatures <= mapped:
         raise AnalysisError('COMPARABILITY_UNCONFIRMED' if binding_conflict else 'METRIC_CONFLICT',
                             '指标或表绑定不同，需要覆盖全部输入的明确指标映射。')
-    ignored = {scope.get('memberDimension'), *varying_dimensions, *policy.get('varyingDimensions', [])}
+    # 混合输入的范围标识不能替代本次操作的真实粒度。只采用操作内全部
+    # 来源事实共有的粒度；不同粒度的对照仍需明确规则。时期、单位、来源
+    # 和指标的检查已在上面执行，不能因时期也是 grain 的一部分而跳过。
+    ignored = member_dimensions(facts, scope) | set(varying_dimensions) | set(policy.get('varyingDimensions', []))
     if len({digest({key: value for key, value in fact.get('dimensions', {}).items() if key not in ignored}) for fact in facts}) > 1:
         raise AnalysisError('METRIC_CONFLICT', '所选数值存在规则未允许变化的维度。')

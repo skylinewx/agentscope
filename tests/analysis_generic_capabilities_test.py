@@ -41,7 +41,7 @@ def readings():
 
 def run_check(facts, target="output"):
     return calculate(facts, {"scopeId": "scope-lab"},
-                     [{"id": "check", "operator": "FORMULA_CHECK", "inputRefs": [target]}],
+                     [{"id": "check", "operator": "FORMULA_CHECK", "inputRefs": [target], "checkScope": "RECURSIVE"}],
                      RuleRegistry())[0]
 
 
@@ -79,7 +79,8 @@ class GenericFormulaTests(TestCase):
             {"id": "check", "operator": "FORMULA_CHECK", "inputRefs": ["output"]},
             {"id": "sum", "operator": "ARITHMETIC", "inputRefs": ["derived_check"], "expression": "v0+1"},
         ], RuleRegistry())
-        self.assertEqual(results[1]["diagnostics"][0]["code"], "INCOMPLETE_VALUES")
+        self.assertEqual(results[1]["diagnostics"][0]["code"], "UPSTREAM_CALCULATION_BLOCKED")
+        self.assertFalse(results[1]["diagnostics"][0]["details"]["requiresSourceQuery"])
         self.assertIsNone(results[1]["value"])
 
     def test_unavailable_target_does_not_claim_a_captured_formula(self):
@@ -90,7 +91,8 @@ class GenericFormulaTests(TestCase):
         self.assertEqual(result["applicability"], "UNDETERMINED")
         self.assertEqual(result["sourceConsistency"], "NOT_CHECKED")
         self.assertEqual(result["formulaTrace"]["recovery"]["blockers"][0]["code"],
-                         "FORMULA_VALUE_UNAVAILABLE")
+                         "FORMULA_SOURCE_VALUE_MISSING")
+        self.assertNotIn('completionReason', result)
         self.assertEqual(completion(facts, result)["state"], "INCOMPLETE")
 
     def test_local_match_and_recursive_difference_remain_distinct_for_nonfinancial_data(self):
@@ -195,7 +197,7 @@ class GenericFreeHtmlTests(PresentationCase):
         self.assertTrue(all(f["period"] == "shift-omega" and f["unit"] is None for f in artifact["facts"]))
         html = '<html><head><style>main{display:grid;gap:17px;color:teal}</style></head><body><main><h1>探头对照</h1><aside>{{west}}</aside><section>{{east}}</section></main></body></html>'
         preview = await self.service.publish(
-            built["analysisRef"], requestKey="lab-preview", expectedBaseRevision=0, previewOnly=True,
+            built["analysisRef"], requestKey="lab-preview",  previewOnly=True,
             document={"title": "探头对照", "html": html, "bindings": [
                 {"key": "west", "valueRef": artifact["facts"][0]["factId"]},
                 {"key": "east", "valueRef": artifact["facts"][1]["factId"]}]},

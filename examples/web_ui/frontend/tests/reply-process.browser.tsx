@@ -110,7 +110,7 @@ const tests: [string, () => Promise<void>][] = [
 	['分析被否决后，运行中、失败及重新加载均不展示正文卡片', async () => {
 		const current = msg({ content: published(4), finished_reason: null, finished_at: null });
 		render([current], 'rejected', true);
-		assert(cardCount() === 1, '发布回执应产生卡片');
+		assert(cardCount() === 0, '发布回执尚未经过最终审查，不应提前显示正文卡片');
 		current.content = [...current.content, rejected, text('repair', `[修正尚未完成](${analysisPath(4)})`)];
 		for (const reason of [null, 'error', 'interrupted', 'exceed_max_iters'] as Msg['finished_reason'][]) {
 			const pending = { ...current, finished_reason: reason, finished_at: reason ? at : null };
@@ -173,9 +173,13 @@ const tests: [string, () => Promise<void>][] = [
 					: { ...block, finished_at: at });
 				finished.push({ type: 'tool_result', id: 'live-read', name: 'Read', state: 'success', output: '读取完成', metadata: {}, created_at: at, finished_at: at });
 				render([msg({ content: finished })]);
-				await until(() => [...details.querySelectorAll('span')].every((element) => getComputedStyle(element).animationName === 'none'));
-				assert(details.getClientRects().length > 0, '用户正在阅读的详情应保持展开');
-				assert([...details.querySelectorAll('button')].every((element) => getComputedStyle(element).backgroundImage === 'none'), '结束后不能残留渐变条');
+				await until(() => button().getAttribute('aria-expanded') === 'false');
+				assert(document.activeElement === button(), '自动收起时，过程内的键盘焦点应回到摘要');
+				button().click(); await until(() => visible('[data-testid="reply-process-content"]'));
+				detailsButton().click(); await until(() => visible('[data-testid="reply-process-details-content"]'));
+				const completedDetails = container.querySelector<HTMLElement>('[data-testid="reply-process-details-content"]')!;
+				assert([...completedDetails.querySelectorAll('span')].every((element) => getComputedStyle(element).animationName === 'none'), '完成后重新查看时应停止扫光');
+				assert([...completedDetails.querySelectorAll('button')].every((element) => getComputedStyle(element).backgroundImage === 'none'), '结束后不能残留渐变条');
 			} finally {
 				document.documentElement.classList.toggle('dark', wasDark);
 				container.style.width = oldWidth;
@@ -217,27 +221,33 @@ const tests: [string, () => Promise<void>][] = [
 		render([msg({ finished_at: null, finished_reason: null, content: [...content, text('new-progress')] })]);
 		assert(detailsButton().getAttribute('aria-expanded') === 'false', 'Streaming must preserve explicit collapse');
 	}],
-	['用户主动查看工具详情时，完成后保留阅读状态', async () => {
+	['用户主动查看工具详情时，完成后仍自动收起', async () => {
 		render([msg({ finished_at: null, finished_reason: null })]);
 		container.querySelector('[data-testid="reply-process-details-content"]')!.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
 		await new Promise((resolve) => setTimeout(resolve, 30));
 		render([msg()]);
-		assert(button().getAttribute('aria-expanded') === 'true', 'Reading process must remain open');
-		assert(detailsButton().getAttribute('aria-expanded') === 'true', 'Reading details must remain open');
+		await until(() => button().getAttribute('aria-expanded') === 'false');
+		assert(!visible('[data-testid="reply-process-details-content"]'), 'Reading details must close on completion');
 	}],
-	['用户手动展开后，流式更新和完成不打断阅读', async () => {
+	['手动展开在流式更新中保留，完成后收起，重新展开仍可阅读', async () => {
 		render([msg({ finished_at: null, finished_reason: null })]); button().click();
 		await until(() => button().getAttribute('aria-expanded') === 'false');
 		button().click(); await until(() => button().getAttribute('aria-expanded') === 'true');
+		render([msg({ finished_at: null, finished_reason: null, content: [...content, text('stream-update')] })]);
+		assert(button().getAttribute('aria-expanded') === 'true', 'Streaming updates must preserve explicit choice');
 		render([msg()]);
-		assert(button().getAttribute('aria-expanded') === 'true', 'Explicit choice must survive completion');
+		await until(() => button().getAttribute('aria-expanded') === 'false');
+		button().click(); await until(() => button().getAttribute('aria-expanded') === 'true');
+		render([msg({ usage: { input_tokens: 100, output_tokens: 20 } })]);
+		assert(button().getAttribute('aria-expanded') === 'true', 'Reopening after completion must survive later updates');
 	}],
-	['过程中选中内容时保留展开状态', async () => {
+	['过程中选中或滚动内容，完成后仍自动收起', async () => {
 		render([msg({ finished_at: null, finished_reason: null })]);
 		container.querySelector('[data-testid="reply-process-content"]')!.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }));
+		container.querySelector('[data-testid="reply-process-content"]')!.dispatchEvent(new WheelEvent('wheel', { bubbles: true }));
 		await new Promise((resolve) => setTimeout(resolve, 30));
 		render([msg()]);
-		assert(button().getAttribute('aria-expanded') === 'true', 'Reading process must stay open');
+		await until(() => button().getAttribute('aria-expanded') === 'false');
 	}],
 	['失败提示、部分答案在收起状态仍可见', async () => {
 		render([msg({ finished_reason: 'error' as Msg['finished_reason'], error: { type: ErrorType.CONNECTION, message: 'offline' } })]);

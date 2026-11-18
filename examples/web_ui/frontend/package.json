@@ -7,6 +7,7 @@
 		"test:branding": "node --experimental-strip-types --test tests/branding.test.mjs",
 		"test:appearance": "node --experimental-strip-types --test tests/appearance.test.mjs tests/nros-theme.test.mjs",
 		"test:reply-presentation": "node --experimental-strip-types --test tests/reply-presentation.test.mjs",
+		"test:agent-progress": "node --experimental-strip-types --test tests/agent-progress.test.mjs tests/reply-presentation.test.mjs",
 		"test:reports": "node --experimental-strip-types --test tests/workspace-reports.test.mjs",
 		"dev": "vite",
 		"build": "tsc -b && vite build",

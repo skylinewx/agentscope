@@ -4,12 +4,11 @@ from __future__ import annotations
 
 from copy import deepcopy
 from decimal import Decimal, ROUND_HALF_EVEN, localcontext
-import ast
 import re
 
 from .models import AnalysisError, decimal_text, decimal_value, digest, precise_sum
 
-OPERATORS = {"SORT", "RANK", "COUNT", "SUM", "DIFFERENCE", "RATIO", "LINEAR", "CONVERT", "FORMULA_CHECK", "RECONCILE", "ARITHMETIC"}
+OPERATORS = {"SORT", "RANK", "COUNT", "SUM", "DIFFERENCE", "RATIO", "LINEAR", "CONVERT", "FORMULA_CHECK", "RECONCILE", "ARITHMETIC", "DESCRIBE"}
 
 
 class RuleRegistry:
@@ -44,10 +43,14 @@ def _select(facts, operation, known):
         try:
             return [known[ref] for ref in operation["inputRefs"]]
         except KeyError as exc:
-            raise AnalysisError("UNKNOWN_VALUE", "计算引用不存在或尚未计算的值。") from exc
+            missing = [ref for ref in operation['inputRefs'] if ref not in known]
+            raise AnalysisError("UNKNOWN_VALUE", "计算引用不存在或尚未计算的值。",
+                                {'missingRefs': missing, 'nextAction': 'USE_EXISTING_VALUE_REFS',
+                                 'hint': '使用真实 factId、derivedId 或前序运算 id；不要重新查询已有数据。'}) from exc
     selected = facts
     selector = operation.get("select", {})
-    allowed = {"cellKey", "measureCode", "objectId", "bindingRef", "period", "sourceContextId", "dimensions"}
+    allowed = {"cellKey", "measureCode", "objectId", "bindingRef", "period", "sourceContextId", "dimensions",
+               "batchId", "columnName", "inputRole", "sourceObjectId"}
     if set(selector) - allowed:
         raise AnalysisError("INVALID_SELECTOR", "计算选择器包含不支持的字段。")
     for key, expected in selector.items():
@@ -73,18 +76,51 @@ def _comparable(facts, scope, same_metric=True, varying_dimensions=(), policy=No
     return check(facts, scope, same_metric, varying_dimensions, policy)
 
 
-def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: RuleRegistry, relations=None) -> list[dict]:
+def source_aggregation_rule(facts):
+    """仅复用同一原生聚合回执的 SUM 语义；不同批次或明细层级不推定可加。"""
+    if not facts or any(fact.get('calcType') != 'SUM'
+                        or any(not fact.get(key) for key in ('batchId', 'tableDigest', 'columnName')) for fact in facts):
+        return None
+    if len({(fact['batchId'], fact.get('tableDigest'), fact.get('columnName')) for fact in facts}) != 1:
+        return None
+    aggregation = facts[0].get('aggregation') or {}
+    grouping = aggregation.get('groupBy') or []
+    if not grouping or any(fact.get('aggregation') != aggregation for fact in facts):
+        return None
+    dimensions = [item['dimCode'] + ('__' + item['field'] if item.get('field') else '') for item in grouping]
+    if any(any(key not in fact.get('dimensions', {}) for key in dimensions) for fact in facts):
+        return None
+    if len({digest([fact['dimensions'][key] for key in dimensions]) for fact in facts}) != len(facts):
+        return None
+    return {'version': facts[0].get('tableDigest'), 'source': 'native_aggregation:' + facts[0]['batchId'],
+            'additive': True, 'exclusiveMembers': True, 'varyingDimensions': dimensions}
+
+
+def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: RuleRegistry, relations=None, failure_cache=None) -> list[dict]:
+    from .operation_contracts import validate_operation
+    from .scalar_references import normalize_reference, reference_id, reference_key, scalar_record
     known = {f["factId"]: f for f in facts}
     results, names = [], set()
+    input_basis = digest([facts, scope, registry.version]) if failure_cache is not None else None
+    preceding_fingerprints = []
     for operation in operations:
+        if not isinstance(operation, dict):
+            raise AnalysisError('INVALID_OPERATION_ARGUMENT', '每项运算必须是对象。')
         oid, operator = operation.get("id", ""), operation.get("operator")
-        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", oid) or oid in names:
+        if not isinstance(oid, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", oid) or oid in names:
             raise AnalysisError("INVALID_OPERATION_ID", "计算标识必须唯一且符合命名范围。")
         names.add(oid)
         result = {"derivedId": "derived_" + oid, "operator": operator, "scopeId": scope["scopeId"],
                   "inputRefs": [], "ruleRef": operation.get("ruleRef"), "value": None,
                   "calculationValidation": "BLOCKED", "rounding": None, "diagnostics": []}
+        failure_key = digest([input_basis, operation, preceding_fingerprints]) if failure_cache is not None else None
         try:
+            if failure_cache is not None and failure_key in failure_cache:
+                previous = failure_cache[failure_key]
+                raise AnalysisError(previous['code'], previous['message'],
+                                    {**previous.get('details', {}), 'repeatedRequest': True,
+                                     'hint': '同一冻结输入与参数已失败；复用具体诊断，修正本项，不重查来源。'})
+            validate_operation(operation)
             if operator not in OPERATORS:
                 raise AnalysisError("UNSUPPORTED_OPERATOR", "不支持该计算类型。")
             # Comparators are available for explicit operations, never silently
@@ -92,9 +128,18 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
             pool = facts
             if scope.get('referenceMembers') and not operation.get('select', {}).get('objectId'):
                 pool = [f for f in facts if f['objectId'] in scope['members']]
-            items = _select(pool, operation, known)
-            result["inputRefs"] = [x.get("factId", x.get("derivedId")) for x in items]
-            if len(result["inputRefs"]) != len(set(result["inputRefs"])):
+            # 同一计算计划可直接引用前序运算 id；保存结果统一为真实 derivedId。
+            aliases = {ref.removeprefix('derived_'): ref for ref in known if ref.startswith('derived_')}
+            aliases.update({ref: ref for ref in known})
+            bindings = [normalize_reference(ref, aliases) for ref in operation.get('inputRefs', [])]
+            resolved = {**operation, 'inputRefs': [reference_id(ref) for ref in bindings]}
+            items = _select(pool, resolved, known)
+            if operator == 'ARITHMETIC':
+                items = [scalar_record(item, binding, known) for item, binding in zip(items, bindings)]
+                result['inputBindings'] = bindings
+                result['selectedCoverageRefs'] = sorted({ref for item in items for ref in item['selectedCoverageRefs']})
+            result["inputRefs"] = list(dict.fromkeys(x.get("factId", x.get("derivedId")) for x in items))
+            if bindings and len({reference_key(ref) for ref in bindings}) != len(bindings):
                 raise AnalysisError("DUPLICATE_INPUT", "同一事实不能在一个计算中重复计入。")
             source_ids = sorted({ref for item in items for ref in item.get("sourceFactIds", [item.get("factId")]) if ref})
             source_facts = [known[ref] for ref in source_ids]
@@ -122,19 +167,38 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
                 result["formulaTrace"] = trace
                 result["sourceFactIds"] = trace["sourceFactIds"]
                 result["applicability"] = trace["applicabilityStatus"]
-                result["sourceConsistency"] = trace["sourceConsistency"]
-                if trace["status"] == "BLOCKED":
-                    raise AnalysisError("FORMULA_INCOMPLETE", "表内公式核对受阻，请按具体断点处理。", trace["recovery"])
-                result.update(value=trace["value"], unit=items[0].get("unit"), meaning=trace["meaning"])
+                check_scope = operation.get('checkScope', 'LOCAL')
+                if check_scope not in ('LOCAL', 'RECURSIVE'):
+                    raise AnalysisError('INVALID_CHECK_SCOPE', '公式核对范围使用 LOCAL 或 RECURSIVE。')
+                result.update(checkScope=check_scope, unit=items[0].get('unit'))
+                check = trace['targetLocalCheck'] if check_scope == 'LOCAL' else trace
+                result["sourceConsistency"] = check['status'] if check['status'] in ('MATCH', 'MISMATCH') else 'NOT_CHECKED'
+                if check['status'] == 'BLOCKED':
+                    if check.get('completionReason') == 'SOURCE_VALUE_MISSING':
+                        # 核对已完成与数值可用是两个条件；保留 BLOCKED，后续算子不得取其金额。
+                        result.update(executionStatus='COMPLETED', valueState='NO_VALUE', value=None,
+                                      completionReason='SOURCE_VALUE_MISSING', diagnostics=[{
+                                          'code': 'FORMULA_SOURCE_VALUE_MISSING',
+                                          'message': '必要输入已读取，来源空值导致无法完整复算；可说明限制，无须重复取数。'}])
+                        results.append(result)
+                        known[result['derivedId']] = result
+                        if failure_cache is not None:
+                            preceding_fingerprints.append([result['derivedId'], digest(result)])
+                        continue
+                    recovery = trace["recovery"]
+                    if check_scope == 'LOCAL' and check.get('diagnostic'):
+                        recovery = {'targetFactRef': items[0]['factId'], 'nextAction': 'CHECK_LOCAL_INPUTS',
+                                    'diagnostic': check['diagnostic'],
+                                    'hint': '按本层具体断点处理；不能把未读数据、冲突或显示精度不足当作真实空值。'}
+                    raise AnalysisError("FORMULA_INCOMPLETE", "表内公式核对受阻，请按具体断点处理。", recovery)
+                result.update(value=check['value'], meaning='captured_local_formula_arithmetic' if check_scope == 'LOCAL' else trace['meaning'])
+            elif operator == 'DESCRIBE':
+                from .native_analysis import describe
+                result.update(describe(items, scope, operation))
             elif operator == "ARITHMETIC":
                 from numeric_tools import calculate as arithmetic
                 _numeric(items)
-                if not operation.get('inputRefs'):
-                    raise AnalysisError('ARITHMETIC_INPUTS', '通用算术须显式列出输入引用，以 v0、v1 等按顺序引用。')
                 output = arithmetic(operation.get('expression'), {f'v{i}': item['value'] for i, item in enumerate(items)}, operation.get('decimalPlaces'))
-                used = {node.id for node in ast.walk(ast.parse(operation['expression'].strip(), mode='eval')) if isinstance(node, ast.Name) and node.id.startswith('v')}
-                if used != {f'v{i}' for i in range(len(items))}:
-                    raise AnalysisError('UNUSED_ARITHMETIC_INPUT', '每个输入引用都须实际参与表达式；纯常量运算请使用 Calculate。')
                 result.update(value=output['value'], unit=None, meaning='explicit_arithmetic_not_business_rule',
                               expression=operation['expression'], rounding=output)
             elif operator == "RECONCILE":
@@ -171,11 +235,13 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
                 values = _numeric(items)
                 rule = None
                 if operator in ("SUM", "LINEAR", "CONVERT"):
-                    rule = registry.resolve(operation.get("ruleRef"), operator, source_facts)
+                    if operator == 'SUM' and not operation.get('ruleRef') and all('factId' in item for item in items):
+                        rule = source_aggregation_rule(source_facts)
+                    rule = rule or registry.resolve(operation.get("ruleRef"), operator, source_facts)
                     result["ruleVersion"] = rule["version"]
                     result["ruleSource"] = rule["source"]
                 _comparable(source_facts, scope, same_metric=operator in ("SUM", "DIFFERENCE", "RATIO"),
-                            varying_dimensions=(rule or {}).get("varyingDimensions", ()) if operator == "LINEAR" else (),
+                            varying_dimensions=(rule or {}).get("varyingDimensions", ()) if operator in ('SUM', 'LINEAR') else (),
                             policy=comparison_policy)
                 if len({item.get("unit") for item in items}) != 1 or any(item.get("unit") != source_facts[0]["unit"] for item in items):
                     raise AnalysisError("OPERAND_UNIT_CONFLICT", "运算项的计量单位与来源不一致，请分别计算。")
@@ -233,6 +299,13 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
             result["precision"] = "derived_decimal"
         except AnalysisError as exc:
             result["diagnostics"] = [exc.as_dict()]
+            if failure_cache is not None and exc.code in {
+                    'INVALID_OPERATION_ARGUMENT', 'INVALID_OPERATION_INPUTS', 'INVALID_SCALAR_REFERENCE',
+                    'ARITHMETIC_INPUTS', 'UNKNOWN_ARITHMETIC_VARIABLE', 'UNUSED_ARITHMETIC_INPUT',
+                    'INVALID_EXPRESSION', 'DUPLICATE_INPUT', 'RULE_REQUIRED'}:
+                failure_cache[failure_key] = exc.as_dict()
+                while len(failure_cache) > 32:
+                    failure_cache.pop(next(iter(failure_cache)))
             if operator == 'RANK' and exc.code == 'UNIT_UNCONFIRMED':
                 result['diagnostics'][0]['details'] = {
                     'nextAction': 'CHOOSE_ORDER_MEANING',
@@ -243,4 +316,6 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
             result["valueState"] = "FAILED"
         results.append(result)
         known[result["derivedId"]] = result
+        if failure_cache is not None:
+            preceding_fingerprints.append([result['derivedId'], digest(result)])
     return results

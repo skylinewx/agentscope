@@ -101,7 +101,7 @@ class ActionCase(PresentationCase):
         plan = finding_plan(artifact) if plan is None else plan
         preview = await self.service.inspect("findings", built["analysisRef"], findingPlan=plan)
         views = [{'viewId': 'details', 'scopeId': artifact['scope']['scopeId'], 'type': 'TABLE', 'valueRefs': [f['factId'] for f in artifact['facts']]}]
-        return await self.service.publish(built["analysisRef"], [], views, key, built["baseRevision"],
+        return await self.service.publish(built["analysisRef"], [], views, key,
                                           findingPlan=plan, actionPlan=action_plan(preview["items"]))
 
     async def start(self, key="followup", action=None, text=None, turn="user-turn-1"):

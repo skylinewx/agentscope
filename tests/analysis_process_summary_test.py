@@ -37,7 +37,7 @@ class ProcessSummaryTests(PresentationCase):
         await self.service.publish(built['analysisRef'], [], [{
             'viewId': 'values', 'scopeId': built['scope']['scopeId'],
             'type': 'TABLE', 'valueRefs': refs,
-        }], 'published', built['baseRevision'])
+        }], 'published')
         receipt = await AnalysisRenderReport(self.service).call(
             analysisRef=built['analysisRef'], requestKey='covered-topics',
         )

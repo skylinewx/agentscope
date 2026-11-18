@@ -29,7 +29,7 @@ class PublicationRepairTests(PresentationCase):
         claims = [{'claimId': 'c', 'scopeId': self.sid, 'kind': 'computed', 'parts': [{'text': '**结果** '}, {'valueRef': self.refs[0]}]}]
         presentation = {'labels': [{'valueRef': self.refs[0], 'role': 'measure', 'label': '结果'}]}
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(self.ref, claims, views, 'bad', 0, presentation=presentation)
+            await self.service.publish(self.ref, claims, views, 'bad',  presentation=presentation)
         details = caught.exception.details
         kind_error = next(i for i in details['issues'] if i['path']=='/claims/0/kind')
         self.assertEqual(kind_error['suggestedKind'], 'fact')
@@ -42,7 +42,7 @@ class PublicationRepairTests(PresentationCase):
         edits = [{'op': 'replace', 'path': '/claims/0/kind', 'value': 'fact'},
                  {'op': 'remove', 'path': '/viewPlan/0/includeDetails'},
                  {'op': 'remove', 'path': '/viewPlan/1/nodeRefs'}]
-        result = await self.service.publish(self.ref, requestKey='fixed', expectedBaseRevision=0, repairRef=details['repairRef'], repairs=edits)
+        result = await self.service.publish(self.ref, requestKey='fixed',  repairRef=details['repairRef'], repairs=edits)
         saved = self.store.get_analysis(OWNER, self.ref)
         self.assertEqual(saved['presentation'], presentation)
         self.assertEqual(saved['claims'][0]['parts'], claims[0]['parts'])
@@ -50,7 +50,7 @@ class PublicationRepairTests(PresentationCase):
         self.assertEqual(saved['facts'], self.artifact['facts'])
         self.assertEqual(saved['derivedValues'], self.artifact['derivedValues'])
         self.assertTrue(diagrams(self.delivery.view(result['delivery']['path'])))
-        retry = await self.service.publish(self.ref, requestKey='fixed', expectedBaseRevision=0, repairRef=details['repairRef'], repairs=edits)
+        retry = await self.service.publish(self.ref, requestKey='fixed',  repairRef=details['repairRef'], repairs=edits)
         self.assertEqual(result['analysisRef'], retry['analysisRef'])
         with self.assertRaises(AnalysisError):
             self.store.get_publication_proposal(Owner('other', OWNER.agent_id, OWNER.session_id), details['repairRef'])
@@ -68,7 +68,7 @@ class PublicationRepairTests(PresentationCase):
     async def test_shared_alias_expands_only_to_matching_source_measure_and_preserves_source_labels(self):
         await self.build()
         labels = {'labels': [{'valueRef': self.refs[0], 'role': 'measure', 'label': '业务简称'}]}
-        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'publish', 0, presentation=labels)
+        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'publish',  presentation=labels)
         table = self.delivery.view(result['delivery']['path'])['tables'][0]
         self.assertEqual(table['columns'][0]['label'], '业务简称')
         self.assertEqual(len(table['rows']), 3)
@@ -77,7 +77,7 @@ class PublicationRepairTests(PresentationCase):
     async def test_explicit_conflicting_aliases_have_paths_and_are_not_silently_replaced(self):
         await self.build()
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'bad', 0,
+            await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'bad',
                 presentation={'labels': [{'valueRef': self.refs[0], 'role': 'measure', 'label': '甲'},
                                          {'valueRef': self.refs[1], 'role': 'measure', 'label': '乙'}]})
         self.assertEqual(caught.exception.code, 'AMBIGUOUS_TABLE_LABEL')
@@ -89,7 +89,7 @@ class PublicationRepairTests(PresentationCase):
         await self.build(count=17)
         plans = [self.view('TABLE', self.refs[:11], viewId='one', groupId='g1', pageSize=3),
                  self.view('TABLE', self.refs[11:], viewId='two', groupId='g2', pageSize=4)]
-        result = await self.service.publish(self.ref, [], plans, 'publish', 0,
+        result = await self.service.publish(self.ref, [], plans, 'publish',
             presentation={'groups': [{'groupId': 'g1', 'title': '主题一'}, {'groupId': 'g2', 'title': '主题二'}]})
         document = project(self.store.get_analysis(OWNER, self.ref), self.rules)
         for offset in (0, 12):
@@ -106,9 +106,9 @@ class PublicationRepairTests(PresentationCase):
         await self.build(work=[{'taskId': 'sort', 'title': '排序', 'kind': 'COMPUTATION', 'refs': []}])
         views = [self.view('TABLE', self.refs, orderRef='derived_sort')]
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(self.ref, [], views, 'pending', 0)
+            await self.service.publish(self.ref, [], views, 'pending')
         self.assertEqual(caught.exception.code, 'INCOMPLETE_WORK_PLAN')
-        result = await self.service.publish(self.ref, requestKey='done', expectedBaseRevision=0,
+        result = await self.service.publish(self.ref, requestKey='done',
             repairRef=caught.exception.details['repairRef'], repairs=[{'op':'replace','path':'/workRefs','value':[{'taskId':'sort','refs':['derived_sort']}]}])
         self.assertEqual(result['summary']['completion']['state'], 'READY')
         saved = self.store.get_analysis(OWNER, self.ref)
@@ -117,7 +117,7 @@ class PublicationRepairTests(PresentationCase):
 
     async def test_partial_result_stays_incomplete_and_discloses_the_declared_gap(self):
         await self.build(work=[{'taskId': 'relation', 'title': '直属关系', 'kind': 'RELATION', 'refs': []}])
-        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'partial', 0, partialReason='本次先交付已取得数值，直属范围仍需核对。')
+        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'partial',  partialReason='本次先交付已取得数值，直属范围仍需核对。')
         self.assertEqual(result['summary']['completion']['state'], 'INCOMPLETE')
         self.assertIn('直属范围仍需核对', self.delivery.view(result['delivery']['path'])['claimsScopeLabel'])
         export = self.delivery.render_report(self.ref, 'report')

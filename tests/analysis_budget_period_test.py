@@ -83,11 +83,13 @@ class BudgetPeriodTest(TestCase):
         self.assertEqual(len(result['facts']), 2)
         self.assertEqual(result['scope']['periodCoverage'][0]['pendingWorkIndexes'], [])
 
-    def test_unselected_work_missing_a_period_cannot_be_hidden_by_final_success(self):
+    def test_unselected_work_missing_period_is_retained_without_blocking_selected_facts(self):
         captures, selected, scope = self._multi_work_capture()
         captures.pop('replace-other')
         result = adapt(captures, selected, scope, 50000)
-        self.assertEqual(result['scope']['coverage'], 'PARTIAL')
+        self.assertTrue(result['scope']['selectedDataComplete'])
+        self.assertFalse(result['scope']['sourcePagesComplete'])
+        self.assertFalse(result['scope']['periodCoverage'][0]['complete'])
         self.assertEqual(result['scope']['periodCoverage'][0]['pendingWorkIndexes'], [1])
 
     def test_completed_capture_does_not_replace_an_unselected_required_period(self):
@@ -103,6 +105,16 @@ class BudgetPeriodTest(TestCase):
         result = default_sources().adapt(captures, selected, scope, 50000)
         self.assertTrue(result['scope']['periodCoverage'][0]['complete'])
         self.assertEqual(result['facts'][0]['executionPeriod'], '2026Y0001')
+
+    def test_typed_inputs_combine_period_coverage_without_selecting_extra_page_facts(self):
+        from analysis_extension.adapters import default_sources
+        from analysis_extension.analysis_inputs import adapt_inputs
+        captures, selected, scope = period_fixture()
+        selected = [{**selection, 'role': 'PRIMARY', 'grain': ['MD_ORG']} for selection in selected]
+        result = adapt_inputs(default_sources(), captures, selected, scope, 50000)
+        self.assertTrue(result['scope']['selectedDataComplete'])
+        incomplete = adapt_inputs(default_sources(), captures, selected[:1], scope, 50000)
+        self.assertFalse(incomplete['scope']['selectedDataComplete'])
 
     def test_same_row_missing_middle_cell_page_cannot_prove_complete(self):
         captures, selected, scope = period_fixture()

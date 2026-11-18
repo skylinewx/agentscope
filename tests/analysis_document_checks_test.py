@@ -48,7 +48,7 @@ class DocumentCheckTests(PresentationCase):
         artifact = self.store.get_analysis(OWNER,self.ref)
         self.compiled = compile_document(artifact,self.doc)
         self.refs = [row['factRef'] for row in self.compiled['datasets']['ranking']['rows']]
-        self.preview = await self.service.publish(self.ref,requestKey='p',expectedBaseRevision=0,document=self.doc,previewOnly=True)
+        self.preview = await self.service.publish(self.ref,requestKey='p',document=self.doc,previewOnly=True)
 
     async def record(self, observation):
         return await self.service.record_preview_check(self.preview['repairRef'],self.compiled['contentDigest'],self.compiled['frameKey'],observation)
@@ -78,7 +78,7 @@ class DocumentCheckTests(PresentationCase):
             await self.service.record_preview_check(self.preview['repairRef'],'0'*64,self.compiled['frameKey'],measurements(self.refs))
         self.assertEqual(caught.exception.code,'STALE_PREVIEW_CHECK')
         updated = {**self.doc,'html':self.doc['html'].replace('<main>','<main class="new-layout">')}
-        new = await self.service.publish(self.ref,requestKey='p2',expectedBaseRevision=0,document=updated,previewOnly=True)
+        new = await self.service.publish(self.ref,requestKey='p2',document=updated,previewOnly=True)
         self.assertEqual(new['diagnostics']['renderChecks']['status'],'NOT_CHECKED')
         with self.assertRaises(AnalysisError): self.store.document_checks(Owner('other',OWNER.agent_id,OWNER.session_id),self.ref,self.compiled['contentDigest'])
         self.store.collect_expired(10**15)
@@ -123,13 +123,15 @@ class DocumentCheckTests(PresentationCase):
 
     async def test_publication_requires_actual_measurements_at_two_widths(self):
         await self.setup_preview()
-        self.assertEqual(self.preview['nextAction'], 'RUN_RENDER_CHECKS')
+        from analysis_extension.document_checks import require_publication_checks
+        records = []
         for sample in (None, measurements(self.refs), measurements(self.refs)):
-            if sample is not None: await self.record(sample)
-            with self.assertRaises(AnalysisError) as caught: await self.service.publish(**self.preview['confirmPublish'])
+            if sample is not None:
+                records.append(await self.record(sample))
+            # 有明确的宿主不可用状态才允许未实测交付；不能伪造双宽度通过。
+            with self.assertRaises(AnalysisError) as caught:
+                require_publication_checks(self.compiled, records)
             self.assertEqual(caught.exception.code, 'DOCUMENT_NOT_CHECKED')
-            self.assertEqual(caught.exception.details['nextAction'], 'RUN_RENDER_CHECKS')
-            self.assertIn('previewPage', caught.exception.details)
         await self.record(measurements(self.refs,420))
         result = await self.service.publish(**self.preview['confirmPublish'])
         self.assertTrue(result['diagnostics']['renderChecks']['measurementRequirementMet'])

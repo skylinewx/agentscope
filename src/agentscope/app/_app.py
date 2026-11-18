@@ -31,6 +31,7 @@ from ._router import (
     tts_model_router,
     schedule_router,
     session_router,
+    message_queue_router,
     skill_router,
     sop_router,
     workspace_router,
@@ -463,6 +464,7 @@ def create_app(
         mcp_router,
         schedule_router,
         session_router,
+        message_queue_router,
         skill_router,
         sop_router,
         workspace_router,
@@ -491,6 +493,20 @@ def create_app(
             status_code=status_code,
             content={"detail": str(exc)},
         )
+
+    from .storage._errors import StorageTemporarilyUnavailable, unavailable_detail
+
+    async def storage_unavailable_response(_: Request, exc: Exception) -> JSONResponse:
+        return JSONResponse(status_code=503, content={'detail': unavailable_detail()},
+                            headers={'Retry-After': '1', 'Cache-Control': 'no-store'})
+
+    app.add_exception_handler(StorageTemporarilyUnavailable, storage_unavailable_response)
+    try:
+        from redis.exceptions import ConnectionError as RedisConnectionError, TimeoutError as RedisTimeoutError
+        app.add_exception_handler(RedisConnectionError, storage_unavailable_response)
+        app.add_exception_handler(RedisTimeoutError, storage_unavailable_response)
+    except ImportError:
+        pass
 
     # Optional extra middlewares
     for middleware in extra_middlewares or []:

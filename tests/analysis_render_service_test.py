@@ -11,7 +11,7 @@ from analysis_document_checks_test import measurements
 from analysis_fixtures import OWNER, saved_fixture
 from analysis_extension.models import AnalysisError
 from analysis_extension.publication import repair_fields, repair_request
-from analysis_extension.render_client import RenderChecker
+from analysis_extension.render_client import RenderChecker, validate_rendering, configured_checker
 from analysis_extension.completion import completion_summary
 
 
@@ -30,7 +30,7 @@ class AutomaticRenderTests(PresentationCase):
         self.service.render_checker = self.checker
 
     async def preview(self, **extra):
-        return await self.service.publish(self.ref, requestKey='p', expectedBaseRevision=0,
+        return await self.service.publish(self.ref, requestKey='p',
                                           document=self.document, previewOnly=True, **extra)
 
     async def test_exact_preview_records_reused_and_publication_succeeds(self):
@@ -45,16 +45,19 @@ class AutomaticRenderTests(PresentationCase):
         published = await self.service.publish(**preview['confirmPublish'])
         self.assertTrue(published['delivery']['registered'])
 
-    async def test_unavailable_checker_does_not_grant_publication(self):
+    async def test_unavailable_checker_retains_unchecked_status_without_external_retry(self):
         await self.prepare()
         self.checker.check.side_effect = AnalysisError('RENDER_SERVICE_UNAVAILABLE','offline')
         preview = await self.preview()
         self.assertEqual(preview['diagnostics']['renderService']['status'], 'UNAVAILABLE')
-        self.assertEqual(preview['nextAction'], 'RUN_RENDER_CHECKS')
+        self.assertEqual(preview['nextAction'], 'REVIEW_AND_CONFIRM')
         self.assertFalse(preview['diagnostics']['renderChecks']['performed'])
-        with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(**preview['confirmPublish'])
-        self.assertEqual(caught.exception.code, 'DOCUMENT_NOT_CHECKED')
+        published = await self.service.publish(**preview['confirmPublish'])
+        self.assertTrue(published['delivery']['registered'])
+        self.assertEqual(published['diagnostics']['renderChecks']['status'], 'NOT_CHECKED')
+        self.assertFalse(published['diagnostics']['renderChecks']['measurementRequirementMet'])
+        self.assertTrue(published['diagnostics']['renderChecks']['unavailableReason'])
+        self.checker.check.assert_awaited_once()
 
     async def test_all_records_validated_before_any_write_and_one_width_rejected(self):
         await self.prepare()
@@ -73,6 +76,46 @@ class AutomaticRenderTests(PresentationCase):
         with self.assertRaises(AnalysisError) as caught:
             await self.service.publish(**preview['confirmPublish'])
         self.assertEqual(caught.exception.code, 'DOCUMENT_RENDER_ERRORS')
+
+    async def test_render_errors_do_not_consume_semantic_review_before_repair(self):
+        await self.prepare()
+        self.service.preview_reviewer = AsyncMock(return_value={'issues': []})
+        self.checker.check.return_value[0]['errors'] = ['script failed']
+        failed = await self.preview()
+        self.assertEqual(failed['nextAction'], 'REPAIR_DOCUMENT')
+        self.assertEqual(failed['diagnostics']['semanticReview']['status'], 'NOT_REVIEWED')
+        self.service.preview_reviewer.assert_not_awaited()
+        with self.assertRaises(AnalysisError):
+            await self.service.publish(**failed['confirmPublish'])
+        self.service.preview_reviewer.assert_not_awaited()
+        self.checker.check.return_value[0]['errors'] = []
+        self.document['html'] = self.document['html'].replace('<p>', '<p class="fixed">')
+        fixed = await self.preview()
+        self.assertEqual(fixed['diagnostics']['semanticReview']['status'], 'PASS')
+        self.service.preview_reviewer.assert_awaited_once()
+
+    async def test_missing_order_marker_defers_review_until_actual_order_is_measured(self):
+        await self.prepare()
+        artifact = self.store.get_analysis(OWNER, self.ref)
+        request = artifact['plan']
+        built = await self.service.build(artifact['captureRefs'], request['selections'], request['scope'],
+                                         [{'id': 'ordered', 'operator': 'SORT'}], 'ordered-build')
+        self.ref = built['analysisRef']
+        self.document['datasets'] = [{'key': 'ranking', 'valueRef': 'derived_ordered'}]
+        self.service.preview_reviewer = AsyncMock(return_value={'issues': []})
+        failed = await self.preview()
+        self.assertEqual(failed['diagnostics']['publicationCheck']['code'], 'DOCUMENT_ORDER_NOT_CHECKED')
+        self.assertEqual(failed['diagnostics']['semanticReview']['status'], 'NOT_REVIEWED')
+        self.service.preview_reviewer.assert_not_awaited()
+        from analysis_extension.free_document import compile_document
+        compiled = compile_document(self.store.get_analysis(OWNER, self.ref), self.document)
+        refs = [row['factRef'] for row in compiled['datasets']['ranking']['rows']]
+        self.checker.check.return_value = [measurements(refs, width) for width in (420, 900)]
+        self.document['html'] = self.document['html'].replace('<p>', '<p data-analysis-set="ranking">')
+        fixed = await self.preview()
+        self.assertNotIn('publicationCheck', fixed['diagnostics'])
+        self.assertEqual(fixed['diagnostics']['semanticReview']['status'], 'PASS')
+        self.service.preview_reviewer.assert_awaited_once()
 
     async def test_content_change_requires_new_measurements(self):
         await self.prepare()
@@ -95,6 +138,17 @@ class AutomaticRenderTests(PresentationCase):
 
 
 class RenderProtocolTests(IsolatedAsyncioTestCase):
+    def test_local_config_is_explicit_and_public_address_is_not_model_supplied(self):
+        from analysis_extension.local_render import LocalRenderChecker
+        checker = configured_checker({'mode': 'local', 'widths': [420, 900], 'webUiUrl': 'http://localhost:5173'})
+        self.assertIsInstance(checker, LocalRenderChecker)
+        with patch.dict('os.environ', {'ANALYSIS_RENDER_URL': 'http://renderer:8932', 'ANALYSIS_RENDER_TOKEN': 'fixture-token'}):
+            self.assertEqual(configured_checker({'mode': 'external', 'widths': [480, 1200]}).widths, [480, 1200])
+        for config in ({'mode': 'guess'}, {'widths': [420]}, {'webUiUrl': 'file:///tmp/page'},
+                       {'webUiUrl': 'http://user:secret@localhost'}, {'webUiUrl': 'http://localhost/path'},
+                       {'webUiUrl': 42}):
+            with self.assertRaises(AnalysisError):
+                validate_rendering(config)
     async def test_response_identity_and_widths_are_verified(self):
         document = {'html':'<p>test</p>','contentDigest':'a'*64,'frameKey':'bound-key'}
         answer = {'version':1,'contentDigest':'a'*64,'frameKey':'bound-key',
@@ -125,7 +179,7 @@ class RenderProtocolTests(IsolatedAsyncioTestCase):
 
 class RepairGuidanceTests(TestCase):
     def test_null_existing_field_returns_replace_without_mutating_input(self):
-        saved = {'analysisRef':'a','expectedBaseRevision':0,'claims':[], 'viewPlan':[],
+        saved = {'analysisRef':'a','claims':[], 'viewPlan':[],
                  'renderCheckUnavailableReason':None}
         before = deepcopy(saved)
         fields = repair_fields(saved)

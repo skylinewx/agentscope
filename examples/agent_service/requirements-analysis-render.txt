@@ -1,0 +1,2 @@
+# 安装后执行 python -m playwright install chromium；Linux 首次安装可使用 install --with-deps chromium。
+playwright>=1.51,<2

@@ -16,7 +16,7 @@ from analysis_extension.validation import render_parts, selected_value
 
 class ReviewContractTests(TestCase):
     def request(self):
-        return {'analysisRef': 'analysis:1', 'expectedBaseRevision': 0, 'claims': [],
+        return {'analysisRef': 'analysis:1', 'claims': [],
                 'viewPlan': [{'viewId': 'keep'}], 'presentation': {'labels': []}}
 
     def test_array_append_is_sequential_and_preserves_the_saved_proposal(self):
@@ -64,7 +64,7 @@ class ReviewContractTests(TestCase):
     def test_formula_check_labels_identify_local_basis_and_keep_values(self):
         facts = chain()
         scope = {'scopeId': 'scope', 'coverage': 'UNKNOWN'}
-        derived = calculate(facts, scope, [{'id': 'f', 'operator': 'FORMULA_CHECK', 'inputRefs': ['root']}], RuleRegistry())
+        derived = calculate(facts, scope, [{'id': 'f', 'operator': 'FORMULA_CHECK', 'inputRefs': ['root'], 'checkScope': 'RECURSIVE'}], RuleRegistry())
         artifact = {'facts': facts, 'derivedValues': derived, 'scope': scope, 'technicalDetails': False,
                     'viewPlan': [{'viewId': 'path', 'scopeId': 'scope', 'type': 'FORMULA',
                                   'valueRefs': ['derived_f'], 'nodeRefs': ['root'], 'showChecks': True}]}
@@ -105,7 +105,7 @@ class PublicationValueLocationTests(PresentationCase):
         views = [self.view(descriptionParts=[bad]), self.view('formula', type='FORMULA', valueRefs=['derived_check'],
             nodeDescriptions=[{'nodeRef': self.fact, 'parts': [{'text': '节点 '}, bad]}])]
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(self.ref, claims, views, 'bad', 0, previewOnly=True)
+            await self.service.publish(self.ref, claims, views, 'bad',  previewOnly=True)
         issues = caught.exception.details['issues']
         self.assertEqual({i['path'] for i in issues}, {
             '/claims/0/parts/1', '/viewPlan/0/descriptionParts/0', '/viewPlan/1/nodeDescriptions/0/parts/1'})
@@ -115,7 +115,7 @@ class PublicationValueLocationTests(PresentationCase):
             self.assertEqual(issue['availableFields'], ['value', 'unit'])
             self.assertIn('derivedId', issue['hint'])
         correct = {'valueRef': 'derived_check', 'nodeRef': self.fact, 'field': 'localValue'}
-        result = await self.service.publish(self.ref, requestKey='correct', expectedBaseRevision=0,
+        result = await self.service.publish(self.ref, requestKey='correct',
             repairRef=caught.exception.details['repairRef'], previewOnly=True,
             repairs=[{'op': 'replace', 'path': i['path'], 'value': correct} for i in issues])
         self.assertTrue(result['previewOnly'])
@@ -127,7 +127,7 @@ class PublicationValueLocationTests(PresentationCase):
         presentation = {'groups': [{'groupId': 'group', 'title': '主题',
             'descriptionParts': [{'valueRef': 'derived_check', 'nodeRef': 'not-a-node', 'field': 'localValue'}]}]}
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(self.ref, [], [view], 'bad-group', 0, presentation=presentation, previewOnly=True)
+            await self.service.publish(self.ref, [], [view], 'bad-group',  presentation=presentation, previewOnly=True)
         details = caught.exception.details
         self.assertEqual(details['path'], '/presentation/groups/0/descriptionParts/0')
         self.assertIn(self.fact, details['allowedNodeRefs'])
@@ -137,13 +137,13 @@ class PublicationValueLocationTests(PresentationCase):
         await self.build()
         original = [{'text': '说明'}] * 99 + [{'valueRef': self.fact}]
         claims = [{'claimId': 'c', 'scopeId': self.sid, 'kind': 'fact', 'parts': original}]
-        preview = await self.service.publish(self.ref, claims, [self.view()], 'preview', 0, previewOnly=True)
+        preview = await self.service.publish(self.ref, claims, [self.view()], 'preview',  previewOnly=True)
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(self.ref, requestKey='too-many', expectedBaseRevision=0,
+            await self.service.publish(self.ref, requestKey='too-many',
                 repairRef=preview['repairRef'], repairs=[{'op': 'add', 'path': '/claims/0/parts/-', 'value': {'text': 'extra'}}])
         self.assertEqual(caught.exception.code, 'INVALID_PUBLICATION')
         self.assertEqual(self.store.get_analysis(OWNER, self.ref)['publicationState'], 'DRAFT')
-        published = await self.service.publish(self.ref, requestKey='original', expectedBaseRevision=0,
+        published = await self.service.publish(self.ref, requestKey='original',
             repairRef=preview['repairRef'], repairs=[])
         self.assertEqual(published['publicationState'], 'PUBLISHED')
         self.assertEqual(self.store.get_analysis(OWNER, self.ref)['claims'][0]['parts'], original)

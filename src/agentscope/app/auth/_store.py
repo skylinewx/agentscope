@@ -2,6 +2,8 @@
 
 import hashlib
 import json
+import math
+import time
 from collections.abc import Callable
 from typing import Any, Self
 
@@ -92,6 +94,56 @@ class RedisAuthStore:
     async def session(self, token: str) -> dict[str, Any] | None:
         value = await self.connection.get(self.session_key(token))
         return json.loads(value) if value else None
+
+    async def renew_session(
+        self, token: str, ttl: int
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Extend a live session atomically with account/revocation checks.
+
+        WATCH includes the account record so a concurrent password change or
+        disable cannot revive an old session. XX also forbids recreating a
+        session removed by logout or Redis expiration.
+        """
+        key, users_key = self.session_key(token), self.prefix + "users"
+        for _ in range(20):
+            async with self.connection.pipeline(transaction=True) as pipe:
+                try:
+                    await pipe.watch(key, users_key)
+                    raw = await pipe.get(key)
+                    if not raw:
+                        return None
+                    session = json.loads(raw)
+                    timestamp = time.time()
+                    if session["expires_at"] <= timestamp:
+                        return None
+                    raw_user = await pipe.hget(users_key, session["user_id"])
+                    user = json.loads(raw_user) if raw_user else None
+                    if (
+                        not user
+                        or user["status"] != "active"
+                        or user["auth_version"] != session["auth_version"]
+                    ):
+                        return None
+                    session["expires_at"] = max(
+                        session["expires_at"], timestamp + ttl
+                    )
+                    session["last_activity_at"] = max(
+                        session.get("last_activity_at", 0), timestamp
+                    )
+                    # An absolute Redis deadline cannot drift forward merely
+                    # because a transaction or network response was delayed.
+                    pipe.multi()
+                    pipe.set(
+                        key,
+                        json.dumps(session),
+                        pxat=math.ceil(session["expires_at"] * 1000),
+                        xx=True,
+                    )
+                    (renewed,) = await pipe.execute()
+                    return (session, user) if renewed else None
+                except WatchError:
+                    continue
+        raise RuntimeError("Session changed concurrently; retry renewal.")
 
     async def delete_session(self, token: str) -> None:
         await self.connection.delete(self.session_key(token))

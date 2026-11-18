@@ -3,11 +3,12 @@ import { code } from '@streamdown/code';
 import { math } from '@streamdown/math';
 import { mermaid } from '@streamdown/mermaid';
 import * as React from 'react';
-import { Streamdown } from 'streamdown';
+import { Streamdown, defaultRemarkPlugins } from 'streamdown';
 import type { LinkSafetyModalProps } from 'streamdown';
 
 import { LinkSafetyDialog } from './LinkSafetyDialog';
 import { cn } from '@/lib/utils';
+import { remarkFinancialTables } from '@/lib/financial-table-alignment';
 
 const DEFAULT_PLUGINS = { code, math, cjk, mermaid };
 const renderLinkSafety = (props: LinkSafetyModalProps) => <LinkSafetyDialog {...props} />;
@@ -17,15 +18,20 @@ function Markdown({
 	plugins = DEFAULT_PLUGINS,
 	controls = false,
 	linkSafety,
+	remarkPlugins,
 	...props
 }: React.ComponentProps<typeof Streamdown>) {
 	const safeLinks = React.useMemo(() => ({ enabled: true, ...linkSafety, renderModal: linkSafety?.renderModal ?? renderLinkSafety }), [linkSafety]);
+	const tablePlugins = React.useMemo(() => [
+		...(remarkPlugins ?? Object.values(defaultRemarkPlugins)), remarkFinancialTables,
+	], [remarkPlugins]);
 	return (
 		<Streamdown
 			data-slot="markdown"
 			plugins={plugins}
 			controls={controls}
 			linkSafety={safeLinks}
+			remarkPlugins={tablePlugins}
 			className={cn('cn-markdown w-full min-w-0 overflow-hidden', className)}
 			{...props}
 		/>

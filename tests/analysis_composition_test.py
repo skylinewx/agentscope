@@ -29,7 +29,7 @@ class CompositionTests(PresentationCase):
                  'parts':[{'text':f'**判断 {i}**：'}, {'valueRef':ref}]} for i,ref in enumerate(self.refs[:3])]
 
     async def release(self, plans, options, claims=None):
-        result=await self.service.publish(self.ref, self.claims() if claims is None else claims, plans, 'publish',0,presentation=options)
+        result=await self.service.publish(self.ref, self.claims() if claims is None else claims, plans, 'publish',presentation=options)
         self.document=self.delivery.view(result['delivery']['path'])
         return self.document, render(self.document)
 
@@ -79,9 +79,9 @@ class CompositionTests(PresentationCase):
         await self.build()
         plans=[self.plan('BAR_VALUES',groupId='a')]
         with self.assertRaises(AnalysisError) as error:
-            await self.service.publish(self.ref,self.claims(),plans,'bad',0,presentation={'groups':[{'groupId':'a','title':'主题','claimRefs':['wrong']}]})
+            await self.service.publish(self.ref,self.claims(),plans,'bad',presentation={'groups':[{'groupId':'a','title':'主题','claimRefs':['wrong']}]})
         self.assertEqual(error.exception.details['path'],'/presentation/groups/0/claimRefs/0')
-        repaired=await self.service.publish(self.ref,requestKey='repair',expectedBaseRevision=0,repairRef=error.exception.details['repairRef'],
+        repaired=await self.service.publish(self.ref,requestKey='repair',repairRef=error.exception.details['repairRef'],
             repairs=[{'op':'replace','path':'/presentation/groups/0/claimRefs/0','value':'claim-1'}])
         view=self.delivery.view(repaired['delivery']['path'])
         self.assertEqual(len(view['scenes']),1)

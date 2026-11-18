@@ -268,6 +268,11 @@ def project(artifact, registry: RuleRegistry, view_parameters=None):
     groups = sections(artifact, metrics, scenes, tables)
     placed = {i for group in groups for i in group['claimIndexes']}
     options = artifact.get('presentation', {})
+    # 图形交付失败时，宿主只携带同一证据下已通过审查的完整静态段落。
+    # 使用现有总结组件渲染，既不引入新模板，也不把参考值混入主体合计。
+    claims = [claim['rendered'] for claim in artifact['claims']]
+    if artifact.get('hostSummary', {}).get('content') == 'REVIEWED_ANALYSIS':
+        claims += artifact['hostSummary'].get('reviewedParagraphs', [])
     return {"schemaVersion": 1, "rendererVersion": RENDERER_VERSION, "engineVersion": artifact["engineVersion"],
             "analysisRef": artifact["analysisRef"], "dataDigest": digest(artifact), "viewId": opaque("view_", [digest(artifact), params, RENDERER_VERSION]),
             "scopeId": scope_id, "viewParameters": params, "scopeLabel": scope_text, "isFiltered": restricted,
@@ -284,9 +289,9 @@ def project(artifact, registry: RuleRegistry, view_parameters=None):
             "scenes": scenes, "sections": groups, "claimsCollapsed": options.get("claimsCollapsed", False),
             "summaryPosition": options.get('summaryPosition', 'end'), "summaryTitle": options.get('summaryTitle', '分析总结'),
             "reportTitle": options.get('reportTitle', ''),
-            "summaryClaimIndexes": [i for i in range(len(artifact['claims'])) if i not in placed],
+            "summaryClaimIndexes": [i for i in range(len(claims)) if i not in placed],
             "chartUnavailable": '；'.join(unavailable) or None,
-            "claims": [c["rendered"] for c in artifact["claims"]],
+            "claims": claims,
             "claimsScopeLabel": '；'.join(x for x in ["结论适用于原发布范围" if restricted else '', artifact.get('partialReason', '')] if x), **projection(artifact),
             "sources": sorted({label(" / ".join(str(f.get(k) or "") for k in ("taskName", "formName", "period")), "来源说明未提供") for f in facts}) if artifact["technicalDetails"] else [],
             "limitations": list(dict.fromkeys(limitations)) if artifact["technicalDetails"] else [], "total": len(rows), "originalTotal": len(original)}

@@ -23,6 +23,7 @@ from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Self
 
 from .._base import StorageBase
+from .._model._message_queue import MessageQueueRecord
 from .._model._session import _origin_kwargs
 from .._model import (
     AgentRecord,
@@ -52,6 +53,7 @@ from ._tables import (
     KnowledgeDocumentRow,
     MCPRow,
     MessageRow,
+    MessageQueueRow,
     ScheduleRow,
     SessionRow,
     SkillRow,
@@ -467,6 +469,7 @@ class AsyncSQLAlchemyStorage(StorageBase):
         await sess.execute(
             delete(MessageRow).where(MessageRow.session_id == session_id),
         )
+        await sess.execute(delete(MessageQueueRow).where(MessageQueueRow.id == session_id))
         return True
 
     async def _delete_schedule_impl(
@@ -1054,6 +1057,7 @@ class AsyncSQLAlchemyStorage(StorageBase):
                         .values(
                             payload=new_row.payload,
                             updated_at=record.updated_at,
+                            **({"has_work": bool(record.items) or record.activity != "idle"} if row_cls is MessageQueueRow else {}),
                         )
                         .execution_options(synchronize_session=False),
                     )
@@ -1073,6 +1077,40 @@ class AsyncSQLAlchemyStorage(StorageBase):
         return await self._mutate_record(
             AgentRow, AgentRecord, user_id, agent_id, mutate
         )
+
+    async def get_message_queue(self, user_id: str, session_id: str) -> MessageQueueRecord | None:
+        async with self._session() as sess:
+            row = await sess.get(MessageQueueRow, session_id)
+            return _to_record(row, MessageQueueRecord) if row is not None and row.user_id == user_id else None
+
+    async def mutate_message_queue(self, initial: MessageQueueRecord, mutate: Callable) -> MessageQueueRecord:
+        from sqlalchemy.exc import IntegrityError
+
+        # A losing initializer must never overwrite an existing queue.
+        async with self._session() as sess:
+            if await sess.get(MessageQueueRow, initial.id) is None:
+                initial.created_at = initial.updated_at = _utcnow()
+                sess.add(_from_record(MessageQueueRow, initial))
+                try:
+                    await sess.commit()
+                except IntegrityError:
+                    await sess.rollback()
+        return await self._mutate_record(
+            MessageQueueRow, MessageQueueRecord, initial.user_id, initial.id,
+            mutate, agent_id=initial.agent_id,
+        )
+
+    async def list_message_queues(self) -> list[MessageQueueRecord]:
+        from sqlalchemy import select
+        async with self._session() as sess:
+            rows = (await sess.execute(select(MessageQueueRow).where(MessageQueueRow.has_work.is_(True)))).scalars().all()
+        return [record for row in rows if (record := _to_record(row, MessageQueueRecord)).items or record.activity != "idle"]
+
+    async def delete_message_queue(self, user_id: str, session_id: str) -> None:
+        from sqlalchemy import delete
+        async with self._session() as sess:
+            await sess.execute(delete(MessageQueueRow).where(MessageQueueRow.id == session_id, MessageQueueRow.user_id == user_id))
+            await sess.commit()
 
     async def mutate_session(
         self,

@@ -47,8 +47,7 @@ class ScopeFeedbackTests(TestCase):
         self.assertEqual(request, before)
 
     def test_invalid_publication_variant_does_not_echo_the_entire_plan(self):
-        request = {'analysisRef': 'a:1', 'requestKey': 'key', 'expectedBaseRevision': 0,
-                   'claims': [], 'viewPlan': [], 'repairRef': 'repair', 'repairs': []}
+        request = {'analysisRef': 'a:1', 'requestKey': 'key', 'claims': [], 'viewPlan': [], 'repairRef': 'repair', 'repairs': []}
         issues = schema_issues(request)
         self.assertEqual(issues[0]['validator'], 'oneOf')
         self.assertEqual(issues[0]['unexpectedFields'], ['claims', 'viewPlan'])
@@ -79,15 +78,15 @@ class ServiceFeedbackTests(PresentationCase):
         views = [{'viewId': 'v', 'scopeId': sid, 'type': 'BAR_VALUES', 'valueRefs': [fact]}]
         presentation = {'labels': [{'valueRef': fact, 'role': 'measure', 'label': '合成指标'}]}
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.publish(ref, claims, views, 'bad', 0, presentation=presentation, previewOnly=True)
+            await self.service.publish(ref, claims, views, 'bad',  presentation=presentation, previewOnly=True)
         self.assertEqual(caught.exception.code, 'CLAIM_KIND')
         repair = caught.exception.details['repairRef']
-        result = await self.service.publish(ref, requestKey='preview-repair', expectedBaseRevision=0,
+        result = await self.service.publish(ref, requestKey='preview-repair',
             repairRef=repair, repairs=[{'op': 'replace', 'path': '/claims/0/kind', 'value': 'fact'}], previewOnly=True)
         self.assertTrue(result['previewOnly'])
         self.assertIn('diagnostics', result)
         self.assertEqual(self.store.get_analysis(OWNER, ref)['publicationState'], 'DRAFT')
-        final = await self.service.publish(ref, requestKey='commit', expectedBaseRevision=0,
+        final = await self.service.publish(ref, requestKey='commit',
             repairRef=result['repairRef'], repairs=[])
         self.assertTrue(final['delivery']['registered'])
         saved = self.store.get_analysis(OWNER, ref)

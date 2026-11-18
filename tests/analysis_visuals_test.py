@@ -62,7 +62,7 @@ class VisualTests(unittest.IsolatedAsyncioTestCase):
 
     async def publish(self):
         await self.draft()
-        result=await self.service.publish(self.built['analysisRef'],[],self.plans(),'publish',0)
+        result=await self.service.publish(self.built['analysisRef'],[],self.plans(),'publish')
         self.artifact=self.store.get_analysis(OWNER,self.built['analysisRef'])
         self.path=result['delivery']['path']
         return self.case.delivery.view(self.path)
@@ -89,7 +89,7 @@ class VisualTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(m['label'] for m in view['metrics'])),3)
         html=render(project(self.artifact,self.case.rules))
         self.assertEqual(html.count('<svg '),1)
-        self.assertIn('business-reference-1',html)
+        self.assertIn('business-reference-2',html)
         self.assertIn('一级上下级关系',html)
         self.assertEqual(view['statuses']['receiptVerification'],'UNVERIFIED')
         self.assertEqual(self.built['verificationTaskCount'],1)

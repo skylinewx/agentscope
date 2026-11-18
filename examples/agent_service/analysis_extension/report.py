@@ -7,7 +7,7 @@ from .report_tables import render_details
 from .formatting import inline_markup
 
 REPORT_MAX_BYTES = 10 * 1024 * 1024
-REPORT_TEMPLATE_VERSION = "business-reference-1"
+REPORT_TEMPLATE_VERSION = "business-reference-2"
 REPORT_CSS = Path(__file__).with_name("report.css").read_text(encoding="utf-8")
 COLORS = {"positive": "#185fa5", "negative": "#c3502f", "axis": "#b7c1ce", "label": "#606b7b", "value": "#1f2328", "surface": "#f1f5f9"}
 

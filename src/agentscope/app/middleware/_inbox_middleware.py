@@ -12,6 +12,7 @@ Each injected HintBlock also yields a one-shot ``HintBlockEvent``
 so the front-end SSE stream can render it in real time.
 """
 from typing import Any, AsyncGenerator, Callable
+import json
 
 from ..message_bus import MessageBus, MessageBusKeys
 from ..._logging import logger
@@ -88,6 +89,15 @@ class InboxMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
                 HintBlock.model_validate(payload)
                 for _entry_id, payload in entries
             ]
+            # 仅在完成通知已进入当前上下文时解除等待，避免后台结束与模型读取结果之间的竞态。
+            for hint in hint_blocks:
+                try:
+                    source = json.loads(hint.source or 'null')
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(source, dict) and source.get('label') == 'tool_output':
+                    call_id = source.get('backgroundToolCallId')
+                    agent.state.middle_context.get('background_tools_v1', {}).pop(call_id, None)
 
             logger.info(
                 "InboxMiddleware: injecting %d HintBlock(s) into context "

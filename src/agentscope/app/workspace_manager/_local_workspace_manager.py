@@ -28,6 +28,7 @@ class LocalWorkspaceManager(WorkspaceManagerBase):
         isolation: IsolationPolicy = IsolationPolicy.PER_AGENT,
         default_mcps: list | None = None,
         skill_paths: list[str] | None = None,
+        instructions: str | None = None,
         ttl: float = 3600.0,
     ) -> None:
         """Initialize the local workspace manager.
@@ -43,6 +44,9 @@ class LocalWorkspaceManager(WorkspaceManagerBase):
                 MCP clients seeded into brand-new workspaces.
             skill_paths (`list[str] | None`, optional):
                 Skill directories seeded into brand-new workspaces.
+            instructions (`str | None`, optional):
+                Application workspace instructions. None keeps the coding
+                workspace default; supports the workspace's placeholders.
             ttl (`float`, defaults to `3600.0`):
                 Seconds before an idle cached workspace is evicted.
         """
@@ -52,6 +56,7 @@ class LocalWorkspaceManager(WorkspaceManagerBase):
         self._basedir = os.path.realpath(os.path.abspath(basedir))
         self._default_mcps = default_mcps or []
         self._skill_paths = skill_paths or []
+        self._instructions = instructions
         self._ttl = ttl
         # workspace_id → (workspace, last_access_monotonic)
         self._cache: dict[str, tuple[LocalWorkspace, float]] = {}
@@ -135,6 +140,7 @@ class LocalWorkspaceManager(WorkspaceManagerBase):
                 workdir=workdir,
                 default_mcps=self._default_mcps,
                 skill_paths=self._skill_paths,
+                **({'instructions': self._instructions} if self._instructions is not None else {}),
             )
             await ws.initialize()
             self._cache[workspace_id] = (ws, time.monotonic())
@@ -166,6 +172,7 @@ class LocalWorkspaceManager(WorkspaceManagerBase):
             workdir=workdir,
             default_mcps=self._default_mcps,
             skill_paths=self._skill_paths,
+            **({'instructions': self._instructions} if self._instructions is not None else {}),
         )
         await ws.initialize()
         async with self._lock:

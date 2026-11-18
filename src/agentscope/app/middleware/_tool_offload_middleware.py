@@ -21,12 +21,14 @@ bus/wakeup infrastructure, which works correctly across processes.
 """
 import asyncio
 import json
+import hashlib
 from copy import deepcopy
 from typing import AsyncGenerator, Callable
 
 from .._manager import BackgroundTaskManager
 from ...middleware import MiddlewareBase
 from ...tool import ToolChunk, ToolResponse
+from ...tool._failure import tool_failure, failure_text
 from ...message import (
     DataBlock,
     HintBlock,
@@ -161,6 +163,17 @@ class ToolOffloadMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
                 yield item
             return
 
+        pending = agent.state.middle_context.setdefault('background_tools_v1', {})
+        try:
+            signature_input = json.dumps(json.loads(tool_call.input), sort_keys=True, ensure_ascii=False)
+        except (ValueError, TypeError):
+            signature_input = str(tool_call.input)
+        signature = hashlib.sha256((tool_call.name + '\n' + signature_input).encode()).hexdigest()
+        if any(item.get('signature') == signature for item in pending.values()):
+            yield ToolResponse(id=tool_call.id, state=ToolResultState.ERROR,
+                content=[TextBlock(text='同一工具请求仍在后台执行或等待结果送达，请等待完成通知，不要重复提交。')])
+            return
+
         # ----------------------------------------------------------------
         # Wrap next_handler in a Task, draining output into a Queue
         # ----------------------------------------------------------------
@@ -226,6 +239,7 @@ class ToolOffloadMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
         session_id = agent.state.session_id
         tool_name = tool_call.name
         snapshot = list(pre_collected)
+        pending[tool_call.id] = {'tool': tool_name, 'signature': signature}
 
         logger.info(
             "Tool '%s' timed out after %.1fs, offloading to background: "
@@ -240,34 +254,23 @@ class ToolOffloadMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
             """Wait for the offloaded tool to finish, then push its
             result to the session inbox + enqueue a wakeup.
 
-            On cancellation (e.g. ``ToolStop``) or unhandled exception
-            no result is delivered — the agent is left without a
-            completion notification in those edge cases.
+            Deliver a terminal notification for success, error and cancellation,
+            so completion checks cannot remain waiting indefinitely.
             """
+            terminal_failure = None
             try:
                 await drain_task
             except asyncio.CancelledError:
-                logger.info(
-                    "Background tool '%s' cancelled, skipping delivery: "
-                    "session_id=%s",
-                    tool_name,
-                    session_id,
-                )
-                return
-            except Exception:  # pylint: disable=broad-except
-                logger.warning(
-                    "Background tool '%s' failed, skipping delivery: "
-                    "session_id=%s",
-                    tool_name,
-                    session_id,
-                    exc_info=True,
-                )
-                return
+                terminal_failure = '后台工具已取消，未取得查询结果。'
+            except Exception as exc:  # pylint: disable=broad-except
+                terminal_failure = tool_failure(exc, tool_call, read_only=bool(tool and tool.is_read_only))
 
             remaining_items: list = []
             while not queue.empty():
                 try:
                     item = queue.get_nowait()
+                    if isinstance(item, BaseException):
+                        terminal_failure = tool_failure(item, tool_call, read_only=bool(tool and tool.is_read_only))
                     if isinstance(item, ToolResponse):
                         remaining_items.append(item)
                         break
@@ -279,23 +282,34 @@ class ToolOffloadMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
                 (i for i in all_items if isinstance(i, ToolResponse)),
                 None,
             )
+            if terminal_failure is not None:
+                response = ToolResponse(id=tool_call.id, state=ToolResultState.ERROR,
+                    content=[TextBlock(text=failure_text(terminal_failure) if isinstance(terminal_failure, dict) else terminal_failure)],
+                    metadata={'toolFailure': terminal_failure} if isinstance(terminal_failure, dict) else {})
+            elif response is None:
+                response = ToolResponse(id=tool_call.id, state=ToolResultState.ERROR,
+                    content=[TextBlock(text='后台工具已结束，但没有返回有效的执行结果。')])
 
             tool_call_id = tool_call.id
 
             hint_source = json.dumps(
                 {
                     "label": "tool_output",
+                    "backgroundToolCallId": tool_call_id,
+                    "backgroundState": str(response.state),
+                    "backgroundToolName": tool_name,
+                    "toolResponseMetadata": response.model_dump(mode="json")["metadata"],
                     "sublabel": f"{tool_name} · {tool_call_id}",
                 },
                 ensure_ascii=False,
             )
 
-            if response is None or len(response.content) == 0:
+            if len(response.content) == 0:
                 hint = HintBlock(
                     hint=(
                         f"<system-notification>"
                         f"Tool '{tool_name}' running in background "
-                        f"(id={tool_call_id}) has completed with no output."
+                        f"(id={tool_call_id}) has finished (state={response.state}) with no output."
                         f"</system-notification>"
                     ),
                     source=hint_source,
@@ -311,7 +325,7 @@ class ToolOffloadMiddleware(MiddlewareBase):  # pylint: disable=abstract-method
                 prefix = (
                     f"<system-notification>"
                     f"Tool '{tool_name}' running in background "
-                    f"(id={tool_call_id}) has completed.\n\n"
+                    f"(id={tool_call_id}) has finished (state={response.state}).\n\n"
                     f"Result:\n\n"
                 )
 
@@ -391,4 +405,5 @@ this run.
             content=[TextBlock(text=placeholder_text)],
             state=ToolResultState.SUCCESS,
             id=tool_call.id,
+            metadata={'backgroundToolCallId': tool_call.id},
         )

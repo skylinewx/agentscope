@@ -28,6 +28,8 @@ class SkillViewer(ToolBase):
         "When users asks you to perform tasks, check if any of the available "
         "skills match. "
         "Skills provide specialized capabilities and domain knowledge. "
+        "Copy read_arguments from the available skill entry; the required "
+        "argument is skill, and its value is the exact registered skill name. "
         "To read a referenced text file, use resource with its path relative "
         "to this skill (for example references/guide.md); do not reconstruct "
         "installation paths. On a missing reference, read the skill again "
@@ -49,6 +51,7 @@ class SkillViewer(ToolBase):
             },
         },
         "required": ["skill"],
+        "additionalProperties": False,
     }
     """The input schema of the skill viewer tool."""
 

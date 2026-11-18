@@ -13,15 +13,50 @@ def value_reference_details(value, field=None, node_ref=None):
                'valueField': field or 'value', 'nodeRef': node_ref, 'availableFields': fields}
     if 'counts' in value:
         fields.extend(value['counts'])
+    if 'statistics' in value:
+        fields.extend(value['statistics'])
     if 'formulaTrace' in value:
         fields.extend(['sourceValue', 'localValue', 'localDifference', 'difference', 'absoluteDifference', 'localAbsoluteDifference'])
-        details['allowedNodeRefs'] = [n['factRef'] for n in value['formulaTrace']['nodes']]
-        details['hint'] = '公式数值使用本 FORMULA_CHECK 的 derivedId，nodeRef 选择实际节点；localValue 为本层，value 为逐层。'
+        trace = value['formulaTrace']
+        details['allowedNodeRefs'] = [node['factRef'] for node in trace['nodes']]
+        details['availableFields'] = [candidate for candidate in fields if executable_field(value, candidate, node_ref)]
+        details['checkScope'] = value.get('checkScope', 'RECURSIVE')
+        details['hint'] = ('公式使用实际 derivedId；localValue/localDifference/localAbsoluteDifference 为本层，'
+                           'difference/absoluteDifference 为逐层。未指定 nodeRef 的 value 遵循 checkScope；'
+                           '指定 nodeRef 的 value 为该节点逐层复算值。')
+        local_field = {'difference': 'localDifference', 'absoluteDifference': 'localAbsoluteDifference'}.get(field)
+        if field not in details['availableFields'] and local_field in details['availableFields']:
+            details['suggestedField'] = local_field
+            details['hint'] += ' 当前逐层差额不可用；若正文说明本层差额，仅修正 field 为 suggestedField，无需重新取数或计算。'
     elif 'reconciliation' in value:
         fields.extend(['sourceValue', 'childSum', 'difference', 'absoluteDifference'])
     elif 'factId' in value:
         details['hint'] = '来源 factId 仅提供 value/unit；公式计算字段需引用已有 FORMULA_CHECK derivedId，并用 nodeRef 指向该事实。'
     return details
+
+
+def executable_field(value, field=None, node_ref=None):
+    """核验实际引用的字段；深层缺数不抹掉已完成的本层计算或来源值。"""
+    field = field or 'value'
+    validation = value.get('calculationValidation', 'PASS')
+    trace = value.get('formulaTrace')
+    if not trace:
+        return validation == 'PASS'
+    if validation not in ('PASS', 'BLOCKED'):
+        return False
+    # LOCAL 操作成功只证明本层可用，不能因此放行缺失的逐层差额。
+    node = next((item for item in trace['nodes'] if item['factRef'] == node_ref), None) if node_ref else trace['nodes'][0]
+    if node is None:
+        return False
+    if field == 'value' and node_ref is None:
+        return validation == 'PASS' and value.get('value') is not None
+    if field in ('localValue', 'localDifference', 'localAbsoluteDifference'):
+        return node.get('localCheck', {}).get('status') in ('MATCH', 'MISMATCH')
+    if field == 'sourceValue':
+        return node.get('valueState') == 'PRESENT' and node.get('observed') is not None
+    if field in ('difference', 'absoluteDifference') or field == 'value' and node_ref:
+        return node.get('status') in ('MATCH', 'MISMATCH')
+    return validation == 'PASS'
 
 
 def selected_value(value, field=None, node_ref=None):
@@ -30,8 +65,10 @@ def selected_value(value, field=None, node_ref=None):
         raise AnalysisError('INVALID_VALUE_REF', 'nodeRef 仅能指定当前公式追溯中的实际节点。', value_reference_details(value, field, node_ref))
     if field == 'unit': return value.get('unit') or ''
     if field == 'value' and node_ref is None: return value.get('value')
-    if field in ('positive', 'negative', 'zero', 'observed', 'unavailable') and 'counts' in value:
+    if field in value.get('counts', {}):
         return str(value['counts'][field])
+    if value.get('operator') == 'DESCRIBE' and field in value.get('statistics', {}):
+        return value['statistics'][field]
     if 'formulaTrace' in value:
         nodes = value['formulaTrace']['nodes']
         node = next((n for n in nodes if n['factRef'] == node_ref), None) if node_ref else nodes[0]
@@ -69,8 +106,11 @@ def render_parts(known, parts, path='parts'):
             if not set(part) <= {'valueRef','field','format','nodeRef'} or 'valueRef' not in part:
                 raise AnalysisError('INVALID_VALUE_REF', '文字片段不是受支持的值引用。')
             value = known.get(part['valueRef'])
-            if not value or value.get('valueState') != 'PRESENT' or value.get('calculationValidation','PASS') != 'PASS':
+            if not value:
                 raise AnalysisError('UNSUPPORTED_CLAIM', '文字引用了不存在、缺值或未通过条件的数值。')
+            if not executable_field(value, part.get('field'), part.get('nodeRef')):
+                raise AnalysisError('UNSUPPORTED_CLAIM', '所选字段尚无可用数值；请核对本层与逐层计算口径。',
+                                    value_reference_details(value, part.get('field'), part.get('nodeRef')))
             if 'format' in part:
                 validate_number_format(part['format'])
                 if part.get('field') == 'unit': raise AnalysisError('INVALID_NUMBER_FORMAT', '单位文本不接受数值格式。')
@@ -160,20 +200,25 @@ def validate_claims(artifact: dict, claims: list[dict]) -> list[dict]:
 
 def validate_source_chart(facts, scope):
     """Permit raw-source geometry without asserting business comparability."""
+    from .comparability import member_dimensions
     if not facts or any(not f.get("factId") or f.get("valueState") != "PRESENT" for f in facts):
         raise AnalysisError("INVALID_VIEW_REF", "来源原值图只能引用已取得的来源事实。")
     if len({f["objectId"] for f in facts}) != len(facts):
         raise AnalysisError("DUPLICATE_MEMBER", "来源原值图中每个对象只能选择一个指标。")
     if not scope.get("memberDimension") or any(
-        not f.get("sourceOrigins") or any(not f.get(k) for k in ("bindingRef", "cellKey", "measureCode"))
+        not f.get("sourceOrigins") or any(not f.get(k) for k in ("bindingRef", "measureCode"))
+        or not (f.get("metricKey") or f.get("cellKey"))
         for f in facts
     ):
         raise AnalysisError("SOURCE_CHART_UNCONFIRMED", "来源原值图需要明确的来源、指标与成员维度。")
+    # 批量聚合没有单个表格坐标，以来源适配器的指标语义标识确认同一指标。
+    # 仍要求真实来源、表绑定和下方全部口径一致，不用显示列名代替身份。
+    dimensions = member_dimensions(facts, scope)
     signatures = {digest({
         **{k: f.get(k) for k in ("sourceOrigins", "bindingRef", "period", "measureCode", "unit", "scale")},
         'context': f.get('dataContext', f.get('context')),
         "metricKey": f.get('metricKey', f.get('cellKey')),
-        "dimensions": {k: v for k, v in f.get("dimensions", {}).items() if k != scope["memberDimension"]},
+        "dimensions": {k: v for k, v in f.get("dimensions", {}).items() if k not in dimensions},
     }) for f in facts}
     if len(signatures) != 1:
         raise AnalysisError("SOURCE_CHART_CONFLICT", "来源原值图不能混合来源、指标、时期、口径或不同的单位与缩放标注。")

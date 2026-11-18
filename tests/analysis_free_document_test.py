@@ -17,7 +17,7 @@ class FreeDocumentTests(PresentationCase):
         self.ref = built['analysisRef']
         artifact = self.store.get_analysis(OWNER, self.ref)
         self.fact = artifact['facts'][0]['factId']
-        return {'analysisRef': self.ref, 'expectedBaseRevision': 0, 'requestKey': 'preview-free',
+        return {'analysisRef': self.ref, 'requestKey': 'preview-free',
                 'document': {'title': '自由布局', 'html': '<!doctype html><html><head><meta charset="utf-8"><style>p{color:teal}</style></head><body><h1>比较</h1><p>{{amount}}</p><details><summary>展开</summary><p>内容</p></details><script>document.body.dataset.value=window.analysisData.amount.value;</script></body></html>',
                              'bindings': [{'key':'amount','valueRef':self.fact,'format':{'grouping':True,'decimalPlaces':2}}]}}
 
@@ -35,7 +35,7 @@ class FreeDocumentTests(PresentationCase):
         frozen = self.store.get_publication_proposal(OWNER,preview['repairRef'])
         self.assertNotIn('path',frozen['document'])
         source.write_text('<html>changed after preview</html>','utf-8')
-        result = await self.service.publish(self.ref,requestKey='publish-free',expectedBaseRevision=0,repairRef=preview['repairRef'],repairs=[])
+        result = await self.service.publish(self.ref,requestKey='publish-free',repairRef=preview['repairRef'],repairs=[])
         self.assertTrue(result['delivery']['registered'])
         view=self.delivery.view(result['delivery']['path'])
         doc=view['freeDocument']
@@ -66,7 +66,7 @@ class FreeDocumentTests(PresentationCase):
         error=json.loads(response.content[0].text)['error']
         self.assertEqual(error['details']['path'],'/document/bindings/0/valueRef')
         self.assertEqual(self.store.get_analysis(OWNER,self.ref)['publicationState'],'DRAFT')
-        fixed=await self.service.publish(self.ref,requestKey='repair-free',expectedBaseRevision=0,repairRef=error['details']['repairRef'],previewOnly=True,
+        fixed=await self.service.publish(self.ref,requestKey='repair-free',repairRef=error['details']['repairRef'],previewOnly=True,
             repairs=[{'op':'replace','path':'/document/bindings/0/valueRef','value':self.fact}])
         self.assertTrue(fixed['previewOnly'])
         self.assertEqual(fixed['summary']['document']['bindingCount'],1)

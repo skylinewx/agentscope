@@ -1,0 +1,13 @@
+<!doctype html>
+<html lang="zh">
+<head><meta charset="UTF-8" /><meta name="viewport" content="width=device-width,initial-scale=1" /><title>会话断线恢复回归</title></head>
+<body class="p-6">
+  <h1 class="text-xl">会话断线恢复回归</h1>
+  <p>使用真实聊天 Hook、SSE 解析和界面，所有 API 均由本页模拟，不发送真实问答。</p>
+  <button id="run" class="my-4 rounded border px-3 py-2">运行断线测试</button>
+  <p id="summary" role="status">准备就绪</p>
+  <ol id="results" class="space-y-1"></ol>
+  <div id="harness" class="my-4 h-[480px] max-w-3xl border p-4"></div>
+  <script type="module" src="./session-recovery.browser.tsx"></script>
+</body>
+</html>

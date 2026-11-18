@@ -40,7 +40,7 @@ class PresentationCase(IsolatedAsyncioTestCase):
         artifact = self.store.get_analysis(OWNER, self.ref)
         views.append({'viewId': 'details', 'scopeId': result['scope']['scopeId'], 'type': 'TABLE', 'valueRefs': [f['factId'] for f in artifact['facts']]})
         views = [{**view, 'showUnit': True} for view in views]
-        published = await self.service.publish(self.ref, [], views, "publish", 0)
+        published = await self.service.publish(self.ref, [], views, "publish")
         self.path = published["delivery"]["path"]
         self.artifact = self.store.get_analysis(OWNER, self.ref)
         return published

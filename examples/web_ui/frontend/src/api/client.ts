@@ -48,6 +48,8 @@ async function extractErrorDetail(res: Response): Promise<string> {
 	try {
 		const json = JSON.parse(text) as { detail?: unknown };
 		if (typeof json.detail === 'string') return json.detail;
+		if (json.detail && typeof json.detail === 'object' && 'message' in json.detail
+			&& typeof json.detail.message === 'string') return json.detail.message;
 		if (json.detail !== undefined) return JSON.stringify(json.detail);
 	} catch {
 		// not JSON – fall through
@@ -73,7 +75,8 @@ async function streamRequest(path: string, options: RequestOptions = {}): Promis
 	// AbortSignal.timeout aborts with a TimeoutError, which is what lets the
 	// catch below tell "too slow" apart from the caller's own cancellation.
 	const deadline = timeoutMs ? AbortSignal.timeout(timeoutMs) : undefined;
-	const combined = AbortSignal.any([getAuthSignal(), ...(signal ? [signal] : []), ...(deadline ? [deadline] : [])]);
+	const authSignal = getAuthSignal();
+	const combined = AbortSignal.any([authSignal, ...(signal ? [signal] : []), ...(deadline ? [deadline] : [])]);
 
 	let res: Response;
 	try {
@@ -105,7 +108,8 @@ async function streamRequest(path: string, options: RequestOptions = {}): Promis
 
 	if (!res.ok) {
 		const detail = await extractErrorDetail(res);
-		if (path !== '/auth/login') handleUnauthorized(res.status);
+		// A response from a previous login must not invalidate the current one.
+		if (path !== '/auth/login' && !authSignal.aborted) handleUnauthorized(res.status);
 		const error = new ApiError(res.status, detail);
 		if (!silent) toast.error(detail);
 		throw error;
@@ -126,7 +130,7 @@ export const client = {
 	get: <T>(
 		path: string,
 		params?: Record<string, string>,
-		options?: { silent?: boolean; timeoutMs?: number },
+		options?: { silent?: boolean; signal?: AbortSignal; timeoutMs?: number },
 	) => request<T>(path, { method: 'GET', params, ...options }),
 	post: <T>(
 		path: string,

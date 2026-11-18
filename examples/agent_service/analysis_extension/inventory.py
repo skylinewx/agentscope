@@ -5,10 +5,14 @@ from .actions import source_identity
 from .models import AnalysisError, digest, bounded_page
 
 
-def session_inputs(store, owner, sources=None):
+def session_inputs(store, owner, sources=None, capture_ref=None):
     """Store/ownership/integrity failures stay fatal; bad receipts are isolated."""
     sources = sources or default_sources()
     captures, cursor = [], 0
+    if capture_ref is not None:
+        # 已知捕获时只读该观察；不再扫描、解析无关历史查询。
+        captures = [store.get_capture(owner, capture_ref)]
+        cursor = None
     while cursor is not None:
         page = store.list_captures(owner, cursor, store.limits.page_size)
         if page['total'] > store.limits.max_selections:
@@ -40,7 +44,7 @@ def inventory(store, owner, offset, limit, member_dimension=None, search=None, d
         raise AnalysisError("INVALID_DETAIL", "detail 仅支持 compact 或 full。")
     if filters.get('objectId') is not None and not member_dimension:
         raise AnalysisError('MEMBER_DIMENSION_REQUIRED', '按对象筛选会话输入时须指定来源的成员维度。')
-    captures, issues, counts = session_inputs(store, owner, sources)
+    captures, issues, counts = session_inputs(store, owner, sources, filters.get('captureRef'))
     labels, label_refs, rows, contexts = {}, {}, [], set()
     for capture in captures:
         adapter = sources.for_capture(capture)
@@ -62,10 +66,16 @@ def inventory(store, owner, offset, limit, member_dimension=None, search=None, d
             dimensions = {**item['effectiveDimensions'], **item['dimensions']}
             member = dimensions.get(member_dimension) if member_dimension else None
             model = item['dimensionModels'].get(member_dimension)
-            names = labels.get((origin, model, member), set())
+            names = set(labels.get((origin, model, member), set()))
+            native_name = item.get('dimensionNames', {}).get(member_dimension)
+            if isinstance(native_name, str) and native_name:
+                names.add(native_name)
+            name_refs = set(label_refs.get((origin, model, member), []))
+            if native_name:
+                name_refs.add(capture['captureRef'])
             item = {**item, 'objectId': member, 'objectLabel': next(iter(names)) if len(names) == 1 else '',
                     'objectModelCode': model, 'objectLabelState': 'RESOLVED' if len(names) == 1 else 'CONFLICT' if names else 'MISSING',
-                    'objectLabelCaptureRefs': sorted(label_refs.get((origin, model, member), [])),
+                    'objectLabelCaptureRefs': sorted(name_refs),
                     'resolvedDimensions': dimensions,
                     'sourceGroup': origin, 'capturedAt': capture.get('capturedAt')}
             contexts.add(origin)
@@ -88,7 +98,8 @@ def inventory(store, owner, offset, limit, member_dimension=None, search=None, d
         return {'items': compact, 'contexts': contexts}
     metadata = {**counts, 'detail': detail,
             'diagnosticsSection': 'inventoryIssues' if issues else None,
-            'sourceGroupCount': len({row['sourceGroup'] for row in rows}), 'scannedCells': scanned, 'scope': 'current_session',
+            'sourceGroupCount': len({row['sourceGroup'] for row in rows}), 'scannedCells': scanned,
+            'scope': 'selected_capture' if filters.get('captureRef') else 'current_session',
             'meaning': 'discovery_only_not_merged_or_aggregated', 'nextSection': 'capture_or_build'}
     return character_page(rows, offset, limit, store.limits.page_size, pack, metadata, fields_supported=False)
 

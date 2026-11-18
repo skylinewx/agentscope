@@ -15,6 +15,7 @@ import { DeliveredAnalysisPathsContext } from './AnalysisDeliveryContext';
 import { WorkspaceAnalysis } from './WorkspaceAnalysis';
 import { ApiError, getBaseUrl, getUserId } from '@/api/client';
 import { workspaceApi } from '@/api/workspace';
+import { analysisApi } from '@/api/analysis';
 import { Markdown } from '@/components/markdown';
 import { Button } from '@/components/ui/button';
 import {
@@ -25,7 +26,7 @@ import {
 	DialogTrigger,
 } from '@/components/ui/dialog';
 import { useTranslation } from '@/i18n/useI18n';
-import { analysisPath, remarkWorkspaceAnalyses } from '@/lib/workspace-analysis';
+import { analysisPath, remarkWorkspaceAnalyses, registeredReportPath } from '@/lib/workspace-analysis';
 import {
 	formatReportSize,
 	prepareReportPreview,
@@ -74,8 +75,10 @@ function ReportPreview({
 		const controller = new AbortController();
 		setHtml(null);
 		setError(null);
-		workspaceApi.files
-			.preview(workspace.agentId, workspace.sessionId, path, controller.signal)
+		const content = registeredReportPath(path)
+            ? analysisApi.reportByPath(workspace, path, controller.signal).then(report => analysisApi.preview(workspace, report, controller.signal))
+            : workspaceApi.files.preview(workspace.agentId, workspace.sessionId, path, controller.signal);
+        content
 			.then((content) => {
 				if (!controller.signal.aborted) setHtml(prepareReportPreview(content));
 			})
@@ -160,11 +163,10 @@ function ReportCard({ path, children }: { path: string; children?: ReactNode }) 
 		setDownloadError(null);
 		try {
 			// Mint on each click. The chat stores only the stable workspace reference.
-			const url = await workspaceApi.files.downloadUrl(
-				workspace.agentId,
-				workspace.sessionId,
-				path,
-			);
+			const controller = new AbortController();
+            const report = registeredReportPath(path) ? await analysisApi.reportByPath(workspace, path, controller.signal) : null;
+            const url = report ? await analysisApi.downloadUrl(workspace, report, controller.signal)
+                : await workspaceApi.files.downloadUrl(workspace.agentId, workspace.sessionId, path);
 			const link = document.createElement('a');
 			link.href = url;
 			link.download = fileName;

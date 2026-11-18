@@ -230,7 +230,7 @@ class RepairPublicationTests(PresentationCase):
                    'message': '摘要与正文的大小关系与数据矛盾。',
                    'statement': '支出大于收入。', 'evidenceRefs': [facts[0]['factId'], 'unknown']}
         with patch('analysis_extension.turn_completion._model_review', AsyncMock(side_effect=[
-                {'issues': [failure]}, {'issues': []}])) as reviewer:
+                with_coverage({'issues': [failure]}), with_coverage({'issues': []})])) as reviewer:
             preview = await self.service.publish(**request, finalize=True)
             verdict = preview['diagnostics']['semanticReview']
             issue = verdict['issues'][0]
@@ -254,7 +254,7 @@ class RepairPublicationTests(PresentationCase):
         request, turn = await self.prepare()
         issue = {'severity': 'BLOCKING', 'code': 'ANSWER_MISMATCH', 'message': '摘要仍矛盾',
                  'statement': '摘要：支出大于收入。', 'evidenceRefs': []}
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': [issue]})) as reviewer:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': [issue]}))) as reviewer:
             preview = await self.service.publish(**request, finalize=True)
             args = deepcopy(preview['repairAndFinalize'])
             args['repairs'] = [edit('正文：支出大于收入。', '正文：支出小于收入。')]
@@ -263,7 +263,7 @@ class RepairPublicationTests(PresentationCase):
             edited_path = self.delivery.root / repaired['documentEditSource']['path']
             self.assertIn('正文：支出小于收入。', edited_path.read_text('utf-8'))
             self.assertEqual(reviewer.await_count, 2)
-            self.assertIn('摘要：支出大于收入。', reviewer.call_args.args[2])
+        self.assertIn('摘要：支出大于收入。', reviewer.call_args.args[2].markdown)
         self.assertEqual(self.store.get_analysis(OWNER, self.ref)['publicationState'], 'DRAFT')
 
     async def test_host_locates_bound_statement_and_repairs_in_one_submission(self):
@@ -280,7 +280,7 @@ class RepairPublicationTests(PresentationCase):
 
         with patch('analysis_extension.render_evidence.review_text', side_effect=measured_text), \
                 patch('analysis_extension.turn_completion._model_review', AsyncMock(side_effect=[
-                    {'issues': [failure]}, {'issues': []}])) as reviewer:
+                    with_coverage({'issues': [failure]}), with_coverage({'issues': []})])) as reviewer:
             preview = await self.service.publish(**request, finalize=True)
             issue = preview['diagnostics']['semanticReview']['issues'][0]
             target = next(target for target in issue['textTargets'] if '全部形成了亏损' in target['oldText'])
@@ -294,3 +294,5 @@ class RepairPublicationTests(PresentationCase):
         self.assertIn('需结合成本费用分析', document['html'])
         self.assertIn('<strong>收入</strong>', document['html'])
         self.assertNotIn('全部形成了亏损', document['html'])
+
+from analysis_review_fixtures import with_coverage

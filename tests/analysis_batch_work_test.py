@@ -120,8 +120,10 @@ class BatchWorkTests(PresentationCase):
                    'scope': {'label': '所选口径', 'selectionReason': '使用回执全部分组'},
                    'code': 'result=[]', 'purpose': '验证资料选择器',
                    'fallbackReason': '需要自定义的多指标资料诊断', 'requestKey': 'material'}
-        Draft202012Validator(AnalysisPython.input_schema).validate(request)
         built = await self.service.build([reference], result['selections'], request['scope'], [], 'material')
+        execute = {key: value for key, value in request.items() if key not in ('captureRefs', 'selections', 'scope')}
+        execute['inputSetRef'] = built['inputSetRef']
+        Draft202012Validator(AnalysisPython.input_schema).validate(execute)
         self.assertEqual(built['factCount'], len(result['items']))
 
     async def test_query_projection_gives_usable_formulas_without_touching_history(self):
@@ -241,7 +243,7 @@ result = [{"name":"comparison","label":"本层核对","kind":"TABLE","inputRefs"
                                           operations=operations, code=code, purpose='相关检查一次执行', requestKey='bundle', workPlan=work)
         values = output['derivedValues']
         self.assertEqual(output['completion']['state'], 'READY')
-        self.assertEqual(values[-2]['rows'], [['-5', '-5'], ['20', '20']])
+        self.assertEqual([row['values'] for row in values[-2]['rows']], [{'source':'-5','computed':'-5'}, {'source':'20','computed':'20'}])
         self.assertTrue(values[-2]['payloadComplete'])
         self.assertEqual(values[-1]['data'], {'count': 2})
         run = self.store.get_python_run(OWNER, output['pythonRunRef'])

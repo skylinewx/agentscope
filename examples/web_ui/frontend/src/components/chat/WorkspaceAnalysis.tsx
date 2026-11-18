@@ -3,6 +3,7 @@ import { Download, FileText, Loader2, RotateCcw } from 'lucide-react';
 import { useContext, useEffect, useRef, useState } from 'react';
 
 import { AnalysisVisuals } from './analysis/AnalysisVisuals';
+import { ReportReviewStatus } from './analysis/ReportReviewStatus';
 import { AnalysisDraftContext } from './AnalysisDraftContext';
 import { analysisApi, type AnalysisWorkspace } from '@/api/analysis';
 import { ApiError, getBaseUrl, getUserId } from '@/api/client';
@@ -210,6 +211,7 @@ function AnalysisCard({ path, workspace }: { path: string; workspace: AnalysisWo
 				)}
 				{!issue && view && (
 					<div className="space-y-5 p-5">
+						{view.reportDelivery && <ReportReviewStatus delivery={view.reportDelivery} />}
 						{view.technicalDetails && view.statuses.receiptVerification !== 'VALID' && (
 							<p
 								role="status"

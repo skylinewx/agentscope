@@ -195,7 +195,8 @@ class CapturedVerificationRecoveryTests(PresentationCase):
         preview = await self.service.publish(built['analysisRef'], requestKey='document-preview',
              previewOnly=True, document=document)
         self.assertNotEqual(preview['analysisRef'], built['analysisRef'])
-        self.assertEqual(preview['confirmPublish']['analysisRef'], preview['analysisRef'])
+        self.assertNotIn('analysisRef', preview['confirmPublish'])
+        self.assertEqual(preview['confirmPublish']['repairRef'], preview['repairRef'])
         proposal = self.store.get_publication_proposal(OWNER, preview['repairRef'])
         self.assertEqual(proposal['analysisRef'], preview['analysisRef'])
         self.assertEqual(proposal['document'], document)

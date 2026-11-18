@@ -1,3 +1,4 @@
+from analysis_extension.review_request import review_material
 from copy import deepcopy
 import json
 from unittest import TestCase
@@ -432,7 +433,9 @@ class BusinessQueryTest(TestCase):
                                                    ('BUDGET_FORM_TEMPLATE', 'LRB', '利润表简称', '利润表')]]
         capture['request']['scope'] = {'bindings': [proof['binding'] for proof in proofs],
                                        'formNames': ['利润表简称']}
-        receipt['data']['resolution']['scopeBindings'] = proofs
+        receipt['data']['resolution']['scopeBindings'] = deepcopy(proofs)
+        for proof in receipt['data']['resolution']['scopeBindings']:
+            proof['binding'].update(targetId=None, recoveryExecutionId=None)
         update(capture, receipt)
         # Catalog/AnalysisPython source loading uses the same receipt validator.
         receipt_from_capture(capture)
@@ -452,6 +455,34 @@ class BusinessQueryTest(TestCase):
                 changed['data']['resolution']['scopeBindings'][1]['code'] = 'OTHER'
             with self.assertRaises(AnalysisError):
                 validate(capture, changed)
+
+    def test_target_candidate_proof_only_constrains_the_selected_business_target(self):
+        capture, receipt = business_fixture()
+        data = receipt['data']
+        draft = {'targets': [{'id': 't0'}, {'id': 't1'}]}
+        capture['request']['intentDraft'] = draft
+        data['resolution']['intentDraft'] = deepcopy(draft)
+        binding = {'text': '利润表', 'modelCode': 'BUDGET_FORM_TEMPLATE', 'executionId': 'search',
+                   'candidateId': 'form', 'contextId': 'ctx', 'querySessionId': 'session',
+                   'targetId': 't0', 'recoveryExecutionId': 'prior'}
+        capture['request']['scope'].pop('formCodes')
+        capture['request']['scope']['bindings'] = [binding]
+        data['resolution']['scopeBindings'] = [{'binding': deepcopy(binding), 'code': 'LRB', 'name': '利润表'}]
+        data['resultSets'][1]['context']['target']['formCode'] = 'OTHER'
+        data['stepResults'][0]['batchResults'][0]['metrics'][1]['context']['target']['formCode'] = 'OTHER'
+        other_origins = {ref for row in data['resultSets'][1]['rows'] for ref in row['originRefs']}
+        for origin in data['origins']:
+            if origin['originId'] in other_origins:
+                origin['formCode'] = 'OTHER'
+        validate(capture, receipt)
+        for field, bad in [('targetId', 't1'), ('recoveryExecutionId', 'other')]:
+            changed = deepcopy(receipt)
+            changed['data']['resolution']['scopeBindings'][0]['binding'][field] = bad
+            with self.assertRaises(AnalysisError):
+                validate(capture, changed)
+        data['resultSets'][0]['context']['target']['formCode'] = 'OTHER'
+        with self.assertRaises(AnalysisError):
+            validate(capture, receipt)
 
     def test_full_form_catalog_keeps_data_formulas_and_nulls_without_header_facts(self):
         from analysis_extension.adapters.budget_v2 import catalog
@@ -478,7 +509,7 @@ class BusinessQueryTest(TestCase):
         self.assertEqual(facts[0]['headers'], ['金额'])
         self.assertEqual(facts[2]['formula'], '=SUM(A2:A3)')
 
-    def test_whole_form_review_uses_lossless_dictionary_encoding_before_capacity_failure(self):
+    def test_whole_form_review_preserves_every_business_row_in_actual_markdown_budget(self):
         from analysis_extension.turn_completion import query_review_payloads, _wire_review_json
         from analysis_extension.review_encoding import unpack_review_records
         from analysis_extension.review_revision import compact_query_facts
@@ -493,8 +524,12 @@ class BusinessQueryTest(TestCase):
         envelope = {'candidateAnswer': '不同任务的利润表分别列示。'}
         raw_size = len(_wire_review_json({**envelope, 'evidence': evidence}))
         early_array_size = len(_wire_review_json({**envelope, 'evidence': compact_query_facts(evidence)}))
-        self.assertLess(raw_size + 100, early_array_size)
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', raw_size + 100):
+        self.assertEqual(raw_size, early_array_size)
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=raw_size + 100):
             parts = query_review_payloads(envelope, evidence)
         self.assertEqual(len(parts), 1)
-        self.assertEqual(unpack_review_records(json.loads(parts[0]))['evidence'], evidence)
+        self.assertEqual(unpack_review_records(review_material(parts[0]))['evidence'], evidence)
+        from analysis_review_business_markdown_test import parsed_tables
+        tables = [table for table in parsed_tables(parts[0].markdown) if table[0][0] == '行号']
+        self.assertEqual(sum(len(table) - 1 for table in tables), 1000)
+        self.assertEqual(len(tables), 10)

@@ -135,7 +135,7 @@ class CaptureTest(IsolatedAsyncioTestCase):
                  'contextId': 'context', 'querySessionId': 'session'}
         refs, error = await middleware._call_readonly_source(agent, turn,
             leased_mcp_origin(tool, frozenset({'registered-budget'})), 'execute_budget_query',
-            {'contractVersion': '2.0', 'purpose': 'ANALYZE', 'question': '分析前面结果', 'basis': proof})
+            {'contractVersion': '2.0', 'purpose': 'PREPARE_MATERIALS', 'question': '分析前面结果', 'basis': proof})
         self.assertIsNone(error)
         self.assertEqual(len(refs), 1)
         self.assertEqual(self.store.get_capture(self.owner, refs[0])['request']['basis'], proof)

@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 
 from .models import AnalysisError, digest, json_values
 
+BUDGET_TOTAL_MEMBER = '00000000'
 DEFAULT_LABELS = {'DATATIME': '实际时期', 'MD_ORG': '组织机构', 'MD_SCENE': '情景',
                   'MD_CURRENCY': '币种', 'MD_STAGE': '阶段', 'MD_MGRVER': '管理版本',
                   'MD_BUDACCOUNT': '预算科目'}
@@ -52,7 +53,7 @@ def member_label(fact, dimension):
     label = fact.get('dimensionNames', {}).get(dimension)
     if dimension == 'DATATIME':
         return period_label(code, label)
-    return text(label or ('合计' if code == '00000000' else code))
+    return text(label or ('合计' if code == BUDGET_TOTAL_MEMBER else code))
 
 
 def actual_headers(cell, fallback_period=None):
@@ -121,6 +122,9 @@ class BusinessTable:
     row_index: dict = field(default_factory=dict)
 
     def __post_init__(self):
+        if not self.facts:
+            self.fixed = dict(self.context.get('effectiveDimensions') or {})
+            return
         dimensions = sorted({k for fact in self.facts for k in fact.get('dimensions', {})})
         self.fixed = {k: self.facts[0]['dimensions'][k] for k in dimensions
                       if k in self.facts[0].get('dimensions', {}) and
@@ -181,7 +185,9 @@ class BusinessTable:
         for key in sorted(self.fixed):
             if self.scenario and key == 'MD_SCENE':
                 continue
-            scope.append(self.labels.get(key, key) + '：' + member_label(self.facts[0], key))
+            anchor = self.facts[0] if self.facts else {'dimensions': self.fixed,
+                'dimensionNames': self.context.get('dimensionNames', {})}
+            scope.append(self.labels.get(key, key) + '：' + member_label(anchor, key))
         return '；'.join(escape(v) for v in scope if v)
 
     def coverage(self):
@@ -190,7 +196,7 @@ class BusinessTable:
             if key == 'DATATIME':
                 continue
             members = {f.get('dimensions', {}).get(key) for f in self.facts if key in f.get('dimensions', {})}
-            counts.append(f"{len(members)}个{self.labels.get(key, key)}" + ('（含合计）' if '00000000' in members else ''))
+            counts.append(f"{len(members)}个{self.labels.get(key, key)}" + ('（含合计）' if BUDGET_TOTAL_MEMBER in members else ''))
         numeric = sum(f.get('valueState') == 'PRESENT' and f.get('valueType') == 'DECIMAL_STRING' for f in self.facts)
         counts.append(f'{len(self.rows)}行、{len(self.columns)}个数值/值列、{len(self.facts)}条来源事实、{numeric}个有效数值')
         return '；'.join(counts)
@@ -290,6 +296,14 @@ def build_tables(receipt):
     tables = []
     for result in data.get('resultSets', []):
         groups = OrderedDict()
+        if not result.get('rows'):
+            target = next((t for t in data.get('targets', []) if t.get('id') == result.get('targetId')), {})
+            table = BusinessTable('T' + str(len(tables) + 1), result.get('context', {}),
+                                 result.get('resultSetId', ''), result.get('interpretationId', ''), labels, False, [])
+            table.columns = [{'id': 'C1', 'label': target.get('label') or result.get('label') or '查询值',
+                              'unit': result.get('unit'), 'valueType': result.get('valueType')}]
+            tables.append(table)
+            continue
         for fact in result.get('rows', []):
             if not isinstance(fact.get('factId'), str):
                 raise AnalysisError('INVALID_BUSINESS_FACT', '业务事实缺少稳定标识。')
@@ -448,6 +462,9 @@ def business_view(receipt, capture_ref, *, max_chars=24000, tableRef=None, colum
             result['nextRead'] = next_read(index, begin + take, 0); break
     result['allRowsIncluded'] = 'nextRead' not in result and start == 0 and offset == 0 and column_offset == 0
     result['readComplete'] = 'nextRead' not in result
+    result['materialState'] = {'executionComplete': result['complete'],
+                               'presentationComplete': result['allRowsIncluded'],
+                               'reviewStatus': 'NOT_IMPLIED_BY_QUERY_SUCCESS'}
     result['note'] = '表格只调整排布，未加总。行号及C列标识在同一captureRef内稳定；计算可用Calculate的valueRefs引用。执行覆盖与展示分页分别判断。'
     if len(encode(result)) > max_chars:
         raise AnalysisError('BUSINESS_VIEW_CAPACITY', '业务表格封装超过容量，原始结果已保存。')
@@ -515,4 +532,8 @@ def model_text(value):
                 sections.append(model_text(presentation))
                 item['formulaPresentationTarget'] = presentation['targetFactRef']
         return encode(metadata) + '\n\n' + '\n\n'.join(sections)
+    from .business_dataset import model_tables
+    metadata, tables = model_tables(value)
+    if tables:
+        return '\n\n'.join(tables) + '\n\n执行引用与字段说明：\n```json\n' + encode(metadata) + '\n```'
     return encode(value)

@@ -2,27 +2,66 @@
 from copy import deepcopy
 from .models import AnalysisError, digest
 
-SELECTION_FIELDS = ('captureRef', 'stepId', 'batchId', 'columnNames', 'rowIndices',
+SELECTION_FIELDS = ('captureRef', 'stepId', 'batchId', 'resultSetId', 'columnNames', 'rowIndices',
                     'bindingRef', 'executionPeriod', 'observationId', 'cellKeys',
                     'preparedTargets', 'targetDimensions', 'includeFormulaDependencies', 'grain')
 
 
-def register(turn, selection):
-    service = turn.service
-    selected = {key: deepcopy(selection[key]) for key in SELECTION_FIELDS if key in selection}
-    capture = service.store.get_capture(service.owner, selected['captureRef'])
-    row_count, label, grain, contexts = None, '', selected.get('grain'), []
-    if 'batchId' in selected:
-        from .batch_scope import selected_tables
-        from .adapters.budget_batch import result_ranges
+class _SourceInputs:
+    """Reuse a verified immutable snapshot only within one directory operation.
+
+    Column/row choices still receive their own selection checks. No mutable
+    receipt or validation result is shared across turns, owners or calls.
+    """
+    def __init__(self, turn):
+        self.service = turn.service
+        self.captures, self.receipts, self.tables = {}, {}, {}
+
+    def capture(self, ref):
+        if ref not in self.captures:
+            self.captures[ref] = self.service.store.get_capture(self.service.owner, ref)
+        return self.captures[ref]
+
+    def batch(self, selection):
         from .adapters.budget_v2 import receipt_from_capture
-        _, table, _, columns, rows = next(selected_tables({selected['captureRef']: capture}, [selected]))
+        from .adapters.budget_batch import tables, validate, selection_scope, result_ranges
+        from .adapters.budget_exact import view
+        ref = selection['captureRef']
+        capture = self.capture(ref)
+        if ref not in self.receipts:
+            self.receipts[ref] = receipt_from_capture(capture)
+        receipt = self.receipts[ref]
+        key = (ref, selection.get('stepId'), selection['batchId'])
+        if key not in self.tables:
+            matches = [(step, table) for step, table, _ in tables(receipt)
+                       if step == key[1] and table.get('batchId') == key[2]]
+            if len(matches) != 1:
+                raise AnalysisError('UNKNOWN_BATCH', '请使用 selectors 返回的 stepId 与 batchId。')
+            step, table = matches[0]
+            validate(capture, receipt, step, table)
+            table = view(table)
+            self.tables[key] = (table, result_ranges(receipt, step, table))
+        table, ranges = self.tables[key]
+        columns, rows = selection_scope(selection, table)
+        return receipt, table, columns, rows, ranges
+
+
+def _record(turn, selection, inputs):
+    selected = {key: deepcopy(selection[key]) for key in SELECTION_FIELDS if key in selection}
+    capture = inputs.capture(selected['captureRef'])
+    row_count, label, grain, contexts = None, '', selected.get('grain'), []
+    if 'resultSetId' in selected:
+        from .empty_sources import result
+        _, item = result(capture, selected)
+        row_count, grain = 0, item.get('grain', [])
+        contexts = [deepcopy(item.get('context', {}))]
+        label = ' / '.join(term.get('term', '') for term in item.get('resolvedTerms', [])) or '查询结果'
+    elif 'batchId' in selected:
+        receipt, table, columns, rows, ranges = inputs.batch(selected)
         selected['columnNames'] = sorted(columns)
         if len(columns) != 1:
             raise AnalysisError('SOURCE_METRIC_SELECTION_REQUIRED', '一个来源视图选择一个实际指标列；多指标分别登记并可一起采用。')
         column = next(iter(columns))
-        receipt = receipt_from_capture(capture)
-        ranges = result_ranges(receipt, selected['stepId'], table)
         indices = set(range(table['data']['rowCount'])) if rows is None else set(rows)
         if ranges is not None:
             indices &= ranges.get(column, set())
@@ -49,20 +88,23 @@ def register(turn, selection):
               'turnKey': capture.get('turnKey'), 'intentRevision': capture.get('intentRevision'),
               'sourceIdentity': {key: capture.get(key) for key in
                                  ('resourceId', 'serverName', 'connectionFingerprint')}}
-    return service.store.save_source_view(service.owner, record)
+    return record
 
 
-def register_selections(turn, selections):
+def register(turn, selection):
+    return turn.service.store.save_source_view(turn.service.owner, _record(turn, selection, _SourceInputs(turn)))
+
+
+def register_selections(turn, selections, *, _inputs=None):
+    inputs = _inputs or _SourceInputs(turn)
     result = []
     for selection in selections:
         columns = selection.get('columnNames')
         if 'batchId' in selection and not columns:
-            from .batch_scope import selected_tables
-            capture = turn.service.store.get_capture(turn.service.owner, selection['captureRef'])
-            _, _, _, columns, _ = next(selected_tables({selection['captureRef']: capture}, [selection]))
+            _, _, columns, _, _ = inputs.batch(selection)
         for column in columns if 'batchId' in selection else (None,):
-            result.append(register(turn, {**selection, **({'columnNames': [column]} if column else {})}))
-    return result
+            result.append(_record(turn, {**selection, **({'columnNames': [column]} if column else {})}, inputs))
+    return turn.service.store.save_source_views(turn.service.owner, result)
 
 
 def directory(turn, search=None, offset=0, limit=6, context_refs=None):
@@ -95,9 +137,10 @@ def directory(turn, search=None, offset=0, limit=6, context_refs=None):
         selections.extend(item['selection'] for item in turn.state.get('adoptedInputs', []))
     records = {}
     diagnostics = []
+    inputs = _SourceInputs(turn)
     for selection in selections:
         try:
-            for record in register_selections(turn, [selection]):
+            for record in register_selections(turn, [selection], _inputs=inputs):
                 records[record['sourceRef']] = record
         except AnalysisError as error:
             diagnostics.append({'captureRef': selection.get('captureRef'), 'code': error.code})
@@ -160,6 +203,43 @@ def input_identity(inputs):
         **{key: item.get(key) for key in ('sourceRef', 'inputRef', 'role', 'membersFrom')},
         'selection': {key: item['selection'][key] for key in SELECTION_FIELDS if key in item['selection']}
     }) for item in inputs)
+
+
+def adopt_analysis(turn, artifact):
+    """An explicit report reference adopts its complete frozen inputs, not a metric preview."""
+    selections = artifact.get('plan', {}).get('selections') or []
+    if not selections:
+        raise AnalysisError('REPORT_INPUTS_UNAVAILABLE', '报告没有可重新采用的来源选择；仍可按 analysisRef 读取和续审原报告。')
+    groups = {}
+    for selection in selections:
+        groups.setdefault(selection.get('role', 'PRIMARY'), []).append(selection)
+    choices = []
+    for role, group in groups.items():
+        choices.extend({'sourceRef': item['sourceRef'], 'role': role}
+                       for item in register_selections(turn, group))
+    install(turn, select(turn, choices))
+    return {'analysisRef': artifact['analysisRef'], 'sourceCount': len(choices),
+            'factCount': len(artifact.get('facts', [])), 'roles': sorted(groups),
+            'meaning': '已采用该报告完整的冻结来源，保留行列、粒度和用途；没有取数或重算。'}
+
+
+def selection_identity(turn, selections):
+    """Compare actual selections before/after indexing a delivered result.
+
+    A multi-column Build becomes one source view per metric in the next turn.
+    Normalize both through the same immutable receipt, without adopting inputs
+    or writing source views merely to validate an existing artifact.
+    """
+    inputs, identities = _SourceInputs(turn), []
+    for selection in selections:
+        columns = selection.get('columnNames')
+        if 'batchId' in selection and not columns:
+            _, _, columns, _, _ = inputs.batch(selection)
+        for column in columns if 'batchId' in selection else (None,):
+            record = _record(turn, {**selection, **({'columnNames': [column]} if column else {})}, inputs)
+            identities.append(digest({'selection': record['selection'],
+                                      'role': selection.get('role', 'PRIMARY')}))
+    return sorted(identities)
 
 
 def input_version(turn, inputs):
@@ -274,6 +354,17 @@ def query_basis(turn, origin, request):
     if any(source['sourceIdentity'].get(key) != origin.get(key) for key in source['sourceIdentity']):
         raise AnalysisError('SOURCE_CONNECTION_MISMATCH', '来源引用不属于本次预算工具连接。')
     selection = source['selection']
+    if 'resultSetId' in selection:
+        from .empty_sources import result
+        capture = turn.service.store.get_capture(turn.service.owner, selection['captureRef'])
+        receipt, item = result(capture, selection)
+        if basis['kind'] == 'FACTS':
+            from .query_lineage import fact_draft
+            request = fact_draft(request)
+        return {**request, 'basis': {'kind': basis['kind'],
+            'source': {'executionId': receipt['executionId'], 'resultSetId': item['resultSetId'], 'factIds': []},
+            'contextId': receipt['context']['contextId'], 'querySessionId': receipt['querySessionId'],
+            **({'memberDimensions': []} if basis['kind'] == 'MEMBERS' else {})}}
     if 'batchId' not in selection:
         raise AnalysisError('SOURCE_DETAIL_REQUIRED', '预算范围查询需要带来源身份的明细结果。')
     from .batch_scope import selected_tables

@@ -19,24 +19,28 @@ def render(value):
             *(f"| {cell(item['role'])} | {cell(item['sourceRef'])} | {cell(item['inputRef'])} | {cell(item.get('rowCount'))} | {cell(item.get('label'))} |"
               for item in sources)]))
         sections.append('以上输入组已采用。AnalysisBuild 直接传 operations/requestKey，不再填写 captureRefs/selections；按 inputRef 分组计算，增加标题可传 scope。统计整个输入组时 select 只需 inputRef；确需细分列时使用材料中的实际 columnName，展示列标题不是列编码。改变输入先修改 AnalysisTask.subjectSources。')
+    elif value.get('reusedAnalysis'):
+        sections.append('已复用原报告完整输入与现有计算；仅审查调用 AnalysisPublish(resumeReview=true)，文字修改沿用原报告 analysisRef/repairRef，无须重新 Build 或 Python。')
     elif value.get('mode') in ('ANALYSIS', 'REPORT'):
         sections.append('尚未明确采用来源组。需要选择多个候选或子集时，先读 sources，再以 subjectSources 完整声明采用集合。')
 
     prepared = value.get('preparedFormulaInputs')
     if prepared is not None:
         targets = prepared.get('targets', [])
-        ready = sum('captureRef' in target and 'error' not in target for target in targets)
+        ready = prepared.get('ready', sum('captureRef' in target and 'error' not in target for target in targets))
         sections.append(f"公式材料：预期 {prepared['expected']} 个目标，就绪 {ready} 个。")
         sections.append('\n'.join(['| 目标 | 输入组 | 状态 | 材料或缺口 |', '|---|---|---|---|',
             *(f"| {cell(item.get('subject'))} | {cell(item.get('inputRef'))} | {'待补' if 'error' in item else '已准备'} | {cell(item.get('error', item.get('captureRef')))} |"
               for item in targets)]))
-        if ready == prepared['expected']:
+        if prepared.get('boundaries'):
+            sections.append('来源边界：' + cell(prepared['boundaries']))
+        if ready == prepared['expected'] and prepared['expected'] > 0:
             sections.append('公式目标及依赖已取得。下一步 AnalysisBuild，宿主自动附上材料和 FORMULA_CHECK；仅需展示构成时 operations=[]。直接使用返回的公式数据集，无需为同一构成再取整表或编写 Python。')
         else:
             sections.append(prepared.get('next', '按实际缺口处理，保留已完成目标。'))
     else:
         sections.append(value.get('next', ''))
-    if value.get('delivery') == 'DOCUMENT':
+    if value.get('delivery') == 'DOCUMENT' and not value.get('reusedAnalysis'):
         sections.append('构建完成后使用 AnalysisBuild 返回的 documentDraft.path 写报告，复用已确认模板；同一分析版本的修订沿用该路径。')
     if value.get('mode') == 'DIRECT':
         sections.append('仅查询/排序时取得结果即可答复；用户未要求的合计、占比及报告无需作为交付前置步骤。'
@@ -66,7 +70,7 @@ def render(value):
     requirement = navigation.get('analysisRequirement')
     if isinstance(requirement, dict):
         navigation['analysisRequirement'] = {key: requirement[key] for key in
-            ('requiredEvidence', 'reason', 'status', 'error', 'decision', 'scope') if key in requirement}
+            ('origin', 'materials', 'explanation', 'reason', 'status', 'error', 'decision', 'scope', 'investigations') if key in requirement}
         navigation['requirementDetailRead'] = {'tool': 'AnalysisTask', 'action': 'status'}
     followup = value.get('followupScope', {})
     if followup:

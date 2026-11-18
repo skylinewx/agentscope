@@ -14,7 +14,8 @@ def project_results(values, compact_values, analysis_ref, previous_values=(), fa
         ref = value['derivedId']
         state = 'new' if ref not in previous else 'unchanged' if previous[ref] == digest(value) else 'changed'
         changes[state].append(ref)
-        item = deepcopy(compact)
+        from .business_dataset import project
+        item = project(compact)
         # 宿主按分析版本保存真实依赖；模型用结果 ID 继续引用，不反复抄依赖清单。
         for key in ('sourceFactIds', 'orderedFactIds', 'unavailableFactIds', 'selectedCoverageRefs'):
             if key in item:

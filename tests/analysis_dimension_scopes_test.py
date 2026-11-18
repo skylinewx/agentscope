@@ -14,6 +14,24 @@ def scope(identifier='departments', hint='部门', text='所有部门'):
 
 
 class DimensionScopeTests(TestCase):
+    def test_followup_root_patch_preserves_level_but_explicit_replacement_clears_it(self):
+        from analysis_extension.scope_changes import reconcile_selectors
+        old = {'id': 'org', 'dimensionHint': '组织机构', 'sourceText': '二级单位',
+               'selector': {'type': 'HIERARCHY', 'rootText': '集团', 'level': 2}}
+        record = {'draft': old, 'appliesToAllTargets': True,
+                  'confirmedSource': {'executionId': 'prior'}}
+        for replacement in (False, True):
+            with self.subTest(replacement=replacement):
+                turn = SimpleNamespace(state={'followupContext': {'mode': 'CONTINUE', 'changedFields': ['population']},
+                    'inheritedDimensionScopes': [deepcopy(record)],
+                    'scopeEdits': [{'dimensionHint': '组织机构', 'selector': {'type': 'HIERARCHY', 'rootText': '集团'}}] if replacement else []})
+                request = {'intentDraft': {'dimensionScopes': [{**deepcopy(old),
+                    'selector': {'type': 'HIERARCHY', 'rootText': '集团'}}]}}
+                reconcile_selectors(turn, request)
+                actual = request['intentDraft']['dimensionScopes'][0]['selector']
+                self.assertEqual(actual.get('level'), None if replacement else 2)
+                self.assertEqual('population' in turn.state['followupContext']['changedFields'], replacement)
+
     def test_explicit_value_switch_cannot_reuse_previous_fact_identity(self):
         from analysis_extension.followup_scope import prepare_request
         origin = {'originalToolName': 'execute_budget_query'}
@@ -221,7 +239,7 @@ class DimensionScopeTests(TestCase):
         condition = {'dimCode': 'DEPT', 'all': True}
         coordinate = {'binding': 'b', 'targetId': 't', 'dimensions': {'DEPT': 'A'},
                       'measureCode': 'AMT', 'modelCode': 'MODEL_N'}
-        request = {'question': '分析所有部门预算', 'purpose': 'ANALYZE', 'intentDraft': {'dimensionScopes': [scope()]}}
+        request = {'question': '分析所有部门预算', 'purpose': 'PREPARE_MATERIALS', 'intentDraft': {'dimensionScopes': [scope()]}}
         data = {'scopeVerification': {'bindingComplete': True, 'analysisCoordinates': [coordinate],
                     'selectorChecks': [{'id': 'departments', 'targetId': 't', 'binding': 'b',
                                         'executedConditions': [condition]}]},

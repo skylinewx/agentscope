@@ -18,6 +18,13 @@ MAX_STEPS = 48
 
 def apply_progress(message, event):
     """Application-specific reducer shared by live accumulation and history."""
+    if isinstance(event, CustomEvent) and event.name == 'analysis_execution_progress':
+        value = object_value(event.value)
+        old = message.metadata.get('analysisExecutionProgress', {})
+        if (value.get('replyId') == message.id and value.get('version') == 1 and not message.finished_at
+                and isinstance(value.get('revision'), int) and value['revision'] > old.get('revision', -1)):
+            message.metadata['analysisExecutionProgress'] = deepcopy(value)
+        return True
     if not isinstance(event, CustomEvent) or event.name != 'agent_progress':
         return False
     value = object_value(event.value)

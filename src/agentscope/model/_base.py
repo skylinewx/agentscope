@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError as PydanticValidationError
 from ._model_response import StructuredResponse, ChatResponse, FinishedReason
 from ._model_card import ModelCard
 from ._utils import _StreamAccumulator
-from ._diagnostics import ModelCallDiagnostic
+from ._diagnostics import ModelCallDiagnostic, observed_attempt
 from .._io_log import CallIO, model_response
 from .._logging import logger
 from .._utils._common import _json_loads_with_repair
@@ -595,13 +595,13 @@ class ChatModelBase:
                 )
                 try:
                     with io.model_attempt():
-                        result = await self._call_api_with_structured_output(
+                        result = await observed_attempt(lambda: self._call_api_with_structured_output(
                             self.model,
                             messages=messages,
                             structured_model=structured_model,
                             tool_choice=tool_choice,
                             **merged,
-                        )
+                        ), call_id=diagnostic.call_id, strategy=name, attempt=attempt + 1)
                     io.output(io.model_result if io.model_result is not None else result)
                     if strategy_index > 0:
                         logger.info(

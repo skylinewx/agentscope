@@ -1,5 +1,5 @@
 import { ApiError, client, apiUrl } from './client';
-import { ANALYSIS_VIEW_MAX_BYTES, parseDelivery, parseSnapshot, parseActionResolution, type ExportDelivery, type ViewParameters } from '@/lib/workspace-analysis';
+import { ANALYSIS_VIEW_MAX_BYTES, parseDelivery, parseSnapshot, parseActionResolution, registeredReportPath, type ExportDelivery, type ViewParameters } from '@/lib/workspace-analysis';
 import { REPORT_PREVIEW_MAX_BYTES } from '@/lib/workspace-reports';
 
 export type AnalysisWorkspace = { agentId: string; sessionId: string };
@@ -24,6 +24,14 @@ async function bounded(response: Response, maximum: number) {
 }
 
 export const analysisApi = {
+    async reportByPath(w: AnalysisWorkspace, path: string, signal: AbortSignal) {
+        const location = registeredReportPath(path);
+        if (!location) throw new Error('INVALID_REPORT_PATH');
+        const view = await analysisApi.view(w, location.manifest, signal);
+        const delivery = view.reports?.find(report => report.exportRef === location.exportRef && report.path === path);
+        if (!delivery) throw new ApiError(404, 'Report is not registered in this session.');
+        return delivery;
+    },
 	async publicationPreview(w: AnalysisWorkspace, previewRef: string, signal: AbortSignal) {
 		const query = { ...params(w), preview_ref: previewRef };
 		const [data, html] = await Promise.all([

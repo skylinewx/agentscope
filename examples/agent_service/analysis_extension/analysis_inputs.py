@@ -1,6 +1,12 @@
 """按输入用途和实际粒度汇编分析；参考值不扩大主体，结构证据不伪装成金额。"""
 from copy import deepcopy
 
+
+def fact_roles(fact):
+    """A fact shared by overlapping groups retains both roles."""
+    memberships = fact.get('inputMemberships') or []
+    return {item['inputRole'] for item in memberships} if memberships else {fact.get('inputRole', 'PRIMARY')}
+
 from .models import AnalysisError, digest
 from .sources import combined_context
 
@@ -36,11 +42,20 @@ def structure_evidence(captures, selection):
 
 def adapt_inputs(registry, captures, selections, scope, max_facts):
     """每个输入独立校验来源、成员及粒度，再合并有来源的事实。"""
+    from .receipt_reads import receipt_read_scope
+    # Adapters only read these snapshots. Cache parsing and whole-receipt checks,
+    # while each selection still checks its own table, columns, rows and grain.
+    with receipt_read_scope():
+        return _adapt_inputs(registry, captures, selections, scope, max_facts)
+
+
+def _adapt_inputs(registry, captures, selections, scope, max_facts):
     from .batch_scope import selected_tables, resolve_members
     from .member_scopes import member_ref
     facts, contexts, subjects, references, audits, structures = {}, {}, set(), set(), [], []
     period_scopes, population_evidence, input_groups = {}, [], {}
     complete, pages_complete, population_complete = True, True, True
+    empty_primary = False
     for selection in selections:
         role = selection.get('role', 'PRIMARY')
         input_ref = selection.get('inputRef')
@@ -56,6 +71,7 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
                        if key in ('label', 'selectionReason', 'contextMode', 'expectedDimensions')}
         grain = selection.get('grain')
         table = None
+        empty = 'resultSetId' in selection
         if 'batchId' in selection:
             _, table, _, _, rows = next(selected_tables(captures, [selection]))
             if grain is None:
@@ -63,12 +79,20 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
                          if value['kind'] in ('DIMENSION', 'PROPERTY')]
             if rows is not None and len(rows) != table['data']['rowCount'] and role == 'PRIMARY' and not selection.get('selectionReason'):
                 raise AnalysisError('SELECTION_REASON_REQUIRED', '主体筛选须说明与用户要求对应的选择理由；审查保留被排除行。')
+        elif empty:
+            from .empty_sources import result
+            _, empty_result = result(captures[selection['captureRef']], selection)
+            grain = empty_result.get('grain', [])
+            empty_primary |= role == 'PRIMARY'
         elif grain is None:
             grain = [scope.get('memberDimension', 'MD_ORG')]
-        if not isinstance(grain, list) or not grain or any(not isinstance(dim, str) or not dim for dim in grain) or len(set(grain)) != len(grain):
+        if not isinstance(grain, list) or not grain and not empty or any(not isinstance(dim, str) or not dim for dim in grain) or len(set(grain)) != len(grain):
             raise AnalysisError('INVALID_GRAIN', 'grain 使用实际维度或属性列名组成的非空、不重复数组。')
-        local_scope['memberDimension'] = grain[0]
-        if table is not None:
+        local_scope['memberDimension'] = grain[0] if grain else 'PER_INPUT_GRAIN'
+        if empty:
+            from .empty_sources import adapt
+            data = adapt(captures[selection['captureRef']], selection, local_scope)
+        elif table is not None:
             local_scope = resolve_members(registry, captures, [selection], local_scope, max_facts)
         else:
             candidates = registry.catalog(captures[selection['captureRef']], grain[0], grid_selection=selection)
@@ -78,11 +102,12 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
                        and (not selection.get('observationId') or fact.get('observationId') == selection['observationId'])}
             local_scope['members'] = sorted(member for member in members if member)
         adapter = registry.for_capture(captures[selection['captureRef']])
-        namespace = adapter.member_namespace(captures[selection['captureRef']], grain[0])
-        local_captures = {ref: capture for ref, capture in captures.items()
-                          if ref == selection['captureRef']
-                          or registry.for_capture(capture).member_namespace(capture, grain[0]) == namespace}
-        data = registry.adapt(local_captures, [selection], local_scope, max_facts)
+        if not empty:
+            namespace = adapter.member_namespace(captures[selection['captureRef']], grain[0])
+            local_captures = {ref: capture for ref, capture in captures.items()
+                              if ref == selection['captureRef']
+                              or registry.for_capture(capture).member_namespace(capture, grain[0]) == namespace}
+            data = registry.adapt(local_captures, [selection], local_scope, max_facts)
         periods = data['scope'].get('periodCoverage', [])
         if periods:
             # 同一时期计划可能由多个选择器各选一页；汇编完成后统一检查所需时期，
@@ -142,7 +167,8 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
             # A complete native result can establish its own population even when
             # supplemental formula observations do not enumerate that population.
             # Preserve the exact fact set; another input cannot borrow this proof.
-            population_evidence.append({'captureRef': selection['captureRef'], 'stepId': selection['stepId'],
+            population_evidence.append({'captureRef': selection['captureRef'], 'stepId': selection.get('stepId'),
+                                        **({'resultSetId': selection['resultSetId']} if empty else {}),
                                         'grain': grain, 'members': sorted(local_members),
                                         'factRefs': sorted(local_fact_refs), 'complete': True})
         for audit in data['scope'].get('sourceScopes', []):
@@ -150,7 +176,7 @@ def adapt_inputs(registry, captures, selections, scope, max_facts):
                            'selectionReason': selection.get('selectionReason', scope['selectionReason'])})
         if len(facts) > max_facts:
             raise AnalysisError('FACT_LIMIT', '分析输入超过本次事实容量。')
-    if not subjects:
+    if not subjects and not empty_primary:
         raise AnalysisError('EMPTY_SELECTION', '至少需要一个 PRIMARY 主体数据输入。')
     # A reference population may include the primary subset (e.g. loss-making
     # entities versus all entities). Roles belong to source inputs, not mutually

@@ -4,10 +4,24 @@ import { readFileSync } from 'node:fs';
 import React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { Streamdown, defaultRemarkPlugins } from 'streamdown';
-import { analysisPath, remarkWorkspaceAnalyses, parseDelivery, parseSnapshot, validateScene } from '../src/lib/workspace-analysis.ts';
+import { analysisPath, remarkWorkspaceAnalyses, parseDelivery, parseSnapshot, validateScene, registeredReportPath } from '../src/lib/workspace-analysis.ts';
 import { remarkWorkspaceReports } from '../src/lib/workspace-reports.ts';
 
 const path = './analysis/ana_0123456789abcdef0123456789abcdef/revisions/3/analysis.json';
+test('report status is version bound and historical absence never invents a pass', () => {
+  const fixture = JSON.parse(readFileSync(new URL('../../../agent_service/analysis_extension/presentation-v1.example.json', import.meta.url), 'utf8'));
+  assert.equal(parseSnapshot(fixture).reportDelivery, undefined);
+  const delivery = { analysisRef: fixture.analysisRef, mode: 'PENDING_REVIEW', semanticReview: 'PARTIAL', programChecks: 'PASS', requirementsState: 'READY', notice: '待审查报告',
+    review: { parts: [{ index: 1, kind: 'COMPLETE_REPORT', status: 'UNAVAILABLE', issues: [] }] } };
+  assert.equal(parseSnapshot({ ...fixture, reportDelivery: delivery }).reportDelivery.semanticReview, 'PARTIAL');
+  assert.throws(() => parseSnapshot({ ...fixture, reportDelivery: { ...delivery, analysisRef: 'different' } }));
+  assert.throws(() => parseSnapshot({ ...fixture, reportDelivery: { ...delivery, review: { parts: [{ index: 1, kind: 'x', status: 'REVISE', issues: [{ message: {} }] }] } } }));
+});
+test('registered exports resolve only their exact immutable version path', () => {
+  const exported = path.replace('analysis.json', `reports/export_${'a'.repeat(64)}.html`);
+  assert.deepEqual(registeredReportPath(exported), { manifest: path, exportRef: `export_${'a'.repeat(64)}` });
+  for (const invalid of [exported.replace('/3/', '/03/'), exported + '?version=other', './other.html', exported.replace('revisions/', 'revisions/../')]) assert.equal(registeredReportPath(invalid), null);
+});
 test('current engine and frozen historical reports remain readable', () => {
   const fixture = JSON.parse(readFileSync(new URL('../../../agent_service/analysis_extension/presentation-v1.example.json', import.meta.url), 'utf8'));
   for (const engineVersion of ['2.0.0', '1.5.0']) assert.equal(parseSnapshot({ ...fixture, engineVersion }).engineVersion, engineVersion);
@@ -183,4 +197,19 @@ test('model-selected titles units and page settings are not replaced by the clie
   assert.equal(parsed.tables[0].collapsed, true);
   assert.ok(parsed.tables[0].columns.every(column => column.unit === ''));
   assert.deepEqual(parsed.claims, fixture.claims);
+});
+
+test('fallback retains the rejected candidate review without changing the delivered verdict', () => {
+  const fixture = JSON.parse(readFileSync(new URL('../../../agent_service/analysis_extension/presentation-v1.example.json', import.meta.url), 'utf8'));
+  fixture.reportDelivery = {
+    analysisRef: fixture.analysisRef, mode: 'REVIEWED_FALLBACK', semanticReview: 'PASS', programChecks: 'PASS', requirementsState: 'READY',
+    review: { parts: [{ index: 1, kind: 'COMPLETE_REPORT', status: 'PASS', issues: [] }] },
+    newerCandidate: { analysisRef: fixture.analysisRef, previewRef: 'new-preview', programChecks: 'PASS',
+      review: { parts: [{ index: 1, kind: 'COMPLETE_REPORT', status: 'REVISE', issues: [{ message: '新增表述与数值矛盾' }] }] } },
+  };
+  const delivery = parseSnapshot(fixture).reportDelivery;
+  assert.equal(delivery.semanticReview, 'PASS');
+  assert.equal(delivery.newerCandidate.review.parts[0].status, 'REVISE');
+  fixture.reportDelivery.newerCandidate.analysisRef = 'another-analysis';
+  assert.throws(() => parseSnapshot(fixture), /INVALID/);
 });

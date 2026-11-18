@@ -13,7 +13,6 @@ from agentscope.app.storage import (
     RedisStorage,
     AgentRecord,
     SessionConfig,
-    SessionRecord,
     ChatModelConfig,
     ScheduleRecord,
     ScheduleData,
@@ -536,6 +535,34 @@ class TestMessage(IsolatedAsyncioTestCase):
             "no-such-id",
         )
         self.assertIsNone(result)
+
+    async def test_checkpoints_and_new_ids_do_not_read_history(self) -> None:
+        """Repeated checkpoints should not fetch previous messages."""
+        first = UserMsg(name="alice", content="older conversation")
+        reply = AssistantMsg(name="bot", content="first checkpoint")
+        await self.storage.upsert_message(self.user_id, self.session_id, first)
+        await self.storage.upsert_message(self.user_id, self.session_id, reply)
+
+        updated = AssistantMsg(
+            id=reply.id, name="bot", content="latest checkpoint",
+        )
+        with patch.object(
+            self.storage._client, "lrange", side_effect=AssertionError,
+        ):
+            await self.storage.upsert_message(
+                self.user_id, self.session_id, updated,
+            )
+        with patch.object(
+            self.storage._client, "lindex", side_effect=AssertionError,
+        ):
+            self.assertIsNone(await self.storage.get_message(
+                self.user_id, self.session_id, "new-id",
+            ))
+
+        messages, _ = await self.storage.list_messages(
+            self.user_id, self.session_id,
+        )
+        self.assertEqual(messages, [first, updated])
 
     async def test_delete_message(self) -> None:
         """Deleting by id removes the matching message."""
@@ -1230,21 +1257,14 @@ class TestTeamCascade(IsolatedAsyncioTestCase):
         await self.storage.upsert_team(self.user_id, self.team)
 
         # Stamp team_id on every team-participating session
-        # pylint: disable=protected-access
         for sid in [
             self.leader_session_id,
             self.worker_a_session_id,
             self.worker_b_session_id,
         ]:
-            session_key = self.storage._key(
-                self.storage.key_config.session,
-                user_id=self.user_id,
-                session_id=sid,
+            await self.storage.set_session_team_id(
+                self.user_id, sid, self.team.id,
             )
-            raw = await self.storage._client.get(session_key)
-            rec = SessionRecord.model_validate_json(raw)
-            rec.team_id = self.team.id
-            await self.storage._client.set(session_key, rec.model_dump_json())
 
     async def test_delete_team_cascades_workers_and_clears_leader(
         self,
@@ -1280,6 +1300,10 @@ class TestTeamCascade(IsolatedAsyncioTestCase):
         )
         self.assertIsNotNone(leader)
         self.assertIsNone(leader.team_id)
+        summary = await self.storage.get_session_summary(
+            self.user_id, self.leader_agent.id, self.leader_session_id,
+        )
+        self.assertIsNone(summary.session.team_id)
 
     async def test_delete_team_removes_cross_owner_borrowed_session(
         self,
@@ -1332,6 +1356,15 @@ class TestTeamCascade(IsolatedAsyncioTestCase):
 
     async def test_delete_leader_session_dissolves_team(self) -> None:
         """Deleting a leader session auto-dissolves its team."""
+        summary = await self.storage.get_session_summary(
+            self.user_id, self.leader_agent.id, self.leader_session_id,
+        )
+        # Older Redis versions updated the full record only on team attach.
+        summary.session.team_id = None
+        await self.storage._client.set(
+            self.storage._summary_key(self.user_id, self.leader_session_id),
+            summary.model_dump_json(exclude={"has_background_tools"}),
+        )
         await self.storage.delete_session(
             self.user_id,
             self.leader_agent.id,

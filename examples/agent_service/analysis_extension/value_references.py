@@ -7,6 +7,15 @@ from .models import AnalysisError, digest
 _CURRENT = ContextVar('business_value_reference_service', default=None)
 
 
+def check_calculation(operation, request):
+    bound = _CURRENT.get()
+    if bound is not None:
+        from .execution_policy import require, record
+        _, turn = bound
+        require(turn, 'computations', operation)
+        record(turn, 'EXACT_CALCULATION', digest([operation, request]), operation=operation, status='REQUESTED')
+
+
 @contextmanager
 def reference_context(service, turn):
     token = _CURRENT.set((service, turn))

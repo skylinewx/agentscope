@@ -11,6 +11,11 @@ from ..sources import SourceAdapter, source_context, combined_context
 from .budget_periods import period_execution, period_coverage
 
 def budget_receipt(response: dict) -> dict:
+    from ..receipt_reads import read_once
+    return read_once('budget_receipt_body', (response,), lambda: _budget_receipt(response))
+
+
+def _budget_receipt(response: dict) -> dict:
     candidates = []
     for block in response.get("content", []):
         if block.get("type") != "text":
@@ -131,6 +136,11 @@ def _incomplete_details(capture: dict, receipt: dict | None = None) -> dict:
 
 
 def receipt_from_capture(capture: dict) -> dict:
+    from ..receipt_reads import read_once
+    return read_once('budget_receipt', (capture,), lambda: _receipt_from_capture(capture))
+
+
+def _receipt_from_capture(capture: dict) -> dict:
     if str(capture.get("captureState", "")).upper() not in ("SUCCESS", "SUCCEEDED"):
         raise AnalysisError("CAPTURE_INCOMPLETE", "该工具调用未成功完成，不能作为完整分析输入。", _incomplete_details(capture))
     receipt = budget_receipt(capture["response"])
@@ -178,10 +188,12 @@ def pointer(value, path: str):
     return value
 
 
-def _step_request(capture, step_id):
+def _step_request(capture, step_id, *, receipt=None):
     if capture.get('originalToolName') == 'execute_budget_query':
         from .budget_query import server_steps
-        steps = server_steps(capture, budget_receipt(capture['response']))
+        from ..receipt_reads import read_once
+        receipt = receipt if receipt is not None else budget_receipt(capture['response'])
+        steps = read_once('budget_server_steps', (capture, receipt), lambda: server_steps(capture, receipt))
     else:
         steps = capture["request"].get("plan", {}).get("steps", [])
     selected = [s for s in steps if s.get("id") == step_id]
@@ -920,7 +932,7 @@ class BudgetV2Adapter(SourceAdapter):
         if tool.is_read_only:
             return 'mcp-readonly-annotation'
         metadata = tool._tool._tool.meta or {}
-        if (origin['originalToolName'] in {'execute_semantic_plan', 'execute_budget_query', 'validate_evidence'}
+        if (origin['originalToolName'] in {'execute_semantic_plan', 'execute_budget_query', 'validate_evidence', 'search_entities'}
                 and self.matches(tool, origin) and metadata.get('risk') in {'L1', 'READ_ONLY'}
                 and metadata.get('dataBoundary') == 'PINNED_SOURCE_SNAPSHOT_ASOF'
                 and metadata.get('evidencePolicy') == 'EVIDENCE_REQUIRED'):

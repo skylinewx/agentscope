@@ -18,7 +18,7 @@ class RegressionReliabilityTests(TestCase):
     def test_property_group_analysis_does_not_request_a_sample_members_formula(self):
         capture, _, _, receipt = batch_fixture()
         capture['captureRef'] = 'cap'
-        capture.update(originalToolName='execute_budget_query', request={'purpose': 'ANALYZE', 'groupBy': ['板块']})
+        capture.update(originalToolName='execute_budget_query', request={'purpose': 'PREPARE_MATERIALS', 'groupBy': ['板块']})
         # The native table is already validated; automatic preparation must not
         # invent a representative member for a property aggregate.
         service = SimpleNamespace(sources=SimpleNamespace(for_capture=lambda item: SimpleNamespace(adapter_id='budget-v2')))

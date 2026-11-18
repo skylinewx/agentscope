@@ -161,6 +161,32 @@ class BudgetBatchTest(TestCase):
         result = registry.adapt({'batch-ref': capture}, [selection], scope, 100)
         self.assertEqual(result['scope']['sourceScopes'][0]['omittedRows'][0]['values']['metric1'], '238432697.67')
 
+    def test_column_fixed_dimension_can_be_the_analysis_subject(self):
+        from analysis_extension.analysis_inputs import adapt_inputs
+        capture, selection, scope, _ = batch_fixture(False)
+        scope = {key: value for key, value in scope.items() if key not in ('members', 'memberDimension')}
+        selected = {**selection, 'role': 'PRIMARY', 'grain': ['MD_BUDACCOUNT']}
+        registry = SourceRegistry([BudgetV2Adapter])
+        result = adapt_inputs(registry, {'batch-ref': capture}, [selected], scope, 100)
+        self.assertEqual({fact['rowIdentity']['MD_BUDACCOUNT'] for fact in result['facts']}, {'0205', '0206'})
+        self.assertEqual([fact['value'] for fact in result['facts']], ['85084700.00', '2965.89', '1209100.00', '609.20'])
+        self.assertEqual(len(result['scope']['members']), 2)
+        selected['columnNames'] = ['metric2']
+        subset = adapt_inputs(registry, {'batch-ref': capture}, [selected], scope, 100)
+        self.assertEqual({fact['rowIdentity']['MD_BUDACCOUNT'] for fact in subset['facts']}, {'0206'})
+        self.assertEqual(len(subset['facts']), 2)
+
+    def test_missing_dimension_on_one_selected_column_is_not_invented(self):
+        from analysis_extension.analysis_inputs import adapt_inputs
+        capture, selection, scope, receipt = batch_fixture(False)
+        receipt['data']['stepResults'][0]['batchResults'][0]['data']['columns'][-1]['fixedDimValMap'] = {}
+        update(capture, receipt)
+        selected = {**selection, 'role': 'PRIMARY', 'grain': ['MD_BUDACCOUNT']}
+        scope = {key: value for key, value in scope.items() if key not in ('members', 'memberDimension')}
+        with self.assertRaises(AnalysisError) as caught:
+            adapt_inputs(SourceRegistry([BudgetV2Adapter]), {'batch-ref': capture}, [selected], scope, 100)
+        self.assertEqual(caught.exception.code, 'BATCH_GRAIN_MISMATCH')
+
     def test_bad_member_reference_identifies_exact_parameter_without_creating_raw_key(self):
         capture, selection, scope, _ = batch_fixture()
         registry = SourceRegistry([BudgetV2Adapter])

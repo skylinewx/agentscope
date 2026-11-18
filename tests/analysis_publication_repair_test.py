@@ -117,8 +117,27 @@ class PublicationRepairTests(PresentationCase):
 
     async def test_partial_result_stays_incomplete_and_discloses_the_declared_gap(self):
         await self.build(work=[{'taskId': 'relation', 'title': '直属关系', 'kind': 'RELATION', 'refs': []}])
-        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'partial', unresolvedItems=[{'requirement': '核对直属范围', 'reason': '本次先交付已取得数值，直属范围仍需核对。'}])
+        result = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'partial', unresolvedItems=[{'requirement': '核对直属范围', 'reason': '本次先交付已取得数值，直属范围仍需核对。', 'basis': {'kind': 'USER_REQUIREMENT', 'userQuote': '核对直属范围'}}])
         self.assertEqual(result['summary']['completion']['state'], 'INCOMPLETE')
         self.assertIn('直属范围仍需核对', self.delivery.view(result['delivery']['path'])['claimsScopeLabel'])
         export = self.delivery.render_report(self.ref, 'report')
         self.assertIn('直属范围仍需核对', self.delivery.report(self.ref, export['exportRef'])['html'])
+
+    async def test_completed_audit_classification_survives_preview_repair_publish_and_reopen(self):
+        await self.build(formula=True, work=[{'taskId': 'audit', 'title': '核对', 'kind': 'COMPUTATION',
+                                            'operator': 'FORMULA_CHECK', 'refs': ['derived_check']}])
+        preview = await self.service.publish(self.ref, [], [self.view('TABLE', self.refs)], 'audit-preview',
+            previewOnly=True, unresolvedItems=[{'requirement': '追加差额调查', 'reason': '额外调查没有证据',
+                                                'basis': {'kind': 'AUDIT_RESULT', 'resultRefs': ['derived_check']}}])
+        self.assertEqual(preview['summary']['completion']['state'], 'READY')
+        repaired = await self.service.publish(self.ref, requestKey='audit-repair', repairRef=preview['repairRef'],
+            repairs=[{'op': 'replace', 'path': '/technicalDetails', 'value': True}], previewOnly=True)
+        published = await self.service.publish(**repaired['confirmPublish'])
+        self.assertTrue(published['delivery']['registered'])
+        saved = self.store.get_analysis(OWNER, self.ref)
+        self.assertEqual(saved['unresolvedItems'], [])
+        self.assertEqual(saved['derivedValues'], self.artifact['derivedValues'])
+        self.assertNotIn('partialReason', saved)
+        self.delivery.view(published['delivery']['path'])
+        inspected = await self.service.inspect(section='summary', analysisRef=self.ref)
+        self.assertEqual(inspected['summary']['completion']['state'], 'READY')

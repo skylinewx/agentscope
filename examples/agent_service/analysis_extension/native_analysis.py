@@ -1,10 +1,10 @@
 """通用来源数值统计与可直接绑定的结果目录，不选择业务分析流程。"""
 from copy import deepcopy
-from decimal import Decimal, Inexact, Rounded, ROUND_HALF_EVEN, localcontext
+from decimal import Decimal, Inexact, Rounded, ROUND_HALF_UP, localcontext
 
 from .models import AnalysisError, decimal_text, decimal_value, digest, precise_sum
 
-CAPABILITY_VERSION = 'native-analysis-20261110-population-evidence'
+CAPABILITY_VERSION = 'native-analysis-20261116-half-up'
 STATISTIC_FIELDS = ('sum', 'positiveSum', 'negativeSum', 'minimum', 'maximum', 'mean', 'topSum', 'topShare')
 
 
@@ -75,7 +75,7 @@ def describe(items, scope, operation):
             context.prec = 512
             context.traps[Inexact] = False
             context.traps[Rounded] = False
-            return decimal_text((numerator / denominator * factor).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_EVEN))
+            return decimal_text((numerator / denominator * factor).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP))
 
     top_sum = precise_sum(numbers[:top]) if top is not None and numbers else None
     statistics = {
@@ -177,5 +177,7 @@ def document_inputs(artifact):
             item.update(dataset={'valueRef': value['derivedId']}, kind='ORDERED')
         else:
             continue
+        if item['kind'] in ('ORDERED', 'TABULAR'):
+            item['rowAccess'] = 'rows 每行为 {rowRef,values,valueStates,metadata?}；按 row.values[column.name] 读取，不用位置或 row.value。'
         results.append(item)
     return results

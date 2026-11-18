@@ -19,7 +19,8 @@ from ...types import ReplyFinishedReason
 from .._bus_ops import publish_session_event
 from ..message_bus import MessageBusKeys
 from ..storage._model._message_queue import MessageQueueRecord, QueuedMessage
-from ._session import SessionService, SessionStatus
+from ..storage._session_summary import SessionSummary
+from ._session import SessionStatus
 
 
 class MessageQueueService:
@@ -73,13 +74,15 @@ class MessageQueueService:
 
     async def ensure_session(self, user_id, agent_id, session_id):
         await self.access.resolve_agent(user_id, agent_id)
-        session = await self.storage.get_session(user_id, agent_id, session_id)
-        if session is None:
+        summary = await self.storage.get_session_summary(
+            user_id, agent_id, session_id,
+        )
+        if summary is None:
             raise HTTPException(404, "Session not found.")
-        return session
+        return summary
 
     async def read(self, user_id, agent_id, session_id):
-        session = await self.ensure_session(user_id, agent_id, session_id)
+        summary = await self.ensure_session(user_id, agent_id, session_id)
         queue = await self.storage.get_message_queue(user_id, session_id)
         if queue is not None:
             return queue
@@ -89,7 +92,7 @@ class MessageQueueService:
         if await self.bus.is_locked(MessageBusKeys.session_lock(session_id)):
             queue.activity = "running"
         else:
-            self._park(queue, session)
+            self._park(queue, await self._waiting_reason(summary))
         return queue
 
     async def _change(self, initial, mutate):
@@ -346,17 +349,36 @@ class MessageQueueService:
 
         return await self._change(initial, apply)
 
-    @staticmethod
-    def _park(queue, session):
-        status = SessionService.derive_parked_status(session.state.context)
+    async def _waiting_reason(
+        self, summary: SessionSummary, *, discard_background: bool = False,
+    ) -> str | None:
+        if (
+            summary.parked_status == SessionStatus.IDLE
+            and summary.has_background_tools is None
+            and not discard_background
+        ):
+            # Legacy summaries can identify parked tool calls but do not
+            # record whether background tools still need to finish.
+            record = summary.session
+            summary = await self.storage.get_session_summary(
+                record.user_id, record.agent_id, record.id, refresh_legacy=True,
+            )
+            if summary is None:
+                return None
         reason = {
             SessionStatus.AWAITING_PERMISSION: "permission",
             SessionStatus.AWAITING_EXTERNAL_RESULT: "external",
-        }.get(status)
-        if not reason and session.state.middle_context.get(
-            "background_tools_v1"
+        }.get(summary.parked_status)
+        if (
+            not reason
+            and summary.has_background_tools
+            and not discard_background
         ):
-            reason = "background"
+            return "background"
+        return reason
+
+    @staticmethod
+    def _park(queue, reason):
         if reason:
             queue.activity, queue.waiting_reason = "waiting", reason
         return bool(reason)
@@ -369,7 +391,7 @@ class MessageQueueService:
         ):
             return
         if (
-            await self.storage.get_session(
+            await self.storage.get_session_summary(
                 snapshot.user_id, snapshot.agent_id, sid
             )
             is None
@@ -452,15 +474,29 @@ class MessageQueueService:
         initial = initial or MessageQueueRecord(
             id=session_id, user_id=user_id, agent_id=agent_id
         )
-        session = await self.storage.get_session(user_id, agent_id, session_id)
-        if session is None:
+        summary = await self.storage.get_session_summary(
+            user_id, agent_id, session_id,
+        )
+        if summary is None:
             yield None
             return
-        discard_background = (
-            consume_queue or submission is not None
-        ) and initial.discard_background
+        admit_input = consume_queue or submission is not None
+        discard_background = admit_input and initial.discard_background
+        session = None
         if discard_background:
+            session = await self.storage.get_session(
+                user_id, agent_id, session_id,
+            )
+            if session is None:
+                yield None
+                return
             session.state.middle_context.pop("background_tools_v1", None)
+        waiting_reason = (
+            await self._waiting_reason(
+                summary, discard_background=discard_background,
+            )
+            if admit_input else None
+        )
         claimed = [None]
         disposition = ["started"]
 
@@ -480,7 +516,9 @@ class MessageQueueService:
                 item = QueuedMessage(
                     message=input_msg, sequence=queue.next_sequence
                 )
-                if not self.can_start(queue) or self._park(queue, session):
+                if not self.can_start(queue) or self._park(
+                    queue, waiting_reason,
+                ):
                     if len(queue.items) >= 100:
                         raise HTTPException(
                             409, "Queue is full (100 messages)."
@@ -505,7 +543,7 @@ class MessageQueueService:
                     or not queue.items
                 ):
                     return
-                if self._park(queue, session):
+                if self._park(queue, waiting_reason):
                     return
                 item = queue.items.pop(0)
                 queue.active_id = item.message.id
@@ -550,8 +588,8 @@ class MessageQueueService:
             ).isoformat()
         failed = False
         try:
-            if consume_queue or submission is not None:
-                if discard_background:
+            if admit_input:
+                if session is not None:
                     await self.storage.update_session_state(
                         user_id, agent_id, session_id, session.state
                     )
@@ -584,10 +622,10 @@ class MessageQueueService:
 
     async def settle(self, initial, failed=False):
         """Persist a whole-run boundary before releasing the execution lock."""
-        session = await self.storage.get_session(
+        summary = await self.storage.get_session_summary(
             initial.user_id, initial.agent_id, initial.id
         )
-        if session is None:
+        if summary is None:
             return
         messages, _ = await self.storage.list_messages(
             initial.user_id, initial.id, limit=5
@@ -598,18 +636,18 @@ class MessageQueueService:
         background = bool(
             await self.bus.registry_getall(MessageBusKeys.bg_tasks(initial.id))
         )
+        terminal_failure = reply is not None and reply.finished_reason in (
+            ReplyFinishedReason.ERROR,
+            ReplyFinishedReason.INTERRUPTED,
+            ReplyFinishedReason.EXCEED_MAX_ITERS,
+        )
+        waiting_reason = (
+            await self._waiting_reason(summary)
+            if not failed and not terminal_failure else None
+        )
 
         def finish(queue):
-            terminal_failure = reply and reply.finished_reason in (
-                ReplyFinishedReason.ERROR,
-                ReplyFinishedReason.INTERRUPTED,
-                ReplyFinishedReason.EXCEED_MAX_ITERS,
-            )
-            if (
-                not failed
-                and not terminal_failure
-                and self._park(queue, session)
-            ):
+            if self._park(queue, waiting_reason):
                 return
             if (
                 failed

@@ -3,6 +3,7 @@ import { useCallback } from 'react';
 
 import { sessionApi } from '../api';
 import type { SessionView, CreateSessionRequest, UpdateSessionRequest } from '../api';
+import { getAuthSignal } from '../api/auth-state';
 
 /** Stable empty list, so `sessions` keeps its identity between renders. */
 const NO_SESSIONS: SessionView[] = [];
@@ -39,7 +40,7 @@ export function useSessions(agentId: string | null) {
 		refetch: runRefetch,
 	} = useQuery({
 		queryKey: [...SESSIONS_KEY, agentId],
-		queryFn: () => sessionApi.list(agentId as string).then((res) => res.sessions),
+		queryFn: ({ signal }) => sessionApi.list(agentId as string, signal).then((res) => res.sessions),
 		enabled: agentId !== null,
 		// This list carries `is_running` and team membership, both of
 		// which move underneath the page. Sharing one copy between the
@@ -69,14 +70,32 @@ export function useSessions(agentId: string | null) {
 		return result.data ?? NO_SESSIONS;
 	}, [runRefetch]);
 
-	/** Creates a new session and refreshes the list. */
+	/** Make the new session available immediately, then reconcile its list. */
 	const create = useCallback(
 		async (body: CreateSessionRequest) => {
+			const authSignal = getAuthSignal();
 			const res = await sessionApi.create(body);
-			await invalidate();
+			authSignal.throwIfAborted();
+			const queryKey = [...SESSIONS_KEY, body.agent_id];
+			const target = { queryKey, exact: true };
+			// A list read started before the POST may omit the new session.
+			await queryClient.cancelQueries(target);
+			authSignal.throwIfAborted();
+			const view = res.view;
+			if (view) {
+				queryClient.setQueryData<SessionView[]>(queryKey, (current = NO_SESSIONS) => [
+					view,
+					...current.filter((item) => item.session.id !== view.session.id),
+				]);
+				void queryClient.invalidateQueries(target);
+			} else {
+				// Older servers only send the ID. Load the view before opening it.
+				await queryClient.invalidateQueries(target);
+				authSignal.throwIfAborted();
+			}
 			return res;
 		},
-		[invalidate],
+		[queryClient],
 	);
 
 	/** Updates a session's model config and refreshes the list. */

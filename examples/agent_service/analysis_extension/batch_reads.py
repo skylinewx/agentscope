@@ -9,7 +9,7 @@ MAX_REQUESTS = 12
 MAX_CHARS = 24000
 MAX_PAGES = 100
 CAPTURE_SECTIONS = ('materials', 'inventory', 'entities', 'selectors', 'capture', 'receipt', 'rows', 'gridFiles')
-ANALYSIS_SECTIONS = ('facts', 'derived', 'formulas', 'summary', 'claims', 'verificationRecords', 'relations', 'order', 'products')
+ANALYSIS_SECTIONS = ('facts', 'derived', 'formulas', 'summary', 'claims', 'verificationRecords', 'relations', 'order', 'products', 'inputFields')
 
 
 def validate_inspect_requests(requests):
@@ -18,7 +18,7 @@ def validate_inspect_requests(requests):
         if not isinstance(request, dict):
             continue
         section = request.get('section')
-        required = ('captureRef',) if section in CAPTURE_SECTIONS else ('analysisRef',) if section in ANALYSIS_SECTIONS else (
+        required = ('inputSetRef', 'analysisRef') if section == 'inputFields' else ('captureRef',) if section in CAPTURE_SECTIONS else ('analysisRef',) if section in ANALYSIS_SECTIONS else (
             ('pythonRunRef', 'analysisRef') if section == 'python' else ())
         if not required or not any(request.get(key) for key in required):
             raise AnalysisError('READ_SCOPE_REQUIRED', '批量项须选择按实际引用读取的 section，并提供该区段需要的引用。',
@@ -44,7 +44,7 @@ async def read_batch(requests, all_pages, reader, *, allowed_fields):
     for index, request in enumerate(requests):
         if not isinstance(request, dict) or not request or set(request) - allowed_fields:
             raise AnalysisError('INVALID_READ_BATCH', '批量项只接受本工具的单次读取参数。', {'requestIndex': index})
-        if not request.get('captureRef') and not request.get('analysisRef') and not request.get('pythonRunRef'):
+        if not request.get('captureRef') and not request.get('analysisRef') and not request.get('pythonRunRef') and not request.get('inputSetRef'):
             raise AnalysisError('READ_SCOPE_REQUIRED', '批量读取须明确 captureRef、analysisRef 或 pythonRunRef，不自动扫描会话历史。',
                                 {'requestIndex': index})
     # 为每项预留额度，避免第一项大资料挤掉后续对象；预算只控制模型投影。

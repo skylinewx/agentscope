@@ -47,6 +47,7 @@ class GroupingRecoveryTests(PresentationCase):
         receipt['data'] = {}
         capture['response']['content'][0]['text'] = json.dumps(receipt)
         remember_grouping(turn, capture)
+        turn.state['selectedGroupingCaptureRefs'] = ['failed']
         requirement, = grouping_requirements(turn)
         self.assertTrue(requirement['required'])
         self.assertEqual(requirement['status'], 'UNRESOLVED')
@@ -102,8 +103,10 @@ class GroupingRecoveryTests(PresentationCase):
         turn.state['adoptedInputs'] = [{'role': 'PRIMARY', 'selection': selections[0]}]
         self.assertTrue(all(not row['required'] for row in grouping_requirements(turn)))
         self.assertEqual(grouping_issues(turn, {'captureRefs': [actual]}), [])
-        # Explicitly requesting this grouping still requires its native result.
+        # A label alone cannot turn an unadopted failed route into a requirement.
         turn.task(mode='ANALYSIS', goal='按组织机构聚合', intent={'grouping': '组织机构'})
+        self.assertEqual(grouping_issues(turn, {'captureRefs': [actual]}), [])
+        turn.state['selectedGroupingCaptureRefs'] = ['failed']
         self.assertEqual(grouping_issues(turn, {'captureRefs': [actual]})[0]['code'], 'GROUPING_RESULT_REQUIRED')
 
     def test_clearing_or_replacing_grouping_clears_old_discovery_selection(self):
@@ -117,6 +120,8 @@ class GroupingRecoveryTests(PresentationCase):
         self.assertTrue(all(not item['required'] for item in grouping_requirements(turn)))
         turn.task(mode='ANALYSIS', goal='按分类一分析', groupingCaptureRefs=[first])
         turn.task(mode='ANALYSIS', goal='改为分类二', intent={'grouping': '分类二'})
+        self.assertTrue(all(not item['required'] for item in grouping_requirements(turn)))
+        turn.task(mode='ANALYSIS', goal='按选定分类二分析', groupingCaptureRefs=[second])
         self.assertEqual([item['captureRef'] for item in grouping_requirements(turn) if item['required']], [second])
 
     def test_two_required_groupings_are_not_satisfied_by_only_one(self):
@@ -227,10 +232,11 @@ class GroupingRecoveryTests(PresentationCase):
         facts = [{'factId': 'f'+str(index), 'value': str(index), 'headers': ['x' * 300 + str(index)]} for index in range(30)]
         payload = {'userRequest': '分析全部', 'facts': facts, 'relations': [],
                    'derived': [{'derivedId': 'd1', 'inputRefs': ['f0', 'f29'], 'value': '29'}]}
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 2000):
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=2000):
             from analysis_extension.review_encoding import unpack_review_records
             encoded = analysis_review_payloads(payload)
-            parts = [unpack_review_records(json.loads(text)) for text in encoded]
+            from analysis_extension.review_request import review_material
+            parts = [unpack_review_records(review_material(text)) for text in encoded]
         self.assertGreater(len(parts), 1)
         self.assertTrue(all(len(text) <= 2000 for text in encoded))
         self.assertEqual({fact['factId'] for part in parts for fact in part['facts']}, {fact['factId'] for fact in facts})

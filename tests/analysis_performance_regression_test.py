@@ -31,22 +31,23 @@ class ReviewPerformanceTests(PresentationCase):
     async def test_repaired_preview_confirmation_reuses_document_after_background_restore(self):
         artifact, turn = await self.artifact(), self.turn()
         stale = deepcopy(turn.state)
-        verdicts = [{'issues': [{'severity': 'BLOCKING', 'code': 'ANSWER_MISMATCH',
-                                'message': '结论与计算矛盾'}]}, {'issues': []}]
+        verdicts = [with_coverage({'issues': [{'severity': 'BLOCKING', 'code': 'ANSWER_MISMATCH',
+                                'message': '结论与计算矛盾'}]}), with_coverage({'issues': []})]
         with patch('analysis_extension.turn_completion._model_review', AsyncMock(side_effect=verdicts)) as model:
             await review_answer(None, turn, artifact, '')
             artifact['freeDocument']['html'] += '<p>已根据实际计算更正结论。</p>'
             await review_answer(None, turn, artifact, '')
             resumed = self.turn(state=stale)
             result = await review_answer(None, resumed, artifact, '')
-            self.assertEqual(result, {'issues': []})
+            self.assertEqual(result['issues'], [])
+            self.assertTrue(result['coverage'])
             self.assertEqual(model.await_count, 2)
             self.assertEqual(resumed.state['analysisReviewAttempts'][-1]['cacheScope'], 'DOCUMENT')
             self.assertEqual(resumed.state['analysisReviewTotals']['chargedAttempts'], 2)
 
     async def test_style_whitespace_and_edit_failure_reuse_business_review(self):
         artifact, turn = await self.artifact(), self.turn()
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             await review_answer(None, turn, artifact, '')
             changed = deepcopy(artifact)
             changed['freeDocument']['html'] = changed['freeDocument']['html'].replace(
@@ -58,7 +59,7 @@ class ReviewPerformanceTests(PresentationCase):
 
     async def test_values_units_scope_bindings_text_and_source_failure_invalidate_review(self):
         artifact = await self.artifact()
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             await review_answer(None, self.turn(), artifact, '')
             for kind in ('value', 'unit', 'scope', 'binding', 'dataset', 'text', 'source_failure'):
                 changed, turn = deepcopy(artifact), self.turn()
@@ -80,7 +81,7 @@ class ReviewPerformanceTests(PresentationCase):
 
     async def test_repaired_order_marker_keeps_review_without_hiding_business_failure(self):
         artifact, turn = await self.artifact(), self.turn()
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             await review_answer(None, turn, artifact, '')
             changed = deepcopy(artifact)
             changed['freeDocument']['html'] = changed['freeDocument']['html'].replace(
@@ -97,7 +98,7 @@ class ReviewPerformanceTests(PresentationCase):
     async def test_style_preview_still_checks_rendering_and_binding(self):
         request, turn = await self.request(), self.turn()
         self.service.preview_reviewer = lambda artifact: review_answer(None, turn, artifact, '')
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model, \
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model, \
                 patch.object(self.service, '_automatic_preview_checks', wraps=self.service._automatic_preview_checks) as checks:
             await self.service.publish(**request, previewOnly=True)
             request['requestKey'] += '-style'
@@ -109,7 +110,7 @@ class ReviewPerformanceTests(PresentationCase):
     async def test_background_review_metrics_survive_stale_session_state(self):
         artifact, turn = await self.artifact(), self.turn()
         stale = deepcopy(turn.state)
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             await review_answer(None, turn, artifact, '')
             resumed = self.turn(state=stale)
             await review_answer(None, resumed, artifact, '')
@@ -128,7 +129,7 @@ class ReviewPerformanceTests(PresentationCase):
     async def test_new_final_claim_is_reviewed_but_registered_entry_is_reused(self):
         artifact, turn = await self.artifact(), self.turn()
         turn.state['delivery'] = {'registered': True, 'markdown': '[查看分析](./approved)'}
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             await review_answer(None, turn, artifact, '')
             await review_answer(None, turn, artifact, turn.state['delivery']['markdown'])
             self.assertEqual(model.await_count, 1)
@@ -222,7 +223,7 @@ class PublicationLoopTests(PresentationCase):
         self.service.preview_reviewer = lambda artifact: review_answer(None, turn, artifact, '')
         middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize)
         middleware.service = self.service
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})):
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))):
             await self.generic_result(turn)
         self.assertEqual(middleware._approved_delivery(), turn.state['delivery']['markdown'])
         turn.state['queryIntent'] = {'population': 'new scope'}
@@ -292,7 +293,7 @@ class PublicationLoopTests(PresentationCase):
         toolkit = Toolkit(tools=await middleware.list_tools())
         async def review(*args):
             await gate.wait()
-            return {'issues': []}
+            return with_coverage({'issues': []})
         with patch('analysis_extension.turn_completion._model_review', side_effect=review) as reviewer:
             first = [event async for event in agent().reply_stream(None, yield_final_msg=True)]
             ending = next(event for event in first if isinstance(event, ReplyEndEvent))
@@ -303,7 +304,7 @@ class PublicationLoopTests(PresentationCase):
             gate.set()
             await asyncio.wait_for(done.wait(), 10)
             proof = progress(middleware.service.turn)['lastPublicationPreview']
-            model.set_responses([call('AnalysisPublish', analysisRef=artifact['analysisRef'], repairRef=proof['previewRef'], repairs=[], requestKey='confirm-' + proof['previewRef'])])
+            model.set_responses([call('AnalysisPublish', repairRef=proof['previewRef'], repairs=[], requestKey='confirm-' + proof['previewRef'])])
             state = AgentState.model_validate(saved_state)
             middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize,
                                             rules=self.service.rules, delivery=self.service.delivery)
@@ -319,3 +320,5 @@ class PublicationLoopTests(PresentationCase):
             self.assertEqual(reviewer.await_count, 1)
             delivered = [event.get_text_content() for event in second if isinstance(event, Msg)]
             self.assertEqual(delivered, [middleware.service.turn.state['delivery']['markdown']])
+
+from analysis_review_fixtures import with_coverage

@@ -40,6 +40,12 @@ def numeric_coverage(observations):
 
 
 def evaluate(document, observations):
+    # Text is stored separately by the owning preview endpoint, after checking
+    # its document identity. Diagnostics never certify an uploaded text as DOM.
+    if isinstance(observations, dict) and 'hostRenderedText' in observations:
+        from .render_evidence import validate_snapshot
+        validate_snapshot(observations['hostRenderedText'])
+        observations = {key: value for key, value in observations.items() if key != 'hostRenderedText'}
     expected = {'version', 'viewport', 'pageOverflow', 'overflow', 'overlaps', 'smallText', 'clippedText', 'orders', 'errors', 'truncated', 'numericChecks'}
     if isinstance(observations, dict) and observations.get('version') == 4:
         expected.add('valueCoverage')
@@ -86,7 +92,8 @@ def evaluate(document, observations):
             orders.append({'key': item['key'], 'status': 'UNSUPPORTED_MARKER', 'partial': item['partial']})
             continue
         seen.add(item['key'])
-        expected = [row['factRef'] for row in dataset['rows']]
+        from .business_dataset import row_values
+        expected = [row_values(row, dataset.get('columns', []))['factRef'] for row in dataset['rows']]
         selected = set(item['refs'])
         subsequence = [ref for ref in expected if ref in selected]
         correct = item['refs'] == (subsequence if item['partial'] else expected)
@@ -128,12 +135,24 @@ def require_publication_checks(document, records, unavailable_reason=None, requi
         identities.update(reference(document, {'valueKey': key}) for key in
                           set(document.get('staticBindingKeys', [])) & set(document.get('numericBindingKeys', [])))
     current = [record.get('valueCoverage') for record in records]
+    from .document_coverage import required_formula_steps
+    expected_formula_steps=required_formula_steps(document)
+    formula_checks = [item for item in current if item is not None]
+    if records and expected_formula_steps and not any(
+            item['complete'] and expected_formula_steps<=set(item['charted']) for item in formula_checks):
+        missing = min((expected_formula_steps-set(item['charted']) for item in formula_checks),key=len,
+                      default=expected_formula_steps)
+        raise AnalysisError('DOCUMENT_FORMULA_COVERAGE_MISSING', '已采用的多项公式构成尚未完整绑定为瀑布图。',
+                            {'missingFormulaSteps': sorted(missing), 'requiresBuild': False,
+                             'hint': '保留现有模板及全部公式项，仅补齐对应节点的 waterfall.steps 绑定；科目表或企业比较图不能替代本次公式瀑布。下层允许放在可展开区域。'})
     if current and all(item is not None for item in current):
         identities.update(ref for item in current for ref in item['charted'])
         if not any(item['complete'] and identities <= set(item['presented']) for item in current):
+            missing = min((identities - set(item['presented']) for item in current), key=len)
             raise AnalysisError('DOCUMENT_CHECK_COVERAGE_LOST', '原数值可改用图形、精确标签或表格，但仍须在实测页面完整表达。',
                                 {'path': '/document/html', 'requiredValueRefs': sorted(identities),
-                                 'hint': '保留实际图形的绑定；替换为标签时用 analysisCharts.bindValueLabel，或保留带 data-analysis-ref 的精确明细行。无需维持旧条形数量。'})
+                                 'missingValueRefs': sorted(missing),
+                                 'hint': '只修复 missingValueRefs 所列的实际缺失项，requiredValueRefs 是完整要求，并非全部缺失。保留实际图形的绑定；替换为标签时用 analysisCharts.bindValueLabel，或保留带 data-analysis-ref 的精确明细行。无需维持旧条形数量。'})
         # v4 checks actual data identities, including replacements, instead of
         # perpetuating the number of geometric elements in the first draft.
         requirements = {}

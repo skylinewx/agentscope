@@ -113,6 +113,20 @@ class FormulaBindingTests(TestCase):
         self.assertIn('<p>差额 0.00 元</p>',
                       visible_markup(compile_document(artifact, self.document('localAbsoluteDifference'))['html']))
 
+    def test_review_projection_keeps_formula_layers_and_operand_rules(self):
+        from copy import deepcopy
+        from analysis_extension.review_revision import formula_review_trace
+        trace = self.artifact(missing=False)['derivedValues'][0]['formulaTrace']
+        before = deepcopy(trace)
+        projected = formula_review_trace(trace)
+        self.assertEqual(projected['targetFactRef'], trace['targetFactRef'])
+        self.assertEqual(len(projected['nodes']), len(trace['nodes']))
+        for original, visible in zip(trace['nodes'], projected['nodes']):
+            for key in ('factRef', 'headers', 'expression', 'dependencies', 'localCheck', 'valueState'):
+                if key in original:
+                    self.assertEqual(visible[key], original[key])
+        self.assertEqual(trace, before)
+
     def test_source_null_and_missing_unit_are_preserved(self):
         artifact = self.artifact()
         document = self.document('value', valueRef='cost')

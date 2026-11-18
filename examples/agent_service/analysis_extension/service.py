@@ -15,6 +15,7 @@ from .validation import public_states, summary, validate_claims, validate_views
 from . import findings
 from .actions import ACTION_CHECKS, ActionRuntime, proposals, validate_plan, source_identity
 from .python_libraries import capability as python_capability
+from .execution_resources import PYTHON_DEFAULT_TIMEOUT_SECONDS, PYTHON_MAX_TIMEOUT_SECONDS
 
 
 def verification(facts, captures, verifier_refs=None, sources=None):
@@ -26,11 +27,13 @@ def compact_derived(values, limit=100, analysis_ref=None):
     result = []
     payload_budget = 12000
     for value in values:
-        compact = dict(value)
+        from .business_dataset import project
+        compact = project(value)
+        compact.pop('reviewInputRefs', None)  # Host invalidation dependencies are not model-authored lineage.
         if value.get('outputKind') in ('TABLE', 'CHART_DATA', 'DIAGNOSTIC', 'FILE'):
             # 小产物直接返回，避免刚算完又逐项 Inspect；大产物仍保持可恢复的完整引用。
             from .query_results import encode
-            payload = {field: value[field] for field in ('rows', 'data', 'text') if field in value}
+            payload = {field: compact[field] for field in ('rows', 'data', 'text') if field in compact}
             size = len(encode(payload))
             complete = size <= min(6000, payload_budget)
             if complete:
@@ -103,26 +106,54 @@ class AnalysisService:
         self.turn = None
         self.web_ui_url = None
         self.preview_reviewer = None
-        self.requirement_resolver = None
+        self.material_reviewer = None
         self.verification_runner = None
         from .budget_preparation import BudgetPreparation
         self.budget_preparation = BudgetPreparation(self)
         self._evidence_cache = {}
+        from .review_budget import ReviewBudgetConfig
+        self.review_budget = ReviewBudgetConfig.from_environment()
+        import os
+        from dataclasses import replace
+        for env, field, label in (
+            ('ANALYSIS_REVIEW_TOTAL_SECONDS', 'review_budget_seconds', '审核总时限'),
+            ('ANALYSIS_REPAIR_TOTAL_SECONDS', 'repair_budget_seconds', '自动补做总时限'),
+        ):
+            if env in os.environ:
+                try:
+                    seconds = int(os.environ[env])
+                    if seconds <= 0:
+                        raise ValueError('non-positive time budget')
+                except ValueError as error:
+                    raise AnalysisError('REVIEW_CONFIG', f'{label}必须是正整数。') from error
+                self.store.limits = replace(self.store.limits, **{field: seconds})
 
     async def task(self, **kwargs):
         await self.authorize()
+        if kwargs.get('action') == 'prepare_inputs':
+            from .prepared_inputs import prepare_input_set
+            return await prepare_input_set(self, **{key: value for key, value in kwargs.items() if key != 'action'})
         if self.turn is None:
             raise AnalysisError('NO_ACTIVE_USER_TURN', '当前没有可登记的真实用户轮。')
         from . import source_views
         if kwargs.get('action') == 'sources':
             return source_views.directory(self.turn, kwargs.get('search'), kwargs.get('offset', 0),
                                           kwargs.get('limit', 6), kwargs.get('contextRefs'))
+        if 'contextRefs' in kwargs:
+            raise AnalysisError('INVALID_TASK_ARGUMENT',
+                '顶层 contextRefs 只用于 action=sources；声明沿用或综合历史上下文请使用 context.contextRefs。',
+                {'path': '/contextRefs', 'expectedPath': '/context/contextRefs'})
         if 'subjectFilter' in kwargs or any(key in (kwargs.get('context') or {}) for key in ('changedFields', 'changedDimensions')):
             raise AnalysisError('TASK_CONTRACT_CHANGED', '数值筛选放在查询 valueFilter；条件变更使用 intent 或 scopeEdits，不再申报旧变化标记。')
         choices = kwargs.pop('subjectSources', None)
         scope_edits = kwargs.pop('scopeEdits', None)
+        report_ref = kwargs.pop('analysisRef', None)
+        if report_ref and (kwargs.get('action', 'declare') != 'declare' or choices is not None or scope_edits):
+            raise AnalysisError('INVALID_REPORT_REUSE', '复用原报告时在 declare 中仅用 analysisRef 选择完整输入；不要同时选择部分 subjectSources 或改范围。')
+        report_artifact = self.store.get_analysis(self.owner, report_ref) if report_ref else None
+        from .material_plan import needs_formulas
         subjects = kwargs.pop('formulaSubjects', None)
-        if subjects is not None and (kwargs.get('action', 'declare') != 'declare' or kwargs.get('requiredEvidence') != 'FORMULAS'
+        if subjects is not None and (kwargs.get('action', 'declare') != 'declare' or not needs_formulas({'materials': kwargs.get('materials', self.turn.state.get('materials', []))})
                                      or kwargs.get('mode') not in ('ANALYSIS', 'REPORT')):
             raise AnalysisError('INVALID_FORMULA_SUBJECTS', '按主体准备表展开适用于声明 FORMULAS 的数据分析。')
         turn = self.turn
@@ -130,8 +161,7 @@ class AnalysisService:
             # The host owns the actual user utterance. Models declare changes, not a duplicate quote.
             kwargs['context'] = {**kwargs['context'], 'userQuote': turn.state['request']}
         assessment = None
-        if (kwargs.get('action', 'declare') == 'declare' and kwargs.get('mode') in ('ANALYSIS', 'REPORT')
-                and self.requirement_resolver is not None):
+        if kwargs.get('action', 'declare') == 'declare' and (kwargs.get('mode') in ('ANALYSIS', 'REPORT') or 'investigations' in kwargs):
             from .analysis_requirements import prepare
             kwargs, assessment = await prepare(self, turn, kwargs)
         if self.turn is not turn:
@@ -142,7 +172,9 @@ class AnalysisService:
         if kwargs.get('action', 'declare') == 'declare':
             from .scope_changes import apply_scope_edits
             apply_scope_edits(staged, scope_edits)
-            if choices is not None:
+            if report_artifact is not None:
+                result['reusedAnalysis'] = source_views.adopt_analysis(staged, report_artifact)
+            elif choices is not None:
                 source_views.install(staged, source_views.select(staged, choices))
             elif (staged.state.get('followupContext', {}).get('mode') == 'NEW'
                   and (turn.state.get('followupContext', {}).get('mode') != 'NEW'
@@ -198,7 +230,7 @@ class AnalysisService:
             turn.state['analysisRequirement'] = assessment
             result['analysisRequirement'] = deepcopy(assessment)
         if kwargs.get('action', 'declare') == 'declare':
-            result['requiredEvidence'] = turn.state.get('requiredEvidence', 'VALUES')
+            result['materials'] = deepcopy(turn.state['materials'])
         if subjects is not None:
             from .input_state import snapshot, require_unchanged
             input_state = snapshot(self)
@@ -219,11 +251,35 @@ class AnalysisService:
                 'next': ('构建时选择本题的总体数据或已准备目标回执，宿主自动附上各对象的公式材料；额外统计放在 operations。'
                          if all('selection' in item for item in records) else
                          '已登记各预期主体及缺口。仅补失败目标；提交后续实际回执构建时，宿主会重新核对并更新准备状态。')}
+        if report_artifact is None and subjects is None and kwargs.get('action', 'declare') == 'declare' and needs_formulas(turn.state) and turn.state.get('adoptedInputs'):
+            result['preparedFormulaInputs'] = await self.budget_preparation.prepare_selected(turn)
+        if report_artifact is not None:
+            # The full input set stays in state; avoid 100+ metric references in
+            # the model reply when one explicit report reference selected them.
+            result.pop('subjectSources', None)
         return result
 
     async def python(self, **kwargs):
         from .python_analysis import analyze
-        return await analyze(self, **kwargs)
+        result = await analyze(self, **kwargs)
+        if result.get('analysisRef'):
+            self._record_completed_build(result['analysisRef'])
+        return result
+
+    def _record_completed_build(self, analysis_ref):
+        """Successful computation registration survives background continuations.
+
+        Do not depend on the model session having observed every intermediate
+        revision; ownership and turn identity remain the store boundary.
+        """
+        if self.turn is None:
+            return
+        from .review_control import turn_key
+        def record(state):
+            refs = state.setdefault('completedBuildRefs', [])
+            if analysis_ref not in refs:
+                refs.append(analysis_ref)
+        self.store.turn_progress(self.owner, turn_key(self.turn), record)
 
     async def read_query_result(self, captureRef=None, pointer='', offset=0, limit=20, search=None, fields=None,
                                 requests=None, allPages=False, tableRef=None, columns=None, filters=None, cursor=None):
@@ -275,9 +331,19 @@ class AnalysisService:
         return read_receipt(receipt, captureRef, pointer, offset, limit, search, fields, tableRef, columns, filters, cursor)
 
     async def build(self, captureRefs=None, selections=None, scope=None, operations=None, requestKey=None,
-                    baseAnalysisRef=None, actionRunRef=None, workPlan=None):
+                    baseAnalysisRef=None, actionRunRef=None, workPlan=None, inputSetRef=None):
         started = perf_counter()
         await self.authorize()
+        if inputSetRef is not None:
+            from .prepared_inputs import task_basis
+            prepared = self.store.get_input_set(self.owner, inputSetRef)
+            if any(value is not None for value in (captureRefs, selections, scope, baseAnalysisRef)):
+                raise AnalysisError('INPUT_SET_SELECTION', 'inputSetRef 与手工来源或续建引用二选一。')
+            if prepared['taskBasis'] != task_basis(self):
+                raise AnalysisError('STALE_INPUT_SET', '任务条件已变化，原输入集合保留，请重新准备。')
+            baseAnalysisRef = prepared['analysisRef']
+            if not baseAnalysisRef:
+                raise AnalysisError('INPUT_SET_SELECTION', '纯文件集合用于 Python；原生预算运算需要已确认的业务事实。')
         from .input_state import snapshot, require_unchanged, validate_analysis
         input_state = snapshot(self)
         adopted = self.turn.state.get('adoptedInputs', []) if self.turn else []
@@ -313,6 +379,8 @@ class AnalysisService:
         if adopted:
             request['inputSetVersion'] = self.turn.state['inputSetVersion']
         from .native_analysis import CAPABILITY_VERSION
+        from .numeric_policy import NUMERIC_POLICY
+        request['numericPolicyVersion'] = NUMERIC_POLICY
         request['capabilityVersion'] = CAPABILITY_VERSION
         request['workPlan'] = deepcopy([] if workPlan is None else workPlan)
         if actionRunRef:
@@ -323,6 +391,7 @@ class AnalysisService:
             if self.turn is not None:
                 from .followup_scope import validate_primary
                 validate_primary(self.turn, artifact)
+            self._record_completed_build(artifact['analysisRef'])
             return self._built(artifact)
         # 同一用户轮的后续构建延续已有工作目标；幂等检查使用调用方原始参数。
         implicit_base = baseAnalysisRef is None and self.turn is not None
@@ -381,6 +450,8 @@ class AnalysisService:
             data = adapt_inputs(self.sources, captures, selections, scope, self.store.limits.max_facts)
         else:
             data = self.sources.adapt(captures, selections, scope, self.store.limits.max_facts)
+        from .business_records import annotate_records
+        annotate_records(data['facts'])
         adapted = perf_counter()
         from .validation import validate_report_topics
         validate_report_topics(data)
@@ -408,10 +479,17 @@ class AnalysisService:
         if actionRunRef:
             validate_plan(self.store, self.owner, actionRunRef, data, captures, baseAnalysisRef, verified == "VALID")
         operations = add_checks(operations, formula_targets, data['facts'], data['scope'])
+        if operations:
+            from .execution_policy import require
+            require(self.turn, 'computations', 'AnalysisBuild')
         if len(operations) > self.store.limits.max_operations:
             raise AnalysisError('PLAN_LIMIT', '包含目标公式检查后的分析计划超过本次容量上限。')
         failure_cache = self.turn.state.setdefault('operationInputFailures', {}) if self.turn is not None else None
         derived = calculate(data["facts"], data["scope"], operations, self.rules, data["relations"], failure_cache=failure_cache)
+        if operations:
+            from .execution_policy import record
+            record(self.turn, 'NATIVE_CALCULATION', requestKey, operators=[item['operator'] for item in operations],
+                   status='COMPLETED', resultRefs=[item['derivedId'] for item in derived])
         if formula_targets:
             from .prepared_inputs import formula_work
             from .budget_preparation import formula_fact_links
@@ -450,11 +528,12 @@ class AnalysisService:
                 if value.get('operator') != 'PYTHON':
                     continue
                 changed_inputs = []
-                for ref in value['inputRefs']:
+                for ref in value.get('reviewInputRefs', value['inputRefs']):
                     if ref not in known or ref not in old_known:
                         changed_inputs.append({'inputRef': ref, 'missing': True})
                         continue
-                    current_input, previous_input = input_record(ref, known[ref]), input_record(ref, old_known[ref])
+                    current_input = input_record(ref, known[ref], data['facts'])
+                    previous_input = input_record(ref, old_known[ref], base['facts'])
                     fields = sorted(key for key in current_input.keys() | previous_input.keys()
                                     if current_input.get(key) != previous_input.get(key))
                     if fields:
@@ -486,7 +565,15 @@ class AnalysisService:
             from .grouping_policy import grouping_requirements
             artifact['declaredGoals'] = deepcopy(self.turn.state.get('declaredGoals', []))
             artifact['groupingRequirements'] = deepcopy(grouping_requirements(self.turn, artifact))
+            from .completion_issues import context_for
+            artifact['computationIntent'] = {**context_for(self.turn),
+                'queryIntent': deepcopy(self.turn.state.get('queryIntent', {})),
+                'materials': deepcopy(self.turn.state.get('materials', []))}
         artifact["findingRules"] = self.finding_rules
+        from .completion_issues import context_for
+        completion_context = context_for(self.turn, base if baseAnalysisRef else None)
+        if completion_context is not None:
+            artifact['completionContext'] = completion_context
         artifact["findingVersion"] = findings.FINDING_VERSION
         artifact["sourceResourceIds"] = sorted({captures[ref]["resourceId"] for fact in data["facts"] for ref in fact.get("captureRefs", [])})
         artifact["sourceOrigins"] = origins
@@ -516,11 +603,15 @@ class AnalysisService:
         if baseAnalysisRef:
             from .completion import validate_target_continuity
             validate_target_continuity(base, artifact)
+            from .plan_revisions import record_revisions, prune_replaced_failures
+            record_revisions(base, artifact)
+            prune_replaced_failures(artifact)
         artifact = self.store.build(self.owner, request, artifact, requestKey, baseAnalysisRef)
         logging.getLogger(__name__).info(
             '分析构建 版本=%s 输入方式=%s 事实=%d 来源=%d 读取毫秒=%.2f 范围毫秒=%.2f 核验计算毫秒=%.2f 总耗时毫秒=%.2f',
             artifact['analysisRef'], '沿用冻结输入' if incremental else '适配来源输入', len(data['facts']), len(captures), (loaded-started)*1000,
             (adapted-loaded)*1000, (calculated-adapted)*1000, (perf_counter()-started)*1000)
+        self._record_completed_build(artifact['analysisRef'])
         return self._built(artifact)
 
     def _built(self, artifact):
@@ -548,7 +639,10 @@ class AnalysisService:
                                        if key in ('captureRef', 'stepId', 'batchId', 'returnedRowCount', 'selectedRowCount', 'missingSelectedCellCount', 'columnSelection',
                                                   'rangeSummary', 'aggregationSummary', 'aggregationExplanation')}
                                       for item in annotate(artifact['scope'].get('sourceScopes', []))]
+        from .prepared_inputs import freeze_input_set
+        prepared = freeze_input_set(self, artifact, examples=0)
         return {"schemaVersion": SCHEMA_VERSION, "analysisRef": artifact["analysisRef"],
+                'inputSetRef': prepared['inputSetRef'],
                 **({'documentDraft': self.delivery.document_draft(artifact['analysisRef'])} if self.delivery else {}),
                 **({'inputPreparation': artifact['inputPreparation']} if artifact.get('inputPreparation') else {}),
                 "revision": artifact["revision"], "scope": scope, **public_states(artifact),
@@ -556,6 +650,7 @@ class AnalysisService:
                 'resultChanges': changes, 'calculationSummary': calculation_summary,
                 'evidenceCoverage': artifact.get('evidenceCoverage'),
                 'documentInputs': document_inputs(artifact),
+                'pythonInputCatalog': prepared['pythonInputCatalog'],
                 'compositionMaterials': composition_materials(artifact),
                 'sourceContexts': artifact.get('sourceContexts', []),
                 'verificationTasks': verification_tasks[:100], 'verificationTaskCount': len(verification_tasks),
@@ -566,6 +661,11 @@ class AnalysisService:
 
     def pending_verifications(self, artifact):
         """以来源、快照、查询会话、执行和证据标识计算差集，不整批重发。"""
+        from .receipt_reads import receipt_read_scope
+        with receipt_read_scope():
+            return self._pending_verifications(artifact)
+
+    def _pending_verifications(self, artifact):
         tasks = {}
         if artifact['receiptVerification'] != 'VALID':
             captures = {ref: self.store.get_capture(self.owner, ref) for ref in artifact['captureRefs']}
@@ -628,10 +728,17 @@ class AnalysisService:
             if closeout_reason(self.turn):
                 # 到限后的最后登记只能复用精确匹配的审查，不开启新一轮模型调用。
                 from .turn_completion import document_review
-                _, verdict = document_review(self.turn, artifact)
+                key, verdict = document_review(self.turn, artifact)
                 if verdict is not None:
+                    ref = 'review_' + digest([artifact['analysisRef'], key])
+                    if self.store.get_report_review(self.owner, ref):
+                        self.turn.state['currentReportReviewRef'] = ref
+                    else:
+                        self.turn.state.pop('currentReportReviewRef', None)
                     return verdict
-                raise AnalysisError('ANALYSIS_RETRY_LIMIT', '当前内容未有可复用的审查结果，保留已有有效数据。')
+                from .turn_completion import freeze_document_review
+                freeze_document_review(self.turn, artifact)
+                raise AnalysisError('ANALYSIS_RETRY_LIMIT', '当前内容未有可复用的审查结果，已冻结原审查材料供后续继续。')
         for attempt in range(2):
             try:
                 return await self.preview_reviewer(artifact)
@@ -694,10 +801,14 @@ class AnalysisService:
         request = {'kind': 'AVAILABLE_FACTS', 'baseAnalysisRef': analysis_ref, 'reason': reason}
         draft = self.store.build(self.owner, request, draft, 'available-' + digest(request), analysis_ref)
         scope_id = draft['scope']['scopeId']
+        from .analysis_inputs import fact_roles
         references = set(draft['scope'].get('referenceMembers', []))
-        primary = [fact for fact in facts if fact.get('inputRole') != 'REFERENCE' and fact['objectId'] not in references]
-        primary_refs = {fact['factId'] for fact in primary}
-        comparison = [fact for fact in facts if fact['factId'] not in primary_refs]
+        def roles(fact):
+            if 'inputRole' not in fact and not fact.get('inputMemberships') and fact['objectId'] in references:
+                return {'REFERENCE'}
+            return fact_roles(fact)
+        primary = [fact for fact in facts if 'PRIMARY' in roles(fact)]
+        comparison = [fact for fact in facts if 'REFERENCE' in roles(fact)]
         views = []
         for name, title, selected in (('primary', '分析主体数据', primary), ('reference', '参考数据', comparison)):
             for start in range(0, len(selected), 1000):
@@ -731,8 +842,28 @@ class AnalysisService:
         if reviewed and reviewed['partialReason']:
             partial_reason += ' ' + reviewed['partialReason']
         return await self._publish_content(draft['analysisRef'], [], views, 'available-publish-' + digest(request),
-            draft['baseRevision'], unresolvedItems=[{'requirement': '完成本轮分析或报告交付', 'reason': partial_reason}],
+            draft['baseRevision'], unresolvedItems=[{'requirement': '完成本轮分析或报告交付', 'reason': partial_reason,
+                                                    'basis': {'kind': 'HOST_DELIVERY'}}],
             host_summary=reason)
+
+    async def publish_available_report(self, analysis_ref, reason):
+        """Deliver an exact saved candidate, with independent review status."""
+        await self.authorize()
+        from .report_review import choose_candidate, status_text
+        artifact = self.store.get_analysis(self.owner, analysis_ref)
+        candidate = choose_candidate(self, artifact)
+        if not candidate:
+            return None
+        saved = self.store.get_publication_proposal(self.owner, candidate['previewRef'])
+        if not saved.get('document') or saved['analysisRef'] != candidate['analysisRef']:
+            return None
+        request = {key: value for key, value in saved.items()
+                   if key not in ('requestKey', 'previewOnly', 'expectedBaseRevision')}
+        result = await self._publish_content(**request,
+            requestKey='deliver-candidate-' + candidate['previewRef'],
+            review_delivery={**candidate, 'reason': reason})
+        result['reviewNotice'] = status_text(result['reportDelivery'])
+        return result
 
     async def inspect(self, *args, **request):
         """续读原样保留调用条件；不因分页扩大捕获、对象或字段范围。"""
@@ -747,7 +878,7 @@ class AnalysisService:
                 raise AnalysisError('INVALID_READ_BATCH', 'requests 必须是读取条件对象的列表。')
             if request.get('analysisRef'):
                 for item in requests:
-                    if not item.get('captureRef') and not item.get('pythonRunRef'):
+                    if not item.get('captureRef') and not item.get('pythonRunRef') and not item.get('inputSetRef'):
                         item.setdefault('analysisRef', request['analysisRef'])
             validate_inspect_requests(requests)
             return await read_batch(requests, request.get('allPages', False), self.inspect,
@@ -767,9 +898,28 @@ class AnalysisService:
                 result = candidate
         return result
 
-    async def _inspect(self, section="captures", analysisRef=None, captureRef=None, offset=0, limit=50, derivedId=None, stepId=None, search=None, findingPlan=None, thresholds=None, factRef=None, memberDimension=None, objectId=None, bindingRef=None, period=None, measureCode=None, cellKey=None, detail="compact", fields=None, previewRef=None, pythonRunRef=None, pythonPath=''):
+    async def _inspect(self, section="captures", analysisRef=None, captureRef=None, offset=0, limit=50, derivedId=None, stepId=None, search=None, findingPlan=None, thresholds=None, factRef=None, memberDimension=None, objectId=None, bindingRef=None, period=None, measureCode=None, cellKey=None, detail="compact", fields=None, previewRef=None, pythonRunRef=None, pythonPath='', inputSetRef=None):
         await self.authorize()
         bounded_page([], offset, limit, self.store.limits.page_size)
+        if inputSetRef is not None and section != 'inputFields':
+            raise AnalysisError('INVALID_SECTION', 'inputSetRef 仅用于 inputFields，其他读取使用实际分析或运行引用。')
+        if section == 'inputFields':
+            from .input_contract import field_catalog
+            from .python_analysis import input_record
+            if inputSetRef:
+                prepared = self.store.get_input_set(self.owner, inputSetRef)
+                if analysisRef and analysisRef != prepared['analysisRef']:
+                    raise AnalysisError('INPUT_SET_SELECTION', '引用不属于同一冻结输入。')
+                records = prepared['records'] + prepared['files']
+            else:
+                artifact = self.store.get_analysis(self.owner, analysisRef)
+                records = [input_record(item['factId'], item) for item in artifact['facts']]
+                records += [input_record(item['derivedId'], item, artifact['facts']) for item in artifact['derivedValues']]
+            if factRef or derivedId:
+                records = [item for item in records if item['ref'] in (factRef, derivedId)]
+                if not records:
+                    raise AnalysisError('UNKNOWN_VALUE', '当前分析中没有此输入引用。')
+            return field_catalog(records, examples=min(limit, 3), offset=offset)
         if analysisRef and section == 'captures' and (derivedId or factRef):
             section = 'products' if derivedId else 'facts'
         if derivedId and section in ('products', 'formulas'):
@@ -796,8 +946,8 @@ class AnalysisService:
             from .grid_files import file_summary
             capture = self.store.get_capture(self.owner, captureRef)
             return {'captureRef': captureRef, **bounded_page(file_summary(capture), offset, limit),
-                    'errors': capture.get('gridFileErrors', []), 'tool': 'AnalysisPython',
-                    'input': 'gridInputs[{captureRef,fileRef}]',
+                    'errors': capture.get('gridFileErrors', []), 'tool': 'AnalysisTask',
+                    'input': 'action=prepare_inputs, gridInputs[{captureRef,fileRef}]',
                     'reader': 'grid_rows(ref, where)', 'previewIsCompleteData': False}
         if section == 'python':
             if pythonRunRef:
@@ -835,6 +985,7 @@ class AnalysisService:
                                        'analysisRequiresDeclaredWork': True, 'checksActualSourceVerification': True,
                                        'endGuard': 'bounded_continuation', 'semanticReview': 'evidence_based_model_review',
                                        'retryLimits': {'reviewAttempts': self.store.limits.max_review_attempts,
+                                                       'outputRepairsPerMaterial': self.store.limits.max_review_output_repairs,
                                                        'reviewSeconds': self.store.limits.review_budget_seconds,
                                                        'analysisErrors': self.store.limits.max_analysis_repairs,
                                                        'repairSeconds': self.store.limits.repair_budget_seconds},
@@ -850,9 +1001,11 @@ class AnalysisService:
                                           'inputs': ['owned_fact_or_product_refs', 'captured_query_selectors', 'workspace_data_files', 'captured_grid_files'],
                                           'outputs': ['SCALAR', 'TABLE', 'CHART_DATA', 'DIAGNOSTIC', 'FILE'],
                                           'outputPrecision': {'field': 'decimalPlaces', 'range': [0, 16],
-                                                              'rounding': 'ROUND_HALF_EVEN', 'intermediatesUnchanged': True},
+                                                              'rounding': 'ROUND_HALF_UP', 'intermediatesUnchanged': True},
                                           'inspectSection': 'python', 'productSection': 'products',
-                                          'maximumSeconds': 60, 'memoryLimitBytes': {'standard': 256 * 1024 * 1024, 'libraries': 1024 * 1024 * 1024},
+                                          'defaultSeconds': PYTHON_DEFAULT_TIMEOUT_SECONDS,
+                                          'maximumSeconds': PYTHON_MAX_TIMEOUT_SECONDS,
+                                          'memoryLimitBytes': {'standard': 256 * 1024 * 1024, 'libraries': 1024 * 1024 * 1024},
                                           'gridFiles': {'input': 'gridInputs', 'reader': 'grid_rows', 'maximumFileBytes': 512 * 1024 * 1024},
                                           'businessValidation': 'separate_semantic_review', 'nativeGroupingRequired': True},
                     "viewTypes": ["METRIC", "TABLE", "BAR_VALUES", "BAR_RANK", "BRIDGE", "ORDER", "FORMULA", "HIERARCHY", "WATERFALL", "RECONCILIATION"],
@@ -1026,9 +1179,12 @@ class AnalysisService:
             value = next((item for item in artifact['derivedValues'] if item['derivedId'] == derivedId), None)
             if value is None:
                 raise AnalysisError('UNKNOWN_VALUE', 'products 需要当前分析已返回的 derivedId。')
+            from .business_dataset import project
+            value = project(value)
             if 'rows' in value:
+                page = bounded_page(value['rows'], offset, limit, self.store.limits.page_size)
                 return {**{key: item for key, item in value.items() if key != 'rows'},
-                        'rows': bounded_page(value['rows'], offset, limit, self.store.limits.page_size)}
+                        'rows': page['items'], 'rowPage': {key: item for key, item in page.items() if key != 'items'}}
             if 'text' in value:
                 text = value['text']
                 return {**{key: item for key, item in value.items() if key != 'text'},
@@ -1137,7 +1293,7 @@ class AnalysisService:
                 saved = {k: v for k, v in request.items() if k not in ('requestKey', 'previewOnly')}
                 details['repairRef'] = self.store.save_publication_proposal(self.owner, ref, saved)
                 details['repairHint'] = '按 issues/path 修改，未修改的图表、简称和结论保持原样。'
-        raise AnalysisError('INVALID_PUBLICATION', '发布参数校验未通过。', details)
+        raise AnalysisError('INVALID_PUBLICATION', '发布参数校验未通过：' + issues[0]['message'], details)
 
     def _verifier_refs(self, artifact):
         """追查行动只接受该行动新取得的核验；普通分析使用已保存凭据。"""
@@ -1236,14 +1392,32 @@ class AnalysisService:
         def record(state):
             revisions = state.setdefault('presentationRevisionRefs', {})
             base_ref = artifact.get('baseAnalysisRef')
-            if created or base_ref in revisions:
+            # Host-only verification drafts retain the identity of a completed
+            # build even when its background notification has not reached the
+            # coordinator. The persisted list is scoped to this owner and turn.
+            if (created or base_ref in revisions or base_ref in state.get('completedBuildRefs', [])
+                    or base_ref in self.turn.state.get('buildRefs', [])):
                 revisions[artifact['analysisRef']] = base_ref
         progress(self.turn, record)
 
-    async def publish(self, analysisRef, claims=None, viewPlan=None, requestKey=None,
+    async def publish(self, analysisRef=None, claims=None, viewPlan=None, requestKey=None,
                       thresholds=None, hypotheses=None, findingPlan=None, actionPlan=None, technicalDetails=None,
-                      presentation=None, workRefs=None, unresolvedItems=None, repairRef=None, repairs=None, previewOnly=False, document=None, renderCheckUnavailableReason=None, finalize=False):
+                      presentation=None, workRefs=None, unresolvedItems=None, repairRef=None, repairs=None, previewOnly=False, document=None, renderCheckUnavailableReason=None, finalize=False, resumeReview=False):
         from .publication import repair_request
+        if repairRef is not None:
+            saved_target = self.store.get_publication_proposal(self.owner, repairRef)
+            if analysisRef is not None and analysisRef != saved_target['analysisRef']:
+                raise AnalysisError('REPAIR_SCOPE', '修复引用与显式分析不一致；不能改绑另一个任务。')
+            analysisRef = saved_target['analysisRef']
+        if not analysisRef:
+            raise AnalysisError('INVALID_PUBLICATION', '首次发布提供 analysisRef；修复使用返回的 repairRef。')
+        if resumeReview:
+            if any(value is not None for value in (claims, viewPlan, thresholds, hypotheses, findingPlan, actionPlan,
+                    technicalDetails, presentation, workRefs, unresolvedItems, repairRef, repairs, document,
+                    renderCheckUnavailableReason)) or previewOnly or finalize:
+                raise AnalysisError('INVALID_PUBLICATION', '续审只使用 analysisRef、requestKey、resumeReview=true。')
+            from .report_review import resume_review
+            return await resume_review(self, analysisRef)
         if finalize:
             if previewOnly:
                 raise AnalysisError('INVALID_PUBLICATION', 'finalize 与 previewOnly 不能同时为 true。')
@@ -1345,6 +1519,10 @@ class AnalysisService:
                               'renderCheckUnavailableReason', 'actionRunRef', 'hostSummary'):
                     draft.pop(field, None)
                 draft.update(claims=[], viewPlan=[], findings=[], actions=[], technicalDetails=False)
+                from .completion_issues import context_for
+                completion_context = context_for(self.turn, artifact)
+                if completion_context is not None:
+                    draft['completionContext'] = completion_context
                 draft['baseAnalysisRef'] = analysisRef
                 # 已发布版本先创建展示修订时，也将同轮新核验一并登记；不多建中间草稿。
                 draft.update(self._captured_verification_updates(draft))
@@ -1361,6 +1539,8 @@ class AnalysisService:
                                                  expectedBaseRevision=artifact['baseRevision'], **request)
             if previewOnly:
                 proposed = result.pop('_reviewArtifact')
+                if self.turn is not None:
+                    self.turn.state.pop('currentReportReviewRef', None)
                 result.pop('document')
                 # 对外展示投影省略了数据集；排序覆盖校验必须使用完整的冻结文档，
                 # 否则预览会漏报缺少标记，直到正式发布才返回同一个问题。
@@ -1370,6 +1550,8 @@ class AnalysisService:
                 result['repairFields'] = repair_fields(request)
                 async def review_preview():
                     if self.preview_reviewer:
+                        if self.turn is not None:
+                            self.turn.state.pop('currentReportReviewRef', None)
                         try:
                             verdict = await self._review_publication(proposed)
                             if verdict['issues']:
@@ -1424,10 +1606,9 @@ class AnalysisService:
                 result.update(repairRef=preview_ref, previewUrl='/workspace/analyses/preview?' + urlencode({
                     'agent_id': self.owner.agent_id, 'session_id': self.owner.session_id, 'preview_ref': preview_ref}),
                     previewPage='/analysis-preview/' + '/'.join(quote(v, safe='') for v in (self.owner.agent_id, self.owner.session_id, preview_ref)),
-                    confirmPublish={'analysisRef': analysisRef,
-                                    'repairRef': preview_ref, 'repairs': [], 'requestKey': 'confirm-' + preview_ref},
+                    confirmPublish={'repairRef': preview_ref, 'repairs': [], 'requestKey': 'confirm-' + preview_ref},
                     next='查看实际预览；如无修改，直接使用 confirmPublish 作为完整参数正式发布，不再附 document/workRefs 等内容；改动后再次预览。',
-                    repairAndFinalize={'analysisRef': analysisRef, 'repairRef': preview_ref,
+                    repairAndFinalize={'repairRef': preview_ref,
                         'repairs': [], 'requestKey': 'repair-' + preview_ref, 'finalize': True},
                     repairHint='textRepairable=true 的文字问题优先把所有相关修改一次放入 repairs：{op:"replaceText",path:"/document/html",value:{oldText:textTargets原文片段,newText:修正文字,textRef:textTargets引用}}。使用 textTargets 的 oldText/textRef；原句跨标签时只修改必要片段并保留其中占位符；可补充引用页面已有绑定。正文、摘要和图注一起修正；依据 semanticReview.repairEvidence，不重查重算。textRepairable=false 不试猜跨标签或动态脚本文字，直接编辑当前文件，用 /document/path 刷新；已有 documentEditSource 时以该源为准。bindings/datasets 沿用。')
                 if self.delivery and repairs and any(change.get('op') == 'replaceText' for change in repairs):
@@ -1456,7 +1637,13 @@ class AnalysisService:
                              'contentDigest': (preview_document or {}).get('contentDigest'),
                              'publicationCheckCode': result['diagnostics'].get('publicationCheck', {}).get('code'),
                              'semanticReview': result['diagnostics'].get('semanticReview', {}).get('status', 'NOT_REVIEWED')}
-                    progress(self.turn, lambda state: state.update(lastPublicationPreview=proof))
+                    from .turn_completion import _VisibleText
+                    from .render_evidence import review_text
+                    parser = _VisibleText()
+                    parser.feed((preview_document or {}).get('html', ''))
+                    proof['documentTexts'] = review_text(self.turn, proposed, '\n'.join(parser.parts))
+                    from .report_review import candidate_proof
+                    candidate_proof(self.turn, proof, result['diagnostics'])
             return result
         except AnalysisError as exc:
             if exc.code in ('ACCESS_DENIED', 'OWNER_MISMATCH'): raise
@@ -1472,14 +1659,12 @@ class AnalysisService:
             details['repairFields'] = repair_fields(request)
             details = recovery_details(exc.code, details)
             if exc.code == 'VERSION_CONFLICT' and details['nextAction'] == 'RETRY_PREVIEW':
-                details['retryPreview'] = {'analysisRef': analysisRef,
-                                          'repairRef': proposal_ref, 'repairs': [], 'previewOnly': True,
+                details['retryPreview'] = {'repairRef': proposal_ref, 'repairs': [], 'previewOnly': True,
                                           'requestKey': 'resume-preview-' + proposal_ref}
             if exc.code == 'DOCUMENT_NOT_CHECKED':
                 from urllib.parse import quote
                 details.update(previewPage='/analysis-preview/' + '/'.join(quote(v, safe='') for v in (self.owner.agent_id, self.owner.session_id, proposal_ref)),
-                               confirmPublish={'analysisRef': analysisRef,
-                                               'repairRef': proposal_ref, 'repairs': [], 'requestKey': 'confirm-' + proposal_ref},
+                               confirmPublish={'repairRef': proposal_ref, 'repairs': [], 'requestKey': 'confirm-' + proposal_ref},
                                repairHint='页面内容已保留；先完成实际浏览器检查，再复用 confirmPublish，无需重写页面或重建数据。')
                 if self.web_ui_url:
                     details['previewPage'] = self.web_ui_url.rstrip('/') + details['previewPage']
@@ -1487,7 +1672,7 @@ class AnalysisService:
 
     async def _publish_content(self, analysisRef, claims=None, viewPlan=None, requestKey=None, expectedBaseRevision=None, thresholds=None,
                                hypotheses=None, findingPlan=None, actionPlan=None, technicalDetails=False,
-                               presentation=None, workRefs=None, unresolvedItems=None, previewOnly=False, document=None, renderCheckUnavailableReason=None, host_summary=None):
+                               presentation=None, workRefs=None, unresolvedItems=None, previewOnly=False, document=None, renderCheckUnavailableReason=None, host_summary=None, review_delivery=None):
         from .publication import validate_content, located, raise_issues
         from .completion import completion_summary
         from .input_state import snapshot, require_unchanged, validate_analysis
@@ -1600,13 +1785,38 @@ class AnalysisService:
             return {'schemaVersion': SCHEMA_VERSION, 'analysisRef': analysisRef, 'previewOnly': True,
                     'publicationState': 'DRAFT', 'document': publication_view,
                     '_reviewArtifact': proposed, 'diagnostics': diagnostics, 'summary': summary(proposed, publication_view)}
-        if self.preview_reviewer and artifact['publicationState'] == 'DRAFT' and not host_summary:
+        if review_delivery:
+            from .closeout_content import evidence_digest
+            from .report_review import choose_candidate
+            chosen = choose_candidate(self, artifact)
+            if (not chosen or chosen['previewRef'] != review_delivery['previewRef']
+                    or review_delivery['evidenceDigest'] != evidence_digest(artifact)
+                    or not proposed.get('freeDocument')
+                    or proposed['freeDocument']['contentDigest'] != review_delivery['contentDigest']):
+                raise AnalysisError('INVALID_REVIEW_VERSION', '受限交付必须使用精确匹配且程序检查通过的保存版本。')
+        if self.preview_reviewer and artifact['publicationState'] == 'DRAFT' and not host_summary and not review_delivery:
             verdict = await self._review_publication(proposed)
             if verdict['issues']:
                 from .document_repair import attach_text_targets
                 verdict = {**verdict, 'issues': attach_text_targets(verdict['issues'], document, proposed.get('freeDocument'))}
                 raise AnalysisError('DOCUMENT_SEMANTIC_ERRORS', '页面内容与实际证据存在实质不一致，须先修正再发布。',
                                     {'path': '/document', **verdict, 'requiresBuild': False})
+        if not host_summary:
+            review_ref = review_delivery.get('reviewRef') if review_delivery else (self.turn.state.get('currentReportReviewRef') if self.turn else None)
+            review_record = self.store.get_report_review(self.owner, review_ref) if review_ref else None
+            proposed['reportDelivery'] = {
+                'mode': (review_delivery or {}).get('mode', 'REVIEWED' if self.preview_reviewer else 'NOT_REVIEWED'), 'analysisRef': analysisRef,
+                'contentDigest': proposed.get('freeDocument', {}).get('contentDigest'),
+                'programChecks': 'PASS', 'requirementsState': completion['state'],
+                'semanticReview': ((review_record or {}).get('status', (review_delivery or {}).get('semanticReview', 'PENDING')) if review_delivery
+                                   else 'PASS' if self.preview_reviewer else 'NOT_REVIEWED'),
+                'reviewRef': review_ref, 'review': review_record,
+                'selectedPreviewRef': (review_delivery or {}).get('previewRef'),
+                'reason': (review_delivery or {}).get('reason'),
+                **({'newerCandidate': deepcopy(review_delivery['newerCandidate'])}
+                   if review_delivery and review_delivery.get('newerCandidate') else {}),
+            }
+            publication_view['reportDelivery'] = deepcopy(proposed['reportDelivery'])
         request = {"analysisRef": analysisRef, "claims": claims, "viewPlan": viewPlan, "expectedBaseRevision": expectedBaseRevision}
         if thresholds is not None or hypotheses is not None:
             request.update(thresholds=thresholds, hypotheses=hypotheses)
@@ -1618,6 +1828,7 @@ class AnalysisService:
         if workRefs is not None: request['workRefs'] = workRefs
         if unresolvedItems is not None: request['unresolvedItems'] = unresolvedItems
         if renderCheckUnavailableReason is not None: request['renderCheckUnavailableReason'] = renderCheckUnavailableReason
+        if review_delivery: request['reviewDelivery'] = proposed['reportDelivery']
         from .review_control import measure_stage
         require_unchanged(self, input_state)
         with measure_stage(self.turn, 'artifactStorage'):
@@ -1631,6 +1842,7 @@ class AnalysisService:
                 delivery = {"type": "workspace_analysis", "registered": False, "error": exc.as_dict() if isinstance(exc, AnalysisError) else {"code": "DELIVERY_IO", "message": "展示文件暂不可用，请重试交付。"}}
         return {"schemaVersion": SCHEMA_VERSION, "analysisRef": result["analysisRef"], "revision": result["revision"],
                 **public_states(result), "summary": summary(result, publication_view),
+                **({'reportDelivery': result['reportDelivery']} if result.get('reportDelivery') else {}),
                 "delivery": delivery, "diagnostics": diagnostics}
 
     async def _automatic_preview_checks(self, result, request, preview_ref, document):
@@ -1705,7 +1917,12 @@ class AnalysisService:
         from .completion import apply_publication_completion
         apply_publication_completion(proposed, saved)
         full = compile_document(proposed, saved['document'])
-        record = evaluate(full, measurements)
+        from .render_evidence import validate_snapshot
+        observed = measurements.get('hostRenderedText') if isinstance(measurements, dict) else None
+        record = evaluate(full, {key: value for key, value in measurements.items() if key != 'hostRenderedText'})
+        if observed is not None:
+            record['hostRenderedText'] = validate_snapshot(observed)
+            record['runner'] = 'workspace-browser'
         record['previewRef'] = preview_ref
         self.store.save_document_check(self.owner, result['analysisRef'], record)
         return record

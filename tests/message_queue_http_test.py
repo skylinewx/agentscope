@@ -88,8 +88,20 @@ class MessageQueueHTTPTest(TestCase):
             ):
                 self.assertEqual(send("first"), "started")
                 fixture.portal.call(asyncio.wait_for, entered.wait(), 10)
-                self.assertEqual(read()["items"], [])
-                self.assertEqual(read()["active_id"], "first")
+                with patch.object(
+                    fixture.storage,
+                    "get_session",
+                    side_effect=AssertionError("Loaded full session record"),
+                ):
+                    queue = read()
+                    self.assertEqual(queue["items"], [])
+                    self.assertEqual(queue["active_id"], "first")
+                    history = fixture.client.get(
+                        f"/sessions/{sid}/messages",
+                        params={"agent_id": "shared"},
+                        headers=fixture.headers,
+                    )
+                    self.assertEqual(history.status_code, 200, history.text)
                 messages, _ = fixture.portal.call(
                     fixture.storage.list_messages, "viewer", sid
                 )

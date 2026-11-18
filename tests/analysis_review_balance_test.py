@@ -36,9 +36,10 @@ class AnalysisReviewBalanceTests(PresentationCase):
         advice = {'severity': 'ADVISORY', 'code': 'UNSUPPORTED_CLAIM',
                   'message': '可以换个标题，并增加一个分析角度。'}
         with patch('analysis_extension.turn_completion._model_review',
-                   AsyncMock(return_value={'issues': [advice]})):
+                   AsyncMock(return_value=with_coverage({'issues': [advice]}))):
             verdict = await review_answer(None, turn, artifact, '')
-        self.assertEqual(verdict, {'issues': []})
+        self.assertEqual(verdict['issues'], [])
+        self.assertTrue(verdict['coverage'])
         self.assertEqual(turn.state['analysisReviewAdvisories'], [advice])
 
     async def test_material_error_is_kept_without_optional_advice(self):
@@ -48,7 +49,7 @@ class AnalysisReviewBalanceTests(PresentationCase):
         advice = {'severity': 'ADVISORY', 'code': 'MISSING_CHECK',
                   'message': '可以再解释未来走势，但用户未要求预测。'}
         with patch('analysis_extension.turn_completion._model_review',
-                   AsyncMock(return_value={'issues': [advice, wrong_value]})):
+                   AsyncMock(return_value=with_coverage({'issues': [advice, wrong_value]}))):
             verdict = await review_answer(None, turn, artifact, '')
         self.assertEqual(len(verdict['issues']), 1)
         self.assertEqual(verdict['issues'][0]['code'], 'ANSWER_MISMATCH')
@@ -63,7 +64,7 @@ class AnalysisReviewBalanceTests(PresentationCase):
         self.service.preview_reviewer = lambda artifact: review_answer(None, first_turn, artifact, '')
         advice = {'severity': 'ADVISORY', 'code': 'UNSUPPORTED_CLAIM', 'message': '标题可以更简洁。'}
         with patch('analysis_extension.turn_completion._model_review',
-                   AsyncMock(return_value={'issues': [advice]})) as model:
+                   AsyncMock(return_value=with_coverage({'issues': [advice]}))) as model:
             preview = await self.service.publish(**request, previewOnly=True)
             self.assertEqual(preview['diagnostics']['semanticReview']['status'], 'PASS')
             self.assertEqual(preview['nextAction'], 'REVIEW_AND_CONFIRM')
@@ -84,7 +85,7 @@ class AnalysisReviewBalanceTests(PresentationCase):
 
     async def test_content_or_evidence_change_invalidates_pass(self):
         artifact, turn = await self.artifact(), self.turn()
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             await review_answer(None, turn, artifact, '')
             changed_text = deepcopy(artifact)
             changed_text['freeDocument']['html'] += '<p>增加新的业务结论。</p>'
@@ -98,7 +99,7 @@ class AnalysisReviewBalanceTests(PresentationCase):
         request = await self.request()
         first_turn = self.turn()
         self.service.preview_reviewer = lambda artifact: review_answer(None, first_turn, artifact, '')
-        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             preview = await self.service.publish(**request, previewOnly=True)
             # 真实回归曾把 confirmPublish 作为额外外层字段。错误必须保留，
             # 修正参数后同一页面的已通过结论仍应被复用，而不是再次审全文。
@@ -128,17 +129,17 @@ class AnalysisReviewBalanceTests(PresentationCase):
     async def test_review_timeout_is_not_saved_as_pass(self):
         artifact = await self.artifact()
         with patch('analysis_extension.turn_completion._model_review',
-                   AsyncMock(side_effect=[TimeoutError(), TimeoutError(), {'issues': []}])) as model:
+                   AsyncMock(side_effect=[TimeoutError(), TimeoutError(), with_coverage({'issues': []})])) as model:
             with self.assertRaises(TimeoutError):
                 await review_answer(None, self.turn(), artifact, '')
-            self.assertEqual(await review_answer(None, self.turn(), artifact, ''), {'issues': []})
+            self.assertEqual((await review_answer(None, self.turn(), artifact, ''))['issues'], [])
             self.assertEqual(model.await_count, 3)
 
     async def test_material_error_still_blocks_publication(self):
         request, turn = await self.request(), self.turn()
         self.service.preview_reviewer = lambda artifact: review_answer(None, turn, artifact, '')
-        failure = {'issues': [{'severity': 'BLOCKING', 'code': 'UNSUPPORTED_UNIT',
-                               'message': '原值为元，展示成万元时没有换算。'}]}
+        failure = with_coverage({'issues': [{'severity': 'BLOCKING', 'code': 'UNSUPPORTED_UNIT',
+                               'message': '原值为元，展示成万元时没有换算。'}]})
         with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=failure)) as model:
             preview = await self.service.publish(**request, previewOnly=True)
             self.assertEqual(preview['nextAction'], 'REPAIR_DOCUMENT')
@@ -148,15 +149,28 @@ class AnalysisReviewBalanceTests(PresentationCase):
             self.assertEqual(model.await_count, 1)
 
     def test_review_cache_is_isolated_by_owner(self):
-        self.store.save_semantic_review(OWNER, 'material', {'issues': []})
+        self.store.save_semantic_review(OWNER, 'material', with_coverage({'issues': []}))
         other = Owner(OWNER.user_id, OWNER.agent_id, 'another-session')
         self.assertIsNone(self.store.get_semantic_review(other, 'material'))
-        self.assertEqual(AnalysisStore(self.store.root).get_semantic_review(OWNER, 'material'), {'issues': []})
+        self.assertEqual(AnalysisStore(self.store.root).get_semantic_review(OWNER, 'material'), with_coverage({'issues': []}))
 
     def test_completed_verdict_is_not_overwritten_by_a_late_duplicate(self):
-        passed = {'issues': []}
+        passed = with_coverage({'issues': []})
         self.store.save_semantic_review(OWNER, 'same-material', passed)
-        late = {'issues': [{'severity': 'BLOCKING', 'code': 'UNSUPPORTED_CLAIM',
-                            'message': '另一次审查提出不同意见。'}]}
+        late = with_coverage({'issues': [{'severity': 'BLOCKING', 'code': 'UNSUPPORTED_CLAIM',
+                            'message': '另一次审查提出不同意见。'}]})
         self.assertEqual(self.store.save_semantic_review(OWNER, 'same-material', late), passed)
         self.assertEqual(self.store.get_semantic_review(OWNER, 'same-material'), passed)
+
+    def test_incomplete_attempt_can_be_completed_without_losing_a_blocking_verdict(self):
+        unavailable = {'kind': 'COMPUTATION', 'status': 'UNAVAILABLE', 'issues': []}
+        blocked = {'kind': 'COMPUTATION', 'status': 'REVISE', 'issues': [
+            {'severity': 'BLOCKING', 'code': 'ANSWER_MISMATCH', 'message': '合计与明细重复相加。'}]}
+        self.store.save_semantic_review(OWNER, 'recoverable', unavailable)
+        self.assertEqual(self.store.save_semantic_review(OWNER, 'recoverable', blocked), blocked)
+        self.assertEqual(self.store.save_semantic_review(OWNER, 'recoverable', unavailable), blocked)
+        self.assertEqual(self.store.save_semantic_review(OWNER, 'recoverable',
+                         {'kind': 'COMPUTATION', 'status': 'PASS', 'issues': []}), blocked)
+        self.assertEqual(AnalysisStore(self.store.root).get_semantic_review(OWNER, 'recoverable'), blocked)
+
+from analysis_review_fixtures import with_coverage

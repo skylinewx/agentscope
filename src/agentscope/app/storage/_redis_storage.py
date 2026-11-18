@@ -35,6 +35,7 @@ from ._model import (
     TeamRecord,
 )
 from ._utils import _dump_with_secrets
+from ._session_summary import SessionSummary
 from ...credential import CredentialBase
 from ...message import Msg
 from ...sop import SOPPhase, SOPRunState
@@ -237,43 +238,132 @@ class RedisStorage(StorageBase):
         return self._key(self.key_config.session_summary, user_id=user_id, session_id=session_id)
 
     async def _write_session(self, key, record):
-        from ._session_summary import SessionSummary
         async with self._client.pipeline(transaction=True) as pipe:
             pipe.set(key, record.model_dump_json(), ex=self.key_ttl)
             pipe.set(self._summary_key(record.user_id, record.id),
                      SessionSummary.from_record(record).model_dump_json(), ex=self.key_ttl)
             await pipe.execute()
 
-    async def _backfill_session_summary(self, user_id, session_id):
-        """Lazily backfill older records under WATCH; never replace newer summaries."""
-        from ._session_summary import SessionSummary
-        key = self._key(self.key_config.session, user_id=user_id, session_id=session_id)
-        for _ in range(3):
-            async with self._client.pipeline(transaction=True) as pipe:
-                try:
-                    await pipe.watch(key)
-                    raw = await pipe.get(key)
-                    if not raw:
-                        return None
-                    record = await asyncio.to_thread(SessionRecord.model_validate_json, raw)
-                    if record.user_id != user_id:
-                        return None
-                    ttl = await pipe.pttl(key)
-                    if ttl == -2 or ttl == 0:
-                        return None
-                    summary = SessionSummary.from_record(record)
-                    pipe.multi()
-                    pipe.set(self._summary_key(user_id, session_id), summary.model_dump_json(),
-                             **({'px': ttl} if ttl > 0 else {}))
-                    await pipe.execute()
-                    return summary
-                except _watch_error():
-                    continue
+    async def _backfill_session_summary(
+        self,
+        user_id: str,
+        session_id: str,
+        *,
+        refresh_legacy: bool = False,
+    ) -> SessionSummary | None:
+        """Build a missing or legacy summary without overwriting updates."""
+        from redis.exceptions import OutOfMemoryError
+
+        key = self._key(
+            self.key_config.session, user_id=user_id, session_id=session_id,
+        )
+        summary_key = self._summary_key(user_id, session_id)
+        # Several requests may discover a missing summary at the same time.
+        # Only one request per process needs to read the full session.
+        async with self._mutation_lock(("session_summary", key)):
+            for _ in range(3):
+                async with self._client.pipeline(transaction=True) as pipe:
+                    try:
+                        await pipe.watch(key, summary_key)
+                        cached = await pipe.get(summary_key)
+                        if cached:
+                            summary = SessionSummary.model_validate_json(cached)
+                            if (
+                                not refresh_legacy
+                                or summary.has_background_tools is not None
+                            ):
+                                return (
+                                    summary if await pipe.exists(key) else None
+                                )
+                        raw = await pipe.get(key)
+                        if not raw:
+                            return None
+                        record = await asyncio.to_thread(
+                            SessionRecord.model_validate_json, raw,
+                        )
+                        if record.user_id != user_id:
+                            return None
+                        ttl = await pipe.pttl(key)
+                        if ttl in (-2, 0):
+                            return None
+                        summary = SessionSummary.from_record(record)
+                        pipe.multi()
+                        pipe.set(
+                            summary_key,
+                            summary.model_dump_json(),
+                            **({'px': ttl} if ttl > 0 else {}),
+                        )
+                        try:
+                            await pipe.execute()
+                        except OutOfMemoryError:
+                            # A full Redis can still serve session metadata.
+                            pass
+                        return summary
+                    except _watch_error():
+                        continue
         from ._errors import StorageTemporarilyUnavailable
         raise StorageTemporarilyUnavailable('会话摘要在并发更新，请重试读取。')
 
+    async def _load_session_summary(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        refresh_legacy: bool = False,
+    ) -> SessionSummary | None:
+        key = self._key(
+            self.key_config.session, user_id=user_id, session_id=session_id,
+        )
+
+        async def read():
+            # Read both keys at the same point in time, including for
+            # expired sessions whose summary may still exist.
+            async with self._client.pipeline(transaction=True) as pipe:
+                pipe.exists(key)
+                pipe.get(self._summary_key(user_id, session_id))
+                return await pipe.execute()
+
+        exists, raw = await self._read('get_session_summary', read)
+        if not exists:
+            return None
+        summary = SessionSummary.model_validate_json(raw) if raw else None
+        if summary is None or (
+            refresh_legacy and summary.has_background_tools is None
+        ):
+            summary = await self._backfill_session_summary(
+                user_id, session_id, refresh_legacy=refresh_legacy,
+            )
+        if summary is None:
+            return None
+        record = summary.session
+        if record.user_id != user_id or (
+            agent_id and record.agent_id != agent_id
+        ):
+            return None
+        return summary
+
+    async def get_session_summary(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        refresh_legacy: bool = False,
+    ) -> SessionSummary | None:
+        summary = await self._load_session_summary(
+            user_id, agent_id, session_id, refresh_legacy=refresh_legacy,
+        )
+        if summary is not None and summary.session.config.inherited_fields:
+            from ._agent_defaults import resolve_defaults
+
+            agent = await self.resolve_session_agent(
+                user_id, summary.session.agent_id,
+            )
+            summary.session = resolve_defaults(summary.session, agent)
+        return summary
+
     async def list_session_summaries(self, user_id: str, agent_id: str):
-        from ._session_summary import SessionSummary
         from ._agent_defaults import resolve_defaults
         started = perf_counter()
         index = self._key(self.key_config.session_index, user_id=user_id, agent_id=agent_id)
@@ -400,7 +490,6 @@ class RedisStorage(StorageBase):
                     pipe.multi()
                     pipe.set(key, record.model_dump_json(), keepttl=True)
                     if record_cls is SessionRecord:
-                        from ._session_summary import SessionSummary
                         ttl_options = ({'ex': self.key_ttl} if self.key_ttl is not None else
                                        {'px': ttl_ms} if ttl_ms and ttl_ms > 0 else {})
                         pipe.set(self._summary_key(user_id, record.id),
@@ -1050,9 +1139,8 @@ class RedisStorage(StorageBase):
                 ``False`` if it did not exist.
         """
         # Cascade: sessions
-        sessions = await self.list_sessions(user_id, agent_id)
-        for session in sessions:
-            await self.delete_session(user_id, agent_id, session.id)
+        for summary in await self.list_session_summaries(user_id, agent_id):
+            await self.delete_session(user_id, agent_id, summary.session.id)
 
         # Cascade: schedules owned by this agent
         schedules = await self.list_schedules(user_id)
@@ -1306,16 +1394,18 @@ class RedisStorage(StorageBase):
                 ``True`` if the session existed and was deleted,
                 ``False`` if no record was found.
         """
+        summary = await self._load_session_summary(
+            user_id, agent_id, session_id, refresh_legacy=True,
+        )
+        if summary is None:
+            return False
+        record = summary.session
+
         key = self._key(
             self.key_config.session,
             user_id=user_id,
             session_id=session_id,
         )
-        raw = await self._client.get(key)
-        if not raw:
-            return False
-
-        record = SessionRecord.model_validate_json(raw)
 
         # Cascade: if this session leads a team, dissolve it first.
         if record.team_id:
@@ -1326,40 +1416,39 @@ class RedisStorage(StorageBase):
         index_key = self._key(
             self.key_config.session_index,
             user_id=user_id,
-            agent_id=agent_id,
+            agent_id=record.agent_id,
         )
-        msg_key = self._key(
-            self.key_config.messages,
+        queue_key = self._key(
+            self.key_config.message_queue,
             user_id=user_id,
             session_id=session_id,
         )
-        msg_index_key = self._key(
-            self.key_config.message_index,
-            user_id=user_id,
-            session_id=session_id,
-        )
-        await self._client.delete(key, self._summary_key(user_id, session_id))
-        await self._client.srem(index_key, session_id)
-        await self._client.delete(msg_key, msg_index_key)
-        await self.delete_message_queue(user_id, session_id)
-
-        if isinstance(record.origin, ScheduleOrigin):
-            schedule_session_key = self._key(
-                self.key_config.schedule_session_index,
-                user_id=user_id,
-                schedule_id=record.origin.schedule_id,
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.delete(key)
+            pipe.delete(
+                self._summary_key(user_id, session_id),
+                self._message_key(user_id, session_id),
+                self._message_index_key(user_id, session_id),
+                queue_key,
             )
-            await self._client.srem(schedule_session_key, session_id)
-
-        if isinstance(record.origin, ChannelOrigin):
-            channel_session_key = self._key(
-                self.key_config.channel_session_index,
-                user_id=user_id,
-                channel_id=record.origin.channel_id,
-            )
-            await self._client.srem(channel_session_key, session_id)
-
-        return True
+            pipe.srem(index_key, session_id)
+            pipe.srem(self.key_config.message_queue_index, queue_key)
+            if isinstance(record.origin, ScheduleOrigin):
+                schedule_session_key = self._key(
+                    self.key_config.schedule_session_index,
+                    user_id=user_id,
+                    schedule_id=record.origin.schedule_id,
+                )
+                pipe.srem(schedule_session_key, session_id)
+            if isinstance(record.origin, ChannelOrigin):
+                channel_session_key = self._key(
+                    self.key_config.channel_session_index,
+                    user_id=user_id,
+                    channel_id=record.origin.channel_id,
+                )
+                pipe.srem(channel_session_key, session_id)
+            deleted, *_ = await pipe.execute()
+        return bool(deleted)
 
     async def list_sessions_by_schedule(
         self,
@@ -1676,6 +1765,16 @@ class RedisStorage(StorageBase):
             session_id=session_id,
         )
 
+    async def _message_index_contains(
+        self, index_key: str, message_id: str,
+    ) -> bool | None:
+        """Return None when a legacy message list has no ID index."""
+        async with self._client.pipeline(transaction=True) as pipe:
+            pipe.exists(index_key)
+            pipe.sismember(index_key, message_id)
+            exists, contains = await pipe.execute()
+        return bool(contains) if exists else None
+
     async def upsert_message(
         self,
         user_id: str,
@@ -1686,12 +1785,8 @@ class RedisStorage(StorageBase):
         key = self._message_key(user_id, session_id)
         index_key = self._message_index_key(user_id, session_id)
 
-        async with self._client.pipeline(transaction=False) as pipe:
-            pipe.exists(index_key)
-            pipe.sismember(index_key, msg.id)
-            index_exists, message_exists = await pipe.execute()
-        message_exists = bool(message_exists)
-        if not index_exists:
+        message_exists = await self._message_index_contains(index_key, msg.id)
+        if message_exists is None:
             raw_messages = await self._client.lrange(key, 0, -1)
             message_ids = {
                 Msg.model_validate_json(raw).id for raw in raw_messages
@@ -1702,7 +1797,9 @@ class RedisStorage(StorageBase):
 
         payload = msg.model_dump_json()
         if message_exists:
-            index = await self._find_message_index(key, msg.id)
+            index = await self._find_message_index(
+                key, msg.id, tail_first=True,
+            )
             if index is not None:
                 async with self._client.pipeline(transaction=True) as pipe:
                     pipe.lset(key, index, payload)
@@ -1752,6 +1849,12 @@ class RedisStorage(StorageBase):
         message_id: str,
     ) -> Msg | None:
         """Fetch a single message by id from the session's message list."""
+        indexed = await self._message_index_contains(
+            self._message_index_key(user_id, session_id), message_id,
+        )
+        if indexed is False:
+            return None
+
         key = self._message_key(user_id, session_id)
         length = await self._client.llen(key)
         for i in range(length - 1, -1, -1):
@@ -1767,6 +1870,8 @@ class RedisStorage(StorageBase):
         key: str,
         message_id: str,
         chunk_size: int = 100,
+        *,
+        tail_first: bool = False,
     ) -> int | None:
         """Return the index of a message in the Redis list, or ``None``.
 
@@ -1778,11 +1883,18 @@ class RedisStorage(StorageBase):
             message_id (`str`): The message ID to locate.
             chunk_size (`int`, optional): Number of entries fetched per
                 round trip. Defaults to 100.
+            tail_first (`bool`, optional): Probe the newest message alone
+                before scanning chunks, for in-progress reply updates.
 
         Returns:
             `int | None`: Zero-based index, or ``None`` if not found.
         """
         end = await self._client.llen(key) - 1
+        if tail_first and end >= 0:
+            raw = await self._client.lindex(key, end)
+            if raw and Msg.model_validate_json(raw).id == message_id:
+                return end
+            end -= 1
         while end >= 0:
             start = max(end - chunk_size + 1, 0)
             raw_list = await self._client.lrange(key, start, end)
@@ -2147,20 +2259,20 @@ class RedisStorage(StorageBase):
                 team (used by :meth:`delete_team` and by the team
                 service when a session leaves a team).
         """
-        key = self._key(
-            self.key_config.session,
-            user_id=user_id,
-            session_id=session_id,
+        summary = await self._load_session_summary(
+            user_id, "", session_id, refresh_legacy=True,
         )
-        raw = await self._client.get(key)
-        if not raw:
+        if summary is None or summary.session.team_id == team_id:
             return
-        record = SessionRecord.model_validate_json(raw)
-        if record.team_id == team_id:
-            return
-        record.team_id = team_id
-        record.updated_at = datetime.now()
-        await self._set_with_ttl(key, record.model_dump_json())
+        try:
+            await self.mutate_session(
+                user_id,
+                summary.session.agent_id,
+                session_id,
+                lambda record: setattr(record, "team_id", team_id),
+            )
+        except KeyError:
+            return  # The session was deleted between the read and update.
 
     async def delete_team(self, user_id: str, team_id: str) -> bool:
         """Delete a team record and cascade-clean its members by role.

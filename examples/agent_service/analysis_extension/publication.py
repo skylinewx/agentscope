@@ -209,14 +209,35 @@ def validate_content(artifact, claims, views, presentation):
     return result
 
 
+def _publication_shape_errors(error):
+    """Explain an identifiable form's missing fields, without choosing a form for the caller."""
+    if error.validator != 'oneOf' or not isinstance(error.instance, dict):
+        return [error]
+    candidates = []
+    for index, branch in enumerate(error.validator_value):
+        errors = [child for child in error.context if child.schema_path[0] == index]
+        # A prohibited field means this is not the requested form. In particular,
+        # do not report the required fields of every rejected oneOf alternative.
+        if errors and all(child.validator == 'required' for child in errors):
+            matched = len(set(branch.get('required', [])) & set(error.instance))
+            if matched:
+                candidates.append((matched, errors))
+    if candidates:
+        best = max(score for score, _ in candidates)
+        selected = [errors for score, errors in candidates if score == best]
+        if len(selected) == 1:
+            return selected[0]
+    return [error]
+
+
 def schema_issues(request):
     from jsonschema import Draft202012Validator
     from .tools import AnalysisPublish
     if isinstance(request, dict) and 'arguments' in request:
         return [{'code': 'INVALID_PUBLICATION', 'path': '/arguments', 'validator': 'additionalProperties',
                  'message': '工具参数直接放在顶层 JSON 对象中，不再包一层 arguments；不能传字符串化的整份参数。',
-                 'requiredFields': ['analysisRef', 'requestKey'],
-                 'hint': '首次用 document（自由页面）或 claims+viewPlan（显式组件）；局部修复用 repairRef+repairs。检查阶段均带 previewOnly=true。'}]
+                 'requiredFields': ['requestKey'],
+                 'hint': '首次提供 analysisRef 和 document 或 claims+viewPlan；局部修复用 repairRef+repairs；续审用 analysisRef+resumeReview=true。仅预览才带 previewOnly=true。'}]
     issues = []
     if isinstance(request, dict) and 'repairRef' in request:
         mixed = sorted(set(request) & REPAIR_FIELDS)
@@ -224,20 +245,52 @@ def schema_issues(request):
             return [{'code': 'INVALID_PUBLICATION', 'path': '/' + key, 'validator': 'oneOf',
                      'message': 'repairRef 已保存完整内容；删除此顶层字段，需更新内容时通过 repairs 修改。',
                      'unexpectedFields': mixed, 'requiresBuild': False} for key in mixed]
-    for error in Draft202012Validator(AnalysisPublish.input_schema).iter_errors(request):
+    errors = [detail for error in Draft202012Validator(AnalysisPublish.input_schema).iter_errors(request)
+              for detail in _publication_shape_errors(error)]
+    seen = set()
+    for error in errors:
         path = ''.join('/' + str(k).replace('~', '~0').replace('/', '~1') for k in error.absolute_path)
         message = error.message[:500]
         extra = {}
         if error.validator == 'oneOf':
-            message = ('首次提交 document（自由页面）或 claims+viewPlan（显式组件），修复提交 repairRef+repairs；不能混传。'
-                       if not path else '该项须符合一种完整参数形式；核对该字段的必填项和可用字段。')
+            forms = [branch.get('required', []) for branch in error.validator_value]
+            extra['parameterForms'] = forms
+            message = '参数形式不完整或存在互斥字段；请选择一种形式并补齐必填项：' + '；'.join(
+                ' + '.join(fields) for fields in forms) + '。'
+            if path:
+                message = path + '：' + message
         elif error.validator == 'additionalProperties' and isinstance(error.instance, dict):
             extra['unknownFields'] = sorted(set(error.instance) - set(error.schema.get('properties', {})))
             extra['availableFields'] = sorted(error.schema.get('properties', {}))
             message = '包含不支持的字段；按 availableFields 选择。'
         elif error.validator == 'required':
-            extra['missingFields'] = [key for key in error.validator_value if key not in error.instance]
+            missing = [key for key in error.validator_value if key not in error.instance]
+            for field in missing:
+                field_path = path + '/' + field.replace('~', '~0').replace('/', '~1')
+                identity = (field_path, 'required')
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                issue = {'code': 'INVALID_PUBLICATION', 'validator': 'required', 'path': field_path,
+                         'missingFields': [field],
+                         'message': (path + ' ' if path else '') + '缺少必填字段：' + field + '。'}
+                if not error.absolute_path and field == 'analysisRef':
+                    issue['hint'] = '补上本次分析已返回的 analysisRef，保留现有报告内容后重新调用 AnalysisPublish；无需重新取数或计算，不要自行编造引用。'
+                elif not error.absolute_path and field == 'repairRef':
+                    issue['hint'] = '使用之前预览或失败响应返回的 repairRef，与 repairs 一起提交。'
+                issues.append(issue)
+                if len(issues) >= 30:
+                    return issues
+            continue
+        elif error.validator == 'not' and not path and request.get('finalize') is True and request.get('previewOnly') is True:
+            path = '/finalize'
+            extra['conflictingFields'] = ['finalize', 'previewOnly']
+            message = 'finalize=true（检查通过后发布）与 previewOnly=true（仅预览）不能同时使用，请保留一个。'
+        identity = (path, error.validator, message)
+        if identity in seen:
+            continue
+        seen.add(identity)
         issues.append({'code': 'INVALID_PUBLICATION', 'message': message, 'path': path,
                        'validator': error.validator, **extra})
-        if len(issues) == 30: break
+        if len(issues) >= 30: break
     return issues

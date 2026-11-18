@@ -1,10 +1,22 @@
 import { parseFreeDocument, type FreeAnalysisDocument } from './analysis-document.ts';
+export interface ReportDelivery {
+    analysisRef: string; mode: string; semanticReview: string; programChecks: string; requirementsState: string; notice?: string;
+    review?: { parts: { index: number; kind: string; status: string; issues?: { message?: string; statement?: string; code?: string; evidenceRefs?: string[]; severity?: string }[] }[] } | null;
+    calculationReview?: { status: string; issues?: { message?: string; severity?: string }[] } | null;
+    finalReview?: string;
+    newerCandidate?: { analysisRef: string; previewRef: string; programChecks: string; review?: ReportDelivery['review'] };
+}
 /** Registered analysis links use one canonical, case-sensitive ASCII spelling. */
 export const ANALYSIS_VIEW_MAX_BYTES = 1024 * 1024;
 export const ANALYSIS_PAGE_SIZE = 12;
 
 export function analysisPath(href: string): string | null {
 	return /^\.\/analysis\/ana_[0-9a-f]{32}\/revisions\/[1-9][0-9]{0,8}\/analysis\.json$/.test(href) ? href : null;
+}
+
+export function registeredReportPath(path: string): { manifest: string; exportRef: string } | null {
+    const match = /^\.\/analysis\/(ana_[0-9a-f]{32})\/revisions\/([1-9][0-9]{0,8})\/reports\/(export_[0-9a-f]{64})\.html$/.exec(path);
+    return match ? { manifest: `./analysis/${match[1]}/revisions/${match[2]}/analysis.json`, exportRef: match[3] } : null;
 }
 
 type Node = { type: string; url?: string; identifier?: string; children?: Node[]; data?: Record<string, unknown> };
@@ -85,6 +97,7 @@ export interface FindingView { findingId: string; statement: string; support: Fi
 export interface ActionView { actionRef: string; findingRefs: string[]; goal: string; scopeLabel: string; requiredEvidence: string[]; expectedDecision: string; availability: 'AVAILABLE' | 'NEEDS_INPUT' | 'UNAVAILABLE'; availabilityReason: string; priorityBasis: string }
 export interface ActionRunView { actionRunId: string; actionRef: string; status: 'PROPOSED' | 'RUNNING' | 'AWAITING_INPUT' | 'PARTIAL' | 'COMPLETED' | 'FAILED' | 'CANCELLED'; resultAnalysisRef: string | null; updatedAt: string; resultNote: string }
 export interface ViewSnapshot {
+    reportDelivery?: ReportDelivery;
     freeDocument?: FreeAnalysisDocument;
 	schemaVersion: 1; rendererVersion: string; engineVersion: string; analysisRef: string; dataDigest: string; viewId: string; scopeId: string;
 	viewParameters: ViewParameters; scopeLabel: string; isFiltered: boolean; publishedAt: string | null; verificationRecordedAt: string | null;
@@ -164,6 +177,35 @@ export function validateScene(value: unknown): asserts value is ChartScene {
 
 export function parseSnapshot(value: unknown): ViewSnapshot {
 	const v = record(value);
+    if (v.reportDelivery !== undefined) {
+        const delivery = record(v.reportDelivery);
+        for (const key of ['analysisRef', 'mode', 'semanticReview', 'programChecks', 'requirementsState']) str(delivery[key]);
+        if (delivery.analysisRef !== v.analysisRef) throw new Error('INVALID_VIEW');
+        if (delivery.notice !== undefined) str(delivery.notice);
+        const reviewRecords = [delivery.review];
+        if (delivery.newerCandidate !== undefined) {
+            const newer = record(delivery.newerCandidate);
+            for (const key of ['analysisRef', 'previewRef', 'programChecks']) str(newer[key]);
+            if (newer.analysisRef !== v.analysisRef) throw new Error('INVALID_VIEW');
+            reviewRecords.push(newer.review);
+        }
+        for (const value of reviewRecords) if (value != null) {
+            const review = record(value);
+            if (!Array.isArray(review.parts) || review.parts.length > 32) throw new Error('INVALID_VIEW');
+            for (const value of review.parts) {
+                const part = record(value); str(part.kind); str(part.status);
+                if (!Number.isInteger(part.index)) throw new Error('INVALID_VIEW');
+                if (part.issues !== undefined) {
+                    if (!Array.isArray(part.issues) || part.issues.length > 100) throw new Error('INVALID_VIEW');
+                    for (const value of part.issues) {
+                        const issue = record(value);
+                        for (const key of ['message', 'statement', 'code', 'severity']) if (issue[key] !== undefined) str(issue[key]);
+                        if (issue.evidenceRefs !== undefined) strings(issue.evidenceRefs);
+                    }
+                }
+            }
+        }
+    }
     if (v.freeDocument !== undefined) parseFreeDocument(v.freeDocument);
 	if (v.schemaVersion !== 1 || v.rendererVersion !== '1.11.1' || !['1.5.0', '2.0.0'].includes(v.engineVersion as string)) throw new Error('UNSUPPORTED_VERSION');
 	if (typeof v.technicalDetails !== 'boolean' || typeof v.chartsRequested !== 'boolean') throw new Error('INVALID_VIEW');

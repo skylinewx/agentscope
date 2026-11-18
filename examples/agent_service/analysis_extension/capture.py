@@ -95,7 +95,7 @@ class ReceiptCapture:
                 receipt = adapter.receipt(capture)
             from .business_tables import business_view
             navigation = {}
-            if receipt['data'].get('purpose') == 'ANALYZE' and receipt.get('status') in ('SUCCEEDED', 'PARTIAL'):
+            if receipt['data'].get('purpose') == 'PREPARE_MATERIALS' and receipt.get('status') in ('SUCCEEDED', 'PARTIAL'):
                 from .prepared_inputs import summaries
                 prepared = summaries(capture)
                 navigation = {'analysisRead': {'tool': 'AnalysisInspect', 'arguments': {
@@ -137,6 +137,14 @@ class ReceiptCapture:
         adapter = self.sources.for_tool(tool, leased_mcp_origin(tool, self.resource_ids))
         bounded_stream = adapter is not None and adapter.adapter_id == 'budget-v2'
         async for event in self._run(agent, input_kwargs, next_handler):
+            if bounded_stream and isinstance(event, ToolResponse) and event.metadata.get('analysisCaptureRef'):
+                from .model_materials import source_navigation, encode as encode_navigation
+                refs = [*(event.metadata.get('analysisCaptureRefs') or []), event.metadata['analysisCaptureRef']]
+                try:
+                    event.metadata['context_projection_text'] = encode_navigation(source_navigation(self, refs))
+                except (AnalysisError, OSError, KeyError, ValueError):
+                    # Projection failure never changes the saved execution result.
+                    pass
             if bounded_stream and isinstance(event, ToolChunk):
                 # The full MCP JSON is also emitted as a stream chunk. Sending it
                 # before the bounded final response bloats persisted UI messages.
@@ -147,6 +155,17 @@ class ReceiptCapture:
             yield event
 
     async def _run(self, agent, input_kwargs, next_handler):
+        tool = await agent.toolkit.get_tool(input_kwargs['tool_call'].name)
+        origin = leased_mcp_origin(tool, self.resource_ids)
+        if not origin or origin['originalToolName'] != 'execute_budget_query' or self.action_ref_provider():
+            async for event in self._run_pages(agent, input_kwargs, next_handler):
+                yield event
+            return
+        from .condition_recovery import run
+        async for event in run(self, agent, input_kwargs, next_handler):
+            yield event
+
+    async def _run_pages(self, agent, input_kwargs, next_handler, *, frozen_request=None):
         from .query_continuation import continuation_request, combined_response, MAX_PAGES, MAX_CONTINUATION_SECONDS
         tool = await agent.toolkit.get_tool(input_kwargs['tool_call'].name)
         origin = leased_mcp_origin(tool, self.resource_ids)
@@ -156,7 +175,6 @@ class ReceiptCapture:
         events, seen, started, stopped = [], set(), perf_counter(), 'SOURCE_STOPPED'
         retries = []
         status_reads = []
-        frozen_request = None
         while True:
             response = None
             async for event in self._run_page(agent, input_kwargs, next_handler, frozen_request=frozen_request):
@@ -276,7 +294,14 @@ class ReceiptCapture:
             if frozen_request is None:
                 if adapter.adapter_id == 'budget-v2' and origin['originalToolName'] == 'execute_budget_query':
                     normalized = host_request(self.owner, turn_key, origin, {**normalized, 'requestId': normalized.get('requestId', 'host-pending')})
-                normalized = canonical_arguments(encode(normalized), tool.input_schema)
+                try:
+                    normalized = canonical_arguments(encode(normalized), tool.input_schema)
+                except AnalysisError as error:
+                    if str((error.details or {}).get('path', '')).startswith('$.conditionContext'):
+                        raise AnalysisError('HOST_CONDITION_PREPARATION_INVALID',
+                            '宿主生成的历史条件未满足工具契约，本次没有发出查询。属于程序错误；无需修改业务参数或反复重试。',
+                            error.details) from error
+                    raise
         except AnalysisError as error:
             # 在发出外部查询前返回可执行的修复参数；错误仍由本轮工具记录接管。
             yield ToolResponse(id=call.id, state=ToolResultState.ERROR,
@@ -321,7 +346,7 @@ class ReceiptCapture:
         cache = self.query_cache_provider()
         cache_key = (digest([origin, request]) if isinstance(cache, dict) and turn_key and not action_run
                      and adapter.adapter_id == 'budget-v2'
-                     and origin['originalToolName'] in ('execute_budget_query', 'execute_semantic_plan') else None)
+                     and origin['originalToolName'] in ('execute_budget_query', 'execute_semantic_plan', 'search_entities') else None)
         if cache_key and cache_key in cache:
             try:
                 saved = self.store.get_capture(self.owner, cache[cache_key])
@@ -410,6 +435,10 @@ class ReceiptCapture:
                         event.metadata["analysisTurnKey"] = turn_key
                         event.content.append(TextBlock(text="\n分析输入保存失败：" + str(exc)))
                     if receipt is not None and saved_ref is not None:
+                        if origin['originalToolName'] == 'execute_budget_query' and receipt.get('status') in ('PARTIAL', 'FAILED'):
+                            from .query_recovery import target_recovery
+                            if target_recovery(receipt, request):
+                                event.metadata['targetDiscoveryRefs'] = [saved_ref]
                         # Preserve a bounded, attributable observation before
                         # projection/offloading hides the original result body.
                         from agentscope.app._service._progress_context import public_observations

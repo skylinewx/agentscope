@@ -255,6 +255,12 @@
 			"EXECUTING": "正在执行后台任务，结果返回后会自动继续。",
 			"PUBLISHING": "正在核对并生成分析页面…",
 			"CALCULATING": "正在运行数据分析…",
+			"CALCULATION_REVIEW": "正在核对计算输入、代码和结果…",
+			"BUSINESS_REVIEW": "正在核对当前报告和业务结果…",
+			"QUERYING": "正在读取预算数据…",
+			"details": "查看执行阶段",
+			"status": { "RUNNING": "进行中", "COMPLETE": "已完成", "FAILED": "未完成", "REUSED": "复用已核对结果" },
+			"retry": "第 {{attempt}} 次尝试",
 			"elapsed": "已等待 {{seconds}} 秒"
 		},
 		"inputPlaceholder": "输入消息...",

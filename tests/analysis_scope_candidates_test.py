@@ -1,11 +1,110 @@
 from copy import deepcopy
 from types import SimpleNamespace
-from unittest import TestCase
-from unittest.mock import Mock
+from unittest import TestCase, IsolatedAsyncioTestCase
+from unittest.mock import AsyncMock, Mock
 from analysis_extension.models import AnalysisError
 from analysis_extension.scope_candidates import candidates, bind, inherit
 from analysis_extension.capture import ReceiptCapture
 from analysis_extension.business_tables import model_text
+
+
+class ExpandedTargetSearchTest(IsolatedAsyncioTestCase):
+    async def test_searches_only_the_unlocated_quote_once_and_returns_real_choices(self):
+        from analysis_extension.query_recovery import expand_targets
+        query = {'contractVersion': '2.0', 'contextId': 'ctx', 'querySessionId': 'session',
+                 'intentDraft': {'targets': [{'id': 'located', 'businessPhrases': [{'text': '收入'}]},
+                                            {'id': 'missing', 'businessPhrases': [{'text': '保障预算'}]}]}}
+        receipt = {'status': 'PARTIAL', 'data': {'unresolvedGroups': [{'code': 'TARGET_DISCOVERY_UNRESOLVED',
+                   'diagnostics': {'logicalTargetId': 'missing', 'unresolvedTitleTerms': ['保障']}}]}}
+        source = {'request': query, 'response': receipt, 'originalToolName': 'execute_budget_query'}
+        search = {'originalToolName': 'search_entities', 'captureRef': 'cap_abc', 'request': {'entityMention': '保障'},
+                  'response': {'status': 'SUCCEEDED', 'data': {'candidates': [
+                      {'modelCode': 'BUDGET_FORM_TEMPLATE', 'kind': 'RESOURCE', 'key': code, 'label': code,
+                       'matchedBy': ['RESOURCE_RDF_VERIFIED']} for code in ('A', 'B')]}}}
+        records = {'one': source, 'two': source, 'cap_abc': search,
+                   'empty': dict(source, response={'status': 'SUCCEEDED', 'data': {'resultSets': []}})}
+        store = Mock()
+        store.get_capture.side_effect = lambda owner, ref: records[ref]
+        sources = Mock()
+        sources.for_capture.return_value.raw_receipt.side_effect = lambda response: response
+        turn = SimpleNamespace(service=SimpleNamespace(store=store, owner='user', sources=sources))
+        runner = AsyncMock(return_value=(['cap_abc'], None))
+        text = await expand_targets(turn, ['empty', 'one', 'two'], runner)
+        runner.assert_awaited_once_with(turn, source, 'search_entities', {
+            'contractVersion': '2.0', 'contextId': 'ctx', 'querySessionId': 'session', 'entityMention': '保障'})
+        self.assertIn('scand:cap_abc:0', text)
+        self.assertIn('scand:cap_abc:1', text)
+        self.assertNotIn('scope', query)
+
+
+
+class ScopedRecoveryTests(TestCase):
+    def test_explicitly_withdrawn_unverified_role_does_not_override_the_selected_form(self):
+        from analysis_extension.scope_candidates import _withdraw_unverified_role
+        member = {'dimensionHint': '费用类别', 'id': 'candidate', 'selector': {'type': 'VALUES', 'members': ['保障']}}
+        scopes = [dict(member, targetIds=['b']),
+                  dict(member, id='verified', targetIds=['b']),
+                  dict(member, id='history', targetIds=['b'], confirmedSource={'scopeId': 'old'}),
+                  dict(member, id='both'),
+                  dict(member, id='compound', targetIds=['b'], selector={'type':'VALUES','members':['保障','其他']}),
+                  dict(member, id='org', targetIds=['b'], dimensionHint='组织机构')]
+        request = {'question':'查一下保障预算', 'intentDraft':{'targets':[{'id':'a'},{'id':'b'}], 'dimensionScopes':scopes}}
+        choices = [{'targetId':'b','text':'保障'}]
+        proof = {'scopeResolution':[{'id':'verified','status':'RESOLVED'}]}
+        edits = {'scopeEdits':[{'dimensionHint':'费用类别','selector':None}, {'dimensionHint':'组织机构','selector':None}]}
+        for state, question in [({}, request['question']), (edits, '按费用类别查询保障预算')]:
+            item = deepcopy(request)
+            item['question'] = question
+            _withdraw_unverified_role(state, item, choices, proof)
+            self.assertEqual(item['intentDraft']['dimensionScopes'], scopes)
+        _withdraw_unverified_role(edits, request, choices, proof)
+        self.assertEqual(request['intentDraft']['dimensionScopes'], scopes[1:])
+
+    def test_shared_and_inherited_search_terms_keep_target_ownership(self):
+        from analysis_extension.query_recovery import target_recovery
+        req = {'intentDraft': {'sharedConditions': [{'text':'社保'}], 'targets': [
+            {'id':'a', 'businessPhrases':[{'text':'管理费'}]},
+            {'id':'b', 'inheritFrom':['a:管理费'], 'businessPhrases':[]}]}}
+        failure = {'status':'PARTIAL', 'data':{'unresolvedGroups':[{'code':'TARGET_DISCOVERY_UNRESOLVED',
+                   'diagnostics':{'logicalTargetId':'b', 'unresolvedTitleTerms':['社保','管理费']}}]}}
+        self.assertEqual(target_recovery(failure, req)['targets'], [
+            {'logicalTargetId':'b','targetIndex':1,'searchTerms':['社保','管理费']}])
+        failure['data']['unresolvedGroups'][0]['diagnostics']['searchTerms'] = ['社保']
+        self.assertEqual(target_recovery(failure, req)['sourceTerms'], ['社保'])
+        self.assertIsNone(target_recovery({'status':'SUCCEEDED','data':{'resultSets':[]}}, req))
+
+    def test_scoped_candidate_reuses_effective_draft_and_refuses_cross_target_or_turn(self):
+        records = {}
+        store = Mock()
+        store.get_capture.side_effect = lambda owner, ref: records[ref]
+        sources = Mock()
+        sources.for_capture.return_value.raw_receipt.side_effect = lambda r: r
+        turn = SimpleNamespace(state={'request':'比较两个指标', 'conditionTurn':2},
+                               service=SimpleNamespace(owner='owner',store=store,sources=sources))
+        source = {'serverName':'ontology','resourceId':'budget','connectionFingerprint':'one'}
+        draft = {'targets':[{'id':'a','businessPhrases':[{'text':'销售费'}]}, {'id':'b','inheritFrom':['a:销售费']}],
+                 'sharedConditions':[{'text':'社保'}], 'valueFilter':{'operator':'GT','value':'0','targetId':'a'}}
+        original = {'question':turn.state['request'],'contextId':'ctx','querySessionId':'s','scope':{'periodCode':'2026N0001'},
+                    'intentDraft':draft,'conditionContext':{'turn':2}}
+        failed = {'status':'PARTIAL','executionId':'failed','context':{'contextId':'ctx'},'querySessionId':'s',
+                  'data':{'unresolvedGroups':[{'code':'TARGET_DISCOVERY_UNRESOLVED',
+                       'diagnostics':{'logicalTargetId':'b','searchTerms':['社保']}}]}}
+        records['cap_aaa'] = dict(source,originalToolName='execute_budget_query',request=original,response=failed)
+        search = {'status':'SUCCEEDED','executionId':'search','context':{'contextId':'ctx'},'querySessionId':'s',
+                  'data':{'candidates':[{'modelCode':'BUDGET_FORM_TEMPLATE','kind':'RESOURCE','candidateId':'chosen','key':'S','label':'保障明细',
+                                        'matchedBy':['RESOURCE_RDF_VERIFIED']}]}}
+        records['cap_bbb'] = dict(source,originalToolName='search_entities',captureRef='cap_bbb',request={'entityMention':'社保'},response=search)
+        choice = {'text':'社保','candidateRef':'scand:cap_bbb:0:cap_aaa:1'}
+        request = {'scope':{'bindings':[choice]},'intentDraft':{'targets':[{'id':'b'}]}}
+        bound = bind(turn,source,request)
+        self.assertEqual(bound['intentDraft'],draft)
+        self.assertEqual(bound['scope']['periodCode'],'2026N0001')
+        self.assertEqual(bound['scope']['bindings'][0]['targetId'],'b')
+        choice['candidateRef'] = 'scand:cap_bbb:0:cap_aaa:0'
+        with self.assertRaises(AnalysisError): bind(turn,source,request)
+        choice['candidateRef'] = 'scand:cap_bbb:0:cap_aaa:1'
+        turn.state['conditionTurn'] = 3
+        with self.assertRaises(AnalysisError): bind(turn,source,request)
 
 
 class ScopeCandidateTest(TestCase):

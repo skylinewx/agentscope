@@ -108,7 +108,15 @@ export function finalAnalysisDeliveries(
 		// A text-only correction can approve the same published version. Do not
 		// require a new receipt after the correction hint, or prefer a larger
 		// revision that the final check did not approve.
-		return completion.semanticReview === 'PASS'
+		const report = object(completion.reportDelivery);
+		const pendingReport = completion.status === 'PARTIAL' && report?.mode === 'PENDING_REVIEW' &&
+			report.analysisRef === completion.analysisRef && report.programChecks === 'PASS' &&
+			typeof report.reviewRef === 'string' && report.reviewRef.length > 0 &&
+			['PENDING', 'PARTIAL', 'UNAVAILABLE', 'NOT_REVIEWED'].includes(String(completion.semanticReview)) &&
+			report.semanticReview === completion.semanticReview;
+		// A host-bound pending report is a delivered artifact, with its review
+		// notice displayed by WorkspaceAnalysis; it is not a semantic pass.
+		return completion.semanticReview === 'PASS' || pendingReport
 			? deliveries.filter((item) => item.analysisRef === completion.analysisRef)
 			: [];
 	}

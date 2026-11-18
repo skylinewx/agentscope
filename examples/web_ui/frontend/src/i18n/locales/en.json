@@ -255,6 +255,12 @@
 			"EXECUTING": "Background task running. Results will resume this response.",
 			"PUBLISHING": "Checking and preparing the analysis page…",
 			"CALCULATING": "Running data analysis…",
+			"CALCULATION_REVIEW": "Reviewing calculation inputs, code and outputs…",
+			"BUSINESS_REVIEW": "Reviewing the current report and business results…",
+			"QUERYING": "Reading budget data…",
+			"details": "Execution stages",
+			"status": { "RUNNING": "Running", "COMPLETE": "Complete", "FAILED": "Not completed", "REUSED": "Reusing reviewed results" },
+			"retry": "Attempt {{attempt}}",
 			"elapsed": "Waiting {{seconds}}s"
 		},
 		"inputPlaceholder": "Type a message...",

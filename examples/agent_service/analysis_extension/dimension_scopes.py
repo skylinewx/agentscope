@@ -27,7 +27,7 @@ def _scope_aliases(record):
         if binding.get('dimCode', binding.get('dimensionCode'))}
 
 
-def changed_fields(state):
+def _declared_changes(state):
     """Both public change declarations must release the same inherited conditions."""
     context = state.get('followupContext', {})
     fields = set(context.get('changedFields', [])) | set(state.get('basePendingChanges', []))
@@ -41,14 +41,17 @@ def changed_fields(state):
             dimensions |= aliases
         if dimensions & aliases:
             dimensions |= aliases
-    return fields | {field for dimension, field in STANDARD_FIELDS.items() if dimension in dimensions}
+    fields |= {field for dimension, field in STANDARD_FIELDS.items() if dimension in dimensions}
+    dimensions |= {dimension for dimension, field in STANDARD_FIELDS.items() if field in fields}
+    return fields, dimensions
+
+
+def changed_fields(state):
+    return _declared_changes(state)[0]
 
 
 def changed_dimensions(state):
-    context = state.get('followupContext', {})
-    fields = changed_fields(state)
-    return {concept(value) for value in context.get('changedDimensions', []) + state.get('basePendingDimensions', [])} | {
-        dimension for dimension, field in STANDARD_FIELDS.items() if field in fields}
+    return _declared_changes(state)[1]
 
 
 def retained_scopes(state):
@@ -57,16 +60,87 @@ def retained_scopes(state):
     return [deepcopy(item) for item in state.get('inheritedDimensionScopes', []) if not changes & _scope_aliases(item)]
 
 
+def scope_identity(record):
+    """Metadata identity, not a display label, separates dimension conditions."""
+    roles = {(str(b.get('dimCode', b.get('dimensionCode', ''))),
+              str(b.get('valueDomain', b.get('baseDataCode', '')))) for b in record.get('bindings', [])}
+    return tuple(sorted(roles)) if roles else (('legacy', concept(record['draft']['dimensionHint'])),)
+
+
+def condition_history(state, actual):
+    """Relaxation is local to a query; explicit replacement/clear changes history."""
+    records = retained_scopes(state)
+    for item in actual:
+        identity = scope_identity(item)
+        # A current explicit confirmation replaces prior choices in that dimension.
+        # An inherited execution only refreshes its proof, never its confirmation age.
+        same = [old for old in records if scope_identity(old) == identity]
+        if state.get('conditionTurn') is not None and item.get('confirmedTurn') == state['conditionTurn']:
+            records = [old for old in records if scope_identity(old) != identity
+                       or old.get('confirmedTurn') == item.get('confirmedTurn')]
+        elif any((old.get('confirmedTurn') or 0) > (item.get('confirmedTurn') or 0) for old in same):
+            continue
+        records = [old for old in records if not (scope_identity(old) == identity
+                   and old['draft']['selector'] == item['draft']['selector'])]
+        records.append(deepcopy(item))
+    return records
+
+
+def _confirmed_member_groups(matches):
+    """Separate distinct dimensions; one term with multiple roles stays ambiguous."""
+    roles_by_term, groups = {}, {}
+    for member in matches:
+        role = (member.get('dimensionCode'), member.get('baseDataCode'))
+        roles_by_term.setdefault(member['term'], set()).add(role)
+        groups.setdefault(role, []).append(member)
+    for role, members in groups.items():
+        if all(len(roles_by_term[member['term']]) == 1 for member in members):
+            # A single member gives a precise source reference even when its
+            # enclosing phrase also contains another dimension such as scene.
+            # A multi-member phrase can retain its existing whole-phrase proof
+            # only when that proof has a single dimension role.
+            if len(groups) == 1 or len({member['term'] for member in members}) == 1:
+                yield role, members
+
+
 def remember(turn, capture):
     if capture.get('originalToolName') != 'execute_budget_query':
         return
     receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
     if receipt.get('status') not in ('SUCCEEDED', 'PARTIAL'):
         return
-    request = capture.get('request', {})
+    from .condition_context import effective_request, native_records
+    request = effective_request(capture.get('request', {}), receipt.get('data') or {})
     draft = request.get('intentDraft') or {}
     scopes = draft.get('dimensionScopes', [])
     data = receipt.get('data') or {}
+    targets = draft.get('targets', [])
+    if 'conditionState' in data:
+        history = native_records(receipt, capture['captureRef'])
+        turn.state.setdefault('nativeConditionHistory', {})[capture['captureRef']] = history
+        actual = set(data['conditionState']['active'])
+        records = [record for record in history if record['conditionId'] in actual]
+    else:
+        # Existing captures predate native condition snapshots. Preserve their scope
+        # proofs for factual follow-ups without assigning a new confirmation turn.
+        records = _legacy_scopes(receipt, capture, draft, scopes, data, targets)
+    turn.state.setdefault('dimensionScopeCaptures', {})[capture['captureRef']] = records
+    if (capture.get('request', {}).get('conditionContext') or {}).get('omitted'):
+        turn.state.setdefault('conditionEffectiveScopes', {})[capture['captureRef']] = [
+            {key: deepcopy(value) for key, value in result.get('context', {}).items()
+             if key in ('taskName', 'formName', 'period', 'effectiveDimensions', 'dataPeriodSelection')}
+            for result in data.get('resultSets', [])]
+    period = {key: deepcopy(value) for key, value in request.get('scope', {}).items()
+              if key in ('periodCode', 'periodRequest')}
+    native_period = next((row.get('systemRequest') for row in records if row.get('scopeField') == 'period'), None)
+    if native_period and native_period.get('scope'):
+        turn.state.setdefault('systemRequestCaptures', {})[capture['captureRef']] = deepcopy(native_period)
+    elif period:
+        turn.state.setdefault('systemRequestCaptures', {})[capture['captureRef']] = {
+            'scope': period, 'periodTexts': list(dict.fromkeys(t['periodText'] for t in targets if t.get('periodText')))}
+
+
+def _legacy_scopes(receipt, capture, draft, scopes, data, targets):
     bindings = data.get('scopeResolution', [])
     records = []
     target_ids = {target['id'] for target in draft.get('targets', [])}
@@ -79,39 +153,45 @@ def remember(turn, capture):
                         'confirmedSource': {'executionId': receipt.get('executionId'), 'scopeId': scope['id'],
                                             'contextId': receipt.get('context', {}).get('contextId'), 'querySessionId': receipt.get('querySessionId')},
                         'appliesToAllTargets': not scope.get('targetIds') or set(scope['targetIds']) == target_ids})
-    # Single values from explicit shared phrases are also per-dimension conditions.
-    # Never infer them from opening defaults or from metric phrases in a target.
+    # Metadata-confirmed common target phrases and shared phrases have the same
+    # status. Where the model placed a product/expense word cannot decide whether
+    # it belongs to the history. Opening defaults never become explicit conditions.
     catalog = data.get('dimensionCatalog', [])
     represented = {binding.get('dimCode') for record in records for binding in record['bindings']}
-    for phrase in draft.get('sharedConditions', []):
-        texts = {phrase.get('text')} | {text for alternative in phrase.get('alternatives', []) for text in alternative}
+    common = set.intersection(*({p.get('text') for p in target.get('businessPhrases', [])} for target in targets)) if targets else set()
+    phrases = {p['text']: p for p in draft.get('sharedConditions', [])}
+    for target in targets:
+        phrases.update({p['text']: p for p in target.get('businessPhrases', []) if p.get('text') in common})
+    for phrase in phrases.values():
+        texts = {phrase.get('text')} | {part for parts in phrase.get('alternatives', []) for part in parts}
         matches = [member for result in data.get('resultSets', []) for member in result.get('resolvedTerms', [])
                    if member.get('term') in texts]
-        roles = {(member.get('dimensionCode'), member.get('baseDataCode')) for member in matches}
-        if len(roles) != 1:
-            continue  # Different interpretations retain their source rows; don't select one as a global condition.
-        code, domain = next(iter(roles))
-        if code in represented:
-            continue
-        labels = {entry['label'] for entry in catalog if entry.get('dimCode') == code and entry.get('valueDomain') == domain}
-        if code == 'MD_ORG':
-            labels = {'组织机构'}
-        if len(labels) != 1:
-            continue
-        item = {'id': 'shared-' + digest([code, domain, phrase])[:16], 'dimensionHint': next(iter(labels)),
-                'sourceText': phrase['sourceText'], 'targetIds': [],
-                'selector': {'type': 'VALUES', 'members': [phrase['text']]}}
-        records.append({'draft': item, 'bindings': deepcopy(matches), 'captureRef': capture['captureRef'],
-                        'confirmedSource': {'executionId': receipt.get('executionId'), 'sharedTerm': phrase['text'],
-                                            'contextId': receipt.get('context', {}).get('contextId'), 'querySessionId': receipt.get('querySessionId')},
-                        'appliesToAllTargets': True, 'basis': 'EXPLICIT_SHARED_CONDITION'})
+        for (code, domain), members in _confirmed_member_groups(matches):
+            if code in represented:
+                continue
+            labels = {entry['label'] for entry in catalog if entry.get('dimCode') == code and entry.get('valueDomain') == domain}
+            if code == 'MD_ORG':
+                labels = {'组织机构'}
+            if len(labels) != 1:
+                continue
+            # Inherit the metadata-confirmed member, not the surrounding metric
+            # phrase. Keep the original quote so the source can verify its origin.
+            matched_terms = {member['term'] for member in members}
+            reference_term = next(iter(matched_terms)) if len(matched_terms) == 1 else phrase['text']
+            item = {'id': 'shared-' + digest([code, domain, phrase])[:16], 'dimensionHint': next(iter(labels)),
+                    'sourceText': phrase['sourceText'], 'targetIds': [],
+                    'selector': {'type': 'VALUES', 'members': [reference_term]}}
+            records.append({'draft': item, 'bindings': deepcopy(members), 'captureRef': capture['captureRef'],
+                            'confirmedSource': {'executionId': receipt.get('executionId'), 'sharedTerm': reference_term,
+                                                'contextId': receipt.get('context', {}).get('contextId'), 'querySessionId': receipt.get('querySessionId')},
+                            'appliesToAllTargets': True, 'basis': 'EXPLICIT_SHARED_CONDITION'})
     for record in records:
         roles = {(binding.get('dimCode', binding.get('dimensionCode')),
                   binding.get('valueDomain', binding.get('baseDataCode'))) for binding in record['bindings']}
         record['dimensionAliases'] = sorted({record['draft']['dimensionHint']} | {
             alias for entry in catalog if (entry.get('dimCode'), entry.get('valueDomain')) in roles
             for alias in [entry.get('label'), entry.get('dimCode'), *entry.get('names', [])] if alias})
-    turn.state.setdefault('dimensionScopeCaptures', {})[capture['captureRef']] = records
+    return records
 
 
 def snapshot(state, captures):
@@ -119,8 +199,11 @@ def snapshot(state, captures):
     by_concept = {}
     for ref in dict.fromkeys(captures):
         for record in state.get('dimensionScopeCaptures', {}).get(ref, []):
-            key = concept(record['draft']['dimensionHint'])
-            by_concept.setdefault(key, {}).setdefault(digest(record['draft']['selector']), record)
+            key = scope_identity(record)
+            choices = by_concept.setdefault(key, {})
+            selector = record.get('conditionId') or digest(record['draft']['selector'])
+            if selector not in choices or (record.get('confirmedTurn') or 0) > (choices[selector].get('confirmedTurn') or 0):
+                choices[selector] = record
     result = []
     for records in by_concept.values():
         for record in records.values():
@@ -133,9 +216,13 @@ def snapshot(state, captures):
 
 def inherit(turn, request):
     context = turn.state.get('followupContext', {})
-    if context.get('mode', 'CONTINUE') != 'CONTINUE':
+    if context.get('mode', 'CONTINUE') not in ('CONTINUE', 'NEW'):
         return request
     previous = deepcopy(turn.state.get('inheritedDimensionScopes', []))
+    if context.get('mode') == 'NEW' and (request.get('basis') or {}).get('kind', 'INTENT') == 'INTENT':
+        from .condition_context import history_sources
+        previous = [*[item for item in previous if not item.get('conditionId')],
+                    *history_sources(turn.state, previous).values()]
     # Index migration uses the original capture; a historical quote is never
     # rewritten into the current question when the active native session changes.
     turn.state['inheritedDimensionScopes'] = previous
@@ -148,6 +235,8 @@ def inherit(turn, request):
     current = {concept(item.get('dimensionHint')): item for item in scopes}
     inherited_text = []
     for record in previous:
+        if record.get('scopeField') == 'period':
+            continue
         old = record['draft']
         key = concept(old['dimensionHint'])
         aliases = _scope_aliases(record)
@@ -166,7 +255,9 @@ def inherit(turn, request):
             raise AnalysisError('FOLLOWUP_DIMENSION_SCOPE_AMBIGUOUS',
                 '所选历史结果在同一维度上具有不同范围，请选择来源或明确本轮范围，不能丢弃条件。',
                 {'dimensionHint': old['dimensionHint']})
-        matches = [item for name, item in current.items() if name in aliases]
+        matches = [item for name, item in current.items() if name in aliases and
+                   (not (item.get('confirmedSource') or {}).get('scopeId') or not record.get('conditionId')
+                    or item['confirmedSource']['scopeId'] == record['conditionId'])]
         if len(matches) > 1:
             raise AnalysisError('FOLLOWUP_DIMENSION_SCOPE_CONFLICT', '同一已确认维度不能重复声明多个范围。')
         if matches:
@@ -186,7 +277,7 @@ def inherit(turn, request):
         item = deepcopy(old)
         if record.get('confirmedSource', {}).get('executionId'):
             item['confirmedSource'] = deepcopy(record['confirmedSource'])
-        item['id'] = 'inherited-' + digest([key, item['selector']])[:16]
+        item['id'] = record.get('conditionId') or 'inherited-' + digest([key, item['selector']])[:16]
         item['targetIds'] = []
         scopes.append(item)
         inherited_text.extend(selector_evidence(item['selector']))
@@ -248,7 +339,7 @@ def validate_execution(request, data):
                     selector_key = {'ALL': 'all', 'VALUES': 'values', 'HIERARCHY': 'hierarchy', 'FILTER': 'where'}[draft['selector']['type']]
                     if selector_key not in condition or selector_key == 'all' and condition['all'] is not True:
                         raise AnalysisError('BUDGET_QUERY_SCOPE_UNVERIFIED', '模型绑定改变了用户要求的范围类型。')
-                    if request.get('purpose') == 'ANALYZE':
+                    if request.get('purpose') == 'PREPARE_MATERIALS':
                         proof = data.get('scopeVerification', {})
                         coordinate = {'binding': binding_key, 'targetId': result.get('targetId'),
                                       'dimensions': row.get('dimensions'), 'measureCode': row.get('measureCode'),

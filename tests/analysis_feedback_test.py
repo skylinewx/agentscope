@@ -55,8 +55,76 @@ class ScopeFeedbackTests(TestCase):
         self.assertIn('repairs', issues[0]['message'])
         self.assertNotIn(str(request), issues[0]['message'])
 
+    def test_document_publish_identifies_missing_analysis_reference_without_rewriting_report(self):
+        request = {'document': {'title': '渠道分析', 'path': 'report.html',
+                               'datasets': [{'key': 'channels', 'valueRef': 'derived_channels'}]},
+                   'finalize': True, 'requestKey': 'publish'}
+        before = deepcopy(request)
+        issues = schema_issues(request)
+        self.assertEqual(len(issues), 1)
+        self.assertEqual(issues[0]['path'], '/analysisRef')
+        self.assertEqual(issues[0]['missingFields'], ['analysisRef'])
+        self.assertIn('缺少必填字段', issues[0]['message'])
+        self.assertNotIn('混传', issues[0]['message'])
+        self.assertIn('无需重新取数或计算', issues[0]['hint'])
+        self.assertEqual(request, before)
+        self.assertEqual(schema_issues({**request, 'analysisRef': 'a:1'}), [])
+
+    def test_missing_fields_follow_the_requested_publication_form(self):
+        for request, missing, completed in (
+            ({'analysisRef': 'a:1', 'claims': []}, ['viewPlan'], {'viewPlan': []}),
+            ({'repairRef': 'repair'}, ['repairs'], {'repairs': []}),
+            ({'repairs': []}, ['repairRef'], {'repairRef': 'repair'}),
+            ({'resumeReview': True}, ['analysisRef'], {'analysisRef': 'a:1'}),
+        ):
+            with self.subTest(request=request):
+                request = {**request, 'requestKey': 'publish'}
+                issues = schema_issues(request)
+                self.assertEqual(len(issues), 1)
+                self.assertEqual(issues[0]['missingFields'], missing)
+                self.assertEqual(schema_issues({**request, **completed}), [])
+
+    def test_multiple_missing_fields_are_deduplicated_and_ambiguous_form_is_not_guessed(self):
+        issues = schema_issues({'claims': [], 'requestKey': 'publish'})
+        self.assertEqual(len(issues), 2)
+        self.assertEqual({issue['path'] for issue in issues}, {'/analysisRef', '/viewPlan'})
+        self.assertEqual([field for issue in issues for field in issue['missingFields']], ['analysisRef', 'viewPlan'])
+        issues = schema_issues({'analysisRef': 'a:1', 'requestKey': 'publish'})
+        self.assertEqual(issues[0]['validator'], 'oneOf')
+        self.assertNotIn('missingFields', issues[0])
+        self.assertIn(['analysisRef', 'document'], issues[0]['parameterForms'])
+        self.assertIn(['analysisRef', 'claims', 'viewPlan'], issues[0]['parameterForms'])
+
+    def test_nested_missing_field_keeps_exact_path_and_validates_all_other_constraints(self):
+        request = {'analysisRef': 'a:1', 'requestKey': 'publish',
+                   'document': {'html': '<html>private-body</html>',
+                                'datasets': [{'key': 'channels', 'valueRef': 'derived_channels'}]}}
+        issues = schema_issues(request)
+        self.assertEqual(issues[0]['path'], '/document/title')
+        self.assertEqual(issues[0]['missingFields'], ['title'])
+        request['document']['title'] = '渠道分析'
+        for extra, expected in (({'viewPlan': []}, 'oneOf'), ({'unexpected': True}, 'additionalProperties'),
+                                ({'finalize': True, 'previewOnly': True}, 'not')):
+            with self.subTest(extra=extra):
+                issues = schema_issues({**request, **extra})
+                self.assertTrue(any(issue['validator'] == expected for issue in issues))
+                self.assertNotIn('private-body', json.dumps(issues))
+
 
 class ServiceFeedbackTests(PresentationCase):
+    async def test_missing_analysis_reference_is_actionable_in_actual_tool_response(self):
+        chunk = await AnalysisPublish(self.service).call(
+            document={'title': '渠道分析', 'path': 'report.html',
+                      'datasets': [{'key': 'channels', 'valueRef': 'derived_channels'}]},
+            finalize=True, requestKey='missing-analysis-reference')
+        response = json.loads(chunk.content[0].text)
+        error = response['error']
+        self.assertEqual(error['code'], 'INVALID_PUBLICATION')
+        self.assertIn('analysisRef', error['message'])
+        self.assertEqual(error['details']['path'], '/analysisRef')
+        self.assertEqual(error['details']['issues'][0]['missingFields'], ['analysisRef'])
+        self.assertNotIn('repairRef', error['details'])
+
     async def test_fields_error_lists_real_fields_and_retry_reads_capture_refs(self):
         cap, selectors, scope = saved_fixture(self.store)
         built = await self.service.build([cap], selectors, scope, [], 'build')

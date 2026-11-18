@@ -217,7 +217,11 @@ class AgentManagement:
         return view(record)
 
     async def sessions(self, record):
-        rows = await self.storage.list_sessions(record.user_id, record.id)
+        summaries = await self.storage.list_session_summaries(
+            record.user_id,
+            record.id,
+        )
+        sessions = [summary.session for summary in summaries]
         return [
             {
                 "id": s.id,
@@ -228,11 +232,15 @@ class AgentManagement:
                     "permission_mode": s.state.permission_context.mode,
                 },
             }
-            for s in rows
+            for s in sessions
         ]
 
     async def workspace(self, record, workspace_id=None):
-        sessions = await self.storage.list_sessions(record.user_id, record.id)
+        summaries = await self.storage.list_session_summaries(
+            record.user_id,
+            record.id,
+        )
+        sessions = [summary.session for summary in summaries]
         ids = {s.config.workspace_id for s in sessions}
         if record.data.workspace_id:
             ids.add(record.data.workspace_id)
@@ -258,11 +266,12 @@ class AgentManagement:
     async def selected_defaults(self, record, source_session_id):
         defaults = record.data.defaults or AgentDefaults()
         if source_session_id:
-            session = await self.storage.get_session(
+            summary = await self.storage.get_session_summary(
                 record.user_id, record.id, source_session_id
             )
-            if session is None or session.agent_id != record.id:
+            if summary is None:
                 raise HTTPException(404, "来源会话不存在。")
+            session = summary.session
             defaults = AgentDefaults(
                 **{key: getattr(session.config, key) for key in MODEL_FIELDS},
                 permission_mode=session.state.permission_context.mode,

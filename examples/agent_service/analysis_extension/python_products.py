@@ -1,6 +1,6 @@
 """冻结授权数据文件及通用代码产物；不把脚本结果升级成来源业务定义。"""
 from copy import deepcopy
-from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN, localcontext
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP, localcontext
 import csv
 import io
 import json
@@ -8,7 +8,7 @@ from pathlib import Path
 import re
 
 from .models import AnalysisError, decimal_text, decimal_value, digest
-from .python_worker import MAX_BYTES
+from .execution_protocol import MAX_BYTES
 
 
 def product_number(raw, decimal_places=None):
@@ -25,7 +25,7 @@ def product_number(raw, decimal_places=None):
             raise AnalysisError('NUMBER_LIMIT', '数值超出支持的精度或数量级。')
         with localcontext() as context:
             context.prec = 512
-            rounded = number.quantize(Decimal(1).scaleb(-decimal_places), rounding=ROUND_HALF_EVEN)
+            rounded = number.quantize(Decimal(1).scaleb(-decimal_places), rounding=ROUND_HALF_UP)
         return decimal_text(decimal_value(rounded))
     except InvalidOperation as error:
         raise AnalysisError('PYTHON_RESULT_INVALID', '输出不是有效的十进制数值。') from error
@@ -79,15 +79,19 @@ def load_files(service, specifications):
     return result
 
 
-def bind_single_grid(outputs, inputs, file_reads):
-    """只有一个授权网格且宿主实测读取完整时，补记产物省略的文件来源。"""
-    if len(inputs) != 1 or inputs[0].get('kind') != 'GRID_FILE' or not file_reads:
+def bind_single_grid(outputs, inputs, manifest):
+    """Bind a uniquely provided grid; delivery never proves algorithm correctness."""
+    from .execution_inputs import PROVENANCE_MODE
+    reads = manifest.get('reads', [])
+    if (len(inputs) != 1 or inputs[0].get('kind') != 'GRID_FILE' or not reads
+            or manifest.get('provenanceMode') != PROVENANCE_MODE or not manifest.get('inlineComplete')
+            or manifest.get('violations')):
         return []
     grid = inputs[0]
     if any(read.get('ref') != grid['ref'] or read.get('sha256') != grid['sha256']
-           or read.get('exhausted') is not True or read.get('scannedCount') != grid['cellCount'] for read in file_reads):
+           or read.get('sendComplete') is not True or read.get('sentThrough') != grid['cellCount'] for read in reads):
         return []
-    if not any(read.get('matchedCount', 0) > 0 for read in file_reads):
+    if not any(read.get('sentCount', 0) > 0 for read in reads):
         return []
     positions = []
     for index, output in enumerate(outputs):
@@ -126,7 +130,7 @@ def products(outputs, known, input_refs, scope_id, run_ref):
                 raise AnalysisError('PYTHON_RESULT_INVALID', 'unit 使用短字符串或 null。')
             value = None if raw is None else product_number(raw, output.get('decimalPlaces'))
             if 'decimalPlaces' in output:
-                payload['rounding'] = {'mode': 'ROUND_HALF_EVEN', 'decimalPlaces': output['decimalPlaces']}
+                payload['rounding'] = {'mode': 'ROUND_HALF_UP', 'decimalPlaces': output['decimalPlaces']}
             state = 'NO_VALUE' if value is None else 'PRESENT'
         elif kind in ('TABLE', 'CHART_DATA'):
             if set(output) - common != {'columns', 'rows'}:
@@ -140,30 +144,31 @@ def products(outputs, known, input_refs, scope_id, run_ref):
                     or len({col['name'] for col in columns}) != len(columns)
                     or not isinstance(rows, list) or len(rows) > 20000):
                 raise AnalysisError('PYTHON_RESULT_INVALID', '表产物需要唯一列名、标签、明确类型，最多 100 列、20000 行。')
-            rows = deepcopy(rows)
+            from .business_dataset import rows as named_rows, CONTRACT
+            # A declared, unique column list makes a positional row an unambiguous
+            # format conversion. All downstream consumers receive named rows.
+            try:
+                rows = named_rows(columns, rows, prefix=run_ref + ':' + name, strict_fields=True)
+            except AnalysisError as error:
+                error.details = {**(error.details or {}),
+                    'path': f'/result/{output_index}' + (error.details or {}).get('path', '/rows')}
+                raise
             for column in columns:
                 if 'decimalPlaces' in column:
                     if column['type'] != 'DECIMAL_STRING':
                         raise AnalysisError('PYTHON_RESULT_INVALID', 'decimalPlaces 仅用于 DECIMAL_STRING 列。')
                     product_number('0', column['decimalPlaces'])
             for row_index, row in enumerate(rows):
-                if not isinstance(row, list) or len(row) != len(columns):
-                    raise AnalysisError('PYTHON_RESULT_INVALID', 'rows 必须是二维数组；每行按 columns 顺序提供同样数量的值，不能传字典行。',
-                                        {'path': f'/result/{output_index}/rows/{row_index}',
-                                         'requiresSourceQuery': False, 'nextAction': 'FIX_OUTPUT_ROWS',
-                                         'columnNames': [column['name'] for column in columns],
-                                         'expectedColumnCount': len(columns), 'actualRowType': type(row).__name__,
-                                         'actualColumnCount': len(row) if isinstance(row, (list, dict)) else None,
-                                         'hint': '保持原数据与口径，仅调整输出结构。若已有字典行且字段齐全，使用 [[record[column["name"]] for column in columns] for record in records]；缺字段应明确处理，不用 0 补齐。'})
-                for index, column in enumerate(columns):
-                    cell = row[index]
+                for column in columns:
+                    key = column['name']
+                    cell = row['values'].get(key)
                     if cell is None:
                         continue
                     if column['type'] == 'DECIMAL_STRING':
-                        row[index] = product_number(cell, column.get('decimalPlaces'))
+                        row['values'][key] = product_number(cell, column.get('decimalPlaces'))
                     elif not isinstance(cell, str if column['type'] == 'STRING' else bool):
                         raise AnalysisError('PYTHON_RESULT_INVALID', '表产物单元格与声明类型不一致。')
-            payload = {'columns': columns, 'rows': rows, 'rowCount': len(rows)}
+            payload = {'columns': columns, 'rows': rows, 'rowCount': len(rows), 'rowContract': CONTRACT}
         elif kind == 'DIAGNOSTIC':
             if set(output) - common != {'data'} or not isinstance(output['data'], (dict, list)):
                 raise AnalysisError('PYTHON_RESULT_INVALID', 'DIAGNOSTIC 需要结构化 data。')

@@ -34,12 +34,29 @@ class ReviewProjectionTests(TestCase):
     def test_actual_python_inputs_and_work_items_are_roots(self):
         original = self.fixture()
         original['pythonRuns'][0]['inputRefs'].append('unused')
-        self.assertEqual(project_analysis_review(original), original)
+        projected = project_analysis_review(original)
+        self.assertEqual(projected['reviewTargets'], ['shown'])
+        self.assertEqual({key:value for key,value in projected.items() if key != 'reviewTargets'}, original)
         original['pythonRuns'][0]['inputRefs'].remove('unused')
         original['completion']['items'] = [{'ref': 'unused'}]
-        self.assertEqual(project_analysis_review(original), original)
+        projected = project_analysis_review(original)
+        self.assertEqual(projected['reviewTargets'], ['shown', 'unused'])
+        self.assertEqual({key: value for key, value in projected.items() if key != 'reviewTargets'}, original)
 
     def test_no_declared_delivery_references_does_not_guess(self):
         original = self.fixture()
         original.pop('documentBindings')
         self.assertEqual(project_analysis_review(original), original)
+
+    def test_explicit_replacement_drops_unused_old_diagnostic_but_keeps_downstream_dependencies(self):
+        original = self.fixture()
+        original['derived'][-1].update(operator='PYTHON', pythonRunRef='old-run')
+        original['pythonRuns'] += [{'runRef': 'old-run', 'status': 'COMPLETED'}]
+        original['pythonRuns'][0].update(status='COMPLETED', supersedesRunRefs=['old-run'])
+        projected = project_analysis_review(original)
+        self.assertNotIn('diagnostic', [item['derivedId'] for item in projected['derived']])
+        self.assertTrue(projected['reviewProjection']['supersededRuns'])
+        original['derived'][0]['inputRefs'].append('diagnostic')
+        projected = project_analysis_review(original)
+        self.assertIn('diagnostic', [item['derivedId'] for item in projected['derived']])
+        self.assertIn('old-run', [item['runRef'] for item in projected['pythonRuns']])

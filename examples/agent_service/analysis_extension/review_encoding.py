@@ -147,6 +147,21 @@ def pack_review_records(material):
 
 def unpack_review_records(material):
     """供同源审计逐字段还原投影，验证没有遗漏必要证据。"""
+    if isinstance(material, dict) and material.get('materialFormat', {}).get('version') == 'READABLE_BUSINESS_V1':
+        from .readable_material import restore_material
+        return restore_material(material)
+    if isinstance(material, dict) and material.get('sharedValueEncoding') == 1:
+        shared = material['reviewSharedValues']
+        def restore(value):
+            if isinstance(value, dict):
+                if set(value) == {'_sharedValueRef'}:
+                    return deepcopy(shared[value['_sharedValueRef']])
+                return {key: restore(child) for key, child in value.items()}
+            if isinstance(value, list):
+                return [restore(child) for child in value]
+            return value
+        material = restore({key: value for key, value in material.items()
+                            if key not in ('sharedValueEncoding', 'reviewSharedValues')})
     if not isinstance(material, dict) or material.get('recordTableEncoding') != 1:
         return deepcopy(material)
     return _unpack({key: value for key, value in material.items() if key != 'recordTableEncoding'})

@@ -1,4 +1,4 @@
-"""Sidebar projections are separate from the complete execution records."""
+"""Session metadata and status without the complete execution context."""
 from pydantic import BaseModel
 from ._model import SessionRecord
 from ...state import ToolContext
@@ -7,6 +7,8 @@ from ...state import ToolContext
 class SessionSummary(BaseModel):
     session: SessionRecord
     parked_status: str
+    # Older Redis summaries did not include this flag.
+    has_background_tools: bool | None = None
 
     @classmethod
     def from_record(cls, record: SessionRecord):
@@ -16,4 +18,10 @@ class SessionSummary(BaseModel):
         state = record.state.model_copy(update={
             'context': [], 'summary': '', 'tool_context': ToolContext(), 'middle_context': {},
         })
-        return cls(session=record.model_copy(update={'state': state}), parked_status=status)
+        return cls(
+            session=record.model_copy(update={'state': state}),
+            parked_status=status,
+            has_background_tools=bool(
+                record.state.middle_context.get('background_tools_v1'),
+            ),
+        )

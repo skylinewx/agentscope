@@ -50,7 +50,7 @@ import asyncio
 from enum import StrEnum
 
 from ..message_bus import MessageBus, MessageBusKeys
-from ..storage import StorageBase
+from ..storage import SessionRecord, StorageBase
 from ..workspace_manager import WorkspaceManagerBase
 from ..storage._utils import _ensure_team_members
 from ._session_projection import SessionProjection
@@ -201,15 +201,12 @@ class SessionService:
         ):
             return SessionStatus.RUNNING
 
-        session = await self._storage.get_session(
+        summary = await self._storage.get_session_summary(
             user_id,
             agent_id,
             session_id,
         )
-        if session is None:
-            return None
-
-        return self.derive_parked_status(session.state.context)
+        return SessionStatus(summary.parked_status) if summary else None
 
     @staticmethod
     def derive_parked_status(context: list) -> SessionStatus:
@@ -370,21 +367,20 @@ class SessionService:
                 ``False`` otherwise. Mirrors
                 :meth:`StorageBase.delete_session`.
         """
-        # Identify all bus-purge targets before storage mutates anything.
-        worker_sids = await self._team_worker_session_ids(
-            user_id,
-            agent_id,
-            session_id,
+        # Resolve the workspace and bus-purge targets from the same snapshot.
+        summary = await self._storage.get_session_summary(
+            user_id, agent_id, session_id, refresh_legacy=True,
         )
+        if summary is None:
+            return False
+        record = summary.session
+        worker_sids = await self._team_worker_session_ids(user_id, record)
         all_sids = [session_id, *worker_sids]
-
-        # Resolve the workspace binding while the record still exists.
-        record = await self._storage.get_session(user_id, agent_id, session_id)
-        workspace_id = record.config.workspace_id if record else None
+        workspace_id = record.config.workspace_id
 
         # Clean leader-side subagent HITL projections before storage
         # cascades remove the records we need to resolve roles from.
-        await self._purge_subagent_hitl(user_id, agent_id, session_id)
+        await self._purge_subagent_hitl(user_id, session_id, record)
 
         await asyncio.gather(
             *(self.cancel_session_run(sid) for sid in all_sids),
@@ -617,8 +613,7 @@ class SessionService:
     async def _team_worker_session_ids(
         self,
         user_id: str,
-        agent_id: str,
-        session_id: str,
+        session: SessionRecord,
     ) -> list[str]:
         """Return the session ids of every worker in the team that
         ``session_id`` leads, or ``[]`` when the session does not lead
@@ -636,26 +631,17 @@ class SessionService:
 
         Args:
             user_id (`str`): The owner user id.
-            agent_id (`str`):
-                The agent that owns ``session_id``. May be empty when
-                unknown; team-leader lookup does not depend on it.
-            session_id (`str`):
-                The candidate leader session.
+            session (`SessionRecord`): The candidate leader session.
 
         Returns:
             `list[str]`:
                 Worker session ids, empty when this session is not a
                 team leader.
         """
-        session = await self._storage.get_session(
-            user_id,
-            agent_id,
-            session_id,
-        )
-        if session is None or not session.team_id:
+        if not session.team_id:
             return []
         team = await self._storage.get_team(user_id, session.team_id)
-        if team is None or team.session_id != session_id:
+        if team is None or team.session_id != session.id:
             return []
         members = await _ensure_team_members(self._storage, user_id, team)
         return [m.session_id for m in members]
@@ -681,8 +667,8 @@ class SessionService:
     async def _purge_subagent_hitl(
         self,
         user_id: str,
-        agent_id: str,
         session_id: str,
+        session: SessionRecord,
     ) -> None:
         """Clean leader-side subagent HITL projections for a session
         about to be deleted (design §3.7).
@@ -703,18 +689,12 @@ class SessionService:
         Args:
             user_id (`str`):
                 The owner user id.
-            agent_id (`str`):
-                The agent that owns ``session_id``.
             session_id (`str`):
                 The session being deleted.
+            session (`SessionRecord`): Its metadata before deletion.
         """
         try:
-            session = await self._storage.get_session(
-                user_id,
-                agent_id,
-                session_id,
-            )
-            if session is None or not session.team_id:
+            if not session.team_id:
                 # Not in a team — also clear any hash that may have been
                 # created with this session as a (future) leader key.
                 await SubagentHitlProjector.purge(self._projection, session_id)

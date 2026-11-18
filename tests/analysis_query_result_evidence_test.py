@@ -1,3 +1,4 @@
+from analysis_extension.review_request import review_material
 """最终结果选择、完整依赖核对及容量兜底的功能回归。"""
 from copy import deepcopy
 from analysis_model_closeout_test import summary_response
@@ -45,16 +46,16 @@ class ResultEvidenceTests(PresentationCase):
         model = AsyncMock(return_value={'issues': []})
         with patch('analysis_extension.turn_completion._model_review', new=model):
             await review_query_answer(None, turn, evidence, '首次两个结果')
-            self.assertEqual(model.await_count, 1)
+            self.assertEqual(model.await_count, 3)
             self.assertEqual(turn.state['queryReviewProgress']['dependencyReviewedCount'], 2)
             selected = deepcopy(evidence)
             selected['pythonRuns'] = selected['pythonRuns'][1:]
             selected['resultRoots'] = ['d1']
-            turn.state['request'] = '只看第二个结果'
+            # Same intent, narrower answer output selection; source computation is unchanged.
             model.return_value = {'issues': [{'code': 'ANSWER_MISMATCH', 'message': '新答复金额错误'}]}
             result = await review_query_answer(None, turn, selected, '第二个结果是999')
-        self.assertEqual(model.await_count, 2, '复用计算核对仍必须审查新的答复')
-        payload = json.loads(model.call_args.args[-1])
+        self.assertEqual(model.await_count, 4, '两次专项审核后，每个新答复仍须独立确认')
+        payload = review_material(model.call_args.args[-1])
         self.assertEqual(payload['resultReviewPhase'], 'FINAL')
         self.assertEqual(payload['candidateAnswer'], '第二个结果是999')
         self.assertNotIn('pythonRuns', payload['evidence'])
@@ -85,15 +86,17 @@ class ResultEvidenceTests(PresentationCase):
                 changed['resultRoots'] = [changed['pythonRuns'][0]['outputs'][0]['derivedId']]
                 self.assertEqual(cached_dependencies(turn, dependency_units(changed), 'rules-1'), [])
 
-    async def test_failed_combined_review_does_not_mark_dependencies_verified(self):
+    async def test_failed_dependency_is_not_verified_while_independent_pass_is_reused(self):
         turn = self.turn()
         evidence = ResultPartitionTests().evidence()
         model = AsyncMock(side_effect=[{'issues': [{'code': 'ANSWER_MISMATCH', 'message': '错误'}]}, {'issues': []}])
         with patch('analysis_extension.turn_completion._model_review', new=model):
             await review_query_answer(None, turn, evidence, '第一版')
             await review_query_answer(None, turn, evidence, '第二版')
-        self.assertEqual(turn.state['queryReviewProgress']['dependencyReusedCount'], 0)
-        self.assertIn('pythonRuns', json.loads(model.call_args.args[-1])['evidence'])
+        self.assertEqual(turn.state['queryReviewProgress']['dependencyReusedCount'], 1)
+        self.assertEqual(turn.state['queryReviewProgress']['phase'], 'REVISE')
+        self.assertEqual(model.await_count, 2)
+        self.assertIn('pythonRuns', review_material(model.call_args.args[-1])['evidence'])
 
     def turn(self):
         turn = TurnCompletion(self.service, current_turn(AgentState(), UserMsg('user', '查询当前范围的数值')))
@@ -123,7 +126,7 @@ class ResultEvidenceTests(PresentationCase):
         self.assertEqual(evidence['pythonRuns'][0]['outputs'][0]['data']['total'], '0.3')
         self.assertEqual(evidence['pythonRuns'][0]['sourceData'][0]['rowCount'], 3)
         self.assertTrue(evidence['pythonRuns'][0]['sourceData'][0]['complete'])
-        self.assertEqual(len(query_review_payloads({'candidateAnswer': '0.3'}, evidence)), 1)
+        self.assertEqual(len(query_review_payloads({'candidateAnswer': '0.3'}, evidence)), 2)
         self.assertEqual(len(self.store.get_python_run(OWNER, exploration['pythonRunRef'])['outputs'][0]['data']['text']), 200000)
         self.assertEqual(self.store.list_results(OWNER, 0, 100)['total'], 0)
 
@@ -162,8 +165,8 @@ class ResultEvidenceTests(PresentationCase):
             "for cell in grid_rows(inputs[0]['ref']):\n    value=cell['value']\n    break\nresult=[{'name':'sample','label':'样例','value':value,'unit':None,'inputRefs':[inputs[0]['ref']]}]",
             answerOutputs=['sample'])
         evidence = query_evidence(turn)
-        self.assertFalse(evidence['pythonRuns'][0]['fileReads'][0]['exhausted'])
-        self.assertEqual(evidence['pythonRuns'][0]['sourceData'][0]['rowCount'], 1)
+        self.assertEqual(evidence['pythonRuns'][0]['inputDeliverySummary']['algorithmUsage'], 'NOT_PROVEN_BY_DELIVERY')
+        self.assertEqual(evidence['pythonRuns'][0]['sourceData'][0]['rowCount'], 20)
         from analysis_extension.grid_files import resolve_input
         from pathlib import Path
         path = resolve_input(self.service, {'captureRef':capture,'fileRef':file})['_path']
@@ -175,7 +178,7 @@ class ResultEvidenceTests(PresentationCase):
     async def test_capacity_records_progress_before_any_model_call(self):
         turn = self.turn()
         evidence = {'sources':[{'facts':[{'value':'1'}]}], 'relations':[]}
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 20), patch('analysis_extension.turn_completion._model_review', new_callable=AsyncMock) as model:
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=20), patch('analysis_extension.turn_completion._model_review', new_callable=AsyncMock) as model:
             with self.assertRaises(AnalysisError):
                 await review_query_answer(None, turn, evidence, 'answer')
             model.assert_not_awaited()
@@ -184,7 +187,7 @@ class ResultEvidenceTests(PresentationCase):
         self.assertEqual(saved['completedPartCount'], 0)
         self.assertGreaterEqual(saved['prepareMs'], 0)
 
-    async def test_direct_capacity_interprets_existing_values_and_data_error_still_blocks(self):
+    async def test_direct_capacity_keeps_current_answer_and_known_data_error_still_blocks(self):
         turn = self.turn()
         capture, _, _ = saved_fixture(self.store, ('0', '-2'))
         turn._add_query_capture(capture)
@@ -192,18 +195,23 @@ class ResultEvidenceTests(PresentationCase):
         middleware.service = self.service
         middleware.query_reviewer = AsyncMock(side_effect=AnalysisError('REVIEW_CAPACITY','容量不足'))
         state = AgentState(reply_id='answer')
-        state.context = [Msg(id='answer', name='agent', role='assistant', content=[TextBlock(text='未经核对的合计是999999')])]
+        state.context = [Msg(id='answer', name='agent', role='assistant', content=[TextBlock(text='来源值为0和-2')])]
         verdict = await middleware._check_end(SimpleNamespace(state=state, name='agent', model=SimpleNamespace(generate_structured_output=AsyncMock(side_effect=summary_response))))
         self.assertEqual(verdict['status'], 'PARTIAL')
-        self.assertEqual(verdict['semanticReview'], 'NOT_REVIEWED')
-        self.assertEqual(verdict['deliveryStatus'], 'FACT_SUMMARY')
-        self.assertNotIn('999999', turn.state['hostCloseout']['answer'])
+        self.assertEqual(verdict['semanticReview'], 'UNAVAILABLE')
+        self.assertEqual(verdict['deliveryStatus'], 'CURRENT_UNREVIEWED')
+        self.assertIn('独立审核尚未完成', turn.state['hostCloseout']['answer'])
         self.assertIn('-2', turn.state['hostCloseout']['answer'])
         turn.state.pop('hostCloseout')
         middleware.query_reviewer = AsyncMock(return_value={'issues':[{'code':'ANSWER_MISMATCH','message':'实际数值不符'}]})
         verdict = await middleware._check_end(SimpleNamespace(state=state, name='agent', model=SimpleNamespace(generate_structured_output=AsyncMock(side_effect=summary_response))))
         self.assertEqual(verdict['status'], 'INCOMPLETE')
         self.assertEqual(verdict['semanticReview'], 'REVISE')
+        state.context = [Msg(id='answer', name='agent', role='assistant', content=[TextBlock(text='错误合计999999')])]
+        middleware.query_reviewer = AsyncMock(side_effect=AnalysisError('REVIEW_UNAVAILABLE', '网络超时'))
+        verdict = await middleware._check_end(SimpleNamespace(state=state, name='agent'))
+        self.assertEqual(verdict['deliveryStatus'], 'FACT_SUMMARY')
+        self.assertNotIn('999999', turn.state['hostCloseout']['answer'])
 
     async def test_interpreted_closeout_stream_and_saved_message_are_identical(self):
         from analysis_turn_completion_test import TurnLoopTests, call, text
@@ -215,14 +223,14 @@ class ResultEvidenceTests(PresentationCase):
         from utils import MockModel
         with patch.object(MockModel, 'generate_structured_output', AsyncMock(side_effect=summary_response)), patch('analysis_extension.middleware.query_evidence', return_value=evidence), patch(
                 'analysis_extension.middleware.review_query_answer', new=AsyncMock(side_effect=AnalysisError('REVIEW_CAPACITY','容量不足'))):
-            events, ends = await TurnLoopTests.run_agent(self, [call('AnalysisTask', action='declare', mode='DIRECT', goal='查询金额'), text('未经核对的合计是999999')])
+            events, ends = await TurnLoopTests.run_agent(self, [call('AnalysisTask', action='declare', mode='DIRECT', goal='查询金额'), text('来源值为0和-2')])
         delivered = ''.join(event.delta for event in events if getattr(event, 'type', '') == 'TEXT_BLOCK_DELTA')
         saved = [event for event in events if isinstance(event, Msg)][-1]
         self.assertEqual(delivered, saved.get_text_content())
-        self.assertNotIn('999999', delivered)
+        self.assertIn('独立审核尚未完成', delivered)
         self.assertIn('-2', delivered)
         self.assertEqual(saved.metadata['analysisCompletion'], ends[0].metadata['analysisCompletion'])
-        self.assertEqual(saved.metadata['analysisCompletion']['deliveryStatus'], 'FACT_SUMMARY')
+        self.assertEqual(saved.metadata['analysisCompletion']['deliveryStatus'], 'CURRENT_UNREVIEWED')
         self.assertEqual(ends[0].finished_reason, ReplyFinishedReason.COMPLETED)
 
     async def test_failed_dependency_review_never_runs_global_approval(self):
@@ -230,12 +238,12 @@ class ResultEvidenceTests(PresentationCase):
         evidence = ResultPartitionTests().evidence()
         failure = {'issues':[{'code':'ANSWER_MISMATCH','message':'输入与合计不符'}]}
         reviewer = AsyncMock(side_effect=[failure, {'issues':[]}])
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 10000), patch(
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=10000), patch(
                 'analysis_extension.turn_completion._model_review', new=reviewer):
             result = await review_query_answer(None, turn, evidence, '两个结果比较')
         self.assertEqual(result, failure)
         self.assertEqual(reviewer.await_count, 2)
-        self.assertTrue(all(json.loads(call.args[-1])['resultReviewPhase']=='DEPENDENCY' for call in reviewer.await_args_list))
+        self.assertTrue(all(review_material(call.args[-1])['resultReviewPhase']=='DEPENDENCY' for call in reviewer.await_args_list))
 
     async def test_saved_grid_focus_once_preserves_result_without_source_query(self):
         from analysis_extension.query_result_evidence import focus_saved_reads, focused_results_preserved
@@ -262,7 +270,7 @@ class ResultEvidenceTests(PresentationCase):
         focused['pythonRuns'][0]['outputs'][0]['value']='999'
         self.assertFalse(focused_results_preserved(turn,focused))
 
-    async def test_capacity_grid_gets_one_recovery_then_source_closeout(self):
+    async def test_capacity_grid_keeps_answer_without_filtering_or_rerunning(self):
         turn=self.turn()
         capture,file,_,_,_=await self.make_grid(3)
         await self.compute(capture,file,'grid',
@@ -275,11 +283,12 @@ class ResultEvidenceTests(PresentationCase):
         state.context=[Msg(id='answer',name='agent',role='assistant',content=[TextBlock(text='总额0.3')])]
         agent=SimpleNamespace(state=state,name='agent',model=SimpleNamespace(generate_structured_output=AsyncMock(side_effect=summary_response)))
         first=await middleware._check_end(agent)
-        self.assertEqual(first['recoveryAction'],'FOCUS_SAVED_GRID')
-        self.assertNotIn('hostCloseout',turn.state)
+        self.assertNotIn('recoveryAction',first)
+        self.assertIn('总额0.3',turn.state['hostCloseout']['answer'])
         second=await middleware._check_end(agent)
-        self.assertEqual(second['deliveryStatus'],'FACT_SUMMARY')
-        self.assertEqual(second['semanticReview'],'NOT_REVIEWED')
+        self.assertEqual(second['deliveryStatus'],'CURRENT_UNREVIEWED')
+        self.assertEqual(second['semanticReview'],'UNAVAILABLE')
+        middleware.query_reviewer.assert_awaited_once()
 
     async def test_focus_diagnostic_change_is_reviewed_instead_of_forced_closeout(self):
         from analysis_extension.query_result_evidence import focus_saved_reads
@@ -308,8 +317,10 @@ class ResultEvidenceTests(PresentationCase):
         self.assertEqual(comparison['changedOutputNames'], ['total'])
         self.assertEqual(comparison['previousCalculations'][0]['outputs'][0]['data']['scan'], 'structure')
         self.assertEqual(evidence['pythonRuns'][0]['outputs'][0]['data']['count'], 3)
-        payload = json.loads(query_review_payloads({'candidateAnswer': '合计0.3'}, evidence)[0])
-        self.assertEqual(payload['evidence']['focusComparison'], comparison)
+        payload = review_material(query_review_payloads({'candidateAnswer': '合计0.3'}, evidence)[-1])
+        self.assertEqual(payload['evidence']['focusComparison']['changedOutputNames'], comparison['changedOutputNames'])
+        self.assertNotIn('code', payload['evidence']['focusComparison']['previousCalculations'][0])
+        self.assertEqual(payload['evidence']['focusComparison']['previousCalculations'][0]['outputs'], comparison['previousCalculations'][0]['outputs'])
 
     async def test_focus_changed_amount_remains_visible_and_can_be_rejected(self):
         from analysis_extension.query_result_evidence import focus_saved_reads, focused_review_context
@@ -336,7 +347,7 @@ class ResultEvidenceTests(PresentationCase):
         self.assertEqual(status['semanticReview'], 'REVISE')
         self.assertNotIn('hostCloseout', turn.state)
 
-    async def test_grid_focus_continues_same_reply_without_publishing_first_draft(self):
+    async def test_grid_capacity_delivers_same_candidate_without_another_model_rewrite(self):
         from analysis_turn_completion_test import TurnLoopTests, call, text
         from agentscope.types import ReplyFinishedReason
         turn=self.turn()
@@ -352,11 +363,13 @@ class ResultEvidenceTests(PresentationCase):
                 call('AnalysisTask',action='declare',mode='DIRECT',goal='查询金额'),
                 text('初次候选0.3'),text('最终数值0.3')])
         delivered=''.join(event.delta for event in events if getattr(event,'type','')=='TEXT_BLOCK_DELTA')
-        self.assertNotIn('初次候选',delivered)
-        self.assertIn('最终数值0.3',delivered)
+        self.assertIn('初次候选0.3',delivered)
+        self.assertNotIn('最终数值',delivered)
+        self.assertIn('独立审核尚未完成',delivered)
+        reviewer.assert_awaited_once()
         self.assertEqual(len(ends),1)
         self.assertEqual(ends[0].finished_reason,ReplyFinishedReason.COMPLETED)
-        self.assertEqual(ends[0].metadata['analysisCompletion']['semanticReview'],'PASS')
+        self.assertEqual(ends[0].metadata['analysisCompletion']['semanticReview'],'UNAVAILABLE')
 
 
 class ResultPartitionTests(TestCase):
@@ -373,25 +386,25 @@ class ResultPartitionTests(TestCase):
 
     def test_complete_dependencies_then_global_result_review(self):
         evidence = self.evidence()
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 10000):
-            payloads = [json.loads(p) for p in query_review_payloads({'candidateAnswer':'两个结果比较'}, evidence)]
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=10000):
+            payloads = [review_material(p) for p in query_review_payloads({'candidateAnswer':'两个结果比较'}, evidence)]
         self.assertEqual([p['resultReviewPhase'] for p in payloads], ['DEPENDENCY','DEPENDENCY','FINAL'])
         self.assertEqual(len(payloads[-1]['evidence']['finalResults']), 2)
         for part in payloads[:-1]:
             self.assertEqual(part['evidence']['pythonRuns'][0]['sourceData'][0]['rows'], [['0'],[None]])
             self.assertNotIn('candidateAnswer', part)
-            self.assertNotIn('userRequest', part)
+            self.assertIn('userRequest', part)
 
     def test_one_global_calculation_is_never_split_to_claim_full_pass(self):
         evidence = self.evidence()
         evidence['pythonRuns'][0]['code'] *= 2
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 10000):
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=10000):
             with self.assertRaises(AnalysisError) as result:
                 query_review_payloads({'candidateAnswer':'全局合计'}, evidence)
         self.assertEqual(result.exception.code,'REVIEW_CAPACITY')
 
     def test_normalized_number_uses_configured_format_not_guessing(self):
-        from analysis_extension.python_worker import grid_value
+        from analysis_extension.grid_contract import grid_value
         cell = {'measureCode':'amount','rawValueJson':'"1,234.50"'}
         self.assertEqual(grid_value(cell,'grouped-dot'),'1234.50')
         self.assertEqual(grid_value(cell),'1,234.50')

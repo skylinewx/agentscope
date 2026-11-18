@@ -292,6 +292,7 @@ def project(artifact, registry: RuleRegistry, view_parameters=None):
             "summaryClaimIndexes": [i for i in range(len(claims)) if i not in placed],
             "chartUnavailable": '；'.join(unavailable) or None,
             "claims": claims,
+            **({'reportDelivery': deepcopy(artifact['reportDelivery'])} if artifact.get('reportDelivery') else {}),
             "claimsScopeLabel": '；'.join(x for x in ["结论适用于原发布范围" if restricted else '', artifact.get('partialReason', '')] if x), **projection(artifact),
             "sources": sorted({label(" / ".join(str(f.get(k) or "") for k in ("taskName", "formName", "period")), "来源说明未提供") for f in facts}) if artifact["technicalDetails"] else [],
             "limitations": list(dict.fromkeys(limitations)) if artifact["technicalDetails"] else [], "total": len(rows), "originalTotal": len(original)}

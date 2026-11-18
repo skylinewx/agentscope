@@ -1,7 +1,7 @@
 """复用宿主对冻结页面的真实观察，避免把动态占位符当作最终展示。"""
 from .models import AnalysisError
 
-TEXT_LIMIT = 16000
+TEXT_LIMIT = 262144
 
 
 def snapshot(text):
@@ -26,14 +26,22 @@ def review_text(turn, artifact, source_text):
     texts, widths = [], []
     for record in records:
         observed = record.get('hostRenderedText', {})
-        if (record.get('runner') != 'headless-service' or record.get('contentDigest') != document.get('contentDigest')
+        if (record.get('runner') not in ('headless-service', 'workspace-browser') or record.get('contentDigest') != document.get('contentDigest')
                 or record.get('blocking') or observed.get('complete') is not True or not observed.get('text')):
             continue
         if observed['text'] not in texts:
             texts.append(observed['text'])
         widths.append(record['viewport']['width'])
     if not texts:
-        return {'documentText': source_text, 'documentTextBasis': 'STATIC_SOURCE'}
+        result = {'documentText': source_text, 'documentTextBasis': 'STATIC_SOURCE',
+                  'documentObservation': '尚无当前页面的完整实测文本；下列绑定内容是冻结业务数据，不能据此断言所有内容已在可见页面正确展示。'}
+        marker = '<script id="analysis-host-data" type="application/json">'
+        if marker in document.get('html', ''):
+            import json
+            payload = json.loads(document['html'].split(marker, 1)[1].split('</script>', 1)[0])
+            result['documentBindingContent'] = {'values': payload['values'], 'sets': payload['sets']}
+            result['documentTextBasis'] = 'STATIC_AND_BOUND_DATA'
+        return result
     result = {'documentText': '\n\n'.join(texts), 'documentTextBasis': 'HOST_RENDERED',
               'documentTextViewports': widths}
     if source_text and source_text.split() != result['documentText'].split():

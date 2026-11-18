@@ -1277,6 +1277,9 @@ class ChatService:
 
                 agent_state = session_record.state
                 agent_state.session_id = session_id
+                from ...agent._tool_history_recovery import restore_persisted_tool_results
+                await restore_persisted_tool_results(agent_state.context,
+                    lambda message_id: self._storage.get_message(user_id, session_id, message_id))
                 chat_config = agent_record.data.chat_config
                 agent = self._agent_cls(
                     name=agent_record.data.name,
@@ -1339,7 +1342,7 @@ class ChatService:
                 nonlocal events_since_checkpoint
                 events_since_checkpoint += 1
                 boundary = isinstance(event, (ReplyStartEvent, ReplyEndEvent)) or (
-                    isinstance(event, CustomEvent) and event.name == 'agent_progress'
+                    isinstance(event, CustomEvent) and event.name in ('agent_progress', 'analysis_execution_progress')
                 )
                 if reply_msg is None or checkpoint_cursor is None or (
                     not boundary and events_since_checkpoint < _REPLY_CHECKPOINT_EVENTS

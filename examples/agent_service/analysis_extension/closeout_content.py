@@ -47,7 +47,8 @@ class ReviewedParagraphs(HTMLParser):
 
 
 def evidence_digest(artifact):
-    return digest({key: artifact.get(key) for key in ('facts', 'derivedValues', 'scope', 'planDigest')})
+    return digest({key: artifact.get(key) for key in ('facts', 'derivedValues', 'scope', 'planDigest',
+                                                     'pythonRuns', 'relations', 'context', 'ruleVersion')})
 
 
 def preview_review_status(service, artifact, closeout_reason=None):

@@ -15,6 +15,23 @@ const output = (value) => ({ ...result, output: [{ type: 'text', text: JSON.stri
 const expected = [{ analysisRef, path }];
 const rejected = { type: 'hint', source: JSON.stringify({ label: 'System', sublabel: 'Completion check' }), hint: '修正' };
 
+test('host-bound pending report stays visible after streaming and reload, without claiming review passed', () => {
+  const reportDelivery = { mode: 'PENDING_REVIEW', analysisRef, programChecks: 'PASS',
+    reviewRef: 'review_frozen', semanticReview: 'PARTIAL' };
+  const completion = { status: 'PARTIAL', analysisRef, semanticReview: 'PARTIAL', reportDelivery };
+  const m = message([call, result], { id: 'pending-reply', finished_reason: 'completed' });
+  applyReplyPresentation(m, { type: 'REPLY_END', reply_id: 'pending-reply', metadata: { analysisCompletion: completion } });
+  assert.deepEqual(finalAnalysisDeliveries(m), expected);
+  assert.deepEqual(finalAnalysisDeliveries(JSON.parse(JSON.stringify(m))), expected);
+  assert.equal(m.metadata.analysisCompletion.semanticReview, 'PARTIAL');
+  for (const change of [{ analysisRef: `${id}:5` }, { programChecks: 'FAILED' },
+    { mode: 'REQUIRES_REVISION' }, { reviewRef: null }, { semanticReview: 'REVISE' }]) {
+    assert.deepEqual(finalAnalysisDeliveries({ ...m, metadata: { analysisCompletion: {
+      ...completion, reportDelivery: { ...reportDelivery, ...change } } } }), []);
+  }
+  assert.deepEqual(finalAnalysisDeliveries({ ...m, content: [] }), []);
+});
+
 // 与 ToolOffloadMiddleware 保存的宿主通知格式一致；后台占位结果本身不是发布回执。
 function background(value = response, metadata = result.metadata, name = call.name, callId = call.id) {
   return [

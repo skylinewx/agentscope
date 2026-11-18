@@ -556,3 +556,22 @@ class RedisMessageQueueTest(_QueueContract, IsolatedAsyncioTestCase):
         storage = RedisStorage()
         storage._client = fakeredis.aioredis.FakeRedis(decode_responses=True)
         return storage
+
+    async def test_legacy_summary_keeps_background_run_parked(self):
+        def mark_background(session):
+            session.state.middle_context["background_tools_v1"] = {"tool": {}}
+
+        await self.storage.mutate_session(
+            "owner", "agent", "session", mark_background,
+        )
+        summary = await self.storage.get_session_summary(
+            "owner", "agent", "session",
+        )
+        await self.storage._client.set(
+            self.storage._summary_key("owner", "session"),
+            summary.model_dump_json(exclude={"has_background_tools"}),
+        )
+
+        queue = await self.read()
+        self.assertEqual(queue.activity, "waiting")
+        self.assertEqual(queue.waiting_reason, "background")

@@ -3176,6 +3176,19 @@ class Agent:
         if n_tokens <= self.context_config.tool_result_limit:
             return tool_result, None
 
+        # A source adapter may supply a complete, bounded navigation envelope
+        # after persisting the original result. Keep that envelope intact rather
+        # than cutting its JSON/Markdown or losing its read references.
+        projection = tool_result.metadata.get('context_projection_text')
+        if isinstance(projection, str) and projection:
+            projected = deepcopy(tool_result)
+            projected.output = [TextBlock(text=projection)]
+            projected_tokens = await self.model.count_tokens(
+                [AssistantMsg(self.name, content=projected.output)], None,
+            )
+            if projected_tokens <= self.context_config.tool_result_limit:
+                return projected, deepcopy(tool_result)
+
         # Use a copied block for token counting
         copied_tool_result = deepcopy(tool_result)
 
@@ -3342,6 +3355,10 @@ class Agent:
             `dict[str, Any]`
                 The keyword arguments passed to the model.
         """
+        from ._tool_history_recovery import repair_tool_history
+        repaired = repair_tool_history(self.state.context)
+        if repaired:
+            logger.warning('Recovered missing tool receipts before model input: %s', repaired)
         # The system prompt
         messages = [
             SystemMsg(name="system", content=await self._get_system_prompt()),

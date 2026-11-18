@@ -39,7 +39,7 @@ def result_ranges(receipt, step_id, table):
 def validate(capture, receipt, step_id, table):
     """核对原请求、固定上下文及完整表形状；失败或未执行的批量范围不可用于分析。"""
     from .budget_v2 import _step_request, _bindings, CONTEXT_FIELDS
-    step, steps = _step_request(capture, step_id)
+    step, steps = _step_request(capture, step_id, receipt=receipt)
     if step.get('operation') != 'BATCH_DATA_QUERY' or table.get('resultType') != 'BATCH_RESULT':
         raise AnalysisError('REQUEST_MISMATCH', '批量结果不属于原批量查询步骤。')
     if table.get('disposition') != 'SUCCEEDED':
@@ -327,19 +327,24 @@ def adapt(captures, selections, scope, max_facts):
         data = validate(captures[ref], receipts[ref], sid, table)
         from .budget_exact import view
         table = view(table); data = table['data']
+        column_names, row_set = selection_scope(selection, table)
+        own = [item for item in catalogs[ref] if item['batchId'] == table['batchId']]
+        available_cells = [item for item in own if item['columnName'] in column_names]
         role = table['columnRoles'].get(dimension, {})
-        if role.get('kind') not in ('DIMENSION', 'PROPERTY') and dimension not in data.get('fixedDimValMap', {}):
+        if (role.get('kind') not in ('DIMENSION', 'PROPERTY') and dimension not in data.get('fixedDimValMap', {})
+                and (not available_cells or any(dimension not in item['dimensions'] for item in available_cells))):
             raise AnalysisError('BATCH_GRAIN_MISMATCH', 'memberDimension 必须是实际结果粒度，不能用原机构维度替代属性分组列。',
                                 {'path': '/scope/memberDimension', 'memberDimension': dimension,
                                  'availableDimensions': [name for name, role in table['columnRoles'].items()
                                                          if role['kind'] in ('DIMENSION', 'PROPERTY')],
                                  'captureRef': ref, 'stepId': sid, 'batchId': table['batchId']})
-        column_names, row_set = selection_scope(selection, table)
-        own = [item for item in catalogs[ref] if item['batchId'] == table['batchId']]
         member_index = next((index for index, column in enumerate(data['columns']) if column['name'] == dimension), None)
-        populations.append({row[member_index] if member_index is not None else data.get('fixedDimValMap', {}).get(dimension)
-                            for index, row in enumerate(data['rows'])
-                            if 'exactRowMetrics' not in table or table['exactRowMetrics'][index] in column_names})
+        if member_index is None and dimension not in data.get('fixedDimValMap', {}):
+            populations.append({item['dimensions'][dimension] for item in available_cells})
+        else:
+            populations.append({row[member_index] if member_index is not None else data['fixedDimValMap'][dimension]
+                                for index, row in enumerate(data['rows'])
+                                if 'exactRowMetrics' not in table or table['exactRowMetrics'][index] in column_names})
         complete &= receipts[ref].get('completeness', {}).get('enumerationExhausted') is True
         for item in own:
             if row_set is not None and item['rowIndex'] not in row_set or item['columnName'] not in column_names:

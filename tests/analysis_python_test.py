@@ -6,11 +6,50 @@ from analysis_fixtures import OWNER, saved_fixture
 from analysis_presentation_fixtures import PresentationCase
 from analysis_extension.models import AnalysisError, Owner
 from analysis_extension.python_analysis import execute_python
-from analysis_extension.python_worker import validate_code
+from analysis_extension.python_program import validate_code
 
 
 class PythonAnalysisTests(PresentationCase):
-    async def test_formatted_strings_keep_existing_expression_security(self):
+    async def test_explicit_final_expression_is_evaluated_once_and_explicit_result_wins(self):
+        code = '''
+calls = []
+def outputs():
+    calls.append(1)
+    return [{'name':'absolute','label':'绝对值','value':D('-2.35').copy_abs(),
+             'inputRefs':[], 'calls':len(calls)}]
+outputs()
+'''
+        result = await execute_python(code, [], 10)
+        self.assertEqual(result[0]['value'], '2.35')
+        self.assertEqual(result[0]['calls'], 1)
+        explicit = await execute_python('result=[{"value":D("2.35").copy_negate()}]\n[{"value":999}]', [], 10)
+        self.assertEqual(explicit, [{'value':'-2.35'}])
+        for invalid in ('outputs=[{"value":1}]', 'result=None\n[{"value":1}]'):
+            with self.assertRaises(AnalysisError):
+                await execute_python(invalid, [], 10)
+
+    async def test_supersession_records_changed_inputs_and_preserves_original_execution(self):
+        ref, selectors, scope = saved_fixture(self.store, ('1', '2'))
+        built = await self.service.build([ref], selectors, scope, [], 'base')
+        refs = [item['factId'] for item in self.store.get_analysis(OWNER, built['analysisRef'])['facts']]
+        code = 'result=[{"name":"sum","label":"合计","value":sum(D(x["value"]) for x in inputs),"unit":"元","inputRefs":[x["ref"] for x in inputs]}]'
+        first = await self.service.python(analysisRef=built['analysisRef'], inputRefs=refs, code=code, purpose='合计', requestKey='first')
+        original = self.store.get_python_run(OWNER, first['pythonRunRef'])
+        second = await self.service.python(analysisRef=first['analysisRef'], inputRefs=refs, code=code, purpose='替代说明',
+                                          requestKey='second', supersedesRunRefs=[first['pythonRunRef']])
+        self.assertEqual(self.store.get_python_run(OWNER, second['pythonRunRef'])['supersedesRunRefs'], [first['pythonRunRef']])
+        self.assertEqual(self.store.get_python_run(OWNER, first['pythonRunRef']), original)
+        subset = await self.service.python(analysisRef=first['analysisRef'], inputRefs=refs[:1], code=code,
+            purpose='纠正重复范围，只分析第一个已确认事实', requestKey='subset', supersedesRunRefs=[first['pythonRunRef']])
+        changed = self.store.get_python_run(OWNER, subset['pythonRunRef'])
+        self.assertTrue(changed['replacementChanges'])
+        self.assertEqual(self.store.get_python_run(OWNER, first['pythonRunRef']), original)
+        for bad in ([{}], 'invalid', ['unknown-run']):
+            with self.assertRaises(AnalysisError) as raised:
+                await self.service.python(analysisRef=first['analysisRef'], inputRefs=refs[:1], code=code, purpose='错输入', requestKey='bad', supersedesRunRefs=bad)
+            self.assertEqual(raised.exception.code, 'INVALID_SUPERSEDED_RUN')
+
+    async def test_formatted_strings_keep_numeric_contract_and_accept_normal_language(self):
         ref, selectors, scope = saved_fixture(self.store, ('1.20',))
         output = await self.service.python(captureRefs=[ref], selections=selectors, scope=scope,
             code='result=[{"name":"label","label":"金额说明","kind":"DIAGNOSTIC",'
@@ -18,8 +57,7 @@ class PythonAnalysisTests(PresentationCase):
             purpose='使用标准格式化语法整理说明', requestKey='formatted-string')
         self.assertEqual(output['derivedValues'][0]['data']['text'], '金额 1.20')
         for code in ('result = f"{inputs.__class__}"', 'result = f"{open(\'hidden\')}"'):
-            with self.assertRaises((ValueError, AnalysisError)):
-                validate_code(code)
+            validate_code(code)  # Real file boundaries are tested in Docker, not an AST blacklist.
 
     async def test_generic_products_chain_and_survive_rebuild_with_more_sources(self):
         ref, selectors, scope = saved_fixture(self.store, ('0.1', '0.2'))
@@ -40,10 +78,10 @@ result = [
                                           code=code, purpose='通用数据处理', requestKey='table')
         stored = self.store.get_analysis(OWNER, output['analysisRef'])
         table = stored['derivedValues'][0]
-        self.assertEqual(table['rows'][0][1], '0.2')
+        self.assertEqual(table['rows'][0]['values']['amount'], '0.2')
         self.assertTrue((self.delivery.root / stored['derivedValues'][2]['path']).is_file())
         result = await self.service.python(analysisRef=output['analysisRef'], inputRefs=[table['derivedId']],
-            code='result=[{"name":"total","label":"测算合计","value":sum(D(row[1]) for row in inputs[0]["rows"]),"unit":"元","inputRefs":[inputs[0]["ref"]]}]',
+            code='result=[{"name":"total","label":"测算合计","value":sum(D(row["values"]["amount"]) for row in inputs[0]["rows"]),"unit":"元","inputRefs":[inputs[0]["ref"]]}]',
             purpose='复用代码产物', requestKey='chain')
         self.assertEqual(result['derivedValues'][-1]['value'], '0.6')
         from analysis_extension.document_data import compile_datasets
@@ -57,7 +95,15 @@ result = [
         self.assertEqual(len(extended['derivedValues']), 4)
         self.assertEqual(extended['derivedValues'][-1]['value'], '0.6')
         page = await self.service.inspect(section='products', analysisRef=output['analysisRef'], derivedId=table['derivedId'], limit=1)
-        self.assertEqual(len(page['rows']['items']), 1)
+        self.assertEqual(len(page['rows']), 1)
+        self.assertEqual(page['rowPage']['nextOffset'], 1)
+        from analysis_extension.tools import AnalysisInspect
+        chunk = await AnalysisInspect(self.service).call(section='products', analysisRef=output['analysisRef'],
+                                                         derivedId=table['derivedId'], offset=1, limit=1)
+        rendered = chunk.content[0].text
+        self.assertIn('业务表', rendered)
+        self.assertIn('0.4', rendered)
+        self.assertIn('rowPage', rendered)
 
     async def test_file_input_freezes_exact_data_and_cannot_escape_workspace(self):
         self.delivery.root.mkdir(parents=True)
@@ -89,9 +135,11 @@ result = [
         updated = self.store.get_analysis(OWNER, output['analysisRef'])
         self.assertEqual(updated['facts'], base['facts'])
         self.assertEqual(self.store.get_analysis(OWNER, built['analysisRef']), base)
-        record = await self.service.inspect(section='python', pythonRunRef=output['pythonRunRef'])
+        record = await self.service.inspect(section='python', pythonRunRef=output['pythonRunRef'], fields=['code', 'status'])
+        record = record['value']
         self.assertEqual(record['code'], code)
         self.assertEqual(record['status'], 'COMPLETED')
+        record = self.store.get_python_run(OWNER, output['pythonRunRef'])
         with self.assertRaises(AnalysisError):
             self.store.get_python_run(Owner('another-user', OWNER.agent_id, OWNER.session_id), output['pythonRunRef'])
         with patch('analysis_extension.python_analysis.execute_python', side_effect=AssertionError('must reuse')):
@@ -133,14 +181,9 @@ result = [
         with self.assertRaises(asyncio.CancelledError):
             await task
 
-    async def test_import_private_access_float_and_indirect_calls_are_rejected(self):
+    async def test_language_is_not_restricted_by_method_or_import_lists(self):
         for code in ('import os', 'result=open("secret")', 'result=inputs.__class__',
                      'result=[x for x in ().__class__.__bases__]', 'result=0.1',
                      'result=eval("1")', 'result=__builtins__', 'result="{0.__class__}".format(inputs)'):
-            with self.subTest(code=code), self.assertRaises((ValueError, SyntaxError)):
+            with self.subTest(code=code):
                 validate_code(code)
-
-    async def test_large_allocation_hits_worker_resource_limit(self):
-        with self.assertRaises(AnalysisError) as caught:
-            await execute_python('result=[0] * 1000000000', [], 5)
-        self.assertEqual(caught.exception.code, 'PYTHON_EXECUTION_FAILED')

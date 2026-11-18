@@ -4,6 +4,7 @@ from datetime import date
 import re
 
 from .models import AnalysisError, digest
+from .receipt_reads import receipt_read_scope
 
 
 INTENT_FIELDS = ('metric', 'task', 'period', 'formExecutionYear', 'scenario', 'population', 'grouping',
@@ -51,8 +52,8 @@ def _selectors(turn):
 def _tables(turn, selectors):
     """范围只引用当前所有者可读的原回执，状态中不复制大表。"""
     from .batch_scope import selected_tables
-    captures = {item['captureRef']: turn.service.store.get_capture(turn.service.owner, item['captureRef'])
-                for item in selectors}
+    captures = {ref: turn.service.store.get_capture(turn.service.owner, ref)
+                for ref in dict.fromkeys(item['captureRef'] for item in selectors)}
     return [(selection, captures[selection['captureRef']], table, rows)
             for selection, table, _, _, rows in selected_tables(captures, selectors)]
 
@@ -226,7 +227,9 @@ def _apply_form_year(request, year):
     return result
 
 
-def prepare_request(turn, origin, request):
+def prepare_request(turn, origin, request, *, host_prepared=False):
+    from .execution_policy import check_query
+    check_query(turn, origin, request)
     if origin.get('originalToolName') == 'execute_budget_query':
         if 'sourceSelection' in request:
             raise AnalysisError('QUERY_CONTRACT_CHANGED', '采用结果使用 basis.kind 与真实 sourceRef；执行和事实凭据由宿主绑定。')
@@ -235,9 +238,20 @@ def prepare_request(turn, origin, request):
         turn = copy(turn)
         turn.state = deepcopy(original_turn.state)
         request = deepcopy(request)
+        from .material_plan import query_purpose
+        # Host retries carry a frozen request and bypass this model-input path.
+        if not host_prepared:
+            request['purpose'] = query_purpose(turn.state, request)
+        material_role = request.pop('materialRole', 'PRIMARY')
         model_request = request
         from .scope_candidates import bind as bind_scope_candidates
         request = bind_scope_candidates(turn, origin, request)
+        if any(b.get('recoveryExecutionId') for b in request.get('scope', {}).get('bindings', [])):
+            from .condition_context import prepare
+            prepare(turn, request)
+            from .material_plan import request_key
+            original_turn.state.setdefault('materialQueryRoles', {})[request_key(request)] = material_role
+            return request
         from .source_views import query_basis
         from .query_lineage import scope_terms
         model_basis = request.get('basis') or {}
@@ -276,9 +290,16 @@ def prepare_request(turn, origin, request):
         if result.get('intentDraft') is not None:
             result['intentDraft'].setdefault('sharedConditions', [])
             result['intentDraft'].setdefault('targets', [])
+        from .condition_context import prepare as prepare_conditions
+        prepare_conditions(turn, result)
         # A speculative query has a local scope. Only explicit declaration/adoption
         # changes the analysis base; asynchronous completions cannot overwrite it.
         original_turn.state.setdefault('businessEvidence', {}).update(turn.state.get('businessEvidence', {}))
+        from .material_plan import request_key
+        roles = original_turn.state.setdefault('materialQueryRoles', {})
+        roles[request_key(result)] = material_role
+        while len(roles) > 128:
+            del roles[next(iter(roles))]
         return result
     result = _inherit_request(turn, origin, request)
     year = turn.state.get('queryIntent', {}).get('formExecutionYear')
@@ -298,12 +319,22 @@ def _inherit_business_request(turn, origin, request, source_ref=None):
     if (result.get('basis') or {}).get('kind') == 'FACTS':
         result.pop('contextText', None)
         return result
-    if turn.state.get('requiredEvidence') == 'VALUES' and not turn.state.get('budgetFormulaTargets'):
-        # Presentation/analysis mode does not imply a formula read.
-        result['purpose'] = 'QUERY'
     # Only inherit previously declared business text. Recall and candidate
     # combinations are rebuilt by the server; never copy a member result subset.
     result.pop('contextText', None)
+    if turn.state.get('followupContext', {}).get('mode') == 'NEW':
+        changes = _changes(turn)
+        prior = turn.state.get('inheritedSystemRequest', {})
+        scope = result.setdefault('scope', {})
+        period_changed = ('period' in changes or any(t.get('periodText') and t['periodText'] in result.get('question', '')
+                         for t in (result.get('intentDraft') or {}).get('targets', [])))
+        if not period_changed:
+            if prior.get('scope'):
+                scope.pop('periodCode', None)
+                scope.pop('periodRequest', None)
+                scope.update(deepcopy(prior['scope']))
+            if prior.get('periodTexts'):
+                result['contextText'] = ' '.join(prior['periodTexts'])
     if turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':
         changes = _changes(turn)
         previous_intent = turn.state.get('previousQueryIntent', {})
@@ -355,6 +386,16 @@ def _inherit_business_request(turn, origin, request, source_ref=None):
             if period:
                 terms.append(period)
         _inherit_phrase_quotes(result, confirmed_requests, terms)
+        active_evidence = result.get('question', '') + ' ' + ' '.join(terms)
+        draft = result.get('intentDraft') or {}
+        phrases = list(draft.get('sharedConditions', [])) + [phrase for target in draft.get('targets', [])
+                                                           for phrase in target.get('businessPhrases', [])]
+        for phrase in phrases:
+            restored = [term for term in released if term and term not in active_evidence
+                        and term in phrase.get('text', '')]
+            if restored:
+                raise AnalysisError('QUERY_DRAFT_EVIDENCE_INVALID', '检索表达恢复了本轮已解除的历史条件。',
+                                    {'releasedConditions': sorted(restored), 'retrievalText': phrase.get('text')})
         if terms:
             result['contextText'] = ' '.join(dict.fromkeys(terms))
     grouping = turn.state.get('queryIntent', {}).get('grouping')
@@ -375,18 +416,21 @@ def _inherit_business_request(turn, origin, request, source_ref=None):
             selected_set = (result.get('basis') or {}).get('source', {}).get('resultSetId') if source_ref else None
             prior = original_request(capture, receipt, selection, selected_set)
             previous[digest(prior)] = prior
+    if len(previous) > 1:
+        from .query_lineage import restore_shared_conditions
+        restore_shared_conditions(result, list(previous.values()), released,
+                                  retained_scenarios if len(retained_scenarios) == 1 else ())
     if len(previous) == 1:
         prior = next(iter(previous.values()))
         changed = _changes(turn)
         from .query_lineage import restore_targets
         supplied_targets = bool((result.get('intentDraft') or {}).get('targets'))
-        supplied_shared = 'sharedConditions' in (result.get('intentDraft') or {})
         restore_targets(result, prior, changed, released)
         # A confirmed scenario may originally have been written inside every
         # target instead of sharedConditions. Its native dimension establishes
         # the same condition either way. Retain only a unique unchanged scenario;
-        # explicit shared conditions (including []) remain authoritative.
-        if not supplied_shared and len(retained_scenarios) == 1:
+        # partial updates and [] preserve other dimensions; explicit clears do not.
+        if len(retained_scenarios) == 1:
             draft = result.setdefault('intentDraft', {})
             scenario = next(iter(retained_scenarios))
             phrases = draft.get('sharedConditions', []) + [phrase for target in draft.get('targets', [])
@@ -724,6 +768,7 @@ def _inherit_request(turn, origin, request):
     return result
 
 
+@receipt_read_scope()
 def query_anchors(turn):
     """返回已成功查询的完整身份；分组追问不靠模型重写长标识。"""
     if 'task' in _changes(turn):
@@ -879,6 +924,7 @@ def _formula_dependencies(facts, accepted):
     return dependencies
 
 
+@receipt_read_scope()
 def validate_primary(turn, data):
     """只阻断主体实质扩围。参考事实、结构和文字表达不参与成员范围判断。"""
     selectors = _selectors(turn)
@@ -1056,8 +1102,18 @@ def _remember_sources(turn, selections):
         turn.state.pop('inputSetVersion', None)
 
 
+@receipt_read_scope()
 def review_context(turn):
     """审查沿用已有调用；仅补充小型条件摘要，不把大表成员重复装进提示词。"""
+    from .condition_context import review_system_scope
+    protected = review_system_scope(turn.state)
+    actual = turn.state.get('conditionEffectiveScopes', {})
+    if actual:
+        # The policy and original request remain in immutable captures. Review
+        # the effective business scopes, not whether the host should relax history.
+        scopes = {digest(scope): scope for ref in turn.state.get('queryCaptureRefs', [])
+                  for scope in actual.get(ref, [])}
+        return {'effectiveScopes': list(scopes.values()), **protected}
     summaries = []
     for selection, capture, table, rows in _inherited_tables(turn, turn.state.get('inheritedScope', {}).get('selections', [])):
         query = _query(capture, selection['stepId'])
@@ -1069,6 +1125,7 @@ def review_context(turn):
     from .scope_changes import presentation_summary
     inherited = turn.state.get('inheritedScope', {})
     return {'context': turn.state.get('followupContext', {}), 'inheritedSubject': summaries,
+            **protected,
             'scopeEdits': deepcopy(turn.state.get('scopeEdits', [])),
             'adoptedInputs': [{key: deepcopy(value) for key, value in item.items() if key != 'selection'}
                               for item in turn.state.get('adoptedInputs', [])],

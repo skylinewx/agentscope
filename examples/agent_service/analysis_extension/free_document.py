@@ -142,6 +142,8 @@ def compile_document(artifact, document):
         fail('INVALID_DOCUMENT', 'bindings 最多 2000 个真实数值引用。', '/document/bindings')
     from .document_data import compile_datasets, fact_context
     datasets, dataset_refs = compile_datasets(artifact, document.get('datasets', []))
+    from .document_formula_requirements import require_formula_datasets
+    require_formula_datasets(artifact, datasets)
     if not bindings and not datasets:
         fail('INVALID_DOCUMENT', 'bindings 与 datasets 至少提供一个真实引用。')
     known = {f['factId']: f for f in artifact['facts']}

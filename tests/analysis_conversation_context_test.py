@@ -160,13 +160,13 @@ class ConversationContextTest(unittest.TestCase):
         self.assertEqual(set(state['businessContexts'][-1]['captureRefs']), {'c1', 'grid-details'})
         self.assertEqual(state['businessContexts'][-1]['analysisRef'], 'report:2')
 
-    def test_new_topic_clears_selected_context_without_erasing_history(self):
+    def test_new_topic_keeps_system_intent_without_reusing_prior_facts(self):
         state = next_context_state(self.first)
         state['request'] = '查询另一种产品'
         select_context(SimpleNamespace(state=state), {'mode': 'NEW', 'userQuote': '另一种产品'})
         self.assertEqual(state['selectedContextRefs'], [])
         self.assertEqual(state['inheritedScope'], {})
-        self.assertEqual(state['previousQueryIntent'], {})
+        self.assertEqual(state['previousQueryIntent'], {'period': '2026', 'population': '第一组'})
         self.assertEqual(len(state['businessContexts']), 1)
 
     def test_new_topic_clears_legacy_context_without_directory(self):

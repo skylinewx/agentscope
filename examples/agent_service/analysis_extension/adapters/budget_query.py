@@ -109,7 +109,14 @@ def _target(value):
 
 
 def validate(capture, receipt):
-    request, data = capture['request'], receipt.get('data', {})
+    from ..receipt_reads import read_once
+    return read_once('budget_query_validation', (capture, receipt), lambda: _validate(capture, receipt))
+
+
+def _validate(capture, receipt):
+    data = receipt.get('data', {})
+    from ..condition_context import effective_request
+    request = effective_request(capture['request'], data)
     if data.get('sourceBasis', {}).get('operation') == 'IMMUTABLE_FACT_VIEW':
         from .budget_source_view import validate_view
         return validate_view(capture, receipt, validate)
@@ -188,7 +195,7 @@ def validate(capture, receipt):
     _require(not data['complete'] or not data.get('unresolvedGroups'), '未确认的执行组不能声明全部完成。')
     from ..dimension_scopes import validate_execution
     validate_execution(request, data)
-    scope = _resolved_scope(request, data)
+    scope, target_bindings = _resolved_scope(request, data)
     if selection == 'FULL_FORM':
         _require(any(scope.get(k) for k in ('formCodes', 'formNames')),
                  '整表读取必须来自明确表样范围。')
@@ -252,6 +259,10 @@ def validate(capture, receipt):
         check_context(context, context)
         target = targets.get(result_set.get('targetId'))
         _require(selection == 'FULL_FORM' or target is not None, '返回了未请求的业务目标。')
+        if target:
+            logical_id = interpretations[target['id']].get('logicalTargetId', target['id'].split(':', 1)[0])
+            for field, allowed in target_bindings.get(logical_id, {}).items():
+                _require(context.get('target', {}).get(field) in allowed, '结果超出了该目标已确认的任务或表样。')
         organizations = ((target or {}).get('organizations', []) if selection != 'FULL_FORM' else
                          [org for item in interpretations.values() for org in item.get('organizations', [])])
         if organizations:
@@ -336,17 +347,30 @@ def _resolved_scope(request, data):
     bindings = scope.get('bindings', [])
     proofs = (data.get('resolution') or {}).get('scopeBindings', [])
     _require(isinstance(proofs, list) and len(proofs) == len(bindings), '候选范围缺少完整的服务端确认依据。')
+    owners = {item['id'] for item in (request.get('intentDraft') or {}).get('targets', [])}
+    target_bindings = {}
+    optional = {'targetId': None, 'recoveryExecutionId': None}
     for binding, proof in zip(bindings, proofs):
-        _require(isinstance(proof, dict) and proof.get('binding') == binding,
+        returned = proof.get('binding') if isinstance(proof, dict) else None
+        _require(isinstance(returned, dict) and isinstance(binding, dict)
+                 and {**optional, **returned} == {**optional, **binding},
                  '候选范围确认依据与请求不一致。')
         model, code, name = binding.get('modelCode'), proof.get('code'), proof.get('name')
         _require(model in ('BUDGET_TASK', 'BUDGET_FORM_TEMPLATE')
                  and isinstance(code, str) and bool(code.strip()) and isinstance(name, str) and bool(name.strip()),
                  '候选范围缺少确定的任务或表样身份。')
         prefix = 'task' if model == 'BUDGET_TASK' else 'form'
+        owner = binding.get('targetId')
+        recovery = binding.get('recoveryExecutionId')
+        if owner is not None or recovery is not None:
+            _require(owner in owners and isinstance(recovery, str) and bool(recovery.strip()), '候选范围缺少所属目标或原查询依据。')
+            if request.get('selection') != 'FULL_FORM':
+                target_bindings.setdefault(owner, {}).setdefault(prefix + 'Code', set()).add(code)
+                continue
+            _require(len(owners) == 1, '整表读取需要唯一明确的表样范围。')
         scope[prefix + 'Codes'] = list(dict.fromkeys([*scope.get(prefix + 'Codes', []), code]))
         scope[prefix + 'Names'] = [value for value in scope.get(prefix + 'Names', []) if value != binding['text']]
-    return scope
+    return scope, target_bindings
 
 
 def _validate_value_filter(request, data, origins, results):

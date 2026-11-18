@@ -2,8 +2,10 @@
 """Test cases for :class:`LocalWorkspaceManager`."""
 
 from unittest.async_case import IsolatedAsyncioTestCase
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
+from agentscope.app.storage import SessionConfig, SessionRecord, StorageBase
+from agentscope.app.storage._session_summary import SessionSummary
 from agentscope.app.workspace_manager import (
     IsolationPolicy,
     LocalWorkspaceManager,
@@ -57,3 +59,27 @@ class TestLocalWorkspaceManager(IsolatedAsyncioTestCase):
             [alice.kwargs["workspace_id"], bob.kwargs["workspace_id"]],
             ["982aa9b33217069a", "883053c3e4594c5b"],
         )
+
+    async def test_reuses_workspace_binding_from_session_summary(self) -> None:
+        manager = LocalWorkspaceManager("/tmp/local-manager-test")
+        storage = AsyncMock(spec=StorageBase)
+        storage.get_agent.return_value = None
+        session = SessionRecord(
+            user_id="alice",
+            agent_id="a1",
+            config=SessionConfig(workspace_id="existing-workspace"),
+        )
+        storage.list_session_summaries.return_value = [
+            SessionSummary.from_record(session),
+        ]
+        manager.bind_storage(storage)
+
+        workspace_id = await manager.assign_workspace_id(
+            user_id="alice",
+            agent_id="a1",
+            session_id="new-session",
+        )
+
+        self.assertEqual(workspace_id, "existing-workspace")
+        storage.list_session_summaries.assert_awaited_once_with("alice", "a1")
+        storage.list_sessions.assert_not_awaited()

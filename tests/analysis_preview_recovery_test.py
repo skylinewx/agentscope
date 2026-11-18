@@ -47,7 +47,7 @@ class PreviewRecoveryTests(PresentationCase):
         error = json.loads(response.content[0].text)['error']
         self.assertEqual(len(error['details']['issues']), 3)
         self.assertEqual(self.store.get_analysis(OWNER, self.ref), self.original)
-        repaired = await tool.call(analysisRef=self.ref, requestKey='fixed', previewOnly=True,
+        repaired = await tool.call(requestKey='fixed', previewOnly=True,
             repairRef=error['details']['repairRef'], repairs=[
                 {'op':'remove','path':'/presentation/showUnit'},
                 {'op':'add','path':'/viewPlan/1/viewId','value':'table'},

@@ -40,7 +40,11 @@ def continue_plan(base, scope, work_plan):
             previous_task = prior[positions[key]]
             if (previous_task.get('operator') in PROTECTED_OPERATORS
                     and task.get('operator', previous_task['operator']) != previous_task['operator']):
-                raise AnalysisError('INVALID_WORK_PLAN', '已声明的来源核对或业务可比运算不能替换为普通统计。', {'taskId': key})
+                from .plan_revisions import revision_basis
+                revision = revision_basis(base, previous_task, task)
+                task['title'] = previous_task['title']
+                if not task.get('targetRefs'):
+                    task['targetRefs'] = revision['targetRefs']
             if task.get('kind') != previous_task['kind']:
                 raise AnalysisError('INVALID_WORK_PLAN', '重建不能改变已有工作项类型；可更新结果引用或新增工作项。', {'taskId': key})
             if previous_task.get('requiredEvidence') == 'FORMULAS' and task.get('requiredEvidence', 'FORMULAS') != 'FORMULAS':
@@ -198,7 +202,7 @@ def completion_summary(artifact):
     if not isinstance(updates, list) or len(updates) > 100:
         raise AnalysisError('INVALID_WORK_PLAN', 'workRefs 最多 100 项。')
     for index, update in enumerate(updates):
-        if (not isinstance(update, dict) or not {'taskId', 'refs'} <= set(update) or set(update) - {'taskId', 'refs', 'operator'}
+        if (not isinstance(update, dict) or not {'taskId', 'refs'} <= set(update) or set(update) - {'taskId', 'refs', 'operator', 'revisionReason'}
                 or not isinstance(update['taskId'], str) or update['taskId'] in updated
                 or update['taskId'] not in {t.get('taskId') for t in plan if isinstance(t, dict)}
                 or not isinstance(update['refs'], list) or len(update['refs']) > 1000
@@ -207,20 +211,28 @@ def completion_summary(artifact):
         if 'operator' in update:
             from .engine import OPERATORS
             task = next(task for task in plan if task.get('taskId') == update['taskId'])
-            if (task.get('kind') != 'COMPUTATION' or task.get('operator') in PROTECTED_OPERATORS
-                    or not isinstance(update['operator'], str) or update['operator'] not in OPERATORS | {'PYTHON'}
-                    or update['operator'] in PROTECTED_OPERATORS):
+            if (task.get('kind') != 'COMPUTATION'
+                    or not isinstance(update['operator'], str) or update['operator'] not in OPERATORS | {'PYTHON'}):
                 raise AnalysisError('INVALID_WORK_PLAN', '只可显式修正普通计算的方法；来源公式/汇总核对要求保持。')
+            if update['operator'] != task.get('operator'):
+                if task.get('operator') in PROTECTED_OPERATORS:
+                    from .plan_revisions import revision_basis
+                    revision_basis(artifact, task, update)
+                elif update['operator'] in PROTECTED_OPERATORS:
+                    raise AnalysisError('INVALID_WORK_PLAN', '新增来源核对或业务规则计算须通过 Build 实际执行。')
         updated[update['taskId']] = update['refs']
     result, seen = [], set()
     for task in plan:
         if (not isinstance(task, dict) or not {'taskId', 'title', 'kind', 'refs'} <= set(task)
-                or set(task) - {'taskId', 'title', 'kind', 'refs', 'operator', 'targetRefs', 'requiredEvidence'}
+                or set(task) - {'taskId', 'title', 'kind', 'refs', 'operator', 'targetRefs', 'requiredEvidence', 'revisionReason'}
                 or any(not isinstance(task.get(k), str) or not task[k].strip() or len(task[k]) > 1024 for k in ('taskId', 'title'))
                 or task['taskId'] in seen or task['kind'] not in ('VALUES', 'COMPUTATION', 'RELATION')
                 or not isinstance(task['refs'], list) or len(task['refs']) > 1000
                 or len({reference_key(ref) for ref in task['refs']}) != len(task['refs'])):
             raise AnalysisError('INVALID_WORK_PLAN', '工作项须有唯一标识、业务标题、类型和真实引用；尚未取得引用时填空列表，不提交完成状态。')
+        if 'revisionReason' in task and (not isinstance(task['revisionReason'], str) or not task['revisionReason'].strip()
+                                         or len(task['revisionReason']) > 1024):
+            raise AnalysisError('INVALID_WORK_PLAN', 'revisionReason 须为非空的简短方法修正说明。')
         from .engine import OPERATORS
         if task.get('requiredEvidence', 'VALUES') not in ('VALUES', 'FORMULAS'):
             raise AnalysisError('INVALID_WORK_PLAN', '工作项 requiredEvidence 使用 VALUES 或 FORMULAS。')
@@ -304,6 +316,10 @@ def completion_summary(artifact):
                        **({'operator': effective_operator} if effective_operator else {}),
                        **({'unexpectedTargetRefs': extra} if extra else {}),
                        **({'targetRefs': targets, 'missingTargetRefs': missing} if targets else {})})
+    if any(update.get('operator') != task.get('operator') and task.get('operator') in PROTECTED_OPERATORS
+           for update in updates if 'operator' in update for task in plan if task['taskId'] == update['taskId']):
+        from .plan_revisions import record_revisions
+        record_revisions({**artifact, 'workRefs': []}, deepcopy(artifact))
     declared_state = 'UNDECLARED' if not result else 'READY' if all(t['state'] == 'READY' for t in result) else 'INCOMPLETE'
     unresolved = artifact.get('unresolvedItems', [])
     if not isinstance(unresolved, list) or len(unresolved) > 100:
@@ -311,7 +327,7 @@ def completion_summary(artifact):
     tasks = {task['taskId']: task for task in result}
     for index, item in enumerate(unresolved):
         if (not isinstance(item, dict) or not {'requirement', 'reason'} <= set(item)
-                or set(item) - {'requirement', 'reason', 'taskId'}
+                or set(item) - {'requirement', 'reason', 'taskId', 'basis'}
                 or any(not isinstance(item.get(key), str) or not item[key].strip() or len(item[key]) > 2000
                        for key in ('requirement', 'reason'))
                 or 'taskId' in item and (not isinstance(item['taskId'], str) or item['taskId'] not in tasks)):
@@ -327,7 +343,10 @@ def completion_summary(artifact):
                            'reason': f"预算材料已准备 {preparation['ready']}/{preparation['expected']} 个目标，未取得的结构或构成见 inputPreparation.issues。",
                            'source': 'HOST_INPUT_PREPARATION'})
     partial_reason = '；'.join(item['requirement'] + '：' + item['reason'] for item in unresolved)
+    from .completion_issues import audit_results
     return {'state': 'INCOMPLETE' if partial_reason else declared_state,
+            'auditResults': audit_results(artifact),
+            'investigations': artifact.get('completionContext', {}).get('investigations', []),
             'declaredWorkState': declared_state,
             'unresolvedItems': unresolved,
             **({'partialReason': partial_reason} if partial_reason else {}),
@@ -337,12 +356,36 @@ def completion_summary(artifact):
 
 def apply_publication_completion(artifact, request):
     """One path for publish, preview, repair and closeout; prose never sets status."""
+    proposed = deepcopy(artifact)
     for key in ('workRefs', 'unresolvedItems'):
         if request.get(key) is not None:
-            artifact[key] = request[key]
-    artifact.pop('partialReason', None)
-    complete = completion_summary(artifact)
+            proposed[key] = deepcopy(request[key])
+    # Revisions also carry saved issues. Omitting this field must not bypass the
+    # same provenance check or keep a completed audit marked as unfinished.
+    if 'unresolvedItems' in proposed:
+        from .completion_issues import normalize_items
+        proposed['unresolvedItems'] = normalize_items(proposed, proposed['unresolvedItems'])
+    proposed.pop('partialReason', None)
+    complete = completion_summary(proposed)
+    from .plan_revisions import record_revisions, effective_tasks, prune_replaced_failures
+    before = len(artifact.get('methodRevisions', []))
+    history = record_revisions(artifact, proposed)
+    if len(history) > before:
+        # Commit the effective plan, so a reopened/repaired artifact never relies
+        # on a deleted failure to re-authorize an already accepted correction.
+        proposed['plan']['workPlan'] = effective_tasks(proposed)
+        revised = {item['taskId']: item for item in history[before:]}
+        for task in proposed['plan']['workPlan']:
+            if task['taskId'] in revised:
+                task.setdefault('targetRefs', deepcopy(revised[task['taskId']]['targetRefs']))
+        proposed.pop('workRefs', None)
+        prune_replaced_failures(proposed)
+        from .models import digest
+        proposed['planDigest'] = digest(proposed['plan'])
+        complete = completion_summary(proposed)
     if complete.get('partialReason'):
         # Existing report slots retain their markup and receive a derived display label.
-        artifact['partialReason'] = complete['partialReason']
+        proposed['partialReason'] = complete['partialReason']
+    artifact.clear()
+    artifact.update(proposed)
     return complete

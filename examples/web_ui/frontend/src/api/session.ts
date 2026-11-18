@@ -42,7 +42,8 @@ export function takeFreshlyCreated(sessionId: string): boolean {
 }
 
 export const sessionApi = {
-	list: (agentId: string) => client.get<SessionListResponse>('/sessions/', { agent_id: agentId }),
+	list: (agentId: string, signal?: AbortSignal) =>
+		client.get<SessionListResponse>('/sessions/', { agent_id: agentId }, { signal }),
 
 	create: async (body: CreateSessionRequest) => {
 		const res = await client.post<CreateSessionResponse>('/sessions/', body);

@@ -44,7 +44,7 @@ class ScopeRecoveryTests(PresentationCase):
 
     def attach_turn(self):
         turn = TurnCompletion(self.service, current_turn(AgentState(), UserMsg('user', '分析所选异常对象')))
-        turn.task(mode='ANALYSIS', goal='分析所选异常对象', delivery='DOCUMENT', requiredEvidence='FORMULAS')
+        turn.task(mode='ANALYSIS', goal='分析所选异常对象', delivery='DOCUMENT', materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}])
         self.service.turn = turn
         return turn
 

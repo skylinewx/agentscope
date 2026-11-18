@@ -75,9 +75,10 @@ class NativePredicateTest(TestCase):
         root = next(record for record in records if record['text'] == '久其集团')
         self.assertEqual(root['source'], 'CONFIRMED_CONTEXT')
         self.assertFalse(any('久其集团的二级单位' == record['text'] for record in records))
-        request['intentDraft']['targets'][0]['businessPhrases'][0]['text'] = '虚构业务'
-        with self.assertRaises(AnalysisError):
-            bind(turn, request)
+        request['intentDraft']['targets'][0]['businessPhrases'][0]['text'] = '利润净额'
+        result = bind(turn, request)
+        self.assertEqual(result['intentDraft']['targets'][0]['businessPhrases'][0]['sourceText'], request['question'])
+        self.assertEqual(result['intentDraft']['targets'][0]['businessPhrases'][0]['text'], '利润净额')
 
     def test_having_proof_validates_aggregate_stage_and_displays_native_group_counts(self):
         from analysis_extension.business_tables import state_markdown

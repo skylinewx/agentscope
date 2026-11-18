@@ -3,6 +3,7 @@ from copy import deepcopy
 import json
 
 from .models import AnalysisError, digest, json_values
+from .execution_evidence import delivery_reads, delivery_projection
 
 
 def select_results(turn, selections):
@@ -51,10 +52,10 @@ def bind_answer_outputs(service, run, names):
     return {'resultRefs': selections}
 
 
-def source_reads(service, run, budget=None):
-    """恢复运行实际读到的单元格。读集属于整个运行，不能伪称逐产物精确血缘。"""
+def source_reads(service, run, budget=None, *, complete_input=False):
+    """恢复宿主提供给运行的单元格；不伪称算法实际使用或逐产物精确血缘。"""
     from .grid_files import resolve_input, records
-    from .python_worker import grid_matches, grid_value
+    from .grid_contract import grid_matches, grid_value
     budget = {'remaining': 4 * 1024 * 1024} if budget is None else budget
     result = []
     for source in run.get('fileInputs', []):
@@ -63,35 +64,48 @@ def source_reads(service, run, budget=None):
         saved = resolve_input(service, {'captureRef': source['captureRef'], 'fileRef': source['ref']})
         if saved['sha256'] != source.get('sha256'):
             raise AnalysisError('GRID_FILE_INTEGRITY', '计算所用网格与已保存来源摘要不一致。')
-        reads = [read for read in run.get('fileReads', []) if read['ref'] == source['ref']]
+        reads = [read for read in delivery_reads(run) if read['ref'] == source['ref']]
         columns = ['key', 'row', 'column', 'measureCode', 'headers', 'dimensions', 'value', 'unit', 'formula', 'mapType', 'issue']
-        rows, seen = [], set()
+        delivered, seen = [], set()
         matched = [0] * len(reads)
         for position, cell in enumerate(records(saved), 1):
             cell = dict(cell)
             cell['dimensions'] = {**saved.get('context', {}).get('effectiveDimensions', {}), **cell.get('dimensions', {})}
             included = False
             for index, read in enumerate(reads):
-                if position <= read['scannedCount'] and grid_matches(cell, cell['dimensions'], read['where']):
+                if position <= read['positionLimit'] and grid_matches(cell, cell['dimensions'], read['where']):
                     matched[index] += 1
                     included = True
-            if not included or cell['key'] in seen:
+            if (not complete_input and not included) or cell['key'] in seen:
                 continue
+            if complete_input:
+                cell['providedToRun'] = included
             seen.add(cell['key'])
             cell['value'] = grid_value(cell, saved.get('numberFormat'))
-            row = [cell.get(key) for key in columns]
-            size = len(json.dumps(row, ensure_ascii=False))
+            cell['sourceRef'] = source['ref']
+            size = len(json.dumps(cell, ensure_ascii=False))
             # 超过核对工作内存时显式标记未完成；不把截取后的明细当完整输入。
             if size <= budget['remaining']:
-                rows.append(row)
+                delivered.append(cell)
                 budget['remaining'] -= size
-        if matched != [read['matchedCount'] for read in reads]:
+        if matched != [read['expectedCount'] for read in reads]:
             raise AnalysisError('GRID_READ_INTEGRITY', '已保存的运行读集与来源记录不一致。')
+        # Retain every delivered field, including raw values and future schema
+        # additions. Absence and explicit null remain distinguishable.
+        columns += sorted({key for cell in delivered for key in cell} - set(columns))
+        rows = [[cell.get(key) for key in columns] for cell in delivered]
+        absent = {str(index): [key for key in columns if key not in cell]
+                  for index, cell in enumerate(delivered) if set(columns) - set(cell)}
         data = {'ref': source['ref'], 'captureRef': source['captureRef'], 'sha256': source['sha256'],
                        'context': deepcopy(source.get('context', {})), 'coverage': source.get('coverage'),
                        'entryType': source.get('entryType'), 'columns': columns, 'rows': rows,
                        'rowCount': len(seen), 'complete': len(rows) == len(seen),
-                       'lineage': 'CONSERVATIVE_RUN_READ_SET'}
+                       'absentCellFields': absent,
+                       'lineage': ('CONSERVATIVE_RUN_DELIVERY_SET' if run.get('provenanceMode') == 'HOST_RECORDED_DELIVERY'
+                                   else 'CONSERVATIVE_RUN_READ_SET')}
+        if complete_input:
+            data.update(lineage='COMPLETE_AVAILABLE_INPUT',
+                        meaning='本次冻结文件的完整可用数据；providedToRun 仅标记宿主实际发送，不证明代码使用或分析正确。')
         pack_source_rows(data)
         result.append(data)
     return result
@@ -158,7 +172,7 @@ def pack_source_rows(data):
 
 def source_cells(data):
     """恢复无损网格投影，供来源明细交付和回归校验共用。"""
-    for row in data['rows']:
+    for index, row in enumerate(data['rows']):
         cell = {**data.get('fixedCellFields', {}), **dict(zip(data['columns'], row))}
         if data.get('rowEncoding') == 'SHARED_GRID_FIELDS_V1':
             for column, dictionary in data.get('columnDictionaries', {}).items():
@@ -169,6 +183,8 @@ def source_cells(data):
                           if ref != data.get('missingDimensionRef')}
             cell['dimensions'] = {**data['fixedDimensions'], **dimensions}
             cell['headers'] = [data['headerDictionary'][ref] for ref in cell['headers']] if cell['headers'] is not None else None
+        for field in data.get('absentCellFields', {}).get(str(index), []):
+            cell.pop(field, None)
         yield cell
 
 
@@ -222,7 +238,7 @@ def execution_evidence(turn):
         runs[run_ref].update(outputs=[deepcopy(outputs[ref]) for ref in output_refs],
                              allOutputsDigest=digest(json_values(run['outputs'])),
                              inputs=deepcopy(inputs), dependencies=list(dict.fromkeys(dependencies)),
-                             fileReads=read_summary(run.get('fileReads', [])), sourceData=source_reads(turn.service, run, read_budget))
+                             **delivery_projection(run), sourceData=source_reads(turn.service, run, read_budget, complete_input=True))
         visiting.remove(run_ref)
 
     for selection in selections:
@@ -285,15 +301,24 @@ def save_dependency_verdict(turn, unit, policy):
 
 def final_result_evidence(evidence, units, verified_refs):
     """最终阶段保留选定输出、来源范围与已核对依赖身份，不再次附整次读集。"""
-    final = {key: value for key, value in evidence.items() if key != 'pythonRuns'}
+    final = {key: deepcopy(value) for key, value in evidence.items() if key != 'pythonRuns'}
+    if final.get('focusComparison'):
+        final['focusComparison']['previousCalculations'] = [
+            {key: value for key, value in item.items() if key in ('purpose', 'outputs')}
+            for item in final['focusComparison'].get('previousCalculations', [])]
     final['finalResults'] = [value for run in evidence.get('pythonRuns', []) for value in run['outputs']
                              if value['derivedId'] in evidence.get('resultRoots', [])]
     final['dependencyUnitRefs'] = [unit['unitRef'] for unit in units]
     final['verifiedDependencyUnitRefs'] = list(verified_refs)
     # 保留每个输出的实际执行范围；它不声称是逐产物精确血缘。
-    final['executionScopes'] = [{key: value for key, value in run.items()
-                                if key in ('runRef', 'purpose', 'inputRefs', 'fileReads', 'dependencies')}
-                               for run in evidence.get('pythonRuns', [])]
+    final['calculationScopes'] = [{'purpose': run.get('purpose'),
+                                  'outputRefs': [item['derivedId'] for item in run.get('outputs', [])],
+                                  'numericPolicy': run.get('numericPolicyVersion')}
+                                 for run in evidence.get('pythonRuns', [])]
+    # Work on detached values, never rewrite saved execution evidence.
+    final['finalResults'] = [{key: deepcopy(value) for key, value in item.items()
+                              if key not in ('pythonRunRef', 'runtime', 'reviewInputRefs', 'code')}
+                            for item in final['finalResults']]
     return final
 
 
@@ -367,11 +392,15 @@ def _output_basis(run_ref, output):
     if output.get('outputKind') == 'SCALAR' and content.get('value') is not None:
         content['value'] = exact_number(content['value'])
     if 'rows' in content and 'columns' in content:
+        from .business_dataset import rows as named_rows
+        content['rows'] = named_rows(content['columns'], content['rows'])
         for index, column in enumerate(content['columns']):
             if column.get('type') == 'DECIMAL_STRING':
                 for row in content['rows']:
-                    if row[index] is not None:
-                        row[index] = exact_number(row[index])
+                    key = column['name']
+                    if row['values'].get(key) is not None:
+                        row['values'][key] = exact_number(row['values'][key])
+        content['rows'] = [{'values': row['values'], 'valueStates': row['valueStates']} for row in content['rows']]
         content['columns'] = [{key: column[key] for key in ('name', 'type', 'unit') if key in column}
                               for column in content['columns']]
     return {'name': output['derivedId'].removeprefix('derived_' + run_ref + '_'),
@@ -418,7 +447,7 @@ def focused_review_context(turn, evidence):
         if not any(_output_basis(run['runRef'], output)['name'] in changed for output in outputs):
             continue
         calculations.append({'runRef': run['runRef'], 'purpose': run.get('purpose'), 'code': run['code'],
-                             'inputRefs': run['inputRefs'], 'fileReads': read_summary(run.get('fileReads', [])),
+                             'inputRefs': run['inputRefs'], **delivery_projection(run),
                              'outputs': outputs})
     # 原始运行与文件仍在存储中；这里保存旧代码和输出作差异证据，当前完整读集仍由 pythonRuns 提供。
     return {'changedOutputNames': sorted(changed), 'previousCalculations': calculations,

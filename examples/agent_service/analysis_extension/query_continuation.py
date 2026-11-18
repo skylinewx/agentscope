@@ -57,7 +57,7 @@ def continuation_request(receipt, request):
             'requestId': 'continue-' + receipt['resumeRef'], 'resumeRef': receipt['resumeRef']}
 
 
-def combined_response(capture, adapter, events, started, stopped_reason):
+def combined_response(capture, adapter, events, started, stopped_reason, *, kind='CONTINUATION'):
     """完整回执分别保存在原捕获记录；一次向模型返回各页的必要材料和恢复入口。"""
     from time import perf_counter
     from agentscope.message import TextBlock
@@ -71,7 +71,7 @@ def combined_response(capture, adapter, events, started, stopped_reason):
         saved = capture.store.get_capture(capture.owner, reference)
         receipt = adapter.raw_receipt(saved['response'])
         # 页面独立分配额度；最后一页的状态不能掩盖前页的缺数、错误和公式边界。
-        budget = max(2500, (MODEL_CHARS - 1500) // len(events))
+        budget = max(350 if kind == 'CONDITIONS' else 2500, (MODEL_CHARS - 1500) // len(events))
         source_chars = sum(len(block.get('text', '')) for block in saved['response']['content'])
         if isinstance(receipt.get('data'), dict) and receipt['data'].get('resultType') == 'BUDGET_QUERY_RESULT':
             from .business_tables import business_view
@@ -80,7 +80,7 @@ def combined_response(capture, adapter, events, started, stopped_reason):
                     from .analysis_materials import material_capture
                     receipt = adapter.receipt(material_capture(saved, capture.sources, capture.store, capture.owner))
                 projected = business_view(receipt, reference, max_chars=budget - 500)
-                if receipt['data'].get('purpose') == 'ANALYZE':
+                if receipt['data'].get('purpose') == 'PREPARE_MATERIALS':
                     projected['analysisRead'] = {'tool': 'AnalysisInspect', 'arguments': {'section': 'materials', 'captureRef': reference}}
             except AnalysisError as error:
                 projected = {**diagnostic_navigation(receipt, reference), 'projectionDiagnostic': error.as_dict()}
@@ -115,12 +115,25 @@ def combined_response(capture, adapter, events, started, stopped_reason):
                'scope': 'SAME_READ_ONLY_PLAN', 'allPagesCaptured': True},
                'captureRefs': refs, 'pages': pages,
                'note': '这些是同一计划的连续回执，使用全部相关 captureRefs 构建分析。顶层 status/resumeRef 是最新状态；前页的 PAGE_BOUNDARY 已继续执行，不再恢复历史游标。每页原值、缺数和公式边界分别保留。'})
+    if kind == 'CONDITIONS':
+        from agentscope.message import ToolResultState
+        statuses = [adapter.raw_receipt(capture.store.get_capture(capture.owner, ref)['response'])['status'] for ref in refs]
+        status = 'SUCCEEDED' if all(s == 'SUCCEEDED' for s in statuses) else (
+            'PARTIAL' if any(s in ('SUCCEEDED', 'PARTIAL') for s in statuses) else 'FAILED')
+        payload.pop('automaticContinuation', None)
+        payload.update(status=status, scopeBranches={'count': len(pages), 'allBranchesExecuted': True},
+                       note='以下各组对应各自实际查询范围，使用全部相关来源分别分析；不同口径不能直接相加。失败组保留各自状态。')
+        if status != 'FAILED':
+            payload.pop('error', None)
+            last.state = ToolResultState.SUCCESS
     last.content = [TextBlock(text=model_text(payload))]
     last.metadata['analysisCaptureRefs'] = refs
+    last.metadata['targetDiscoveryRefs'] = list(dict.fromkeys(
+        ref for event in events for ref in event.metadata.get('targetDiscoveryRefs', [])))
     performance = last.metadata['queryPerformance'] = {
         'elapsedMs': round((perf_counter() - started) * 1000, 2), 'pageCount': len(events),
         'sourceChars': total_source_chars, 'modelChars': len(encode(payload)),
-        'compacted': True, 'automaticContinuation': True,
+        'compacted': True, 'automaticContinuation': kind == 'CONTINUATION',
         'pages': [event.metadata.get('queryPerformance', {}) for event in events]}
     # 分段是页级观测之和，包含于工具总耗时，不重复计时。
     for field in ('sourceResponseMs', 'gridReceiveMs', 'captureStoreMs', 'projectionMs'):

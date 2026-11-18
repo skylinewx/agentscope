@@ -92,7 +92,7 @@ class BusinessPreparationTests(PresentationCase):
         runner = self.service.budget_preparation.runner = AsyncMock(return_value=([], None))
         await self.service.budget_preparation._fetch(self.turn, [target])
         self.assertEqual(runner.call_args.args[-1]['basis']['source'], target['sourceSelection'])
-        self.assertEqual(runner.call_args.args[-1]['purpose'], 'ANALYZE')
+        self.assertEqual(runner.call_args.args[-1]['purpose'], 'PREPARE_MATERIALS')
         self.assertNotIn('scope', runner.call_args.args[-1])
 
     async def test_exact_formula_subjects_use_cell_origin_and_not_representative_or_other_metric(self):
@@ -151,7 +151,7 @@ class BusinessPreparationTests(PresentationCase):
         request = runner.call_args.args[-1]
         self.assertEqual(request['basis']['source']['factIds'], ['f0-0'])
         self.assertEqual(request['basis']['kind'], 'FACTS')
-        self.assertEqual(request['purpose'], 'ANALYZE')
+        self.assertEqual(request['purpose'], 'PREPARE_MATERIALS')
         self.assertNotIn('intentDraft', request)
         self.assertNotIn('scope', request)
 
@@ -200,7 +200,7 @@ class BusinessPreparationTests(PresentationCase):
         capture, _ = self.source()
         source = register(self.turn, {**self.turn.state['inheritedScope']['selections'][0], 'rowIndices': [0]})
         self.turn.state['previousQueryIntent'] = {'population': '集团', 'metric': '净利润', 'period': '2026年'}
-        request = prepare_request(self.turn, capture, {'purpose': 'ANALYZE',
+        request = prepare_request(self.turn, capture, {'purpose': 'PREPARE_MATERIALS',
             'basis': {'kind': 'FACTS', 'sourceRef': source['sourceRef']}, 'question': '改写'})
         self.assertEqual(request['question'], self.turn.state['request'])
         self.assertEqual(request['basis']['source']['factIds'], ['f0-0'])

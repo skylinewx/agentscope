@@ -1,0 +1,133 @@
+{
+  "additionalProperties": false,
+  "description": "宿主传递对话身份、用户轮次和本体已提交的维度条件引用。一般调用方省略。",
+  "maxProperties": 256,
+  "properties": {
+    "conditions": {
+      "items": {
+        "additionalProperties": false,
+        "maxProperties": 256,
+        "properties": {
+          "id": {
+            "maxLength": 16384,
+            "minLength": 1,
+            "type": "string"
+          },
+          "scopeId": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "source": {
+            "additionalProperties": false,
+            "maxProperties": 256,
+            "properties": {
+              "contextId": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "executionId": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "querySessionId": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "scopeId": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "contextId",
+              "executionId",
+              "querySessionId",
+              "scopeId"
+            ],
+            "type": "object"
+          },
+          "sourceOnly": {
+            "description": "该绑定只属于被选中的旧结果，本轮重新确认后才能进入当前对话条件",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "id",
+          "source"
+        ],
+        "type": "object"
+      },
+      "maxItems": 1000,
+      "minItems": 0,
+      "type": "array"
+    },
+    "conversationId": {
+      "maxLength": 4096,
+      "minLength": 1,
+      "type": "string"
+    },
+    "omitted": {
+      "items": {
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 1000,
+      "minItems": 0,
+      "type": "array"
+    },
+    "recoverySource": {
+      "additionalProperties": false,
+      "maxProperties": 256,
+      "properties": {
+        "contextId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        },
+        "executionId": {
+          "maxLength": 4096,
+          "minLength": 1,
+          "type": "string"
+        },
+        "querySessionId": {
+          "maxLength": 64,
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "contextId",
+        "executionId",
+        "querySessionId"
+      ],
+      "type": "object"
+    },
+    "selected": {
+      "items": {
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 1000,
+      "minItems": 0,
+      "type": "array"
+    },
+    "turn": {
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "conditions",
+    "conversationId",
+    "omitted",
+    "turn"
+  ],
+  "type": "object"
+}

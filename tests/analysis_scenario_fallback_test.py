@@ -130,7 +130,7 @@ class ScenarioFallbackTests(TestCase):
         turn.state['followupContext']['changedFields'] = []
         with patch('analysis_extension.followup_scope._same_source', return_value=True), \
              patch('analysis_extension.followup_scope._inherited_tables', return_value=[]):
-            third = prepare_request(turn, origin, {'purpose': 'ANALYZE'})
+            third = prepare_request(turn, origin, {'purpose': 'PREPARE_MATERIALS'})
         self.assertNotIn('预算', third.get('contextText', ''))
         self.assertIn('实际数', third['contextText'])
 
@@ -149,18 +149,23 @@ class ScenarioFallbackTests(TestCase):
         evidence = {'sources': [{'source': {'businessQuery': {'purpose': 'QUERY', 'complete': True,
             'failureSummary': {'outcome': 'NO_DATA', 'matchDiagnostics': [{'rejectionCounts': {'DIFFERENT_MODEL': 10}}]}}},
             'facts': [{'valueState': 'NO_DATA'}]}]}
+        from analysis_empty_delivery_fixtures import attach_empty_business_view
+        attach_empty_business_view(evidence)
         answer = empty_query_answer(evidence)['answer']
-        self.assertIn('完成取数', answer)
+        self.assertIn('合成利润表', answer)
+        self.assertIn('实际数（元）', answer)
         self.assertNotIn('预算值', answer)
         self.assertNotIn('运行匹配记录', answer)
 
     def test_empty_scenario_analysis_is_terminal_only_for_complete_verified_fallbacks(self):
         from analysis_extension.query_empty_result import empty_scenario_analysis_answer
-        evidence = {'sources': [{'source': {'businessQuery': {'purpose': 'ANALYZE', 'complete': True,
+        evidence = {'sources': [{'source': {'businessQuery': {'purpose': 'PREPARE_MATERIALS', 'complete': True,
             'failureSummary': {'outcome': 'NO_DATA'}}}, 'facts': [{'valueState': 'NO_DATA',
             'formulaStatus': 'NO_TARGET_CELL', 'dimensions': {'MD_SCENE': 'ACTUAL'},
             'dimensionNames': {'MD_SCENE': '实际数'}}]}]}
-        self.assertIn('实际数', empty_scenario_analysis_answer(evidence)['answer'])
+        from analysis_empty_delivery_fixtures import attach_empty_business_view
+        attach_empty_business_view(evidence)
+        self.assertIn('合成利润表', empty_scenario_analysis_answer(evidence)['answer'])
         evidence['sources'][0]['source']['businessQuery']['purpose'] = 'QUERY'
         self.assertIsNotNone(empty_scenario_analysis_answer(evidence))
         for change in ('partial', 'present', 'formula', 'diagnostic'):

@@ -30,11 +30,12 @@ class CloseoutControlTests(PresentationCase):
         restored = TurnCompletion(self.service, deepcopy(turn.state))
         async def review(*args):
             await asyncio.sleep(.05)
-            return {'issues': []}
+            return with_coverage({'issues': []})
         with patch('analysis_extension.turn_completion._model_review', AsyncMock(side_effect=review)) as model:
             results = await asyncio.gather(review_answer(None, turn, artifact, ''),
                                            review_answer(None, restored, artifact, ''))
-        self.assertEqual(results, [{'issues': []}, {'issues': []}])
+        self.assertEqual([result['issues'] for result in results], [[], []])
+        self.assertTrue(all(result['coverage'] for result in results))
         self.assertEqual(model.await_count, 1)
         self.assertEqual(progress(turn)['review']['attempts'], 1)
 
@@ -42,7 +43,7 @@ class CloseoutControlTests(PresentationCase):
         turn = self.turn()
         artifact = await self.published(turn)
         self.store.limits = replace(self.store.limits, max_review_attempts=2)
-        bad = {'issues': [{'severity': 'BLOCKING', 'code': 'ANSWER_MISMATCH', 'message': '金额与原值不一致'}]}
+        bad = with_coverage({'issues': [{'severity': 'BLOCKING', 'code': 'ANSWER_MISMATCH', 'message': '金额与原值不一致'}]})
         with patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=bad)) as model:
             await review_answer(None, turn, artifact, '')
             changed = deepcopy(artifact)
@@ -88,13 +89,14 @@ class CloseoutControlTests(PresentationCase):
             'error': {'code': 'UNSUPPORTED_CLAIM', 'message': '计算不能绑定集合',
                       'details': {'path': '/document/datasets/0'}}}))])
         turn.observe(ToolCallBlock(id='binding', name='AnalysisPublish', input='{}'), failure)
-        for index in range(2):
+        self.assertEqual(self.store.limits.max_review_attempts, 5)
+        for index in range(self.store.limits.max_review_attempts - 1):
             response = ToolResponse(content=[TextBlock(text=json.dumps({
                 'analysisRef': artifact['analysisRef'], 'previewOnly': True,
                 'nextAction': 'REPAIR_DOCUMENT',
                 'diagnostics': {'semanticReview': {'status': 'REVISE'}}}))])
             turn.observe(ToolCallBlock(id=f'review-{index}', name='AnalysisPublish', input='{}'), response)
-        self.assertEqual(progress(turn)['repairCounts'], {'parameter': 1, 'semantic': 2})
+        self.assertEqual(progress(turn)['repairCounts'], {'parameter': 1, 'semantic': 4})
         self.assertIsNone(closeout_reason(turn))
         record_repair(turn, 'formal-review', 'DOCUMENT_SEMANTIC_ERRORS')
         self.assertEqual(closeout_reason(turn), 'REPAIR_LIMIT')
@@ -252,10 +254,12 @@ class CloseoutControlTests(PresentationCase):
                   'columns': [{'name': 'ratio', 'label': '占比', 'type': 'DECIMAL_STRING', 'decimalPlaces': 8}],
                   'rows': [[raw]]}
         values = products([output], {'f': {'value': '1'}}, ['f'], 'scope', 'run')
-        self.assertEqual(values[0]['rows'], [['0.00033333']])
+        self.assertEqual([row['values'] for row in values[0]['rows']], [{'ratio':'0.00033333'}])
         self.assertEqual(output['rows'], [[raw]])
         no_precision = deepcopy(output)
         no_precision['columns'][0].pop('decimalPlaces')
         with self.assertRaises(AnalysisError) as raised:
             products([no_precision], {'f': {'value': '1'}}, ['f'], 'scope', 'run')
         self.assertFalse(raised.exception.details['requiresSourceQuery'])
+
+from analysis_review_fixtures import with_coverage

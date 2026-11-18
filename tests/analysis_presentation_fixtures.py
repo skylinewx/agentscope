@@ -13,6 +13,8 @@ class PresentationCase(IsolatedAsyncioTestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        from analysis_execution_fixtures import install_test_backend
+        install_test_backend(self, self.root)
         self.store = AnalysisStore(self.root / "analysis-data")
         self.rules = rules()
         self.delivery = AnalysisDelivery(self.store, OWNER, self.root / "workspace", self.rules)

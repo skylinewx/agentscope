@@ -2,15 +2,46 @@
 import asyncio
 from copy import deepcopy
 from contextlib import contextmanager
+from contextvars import ContextVar
 import logging
 import re
 import time
 from weakref import WeakKeyDictionary
+from uuid import uuid4
 
 from .models import AnalysisError, digest
+from .review_output import ReviewOutputUnavailable, correction_for, output_correction
 
 
 _INFLIGHT = WeakKeyDictionary()
+_MODEL_USAGE = ContextVar('analysis_review_model_usage', default=None)
+
+
+def record_model_budget(estimate):
+    current = _MODEL_USAGE.get()
+    if current is not None:
+        current['reviewBudget'] = deepcopy(estimate)
+
+
+def record_model_attempt(event):
+    current = _MODEL_USAGE.get()
+    if current is not None:
+        events = current.setdefault('adapterAttempts', [])
+        events.append(deepcopy(event))
+        del events[:-32]
+
+
+def record_model_usage(usage):
+    """Keep provider token counts per actual call, without arbitrary metadata."""
+    current = _MODEL_USAGE.get()
+    if current is None or usage is None:
+        return
+    for source, target in (('input_tokens', 'inputTokens'), ('output_tokens', 'outputTokens'),
+                           ('cache_input_tokens', 'cachedInputTokens'),
+                           ('cache_creation_input_tokens', 'cacheCreationInputTokens')):
+        value = getattr(usage, source, None)
+        if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+            current[target] = value
 
 
 def turn_key(turn):
@@ -65,17 +96,28 @@ def reserve_review(turn):
         if not state.get('closeoutReason'):
             review['attempts'] += 1
     state = progress(turn, reserve)
-    if state.get('closeoutReason'):
-        raise AnalysisError('ANALYSIS_RETRY_LIMIT', '本轮自动补做已到限额，将交付已有有效结果。',
-                            {'requiresBuild': False, 'nextAction': 'HOST_CLOSEOUT'})
+    reason = state.get('closeoutReason')
+    if reason:
+        review = state['review']
+        if reason == 'REVIEW_LIMIT' and review['attempts'] >= limits.max_review_attempts:
+            message = f'本轮业务审查已使用 {review["attempts"]} 轮，达到 {limits.max_review_attempts} 轮限额。'
+        elif reason == 'REVIEW_LIMIT':
+            message = '本轮审查已达到累计用时限额。'
+        else:
+            message = '本轮已进入收尾阶段。'
+        raise AnalysisError('ANALYSIS_RETRY_LIMIT', message + '已保留现有结果。',
+                            {'requiresBuild': False, 'nextAction': 'HOST_CLOSEOUT', 'reason': reason,
+                             'businessReviewRounds': review['attempts'], 'businessReviewLimit': limits.max_review_attempts})
 
 
-def finish_review(turn, elapsed_ms, verdict=None, unavailable=False, attempt=None):
+def finish_review(turn, elapsed_ms, verdict=None, unavailable=False, attempt=None, *, release_output_only=False):
     def finish(state):
         if attempt is not None:
             attempts = state.setdefault('reviewAttempts', [])
             if any(item['reviewId'] == attempt['reviewId'] for item in attempts):
                 return
+            if release_output_only:
+                attempt['charged'] = False
             attempts.append(deepcopy(attempt))
             del attempts[:-32]
             totals = state.setdefault('reviewTotals', {'attempts': 0, 'elapsedMs': 0, 'inputChars': 0,
@@ -86,6 +128,8 @@ def finish_review(turn, elapsed_ms, verdict=None, unavailable=False, attempt=Non
             for field in ('elapsedMs', 'inputChars', 'completedPartCount', 'reusedPartCount'):
                 totals[field] = round(totals[field] + attempt[field], 2)
         review = state.setdefault('review', {'attempts': 0, 'elapsedMs': 0, 'unavailable': 0})
+        if release_output_only:
+            review['attempts'] -= 1
         review['elapsedMs'] = round(review['elapsedMs'] + elapsed_ms, 2)
         if verdict is not None:
             state['lastReviewBlocked'] = bool(verdict['issues'])
@@ -165,6 +209,7 @@ def record_review_issue(turn, item, material_key, material):
     progress(turn, record)
     # 修正调用直接取得已验证的原句和证据引用；无法定位不被误判为通过。
     result = {key: item[key] for key in ('code', 'message')}
+    if item.get('impact'): result['impact'] = item['impact']
     result.update(issueId=issue_id, statement=valid_statement, evidenceRefs=refs,
                   statementLocations=locations,
                   locationStatus='LOCATED' if valid_statement else 'UNLOCATED')
@@ -191,10 +236,15 @@ def record_repair(turn, call_id, code):
         semantic = {'PUBLICATION_REVISE', 'DOCUMENT_SEMANTIC_ERRORS'}
         transient = {'REVIEW_UNAVAILABLE', 'DELIVERY_IO', 'STORAGE_TEMPORARILY_UNAVAILABLE',
                      'QUERY_TIMEOUT', 'SOURCE_UNAVAILABLE'}
-        category = 'semantic' if code in semantic else 'transient' if code in transient else 'parameter'
+        preparation = {'PREPARATION_NEEDS_SELECTION', 'PREPARATION_FILE_INPUT'}
+        application = {'PREPARATION_INCOMPLETE', 'INPUT_DATA_INCOMPLETE', 'CAPTURE_INCOMPLETE'}
+        category = ('preparation' if code in preparation else 'application' if code in application else
+                    'semantic' if code in semantic else 'transient' if code in transient else 'parameter')
         counts = state.setdefault('repairCounts', {})
         counts[category] = counts.get(category, 0) + 1
         category_limit = {'semantic': limits.max_review_attempts, 'transient': 2,
+                          'preparation': limits.max_analysis_repairs + limits.max_review_attempts,
+                          'application': limits.max_analysis_repairs + limits.max_review_attempts,
                           'parameter': limits.max_analysis_repairs}[category]
         if counts[category] >= category_limit:
             state.setdefault('closeoutReason', 'REPAIR_LIMIT')
@@ -223,44 +273,121 @@ async def shared_review(turn, material_key, execute):
                 jobs.pop(key, None)
 
 
-async def call_review_model(turn, execute, *, phase, input_chars, round_started):
-    """两类审查共用剩余额度；逐次记录模型请求，暂时故障仅在额度内重试。"""
+def reserve_output_repair(turn, material_key):
+    limit = turn.service.store.limits.max_review_output_repairs
+    permitted = False
+
+    def reserve(state):
+        nonlocal permitted
+        by_material = state.setdefault('reviewOutputRepairs', {})
+        count = by_material.get(material_key, 0)
+        if count < limit:
+            by_material[material_key] = count + 1
+            permitted = True
+        else:
+            state.setdefault('closeoutReason', 'REVIEW_UNAVAILABLE')
+
+    progress(turn, reserve)
+    if not permitted:
+        raise ReviewOutputUnavailable(limit)
+
+
+async def call_review_model(turn, execute, *, phase, input_chars, round_started, material_key=None):
+    """共享实际耗时预算，分别记录业务审查、模型输出纠正和临时传输重试。"""
     from agentscope.model._diagnostics import error_diagnostics
     spent = progress(turn).get('review', {}).get('elapsedMs', 0) / 1000
+    last_duration = 0
+    call_timeout = turn.service.review_budget.call_timeout_seconds
     # 当前轮已经完成的调用尚未结算，调用方传入的轮次起点用于准确扣减。
-    for index in range(2):
+    material_key = material_key or uuid4().hex
+    correction, next_retry = None, None
+    transport_retried = False
+    index = 0
+    while True:
         remaining = turn.service.store.limits.review_budget_seconds - spent - (time.perf_counter() - round_started)
+        if phase == 'CALCULATION':
+            remaining -= turn.service.review_budget.final_reserve_seconds
         if remaining <= 0:
             request_closeout(turn, 'REVIEW_LIMIT')
             raise AnalysisError('ANALYSIS_RETRY_LIMIT', '本轮核对额度已用完，将整理已取得的结果。')
+        if index and remaining < turn.service.review_budget.minimum_retry_seconds:
+            request_closeout(turn, 'REVIEW_LIMIT')
+            raise AnalysisError('REVIEW_UNAVAILABLE', '剩余额度不足以重试同一材料；已保留完成段和报告。',
+                                {'failureKind': 'INSUFFICIENT_RETRY_BUDGET', 'remainingSeconds': round(remaining, 2),
+                                 'minimumRetrySeconds': turn.service.review_budget.minimum_retry_seconds,
+                                 'previousCallSeconds': round(last_duration, 2), 'requiresBuild': False})
+        retry_reason = next_retry
+        if retry_reason == 'REVIEW_OUTPUT':
+            reserve_output_repair(turn, material_key)
+        index += 1
         call_started = time.perf_counter()
         error_code = None
+        failure_kind, diagnostic, deadline = None, {}, None
+        usage = {}
+        usage_token = _MODEL_USAGE.set(usage)
+        from .execution_progress import phase as notify_phase
+        operation_id = await notify_phase(turn, 'CALCULATION_REVIEW' if phase == 'CALCULATION' else 'BUSINESS_REVIEW',
+                                          'RUNNING', attempt=index, inputChars=input_chars, retryReason=retry_reason)
+        correction_token = output_correction.set(correction)
         try:
-            return await asyncio.wait_for(execute(), timeout=min(90, remaining))
+            async with asyncio.timeout(min(call_timeout, remaining)) as deadline:
+                return await execute()
         except asyncio.CancelledError:
             error_code = 'CANCELLED'
             raise
         except Exception as error:
             error_code = getattr(error, 'code', type(error).__name__)
             diagnostic = error_diagnostics(error) or {}
+            names = diagnostic.get('exceptionTypes', [])
+            failure_kind = ('HOST_WAIT_TIMEOUT' if deadline and deadline.expired() else
+                            'CONNECT_TIMEOUT' if 'ConnectTimeout' in names else
+                            'READ_TIMEOUT' if 'ReadTimeout' in names else
+                            'HTTP_ERROR' if diagnostic.get('httpStatus') else
+                            'CONNECTION_ERROR' if isinstance(error, ConnectionError) or diagnostic.get('failureKind') == 'connection' else
+                            'MODEL_OUTPUT_SCHEMA' if diagnostic.get('failureKind') == 'structured_output' or type(error).__name__ == 'ValidationError' else
+                            'TIMEOUT_UNCLASSIFIED' if isinstance(error, TimeoutError) or diagnostic.get('failureKind') == 'timeout' else
+                            type(error).__name__)
             transient = isinstance(error, (TimeoutError, ConnectionError)) or (
                 diagnostic.get('failureKind') in ('timeout', 'connection')
                 or diagnostic.get('httpStatus') in (408, 429, 500, 502, 503, 504))
-            if index or not transient:
+            feedback = correction_for(error, diagnostic, correction)
+            if feedback is not None:
+                correction, next_retry = feedback, 'REVIEW_OUTPUT'
+                failure_kind = 'MODEL_OUTPUT_COVERAGE' if error_code == 'REVIEW_COVERAGE_INVALID' else 'MODEL_OUTPUT_SCHEMA'
+            elif transient and not transport_retried:
+                transport_retried, next_retry = True, 'TRANSPORT'
+            else:
                 raise
         finally:
+            output_correction.reset(correction_token)
+            await notify_phase(turn, 'CALCULATION_REVIEW' if phase == 'CALCULATION' else 'BUSINESS_REVIEW',
+                               'FAILED' if error_code else 'COMPLETED', operation_id=operation_id,
+                               attempt=index, failureKind=failure_kind, retryReason=retry_reason)
+            _MODEL_USAGE.reset(usage_token)
+            estimate = usage.pop('reviewBudget', None)
+            adapter_attempts = usage.pop('adapterAttempts', [])
             elapsed = round((time.perf_counter() - call_started) * 1000, 2)
+            last_duration = elapsed / 1000
             from .timing import timing_event, append_timing
             event = timing_event(turn, 'reviewModel', elapsed,
                                  includedIn='publication' if phase == 'DOCUMENT' else 'queryReview',
-                                 phase=phase, inputChars=input_chars, retry=index > 0,
-                                 errorCode=error_code, status='FAILED' if error_code else 'COMPLETED')
+                                 phase=phase, inputChars=input_chars, retry=index > 1, retryReason=retry_reason,
+                                 errorCode=error_code, failureKind=failure_kind,
+                                 httpStatus=diagnostic.get('httpStatus'), upstreamRequestId=diagnostic.get('upstreamRequestId'),
+                                 tokenUsage=usage or None, inputBudgetEstimate=estimate, firstResponseMs=None,
+                                 adapterAttempts=adapter_attempts,
+                                 firstResponseTiming='UNAVAILABLE_NON_STREAMING_API',
+                                 networkTiming='UNKNOWN', status='FAILED' if error_code else 'COMPLETED')
             def record(state):
                 append_timing(state, event)
                 calls = state.setdefault('reviewModelCalls', [])
                 calls.append({'phase': phase, 'inputChars': input_chars, 'elapsedMs': elapsed,
-                              'retry': index > 0, 'errorCode': error_code})
+                              'retry': index > 1, 'retryReason': retry_reason, 'errorCode': error_code, 'failureKind': failure_kind,
+                              'tokenUsage': usage or None, 'inputBudgetEstimate': estimate, 'firstResponseMs': None,
+                              'adapterAttempts': adapter_attempts,
+                              'firstResponseTiming': 'UNAVAILABLE_NON_STREAMING_API',
+                              'httpStatus': diagnostic.get('httpStatus'), 'networkTiming': 'UNKNOWN'})
                 del calls[:-64]
             progress(turn, record)
             logging.getLogger(__name__).info('审查模型请求 提问=%s 阶段=%s 重试=%s 材料字符=%d 耗时毫秒=%.2f 错误=%s',
-                turn_key(turn), phase, index > 0, input_chars, elapsed, error_code)
+                turn_key(turn), phase, retry_reason, input_chars, elapsed, error_code)

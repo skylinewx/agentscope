@@ -18,10 +18,10 @@ class DocumentDataTests(PresentationCase):
                'datasets':[{'key':'ranking','valueRef':'derived_order'}]}
         compiled = compile_document(artifact, doc)
         dataset = compiled['datasets']['ranking']
-        self.assertEqual([row['value'] for row in dataset['rows']], ['123456789012345678.123456789','-1033.14','-1033.14','-8300'])
-        self.assertEqual([row['objectId'] for row in dataset['rows']], ['object-2','object-1','object-3','object-0'])
-        self.assertEqual(dataset['unavailable'][0]['value'], None)
-        self.assertTrue(all(row['unit'] == '' for row in dataset['rows']))
+        self.assertEqual([row['values']['value'] for row in dataset['rows']], ['123456789012345678.123456789','-1033.14','-1033.14','-8300'])
+        self.assertEqual([row['metadata']['objectId'] for row in dataset['rows']], ['object-2','object-1','object-3','object-0'])
+        self.assertEqual(dataset['unavailable'][0]['values']['value'], None)
+        self.assertTrue(all(row['values']['unit'] == '' for row in dataset['rows']))
         self.assertEqual(compiled['bindingCount'], 0)
         self.assertEqual(compiled['datasetCount'], 1)
         self.assertEqual(schema_issues({'analysisRef':built['analysisRef'],'document':doc,'requestKey':'p'}), [])

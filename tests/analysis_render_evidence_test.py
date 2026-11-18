@@ -31,12 +31,15 @@ class RenderEvidenceTests(TestCase):
         records = [{**record, 'runner': 'browser'}, {**record, 'contentDigest': 'old'},
                    {**record, 'blocking': True}, {**record, 'hostRenderedText': snapshot('长' * (TEXT_LIMIT + 1))}]
         result = review_text(self.fixture(records), {'analysisRef': 'ref', 'freeDocument': {'contentDigest': 'current'}}, '原始文字')
-        self.assertEqual(result, {'documentText': '原始文字', 'documentTextBasis': 'STATIC_SOURCE'})
+        self.assertEqual(result['documentText'], '原始文字')
+        self.assertEqual(result['documentTextBasis'], 'STATIC_SOURCE')
+        self.assertIn('尚无当前页面', result['documentObservation'])
         self.assertEqual(snapshot('长' * (TEXT_LIMIT + 1)), {'text': '', 'complete': False})
 
     def test_manual_measurement_cannot_submit_host_text_and_invalid_host_payload_rejected(self):
-        with self.assertRaises(AnalysisError):
-            evaluate({}, {**measurements(), 'hostRenderedText': snapshot('伪造内容')})
+        diagnostic = evaluate({'contentDigest': 'current'}, {**measurements(), 'hostRenderedText': snapshot('自述内容')})
+        self.assertNotIn('hostRenderedText', diagnostic)
+        self.assertNotIn('runner', diagnostic)
         for value in ({'text': 'prefix', 'complete': False}, {'text': 'text', 'complete': 1}, {'text': '长' * (TEXT_LIMIT + 1), 'complete': True}):
             with self.assertRaises(AnalysisError):
                 validate_snapshot(value)

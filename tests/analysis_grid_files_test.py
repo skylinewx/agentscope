@@ -24,11 +24,12 @@ result = [{'name':'count','label':'已读记录','value':count,'unit':None}]"""
         self.assertEqual(run['outputs'][0]['inputRefs'], [file_ref])
         from analysis_extension.python_products import bind_single_grid
         source = resolve_input(self.service, grid)
-        read = run['fileReads'][0]
-        for sources, reads in (([source, source], [read]), ([source], []), ([source], [{**read, 'exhausted': False}]),
-                               ([source], [{**read, 'sha256': 'other'}]), ([source], [{**read, 'matchedCount': 0}])):
+        manifest = run['inputDeliveryManifest']
+        read = manifest['reads'][0]
+        for sources, reads in (([source, source], [read]), ([source], []), ([source], [{**read, 'sendComplete': False}]),
+                               ([source], [{**read, 'sha256': 'other'}]), ([source], [{**read, 'sentCount': 0}])):
             output = [{}]
-            self.assertEqual(bind_single_grid(output, sources, reads), [])
+            self.assertEqual(bind_single_grid(output, sources, {**manifest, 'reads': reads}), [])
             self.assertNotIn('inputRefs', output[0])
         wrong = code.replace("'unit':None", "'unit':None,'inputRefs':['unknown']")
         with self.assertRaises(AnalysisError) as rejected:
@@ -113,15 +114,14 @@ result = [{"name":"total","label":"合成金额合计","value":total,"unit":"元
                                            code=code, purpose='精确累加合成金额', requestKey='large-grid', timeoutSeconds=30)
         from decimal import Decimal
         self.assertEqual(Decimal(result['derivedValues'][0]['value']), Decimal('600'))
-        read = result['fileReads'][0]
-        self.assertTrue(read['exhausted'])
+        read = result['inputDeliverySummary']['sources'][0]
+        self.assertTrue(read['sendComplete'])
         self.assertEqual(read['matchedCount'], 6000)
-        self.assertFalse(read['selectedKeysComplete'])
         run = self.store.get_python_run(OWNER, result['pythonRunRef'])
         self.assertNotIn('_path', run['fileInputs'][0])
         self.assertNotIn('data', run['fileInputs'][0])
-        self.assertEqual(len(read['selectedKeysPreview']), 12)
-        self.assertEqual(len(run['fileReads'][0]['selectedKeys']), 5000)
+        self.assertEqual(sum(block['count'] for block in run['inputDeliveryManifest']['reads'][0]['blocks']), 6000)
+        self.assertEqual(result['inputDeliverySummary']['algorithmUsage'], 'NOT_PROVEN_BY_DELIVERY')
 
     async def test_file_tail_can_build_original_facts_with_formula_and_publish(self):
         ref, file_ref, selections, scope, _ = await self.make_grid(100)
@@ -133,8 +133,9 @@ result = [{"name":"total","label":"合成金额合计","value":total,"unit":"元
         self.assertEqual(artifact['facts'][0]['dimensions']['MD_ORG'], 'object-0')
         from jsonschema import validate
         from analysis_extension.tools import AnalysisPython
-        validate({'analysisRef':built['analysisRef'], 'inputRefs':[],
-                  'gridInputs':[{'captureRef':ref, 'fileRef':file_ref}],
+        prepared = await self.service.task(action='prepare_inputs', analysisRef=built['analysisRef'],
+            gridInputs=[{'captureRef':ref, 'fileRef':file_ref}])
+        validate({'inputSetRef':prepared['inputSetRef'],
                   'code':'result=[]', 'purpose':'文件补充已有分析',
                   'fallbackReason':'需要扫描原生算子尚未加载的完整网格文件',
                   'requestKey':'schema-check'}, AnalysisPython.input_schema)
@@ -148,7 +149,7 @@ result=[{'name':'value','label':'选中金额','value':D(rows[0]['value']),'unit
         updated = self.store.get_analysis(OWNER, computed['analysisRef'])
         from analysis_extension.document_data import compile_datasets
         dataset, _ = compile_datasets(updated, [{'key':'details','valueRef':updated['derivedValues'][-1]['derivedId']}])
-        self.assertEqual(dataset['details']['rows'], [['101:1', '0.1']])
+        self.assertEqual([row['values'] for row in dataset['details']['rows']], [{'cell': '101:1', 'value': '0.1'}])
         published = await self.service.publish(computed['analysisRef'], [], [
             {'viewId':'amount','scopeId':computed['scope']['scopeId'],'type':'METRIC',
              'valueRefs':[updated['derivedValues'][0]['derivedId']]}], 'grid-publish')
@@ -160,8 +161,8 @@ for cell in grid_rows(inputs[0]["ref"]):
 '''
         result = await self.service.python(gridInputs=[{'captureRef': ref, 'fileRef': file_ref}],
                                            code=code, purpose='仅读取样例', requestKey='preview')
-        self.assertFalse(result['fileReads'][0]['exhausted'])
-        self.assertEqual(result['fileReads'][0]['matchedCount'], 1)
+        self.assertEqual(result['inputDeliverySummary']['algorithmUsage'], 'NOT_PROVEN_BY_DELIVERY')
+        self.assertGreaterEqual(result['inputDeliverySummary']['sources'][0]['sentCount'], 1)
 
     async def test_tampered_file_is_not_accepted_as_budget_evidence(self):
         ref, file_ref, selections, scope, _ = await self.make_grid()
@@ -190,7 +191,7 @@ for cell in grid_rows(inputs[0]["ref"]):
                      ToolResponse(content=[TextBlock(text=json.dumps(result))]))
         evidence = query_evidence(turn)
         self.assertEqual(evidence['pythonRuns'][0]['outputs'][0]['value'], '0.1')
-        self.assertFalse(evidence['pythonRuns'][0]['fileReads'][0]['exhausted'])
+        self.assertEqual(evidence['pythonRuns'][0]['inputDeliverySummary']['algorithmUsage'], 'NOT_PROVEN_BY_DELIVERY')
         self.assertEqual(evidence['sources'][0]['source']['gridFiles'][0]['ref'], file_ref)
         self.assertNotIn('_path', json.dumps(evidence))
 

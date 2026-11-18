@@ -2,7 +2,7 @@
 from copy import deepcopy
 import json
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 import mcp.types
 from analysis_fixtures import OWNER, fixture
@@ -97,6 +97,42 @@ class EvidenceClosureTests(PresentationCase):
         self.assertEqual(len(saved['verificationRecords']), 4)
         self.assertEqual(rebuilt['verificationTaskCount'], 2)
 
+    async def test_verified_background_build_keeps_full_report_at_closeout(self):
+        from analysis_closeout_recovery_test import CloseoutRecoveryTests
+        turn = self.turn()
+        artifact = await self.build_many(1)
+        # A background build persisted its result, while the coordinator still
+        # has the state from before that build completed.
+        self.assertEqual(turn.state['buildRefs'], [])
+        turn.state['queryCaptureRefs'] = [self.verify_capture(artifact['captureRefs'][0])]
+        verified = self.service._with_captured_verification(artifact)
+        self.assertNotEqual(verified['analysisRef'], artifact['analysisRef'])
+        self.assertTrue(turn.current_presentation_revision(verified['analysisRef']))
+        self.assertEqual(verified['facts'], artifact['facts'])
+        from analysis_extension.turn_completion import review_answer
+        model_review = patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=with_coverage({'issues': []})))
+        model_review.start()
+        self.addCleanup(model_review.stop)
+        async def approved(current): return await review_answer(None, turn, current, '')
+        self.service.preview_reviewer = approved
+        preview = await self.service.publish(analysisRef=verified['analysisRef'], requestKey='verified-preview',
+            previewOnly=True, document={'title': '完整分析',
+                'html': '<html><head></head><body><p>保留完整分析页面</p><p>{{value}}</p></body></html>',
+                'bindings': [{'key': 'value', 'valueRef': verified['facts'][0]['factId']}]},
+            renderCheckUnavailableReason='本用例验证后台登记；页面测量由浏览器套件覆盖。')
+        self.assertFalse(preview['diagnostics'].get('publicationCheck'), preview['diagnostics'].get('publicationCheck'))
+        CloseoutRecoveryTests.observe(self, turn, 'AnalysisPublish', preview)
+        middleware = object.__new__(AnalysisMiddleware)
+        middleware.service = self.service
+        await middleware._closeout('REPAIR_TIME_LIMIT')
+        result = turn.state['hostCloseout']
+        self.assertEqual(result['status'], 'READY', result)
+        delivered = self.store.get_analysis(OWNER, result['analysisRef'])
+        self.assertIn('保留完整分析页面', delivered['freeDocument']['html'])
+        self.assertNotIn('hostSummary', delivered)
+        other_turn = self.turn()
+        self.assertFalse(other_turn.current_presentation_revision(verified['analysisRef']))
+
     async def test_other_snapshot_verification_does_not_satisfy_current_fact(self):
         turn = self.turn()
         artifact = await self.build_many(1)
@@ -119,7 +155,7 @@ class EvidenceClosureTests(PresentationCase):
             requestKey='declare-pending-work', workPlan=[{
                 'taskId': 'selected-values', 'title': '尚待登记的所选读数', 'kind': 'VALUES', 'refs': []}])
         artifact = self.store.get_analysis(OWNER, built['analysisRef'])
-        self.service.preview_reviewer = AsyncMock(return_value={'issues': []})
+        self.service.preview_reviewer = AsyncMock(return_value=with_coverage({'issues': []}))
         with self.assertRaises(AnalysisError) as caught:
             await self.service.publish(artifact['analysisRef'], requestKey='premature',
                 previewOnly=True, document={'title': '结果', 'html': '<html><head></head><body>{{value}}</body></html>',
@@ -137,6 +173,23 @@ class EvidenceClosureTests(PresentationCase):
         artifact.update(facts=facts, captureRefs=list(captures))
         tasks = self.service.pending_verifications(artifact)
         self.assertEqual(tasks[0]['evidenceIds'], ['new-evidence'])
+
+    async def test_pending_tasks_read_shared_receipt_once_and_recheck_next_operation(self):
+        from unittest.mock import patch
+        from analysis_fixtures import saved_fixture
+        from analysis_extension.adapters.budget_v2 import _receipt_from_capture
+        ref, selections, scope = saved_fixture(self.store, values=tuple(str(n) for n in range(20)))
+        built = await self.service.build([ref], selections, scope, [], 'many-facts-one-capture')
+        artifact = self.store.get_analysis(OWNER, built['analysisRef'])
+        with patch('analysis_extension.adapters.budget_v2._receipt_from_capture', wraps=_receipt_from_capture) as read:
+            tasks = self.service.pending_verifications(artifact)
+        self.assertEqual(len(tasks), 1)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(set(tasks[0]['evidenceIds']), {eid for fact in artifact['facts'] for eid in fact['evidenceIds']})
+        capture = self.store.get_capture(OWNER, ref)
+        capture['request']['contextId'] = 'changed-source-context'
+        with patch.object(self.store, 'get_capture', return_value=capture), self.assertRaises(AnalysisError):
+            self.service.pending_verifications(artifact)
 
     async def test_explicit_followup_verification_does_not_use_local_capture_as_remote_check(self):
         artifact = await self.build_many(1, connected=True)
@@ -217,3 +270,5 @@ class EvidenceClosureTests(PresentationCase):
         self.assertEqual(status['reason'], 'EVIDENCE_INVALID')
         self.assertEqual(status['issues'][0]['details']['executionId'], 'execution-0')
         self.assertIn('来源不一致', answer)
+
+from analysis_review_fixtures import with_coverage

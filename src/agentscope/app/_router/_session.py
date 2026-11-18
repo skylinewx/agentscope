@@ -301,11 +301,7 @@ async def create_session(
     workspace_manager: WorkspaceManagerBase = Depends(get_workspace_manager),
     access: ResourceAccessService = Depends(get_resource_access_service),
 ) -> CreateSessionResponse:
-    """Create (or resume) a session for a given agent and workspace.
-
-    At most one session exists per ``(user_id, agent_id, workspace_id)``
-    triple — a second call with the same triple updates the existing session
-    rather than creating a duplicate.
+    """Create a new session with the given agent and workspace binding.
 
     Args:
         body (`CreateSessionRequest`): Agent, workspace, and model config.
@@ -318,7 +314,7 @@ async def create_session(
         access (`ResourceAccessService`): Injected access service.
 
     Returns:
-        `CreateSessionResponse`: The session identifier.
+        `CreateSessionResponse`: The session identifier and initial view.
 
     Raises:
         `HTTPException`: 404 if the agent / credential / knowledge base
@@ -382,7 +378,14 @@ async def create_session(
             **({"name": body.name} if body.name is not None else {}),
         ),
     )
-    return CreateSessionResponse(session_id=session_record.id)
+    return CreateSessionResponse(
+        session_id=session_record.id,
+        view=SessionView(
+            session=session_record,
+            is_running=False,
+            status=SessionStatus.IDLE,
+        ),
+    )
 
 
 @session_router.delete(
@@ -671,8 +674,8 @@ async def list_messages(
         Messages, their replay cursor, running status, and whether more
         pages exist.
     """
-    existing = await storage.get_session(user_id, agent_id, session_id)
-    if existing is None:
+    summary = await storage.get_session_summary(user_id, agent_id, session_id)
+    if summary is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",
@@ -891,8 +894,8 @@ async def stream_session_events(
         `StreamingResponse`:
             SSE stream of AgentEvent frames + periodic heartbeats.
     """
-    existing = await storage.get_session(user_id, agent_id, session_id)
-    if existing is None:
+    summary = await storage.get_session_summary(user_id, agent_id, session_id)
+    if summary is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Session '{session_id}' not found.",

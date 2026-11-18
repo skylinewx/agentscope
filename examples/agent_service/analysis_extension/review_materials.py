@@ -5,7 +5,7 @@ from copy import deepcopy
 def business_query_projection(capture, receipt, source):
     """Use every verified business row once; native requests remain in the immutable capture.
 
-    Call only after adapter validation. Do not apply to ANALYZE, whose formula evidence
+    Call only after adapter validation. Do not apply to PREPARE_MATERIALS, whose formula evidence
     and calculation dependency graph require the original fact projection.
     """
     from .models import digest
@@ -65,17 +65,23 @@ def business_query_projection(capture, receipt, source):
                             'readTool': 'QueryResultRead',
                             'nativeRead': {'captureRef': capture['captureRef'], 'pointer': '/data'},
                             'boundary': '全部业务行、类型、空值状态和执行失败均保留；原生数据及定位参数已校验并完整保存。'}
+    source['businessTableView'] = business_table_view(receipt)
+    return contexts, facts, source
+
+
+def business_table_view(receipt):
+    """One complete business presentation for query, empty closeout and review."""
     from .business_tables import build_tables, state_markdown, catalog
     tables = build_tables(receipt)
     locations = {}
     for table in tables:
         for fact, places in table.locations.items():
             locations.setdefault(fact, []).extend(places)
-    source['businessTableView'] = {
+    return {
         'markdown': state_markdown(receipt) + '\n\n' + '\n\n'.join(t.markdown() for t in tables),
         'tables': catalog(tables), 'factLocations': locations,
-        'allFactsIncluded': sum(len(t.facts) for t in tables) == len(facts)}
-    return contexts, facts, source
+        'allFactsIncluded': sum(len(t.facts) for t in tables) == sum(
+            len(result.get('rows', [])) for result in receipt.get('data', {}).get('resultSets', []))}
 
 
 def markdown_review_material(value):

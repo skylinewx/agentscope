@@ -7,6 +7,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from .models import AnalysisError
+from .render_timing import RENDER_HTTP_SECONDS, RENDER_REQUEST_SECONDS
 
 
 def validate_rendering(config):
@@ -74,8 +75,8 @@ class RenderChecker:
         payload = {key: document[key] for key in ('html', 'contentDigest', 'frameKey')}
         payload.update(version=1, widths=self.widths)
         try:
-            async with asyncio.timeout(40):
-                async with httpx.AsyncClient(timeout=httpx.Timeout(35, connect=5), trust_env=False,
+            async with asyncio.timeout(RENDER_REQUEST_SECONDS):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(RENDER_HTTP_SECONDS, connect=15), trust_env=False,
                                              follow_redirects=False) as client:
                     async with client.stream('POST', self.url + '/check', json=payload,
                                              headers={'Authorization': 'Bearer ' + self.token}) as response:

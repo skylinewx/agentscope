@@ -5,6 +5,7 @@ from analysis_business_query_test import business_fixture
 from analysis_budget_batch_test import update
 from analysis_fact_view_fixtures import fact_view
 from analysis_fixtures import OWNER
+from analysis_extension.models import AnalysisError
 from analysis_extension.followup_scope import prepare_request
 from analysis_extension.source_views import register, select, install
 from analysis_extension.turn_completion import TurnCompletion
@@ -123,9 +124,8 @@ class QueryLineageTest(PresentationCase):
             'scope': {'taskNames': ['年度预算'], 'formNames': ['利润表']}})
         self.assertIn('年度预算', result['contextText'])
         self.assertIn('利润表', result['contextText'])
-        other = prepare_request(self.service.turn, capture, {'purpose': 'QUERY',
-            'scope': {'formNames': ['另一张未选择的表']}})
-        self.assertNotIn('另一张未选择的表', other.get('contextText', ''))
+        with self.assertRaises(AnalysisError):
+            prepare_request(self.service.turn, capture, {'scope': {'formNames': ['另一张未选择的表']}})
 
     def test_members_grouping_preserves_same_metric_and_does_not_mutate_task(self):
         source, capture = self.source()
@@ -136,7 +136,7 @@ class QueryLineageTest(PresentationCase):
         self.assertIn('科目0', result['contextText'])
         self.assertEqual(result['intentDraft']['targets'][0]['businessPhrases'][0]['sourceText'], '科目0')
         self.assertEqual(result['basis']['memberDimensions'], ['MD_ORG'])
-        self.assertEqual({k: v for k, v in self.service.turn.state.items() if k != 'businessEvidence'}, before)
+        self.assertEqual({k: v for k, v in self.service.turn.state.items() if k not in ('businessEvidence', 'materialQueryRoles')}, before)
 
     def test_members_grouping_can_omit_unchanged_target_without_selecting_other_metric(self):
         source, capture = self.source()
@@ -188,24 +188,90 @@ class QueryLineageTest(PresentationCase):
         self.assertNotIn('valueFilter', result['intentDraft'])
         explicit = prepare_request(self.service.turn, capture, {'purpose': 'QUERY',
             'intentDraft': {'sharedConditions': [], 'targets': [{'id': 'target', 'businessPhrases': [{'text': '科目0'}]}]}})
-        self.assertEqual(explicit['intentDraft']['sharedConditions'], [])
+        self.assertEqual([p['text'] for p in explicit['intentDraft']['sharedConditions']], ['预算'])
         self.service.turn.state.update(request='改查实际',
             followupContext={'mode': 'CONTINUE', 'changedFields': ['scenario']})
         changed = prepare_request(self.service.turn, capture, {'purpose': 'QUERY',
             'intentDraft': {'targets': [{'id': 'target', 'businessPhrases': [{'text': '科目0'}, {'text': '实际'}]}]}})
         self.assertEqual(changed['intentDraft']['sharedConditions'], [])
 
-    def test_shared_condition_clear_and_scenario_switch_do_not_reintroduce_budget(self):
+    def test_empty_shared_list_keeps_budget_but_explicit_scenario_switch_releases_it(self):
         _, capture = self.source()
         result = prepare_request(self.service.turn, capture, {'purpose': 'QUERY',
             'intentDraft': {'sharedConditions': [], 'targets': [{'id': 't0', 'businessPhrases': [{'text': '科目0'}]}]}})
-        self.assertEqual(result['intentDraft']['sharedConditions'], [])
+        self.assertEqual([p['text'] for p in result['intentDraft']['sharedConditions']], ['预算'])
+        self.assertIn('预算', result.get('contextText', ''))
         self.service.turn.state.update(request='改查实际',
             followupContext={'mode': 'CONTINUE', 'changedFields': ['scenario']})
         result = prepare_request(self.service.turn, capture, {'purpose': 'QUERY',
             'intentDraft': {'targets': [{'id': 't0', 'businessPhrases': [{'text': '科目0'}, {'text': '实际'}]}]}})
         self.assertEqual(result['intentDraft']['sharedConditions'], [])
         self.assertNotIn('预算', result.get('contextText', ''))
+
+    def test_partial_shared_update_keeps_confirmed_scenario_without_old_value_filter(self):
+        for embedded in (False, True):
+            with self.subTest(embedded=embedded):
+                _, capture = self.source(scenario_in_targets=embedded)
+                self.service.turn.state['request'] = '在二级单位中查询收入'
+                self.service.turn.state['followupContext']['changedFields'] = ['metric', 'population']
+                request = {'intentDraft': {'sharedConditions': [{'text': '二级单位'}],
+                    'targets': [{'id': 'new', 'businessPhrases': [{'text': '收入'}]}],
+                    'valueFilter': {'targetId': 'new', 'operator': 'GT', 'value': '1000'}}}
+                result = prepare_request(self.service.turn, capture, request)
+                self.assertEqual([p['text'] for p in result['intentDraft']['sharedConditions']], ['二级单位', '预算'])
+                self.assertIn('预算', result['contextText'])
+                self.assertNotIn('科目0', result['contextText'])
+                self.assertEqual(result['intentDraft']['valueFilter']['value'], '1000')
+                self.assertEqual(request['intentDraft']['sharedConditions'], [{'text': '二级单位'}])
+
+    def test_partial_update_does_not_duplicate_target_scenario_or_restore_released_one(self):
+        _, capture = self.source()
+        self.service.turn.state['request'] = '二级单位的科目0预算'
+        request = {'intentDraft': {'sharedConditions': [{'text': '二级单位'}], 'targets': [
+            {'id': 'target', 'businessPhrases': [{'text': '科目0'}, {'text': '预算'}]}]}}
+        result = prepare_request(self.service.turn, capture, request)
+        self.assertEqual([p['text'] for p in result['intentDraft']['sharedConditions']], ['二级单位'])
+        self.service.turn.state.update(request='改查二级单位实际',
+            followupContext={'mode': 'CONTINUE', 'changedFields': ['scenario']})
+        request['intentDraft']['targets'][0]['businessPhrases'] = [{'text': '科目0'}, {'text': '实际'}]
+        result = prepare_request(self.service.turn, capture, request)
+        self.assertNotIn('预算', result.get('contextText', ''))
+        self.assertEqual([p['text'] for p in result['intentDraft']['sharedConditions']], ['二级单位'])
+
+    def test_multiple_selected_targets_keep_common_conditions_without_choosing_a_target(self):
+        for embedded in (False, True):
+            with self.subTest(embedded=embedded):
+                first, capture = self.source(scenario_in_targets=embedded)
+                second = register(self.service.turn, {'captureRef': capture['captureRef'], 'stepId': 'batch',
+                                                     'batchId': 'batch-A', 'columnNames': ['metric2']})
+                install(self.service.turn, select(self.service.turn, [{'sourceRef': first['sourceRef']},
+                                                                    {'sourceRef': second['sourceRef']}]))
+                self.service.turn.state.update(request='在二级单位查询收入',
+                    followupContext={'mode': 'CONTINUE', 'changedFields': ['metric', 'population']})
+                for shared in (None, [{'text': '二级单位'}], []):
+                    request = {'intentDraft': {'targets': [{'id': 'new', 'businessPhrases': [{'text': '收入'}]}]}}
+                    if shared is not None: request['intentDraft']['sharedConditions'] = shared
+                    result = prepare_request(self.service.turn, capture, request)
+                    words = [p['text'] for p in result['intentDraft']['sharedConditions']]
+                    self.assertIn('预算', words)
+                    self.assertIn('预算', result.get('contextText', ''))
+                    self.assertEqual(result['intentDraft']['targets'][0]['businessPhrases'][0]['text'], '收入')
+                    self.assertNotIn('valueFilter', result['intentDraft'])
+
+    def test_multiple_requests_do_not_inherit_noncommon_or_released_conditions(self):
+        from analysis_extension.query_lineage import restore_shared_conditions
+        priors = [{'intentDraft': {'sharedConditions': [{'text': '预算'}, {'text': '甲机构'}]}},
+                  {'intentDraft': {'sharedConditions': [{'text': '预算'}, {'text': '乙机构'}]}}]
+        request = {'question': '新指标', 'contextText': '预算 甲机构 乙机构'}
+        restore_shared_conditions(request, priors)
+        self.assertEqual([p['text'] for p in request['intentDraft']['sharedConditions']], ['预算'])
+        request = {'question': '新指标', 'contextText': '预算 甲机构 乙机构'}
+        restore_shared_conditions(request, priors, released={'预算'})
+        self.assertEqual(request['intentDraft']['sharedConditions'], [])
+        priors[1]['intentDraft']['sharedConditions'][0]['text'] = '实际'
+        request = {'question': '新指标', 'contextText': '预算 实际 甲机构 乙机构'}
+        restore_shared_conditions(request, priors, scenario_terms={'预算', '实际'})
+        self.assertEqual(request['intentDraft']['sharedConditions'], [])
 
     def test_period_and_scenario_changes_release_old_parts_but_keep_metric(self):
         source, capture = self.source()
@@ -239,10 +305,14 @@ class QueryLineageTest(PresentationCase):
         source, capture = self.source()
         self.service.turn.state.update(request='查询这些单位的收入',
             followupContext={'mode': 'CONTINUE', 'changedFields': ['metric']}, queryIntent={'metric': '收入'})
-        result = prepare_request(self.service.turn, capture, {'purpose': 'QUERY',
+        request = {'purpose': 'QUERY',
             'basis': {'kind': 'MEMBERS', 'sourceRef': source['sourceRef']},
             'scope': {'formNames': ['无关表']},
-            'intentDraft': {'targets': [{'id': 'income', 'businessPhrases': [{'text': '收入'}]}]}})
+            'intentDraft': {'targets': [{'id': 'income', 'businessPhrases': [{'text': '收入'}]}]}}
+        with self.assertRaises(AnalysisError):
+            prepare_request(self.service.turn, capture, request)
+        request.pop('scope')
+        result = prepare_request(self.service.turn, capture, request)
         self.assertNotIn('科目0', result.get('contextText', ''))
         self.assertNotIn('无关表', result.get('contextText', ''))
         self.assertNotIn('formCodes', result['scope'])
@@ -251,10 +321,9 @@ class QueryLineageTest(PresentationCase):
     def test_new_query_does_not_borrow_previous_runtime_name(self):
         _, capture = self.source()
         self.service.turn.state.update(request='查询收入', followupContext={'mode': 'NEW'}, queryIntent={'metric': '收入'})
-        result = prepare_request(self.service.turn, capture, {'purpose': 'QUERY',
-            'scope': {'taskNames': ['年度预算']},
-            'intentDraft': {'targets': [{'id': 'income', 'businessPhrases': [{'text': '收入'}]}]}})
-        self.assertNotIn('年度预算', result.get('contextText', ''))
+        with self.assertRaises(AnalysisError):
+            prepare_request(self.service.turn, capture, {'scope': {'taskNames': ['年度预算']},
+                'intentDraft': {'targets': [{'id': 'income', 'businessPhrases': [{'text': '收入'}]}]}})
 
     def test_pending_metric_change_releases_source_metric_after_repeated_resume(self):
         source, capture = self.source()
@@ -279,5 +348,5 @@ class QueryLineageTest(PresentationCase):
         self.assertEqual(result['basis']['memberDimensions'], ['MD_ORG'])
         self.assertEqual([target['id'] for target in result['intentDraft']['targets']], ['income'])
         self.assertNotIn('valueFilter', result['intentDraft'])
-        self.assertEqual({k: v for k, v in state.items() if k != 'businessEvidence'},
-                         {k: v for k, v in before.items() if k != 'businessEvidence'})
+        self.assertEqual({k: v for k, v in state.items() if k not in ('businessEvidence', 'materialQueryRoles')},
+                         {k: v for k, v in before.items() if k not in ('businessEvidence', 'materialQueryRoles')})

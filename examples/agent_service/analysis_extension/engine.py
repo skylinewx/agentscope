@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from decimal import Decimal, ROUND_HALF_EVEN, localcontext
+from decimal import Decimal, ROUND_HALF_UP, localcontext
 import re
 
 from .models import AnalysisError, decimal_text, decimal_value, digest, precise_sum
@@ -325,8 +325,8 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
                         raise AnalysisError("INVALID_ROUNDING", "比率精度必须在零到十六位之间。")
                     with localcontext() as context:
                         context.prec = 512
-                        value = (values[0] / values[1]).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_EVEN)
-                    result["rounding"] = {"mode": "ROUND_HALF_EVEN", "decimalPlaces": places}
+                        value = (values[0] / values[1]).quantize(Decimal(1).scaleb(-places), rounding=ROUND_HALF_UP)
+                    result["rounding"] = {"mode": "ROUND_HALF_UP", "decimalPlaces": places}
                     result["ratioMeaning"] = "signed_net_ratio" if any(decimal_value(f["value"]) < 0 for f in source_facts) else "ratio"
                 elif operator == "LINEAR":
                     terms = rule.get("terms", [])

@@ -40,15 +40,21 @@ def compile_datasets(artifact, specifications):
             if 'nodeRefs' in spec and value['operator'] != 'FORMULA_CHECK':
                 raise AnalysisError('INVALID_DOCUMENT_DATASET', 'nodeRefs 仅用于 FORMULA_CHECK。')
             if value['operator'] in ('SORT', 'RANK'):
-                data = {'kind': 'ORDERED', 'direction': value.get('direction', 'desc'),
-                        'rows': [fact_record(facts[ref], fmt) for ref in value['orderedFactIds']],
-                        'unavailable': [fact_record(facts[ref], fmt) for ref in value.get('unavailableFactIds', [])]}
+                from .business_dataset import table, rows as named_rows
+                columns = [{'name': name, 'label': label, 'type': kind} for name, label, kind in (
+                    ('factRef', '来源引用', 'STRING'), ('objectLabel', '对象', 'STRING'),
+                    ('value', '数值', 'DECIMAL_STRING'), ('display', '展示值', 'STRING'), ('unit', '计量单位', 'STRING'))]
+                data = table(columns, [fact_record(facts[ref], fmt) for ref in value['orderedFactIds']],
+                             ref=ref, kind='ORDERED')
+                data.update(direction=value.get('direction', 'desc'),
+                            unavailable=named_rows(columns, [fact_record(facts[ref], fmt) for ref in
+                                       value.get('unavailableFactIds', [])], prefix=ref + ':unavailable'))
             elif value['operator'] == 'FORMULA_CHECK':
                 data = formula_dataset(value, facts, spec.get('nodeRefs'), fmt)
             elif value['operator'] in ('PYTHON', 'DESCRIBE') and value.get('outputKind') in ('TABLE', 'CHART_DATA'):
-                data = {'kind': 'TABULAR', 'columns': deepcopy(value['columns']),
-                        'rows': deepcopy(value['rows']), 'rowCount': value['rowCount'],
-                        'inputRefs': value['inputRefs']}
+                from .business_dataset import table
+                data = table(value['columns'], value['rows'], ref=ref)
+                data['inputRefs'] = value['inputRefs']
                 if value.get('pythonRunRef'):
                     data['pythonRunRef'] = value['pythonRunRef']
                 if value['operator'] == 'DESCRIBE':

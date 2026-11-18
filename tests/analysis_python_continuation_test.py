@@ -7,7 +7,7 @@ from analysis_presentation_fixtures import PresentationCase
 from analysis_budget_batch_test import batch_fixture, update
 from analysis_extension.models import AnalysisError
 from analysis_extension.tools import AnalysisPython
-from analysis_extension.python_worker import validate_code
+from analysis_extension.python_program import validate_code
 
 
 CODE = '''result=[{"name":"total","label":"所选数据合计","kind":"SCALAR",
@@ -18,11 +18,40 @@ WORK = [{'taskId': 'total', 'title': '所选数据合计', 'kind': 'COMPUTATION'
 
 
 class PythonContinuationTests(PresentationCase):
-    def test_discard_variable_is_allowed_without_opening_private_names(self):
+    async def test_retry_freezes_workspace_file_even_after_it_is_deleted(self):
+        path = self.service.delivery.root / 'frozen.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"amount":"1.005"}', encoding='utf-8')
+        with self.assertRaises(AnalysisError) as caught:
+            await self.service.python(fileInputs=[{'path':'frozen.json'}], code='raise ValueError("fix")',
+                purpose='冻结文件', requestKey='freeze-failed')
+        retry = caught.exception.details['retryInput']
+        failed = self.store.get_python_run(OWNER, retry['retryOfRunRef'])
+        self.assertTrue(failed['inputDeliveryManifest']['inlineComplete'])
+        self.assertFalse(list((self.store.root / 'python-input-journals').rglob('*.jsonl')))
+        path.unlink()
+        result = await self.service.python(**retry, code="result=[{'name':'amount','label':'金额','value':D(inputs[0]['data']['amount']),'decimalPlaces':2,'unit':'元','inputRefs':[inputs[0]['ref']]}]",
+            purpose='修正代码复用原文件', requestKey='freeze-fixed')
+        self.assertEqual(result['derivedValues'][0]['value'], '1.01')
+        record = self.store.get_python_run(OWNER, result['pythonRunRef'])
+        self.assertEqual(record['parentAttemptRef'], retry['retryOfRunRef'])
+        self.assertEqual(record['fileInputs'][0]['data'], {'amount':'1.005'})
+
+    def test_expired_attempt_is_failed_and_preserves_frozen_inputs(self):
+        record = {'runRef':'python_interrupted', 'status':'RUNNING', 'executionDeadline':1,
+                  'inputRecords':[{'ref':'a','value':'1.005'}], 'fileInputs':[], 'code':'result=[]'}
+        self.store.save_python_run(OWNER, record['runRef'], record)
+        self.assertEqual(self.store.recover_expired_python(2), 1)
+        recovered = self.store.get_python_run(OWNER, record['runRef'])
+        self.assertEqual(recovered['status'], 'FAILED')
+        self.assertEqual(recovered['error']['code'], 'PYTHON_HOST_INTERRUPTED')
+        self.assertEqual(recovered['inputRecords'], record['inputRecords'])
+        self.assertEqual(self.store.recover_expired_python(3), 0)
+
+    def test_normal_names_are_language_features_not_security_boundaries(self):
         validate_code('result = [value for _, value in enumerate(inputs)]')
         for code in ('result = __builtins__', 'result = _private', 'result = inputs.__class__'):
-            with self.assertRaises(ValueError):
-                validate_code(code)
+            validate_code(code)
 
     async def test_code_and_work_plan_register_together_without_rebuild(self):
         capture, selections, scope = saved_fixture(self.store, ('0.1', '0.2'))
@@ -50,16 +79,20 @@ class PythonContinuationTests(PresentationCase):
         self.assertEqual(error.details['path'], '/result/0')
         self.assertFalse(error.details['requiresSourceQuery'])
         retry = error.details['retryInput']
-        artifact = self.store.get_analysis(OWNER, retry['analysisRef'])
-        self.assertEqual(retry['inputRefs'], [fact['factId'] for fact in artifact['facts']])
+        run = self.store.get_python_run(OWNER, retry['retryOfRunRef'])
+        artifact = self.store.get_analysis(OWNER, run['sourceAnalysisRef'])
+        self.assertEqual(run['inputRefs'], [fact['factId'] for fact in artifact['facts']])
         fixed = await self.service.python(**retry, code=CODE, purpose='修正真实依赖', requestKey='fixed-dependency')
         self.assertEqual(fixed['derivedValues'][0]['value'], '0.1')
 
-    def test_direct_query_schema_exposes_required_input_triplet(self):
-        request = {'code': CODE, 'purpose': '分析', 'requestKey': 'schema',
-                   'captureRefs': ['capture'], 'selections': [{'captureRef': 'capture', 'stepId': 'step', 'cellKeys': ['1:1']}]}
-        errors = list(Draft202012Validator(AnalysisPython.input_schema).iter_errors(request))
-        self.assertTrue(any(error.validator == 'dependentRequired' and 'scope' in error.message for error in errors))
+    def test_execution_schema_uses_one_frozen_reference(self):
+        request = {'code': CODE, 'purpose': '分析', 'fallbackReason': '自由处理', 'requestKey': 'schema',
+                   'inputSetRef': 'inputs_actual'}
+        validator = Draft202012Validator(AnalysisPython.input_schema)
+        self.assertFalse(list(validator.iter_errors(request)))
+        self.assertTrue(list(validator.iter_errors({**request, 'inputRefs': ['fact_a']})))
+        self.assertTrue(list(validator.iter_errors({**request, 'retryOfRunRef': 'python_old'})))
+        self.assertTrue(list(validator.iter_errors({key: value for key, value in request.items() if key != 'inputSetRef'})))
 
     async def test_registration_failure_preserves_successful_execution_evidence(self):
         capture, selections, scope = saved_fixture(self.store, ('0.1',))

@@ -1,10 +1,54 @@
 """Safe diagnostics for actual model attempts, without request or error bodies."""
 import json
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from time import perf_counter
 from uuid import uuid4
 
 from .._logging import logger
+
+
+_ATTEMPT_OBSERVER = ContextVar('model_attempt_observer', default=None)
+
+
+@contextmanager
+def observe_attempts(observer):
+    token = _ATTEMPT_OBSERVER.set(observer)
+    try:
+        yield
+    finally:
+        _ATTEMPT_OBSERVER.reset(token)
+
+
+async def observed_attempt(execute, *, call_id, strategy, attempt):
+    """Adapter attempt timing, including cancellation; never log request bodies."""
+    observer = _ATTEMPT_OBSERVER.get()
+    if observer is None:
+        return await execute()
+    start = perf_counter()
+    event = {'callId': call_id, 'strategy': strategy, 'attempt': attempt,
+             'scope': 'MODEL_ADAPTER', 'status': 'STARTED'}
+    def emit(value):
+        try:
+            observer(dict(value))
+        except Exception:
+            logger.warning('Model attempt observer failed; execution is unchanged')
+    emit(event)
+    try:
+        result = await execute()
+        event['status'] = 'COMPLETED'
+        return result
+    except BaseException as error:
+        event.update(status='CANCELLED' if type(error).__name__ == 'CancelledError' else 'FAILED',
+                     errorType=type(error).__name__)
+        code = getattr(error, 'status_code', None)
+        if type(code) is int:
+            event['httpStatus'] = code
+        raise
+    finally:
+        event['elapsedMs'] = round((perf_counter() - start) * 1000, 2)
+        emit(event)
 
 
 def causes(error):

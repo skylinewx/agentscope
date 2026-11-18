@@ -1,3 +1,4 @@
+from analysis_extension.review_request import review_material
 """Real Agent loop continuation and actual immutable artifact completion checks."""
 import asyncio
 from copy import deepcopy
@@ -76,7 +77,8 @@ class TurnCompletionTests(PresentationCase):
         middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize)
         middleware.service = self.service
         self.service.turn = turn
-        reviewer = AsyncMock(side_effect=[TimeoutError(), {'issues': []}])
+        reviewer = AsyncMock(side_effect=[TimeoutError(), {'issues': [], 'coverage': [
+            {'requirement': '回答用户问题', 'status': 'COVERED', 'location': '全文', 'evidenceRefs': []}]}])
         agent = SimpleNamespace(name='agent', state=AgentState())
         with patch('analysis_extension.turn_completion._model_review', reviewer):
             result = await middleware._check_end(agent)
@@ -105,16 +107,18 @@ class TurnCompletionTests(PresentationCase):
         self.assertEqual(payload['derived'][0]['formulaTrace']['recursiveStatus'], 'BLOCKED')
         self.assertEqual(payload['derived'][0]['formulaTrace']['pendingDependencies'], [{'factRef': 'missing_input'}])
 
-    async def test_formula_analysis_cannot_finish_with_values_only(self):
+    async def test_formula_material_plan_can_change_without_erasing_user_request(self):
         turn = self.turn()
         await self.generic_result(turn)
-        turn.task(mode='ANALYSIS', goal='公式构成分析', requiredEvidence='FORMULAS')
+        turn.task(mode='ANALYSIS', goal='公式构成分析', materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}])
         result = turn.check()
         issue = next(issue for issue in result['issues'] if issue['code'] == 'FORMULA_TARGETS_REQUIRED')
         self.assertFalse(issue['requiresSourceQuery'])
-        self.assertEqual(issue['path'], '/workPlan')
-        with self.assertRaises(AnalysisError):
-            turn.task(mode='ANALYSIS', goal='改用数值', requiredEvidence='VALUES')
+        self.assertEqual(issue['path'], '/materials')
+        original = turn.state['request']
+        turn.task(mode='ANALYSIS', goal='改用已取得的相关数值解释', materials=[{'role': 'PRIMARY', 'kinds': ['VALUES']}])
+        self.assertEqual(turn.state['materials'], [{'role':'PRIMARY', 'kinds':['VALUES']}])
+        self.assertEqual(turn.state['request'], original)
 
     async def test_python_formula_obligation_checks_only_declared_targets(self):
         turn = self.turn()
@@ -126,7 +130,7 @@ class TurnCompletionTests(PresentationCase):
         artifact['plan']['workPlan'].append({'taskId': 'composition', 'title': '目标的必要构成',
             'kind': 'COMPUTATION', 'operator': 'PYTHON', 'requiredEvidence': 'FORMULAS',
             'targetRefs': [target], 'refs': []})
-        turn.task(mode='ANALYSIS', goal='一项构成，其他用于概览', requiredEvidence='FORMULAS')
+        turn.task(mode='ANALYSIS', goal='一项构成，其他用于概览', materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}])
         _, issues, _ = turn.data_issues(artifact)
         missing = next(item for item in issues if item['code'] == 'FORMULA_DATA_REQUIRED')
         self.assertEqual(missing['missingFactRefs'], [target])
@@ -271,7 +275,7 @@ class TurnCompletionTests(PresentationCase):
         from unittest.mock import patch
         with patch.object(self.service.sources, 'catalog', return_value=[{'headers':['x' * 160001]}]):
             evidence = query_evidence(turn)
-            with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 160000):
+            with patch('analysis_extension.turn_completion.review_material_limit', return_value=160000):
                 with self.assertRaises(AnalysisError) as caught:
                     query_review_payloads({'candidateAnswer': '结论'}, evidence)
         self.assertEqual(caught.exception.code, 'REVIEW_CAPACITY')
@@ -366,7 +370,7 @@ class TurnCompletionTests(PresentationCase):
         turn = self.turn('DIRECT')
         turn.state['queryCaptureRefs'] = [ref]
         evidence = query_evidence(turn)
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 160000):
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=160000):
             with self.assertRaises(AnalysisError) as caught:
                 query_review_payloads({'candidateAnswer': '澄清'}, evidence)
         self.assertEqual(caught.exception.code, 'REVIEW_CAPACITY')
@@ -393,12 +397,12 @@ class TurnCompletionTests(PresentationCase):
                                 'diagnostic': {'code': 'SOURCE_TIMEOUT'}, 'entities': []}],
                     'relations': [{'parentId': 'root', 'childIds': ['member-0', 'member-14']}]}
         _compact_query_entities(evidence)
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 3000):
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=3000):
             payloads = query_review_payloads({'candidateAnswer': '完整答复'}, evidence)
             recovered = []
             for payload in payloads:
                 from analysis_extension.review_encoding import unpack_review_records
-                part = unpack_review_records(json.loads(payload))['evidence']
+                part = unpack_review_records(review_material(payload))['evidence']
                 recovered.extend(expanded_entities(part, part['sources'][0]))
                 self.assertEqual(part['sources'][0]['facts'], facts)
                 self.assertEqual(part['sources'][0]['source'], scope)
@@ -425,7 +429,7 @@ class TurnCompletionTests(PresentationCase):
             {'key': str(index), 'label': 'x' * 500} for index in range(10)]}]}
         _compact_query_entities(evidence)
         failure = {'issues': [{'code': 'ANSWER_MISMATCH', 'message': '全局排序错误'}]}
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 2200), \
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=2200), \
                 patch('analysis_extension.turn_completion._model_review', AsyncMock(return_value=failure)):
             result = await review_query_answer(None, turn, evidence, '完整答复')
         self.assertEqual(result, failure)
@@ -835,7 +839,7 @@ class TurnLoopTests(PresentationCase):
         if checks is not None:
             self.middleware._check_end = AsyncMock(side_effect=checks)
         model = MockModel(context_size=1000000, mock_structured_response=StructuredResponse(content={
-            'requiredEvidence': 'VALUES', 'explanation': '此测试仅解释已给出的读数。'}))
+            'requiredEvidence': 'VALUES', 'investigations': [], 'explanation': '此测试仅解释已给出的读数。'}))
         model.set_responses(responses)
         state = AgentState()
         state.permission_context.mode = PermissionMode.BYPASS
@@ -858,7 +862,7 @@ class TurnLoopTests(PresentationCase):
 
     async def test_analysis_intent_cannot_finish_by_plain_text_and_bounded_retries_stop(self):
         events, ends = await self.run_agent([call('AnalysisTask', action='declare', mode='ANALYSIS', goal='解释所选信号')] + [text('完成了') for _ in range(4)])
-        self.assertEqual(self.middleware.service.turn.state['analysisRequirement']['requiredEvidence'], 'VALUES')
+        self.assertEqual(self.middleware.service.turn.state['analysisRequirement']['materials'], [{'role':'PRIMARY', 'kinds':['VALUES']}])
         self.assertEqual(ends[0].finished_reason, ReplyFinishedReason.ERROR)
         self.assertEqual(ends[0].error.type.value, 'completion_check')
         self.assertIn('未完成项', ends[0].error.message)

@@ -40,7 +40,9 @@ def merge_intent(state, context, intent, *, context_supplied=False):
         # confirmed patches from the current user turn.
         effective = ({key: deepcopy(value) for key, value in previous.items()
                       if key not in changes and key not in PRESENTATION_FIELDS}
-                     if context['mode'] == 'CONTINUE' else {})
+                     if context['mode'] == 'CONTINUE' else
+                     {key: deepcopy(value) for key, value in previous.items()
+                      if context['mode'] == 'NEW' and key in ('population', 'scenario', 'period') and key not in changes})
         decisions = {field: {'operation': 'CLEAR', 'value': None} for field in PRESENTATION_FIELDS}
     for key, value in (intent or {}).items():
         if value is None:
@@ -71,7 +73,7 @@ def presentation_summary(state):
 
 def intent_context(state, context, intent):
     result = deepcopy(context)
-    if result.get('mode', 'CONTINUE') != 'CONTINUE':
+    if result.get('mode', 'CONTINUE') not in ('CONTINUE', 'NEW'):
         return result
     previous = state.get('previousQueryIntent', {})
     changes = set(result.get('changedFields', []))
@@ -97,7 +99,7 @@ def reconcile_selectors(turn, request):
     """
     state = turn.state
     context = deepcopy(state.get('followupContext', {}))
-    if context.get('mode', 'CONTINUE') != 'CONTINUE':
+    if context.get('mode', 'CONTINUE') not in ('CONTINUE', 'NEW'):
         return
     changes = set(context.get('changedFields', []))
     dimensions = list(context.get('changedDimensions', []))
@@ -112,6 +114,14 @@ def reconcile_selectors(turn, request):
         if len(matches) != 1 or record.get('ambiguousScope'):
             continue
         current, old = matches[0], record['draft']
+        # Query selectors patch inherited dimensions, including a new topic.
+        # Repeating the root does not clear its level/where. A scopeEdit is the
+        # explicit replacement operation (including clearing a constraint).
+        replacement = any(concept(edit['dimensionHint']) in aliases
+                          for edit in state.get('scopeEdits', []))
+        selector, previous = current.get('selector', {}), old.get('selector', {})
+        if (not replacement and selector.get('type') == previous.get('type') == 'HIERARCHY'):
+            current['selector'] = {**deepcopy(previous), **selector}
         field = next((field for dimension, field in STANDARD_FIELDS.items() if dimension in aliases), None)
         if current.get('selector') == old.get('selector'):
             changes.discard(field)
@@ -139,7 +149,7 @@ def retained_selector_terms(state, request):
     A hierarchy may change level while keeping its root. The old whole sentence
     must not restore a replaced period, metric, scenario or another organization.
     """
-    if state.get('followupContext', {}).get('mode', 'CONTINUE') != 'CONTINUE':
+    if state.get('followupContext', {}).get('mode', 'CONTINUE') not in ('CONTINUE', 'NEW'):
         return []
     from .dimension_scopes import selector_evidence
     terms = []
@@ -250,7 +260,7 @@ def reconcile_period(state, request):
     the old period. Resolution of the actual date remains with the budget service.
     """
     context = state.get('followupContext', {})
-    if context.get('mode', 'CONTINUE') != 'CONTINUE':
+    if context.get('mode', 'CONTINUE') not in ('CONTINUE', 'NEW'):
         return
     previous = state.get('previousQueryIntent', {}).get('period')
     question = state.get('request', '')

@@ -108,12 +108,6 @@ class CreateSessionRequest(BaseModel):
     )
 
 
-class CreateSessionResponse(BaseModel):
-    """Response body after creating a session."""
-
-    session_id: str = Field(description="Server-assigned session identifier.")
-
-
 class UpdateSessionRequest(BaseModel):
     """Request body for updating an existing session.
 
@@ -220,6 +214,15 @@ class SessionView(BaseModel):
             "(leader agent + member agents with their session ids). "
             "``None`` when the session does not participate in any team."
         ),
+    )
+
+
+class CreateSessionResponse(BaseModel):
+    """Response body after creating a session."""
+
+    session_id: str = Field(description="Server-assigned session identifier.")
+    view: SessionView = Field(
+        description="Initial session view with its effective configuration.",
     )
 
 

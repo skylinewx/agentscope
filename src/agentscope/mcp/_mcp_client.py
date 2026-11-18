@@ -15,6 +15,7 @@ import httpx
 import mcp.types
 from mcp import ClientSession, stdio_client, StdioServerParameters
 from mcp.client.sse import sse_client
+from mcp.shared._httpx_utils import MCP_DEFAULT_SSE_READ_TIMEOUT
 from mcp.client.streamable_http import (
     create_mcp_http_client,
     streamable_http_client,
@@ -537,8 +538,10 @@ class MCPClient(BaseModel):
         tool_timeout = self.execution_timeout
         if isinstance(wait, (int, float)) and not isinstance(wait, bool) and 0 < wait <= 3600:
             tool_timeout = max(tool_timeout or 0, wait)
-            if isinstance(self.mcp_config, HttpMCPConfig) and self.mcp_config.timeout is not None:
-                self.mcp_config.timeout = max(self.mcp_config.timeout, wait)
+            if isinstance(self.mcp_config, HttpMCPConfig):
+                # None selects the SDK's finite read default, not an unlimited wait.
+                configured = self.mcp_config.timeout
+                self.mcp_config.timeout = max(configured if configured is not None else MCP_DEFAULT_SSE_READ_TIMEOUT, wait)
                 if self._http_client is not None:
                     self._http_client.timeout = httpx.Timeout(self.mcp_config.timeout)
 

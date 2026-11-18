@@ -115,12 +115,12 @@ class DeliveryContractTests(PresentationCase):
         self.assertEqual(caught.exception.code, 'ORDER_DATASET_REQUIRED')
         doc = self.doc(); doc['datasets'] = [{'key': 'ordered', 'valueRef': 'derived_order'}]
         result = compile_document(self.artifact, doc)
-        self.assertEqual([r['value'] for r in result['datasets']['ordered']['rows']], ['20', '-1033.14', '-8300'])
+        self.assertEqual([r['values']['value'] for r in result['datasets']['ordered']['rows']], ['20', '-1033.14', '-8300'])
 
     async def test_partial_free_document_discloses_reason_without_forcing_markup(self):
         await self.setup_values(work=[{'taskId': 'unfinished', 'title': '尚缺的关系', 'kind': 'RELATION', 'refs': []}])
         args = {'analysisRef': self.built['analysisRef'], 'previewOnly': True,
-                'unresolvedItems': [{'requirement': '补齐来源', 'reason': '来源暂不可用 <补查>'}], 'requestKey': 'partial'}
+                'unresolvedItems': [{'requirement': '补齐来源', 'reason': '来源暂不可用 <补查>', 'basis': {'kind': 'WORK_ITEM', 'taskId': 'unfinished'}}], 'requestKey': 'partial'}
         with self.assertRaises(AnalysisError) as caught: await self.service.publish(**args, document=self.doc())
         self.assertEqual(caught.exception.code, 'PARTIAL_RESULT_UNDISCLOSED')
         doc = self.doc('{{value}} <em>{{analysisPartialReason}}</em>')

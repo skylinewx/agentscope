@@ -99,7 +99,7 @@ class HierarchyFollowupTest(TestCase):
         self.assertEqual(result['intentDraft']['targets'][0]['businessPhrases'][0]['sourceText'], '净利润预算')
 
     def test_public_compound_cannot_revive_changed_scenario_or_invent_quote(self):
-        for text, changes in (('净利润预算', ['MD_SCENE']), ('预算净利润', [])):
+        for text, changes in (('净利润预算', ['MD_SCENE']),):
             turn, _ = self.confirmed_turn()
             turn.state['request'] = '改查实际' if changes else '继续查询'
             turn.state['followupContext'] = {'mode': 'CONTINUE', 'changedDimensions': changes}
@@ -109,6 +109,17 @@ class HierarchyFollowupTest(TestCase):
                 with self.assertRaises(AnalysisError) as caught:
                     prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
             self.assertEqual(caught.exception.code, 'QUERY_DRAFT_EVIDENCE_INVALID')
+
+    def test_reordered_retrieval_phrase_keeps_true_question_and_confirmed_context(self):
+        turn, _ = self.confirmed_turn()
+        turn.state['request'] = '继续查询'
+        request = {'intentDraft': {'targets': [{'id': 'profit', 'businessPhrases': [{'text': '预算净利润'}]}]}}
+        with patch('analysis_extension.followup_scope._same_source', return_value=True):
+            result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
+        phrase = result['intentDraft']['targets'][0]['businessPhrases'][0]
+        self.assertEqual(phrase['sourceText'], '继续查询')
+        self.assertEqual(phrase['text'], '预算净利润')
+        self.assertNotIn('预算净利润', result['contextText'])
 
     def test_quote_must_come_from_confirmed_source_not_concatenation_alone(self):
         turn, _ = self.confirmed_turn()
@@ -148,7 +159,7 @@ class HierarchyFollowupTest(TestCase):
         turn.state['queryIntent'] = {'grouping': '版块'}
         turn.state['budgetValueFilter'] = {'operator': 'LT', 'value': '0'}
         with patch('analysis_extension.followup_scope._same_source', return_value=True):
-            result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'ANALYZE',
+            result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'PREPARE_MATERIALS',
                 'intentDraft': {'targets': [{'id': 'profit', 'businessPhrases': [{'text': '净利润'}]}]}})
         self.assertEqual(result['groupBy'], ['版块'])
         self.assertEqual(result['scope']['periodCode'], '2026N0001')
@@ -161,7 +172,7 @@ class HierarchyFollowupTest(TestCase):
                 'followupContext': {'mode': 'CONTINUE', 'changedFields': ['population', 'grouping', 'order']}}
 
     def request(self, root='久其集团'):
-        return {'purpose': 'ANALYZE', 'question': '不使用模型改写', 'contextText': '模型伪造上下文',
+        return {'purpose': 'PREPARE_MATERIALS', 'question': '不使用模型改写', 'contextText': '模型伪造上下文',
                 'intentDraft': {'targets': [], 'relations': [{'type': 'HIERARCHY', 'targetIds': ['t'],
                     'sourceText': '二级单位', 'hierarchy': {'rootText': root, 'level': 2}}]}}
 

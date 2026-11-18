@@ -147,7 +147,7 @@ document.getElementById('b').style.minWidth='20px';delete document.getElementByI
 
     async def test_table_row_can_replace_bar_but_hidden_number_cannot(self):
         script = '''document.getElementById('track').remove();const table=document.createElement('div');table.dataset.analysisSet='rows';
-for(const row of analysisSets.rows.rows){const el=document.createElement('div');el.dataset.analysisRef=row.factRef;el.textContent=row.value;table.appendChild(el);}document.body.appendChild(table);'''
+for(const item of analysisSets.rows.rows){const row=item.values;const el=document.createElement('div');el.dataset.analysisRef=row.factRef;el.textContent=row.value;table.appendChild(el);}document.body.appendChild(table);'''
         # Build a real ORDERED dataset, then run the same renderer with dynamic table rows.
         await self.prepare('')
         built = await self.service.build(baseAnalysisRef=self.ref, operations=[{'id':'order','operator':'SORT'}], requestKey='sort')

@@ -121,7 +121,7 @@ class FinalizeTests(PresentationCase):
 
     async def test_finalize_pass_registers_only_after_review_and_keeps_checks(self):
         request = await self.request()
-        self.service.preview_reviewer = AsyncMock(return_value={'issues': []})
+        self.service.preview_reviewer = AsyncMock(return_value=with_coverage({'issues': []}))
         result = await self.service.publish(**request, finalize=True)
         self.assertTrue(result['delivery']['registered'])
         self.assertEqual(result['automaticFinalization']['status'], 'PUBLISHED')
@@ -131,7 +131,7 @@ class FinalizeTests(PresentationCase):
 
     async def test_revise_and_unreviewed_preserve_draft_instead_of_publishing(self):
         request = await self.request()
-        for review in (None, AsyncMock(return_value={'issues': [{'code': 'VALUE_MISMATCH', 'message': '数值不符'}]})):
+        for review in (None, AsyncMock(return_value=with_coverage({'issues': [{'code': 'VALUE_MISMATCH', 'message': '数值不符'}]}))):
             self.service.preview_reviewer = review
             result = await self.service.publish(**request, finalize=True)
             self.assertEqual(result['automaticFinalization']['status'], 'AWAITING_REPAIR_OR_REVIEW')
@@ -144,10 +144,10 @@ class FinalizeTests(PresentationCase):
         path = self.delivery.root / 'report.html'
         path.write_text(request['document'].pop('html'), 'utf-8')
         request['document']['path'] = 'report.html'
-        self.service.preview_reviewer = AsyncMock(return_value={'issues': [{'code': 'VALUE_MISMATCH', 'message': '改正文'}]})
+        self.service.preview_reviewer = AsyncMock(return_value=with_coverage({'issues': [{'code': 'VALUE_MISMATCH', 'message': '改正文'}]}))
         preview = await self.service.publish(**request, finalize=True)
         path.write_text(path.read_text('utf-8').replace('<h1>比较</h1>', '<h1>修正比较</h1>'), 'utf-8')
-        self.service.preview_reviewer = AsyncMock(return_value={'issues': []})
+        self.service.preview_reviewer = AsyncMock(return_value=with_coverage({'issues': []}))
         result = await self.service.publish(**{**preview['repairAndFinalize'],
             'repairs': [{'op': 'replace', 'path': '/document/path', 'value': 'report.html'}]})
         self.assertTrue(result['delivery']['registered'])
@@ -157,7 +157,7 @@ class FinalizeTests(PresentationCase):
 
     def test_finalize_and_preview_are_mutually_exclusive(self):
         validator = Draft202012Validator(AnalysisPublish.input_schema)
-        request = {'analysisRef': 'a', 'requestKey': 'r', 'repairRef': 'p', 'repairs': [], 'finalize': True}
+        request = {'requestKey': 'r', 'repairRef': 'p', 'repairs': [], 'finalize': True}
         validator.validate(request)
         with self.assertRaises(ValidationError):
             validator.validate({**request, 'previewOnly': True})
@@ -171,7 +171,7 @@ class FinalizeTests(PresentationCase):
         artifact = await turn_fixture.TurnCompletionTests.generic_result(self, turn, published=False)
         refs = [fact['factId'] for fact in artifact['facts']]
         self.service.preview_reviewer = lambda artifact: review_answer(None, turn, artifact, '')
-        reviewer = AsyncMock(return_value={'issues': []})
+        reviewer = AsyncMock(return_value=with_coverage({'issues': []}))
         with patch('analysis_extension.turn_completion._model_review', reviewer):
             result = await self.service.publish(analysisRef=artifact['analysisRef'], requestKey='component-finalize',
                 claims=[{'claimId': 'meaning', 'scopeId': artifact['scope']['scopeId'], 'kind': 'fact',
@@ -234,8 +234,11 @@ class RevisionTests(PresentationCase):
         turn = TurnCompletion(self.service, {'turnKey': 'test'})
         material = {'documentText': '说明甲', 'documentSourceText': '隐藏说明甲', 'facts': [{'value': None}],
                     'derived': [{'difference': '-1'}], 'sourceScopes': ['背景' * 100], 'toolFailures': []}
-        remember_review(turn, material, {'issues': [{'code': 'VALUE_MISMATCH'}]})
+        remember_review(turn, material, with_coverage({'issues': [{'code': 'VALUE_MISMATCH'}]}))
         changed = {**material, 'documentText': '说明乙'}
+        focused = focus_revision(turn, changed)
+        self.assertIn('sourceScopes', focused, 'An unresolved issue of unknown impact is not a source approval')
+        remember_review(turn, material, with_coverage({'issues': [{'code': 'VALUE_MISMATCH', 'impact': 'REPORT'}]}))
         focused = focus_revision(turn, changed)
         self.assertEqual(focused['facts'], material['facts'])
         self.assertEqual(focused['derived'], material['derived'])
@@ -244,3 +247,20 @@ class RevisionTests(PresentationCase):
             self.assertNotIn('revisionFocus', focus_revision(turn, {**changed, key: value}))
         hidden = focus_revision(turn, {**material, 'documentSourceText': '隐藏说明乙'})
         self.assertEqual(hidden['revisionFocus']['changes'][0]['field'], 'documentSourceText')
+
+    def test_revision_focus_expires_with_review_policy_or_model_profile(self):
+        from unittest.mock import patch
+        from dataclasses import replace
+        from analysis_extension.turn_completion import TurnCompletion, REVIEW_PROMPT
+        from analysis_extension.review_revision import remember_review, focus_revision
+        turn = TurnCompletion(self.service, {'turnKey': 'revision-policy', 'request': '分析'})
+        original = {'documentText': '原报告', 'facts': [{'value': '10'}], 'sourceScopes': ['完整来源范围']}
+        changed = {**original, 'documentText': '修正报告'}
+        remember_review(turn, original, with_coverage({'issues': []}))
+        self.assertIn('revisionFocus', focus_revision(turn, changed))
+        with patch('analysis_extension.turn_completion.REVIEW_PROMPT', REVIEW_PROMPT + '\n新的审核口径'):
+            self.assertEqual(focus_revision(turn, changed), changed)
+        self.service.review_budget = replace(self.service.review_budget, tokens_per_char=1.1)
+        self.assertEqual(focus_revision(turn, changed), changed)
+
+from analysis_review_fixtures import with_coverage

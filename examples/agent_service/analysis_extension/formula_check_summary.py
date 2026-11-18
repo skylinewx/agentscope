@@ -18,7 +18,9 @@ def summarize(trace):
             'matchedFactRefs': groups['MATCH'], 'mismatchedFactRefs': groups['MISMATCH'],
             'blockedFactRefs': groups['BLOCKED'],
             'externalFormulasVerified': False if trace.get('externalBoundaries') else None,
-            'meaning': '本层核对与已捕获链路分别陈述；INCOMPLETE/MISMATCH 不能概括为整条路径复算一致。预算来源空值按0运算、除以0返回0，来源原值仍保留空；未读或错误不作为空值。'}
+            'meaning': '本层核对与已捕获链路分别陈述；INCOMPLETE/MISMATCH 不能概括为整条路径复算一致。预算来源空值按0运算、除以0返回0，来源原值仍保留空；未读或错误不作为空值。',
+            'presentationGuide': '解释公式构成时展示后台已返回的相关计算层及全部直接操作数：多项加减用现有横向瀑布图，其他关系用适用的公式图或步骤，下层可折叠；重点金额对比图不能代替完整构成。节点与明细标题使用真实科目或维度名称，结果节点使用目标名称。',
+            **({'sourceValuePolicy': '预算服务来源值作为业务判断依据，复算差异另列为审核发现。不得因复算差异把来源结果改判、写成未确定，或要求核实差额后才能判断来源结果。'} if trace.get('arithmeticPolicy') else {})}
 
 
 def local_results(trace):

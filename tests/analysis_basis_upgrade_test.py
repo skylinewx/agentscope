@@ -58,6 +58,16 @@ class BasisUpgradeTests(PresentationCase):
         self.assertEqual(second['rowCount'], first['rowCount'])
         receipt_from_capture(capture)
 
+    async def test_new_effective_fact_request_does_not_replace_archived_scope_during_validation(self):
+        source, _, _ = self.source(filtered=True)
+        _, capture = fact_view(self.service.turn, source['sourceRef'], reopened=True)
+        receipt = deepcopy(self.service.sources.for_capture(capture).raw_receipt(capture['response']))
+        capture['request']['conditionContext'] = {'turn': 3, 'conditions': [], 'omitted': []}
+        receipt['data']['effectiveRequest'] = deepcopy(capture['request'])
+        update(capture, receipt)
+        verified = receipt_from_capture(capture)
+        self.assertEqual(verified['data']['sourceBasis']['operation'], 'IMMUTABLE_FACT_VIEW')
+
     async def test_facts_filter_then_analyze_uses_original_values_and_members_without_repeating_filter(self):
         source, _, _ = self.source()
         filtered, capture = fact_view(self.service.turn, source['sourceRef'], {'operator': 'GT', 'value': '0'}, reopened=True)
@@ -102,7 +112,7 @@ class BasisUpgradeTests(PresentationCase):
         self.assertNotIn('科目0', prepared['contextText'])
         self.assertNotIn('valueFilter', prepared['intentDraft'])
         self.assertEqual(prepared['scope']['formNames'], ['利润表'])
-        self.assertEqual({k: v for k, v in self.service.turn.state.items() if k != 'businessEvidence'}, before)
+        self.assertEqual({k: v for k, v in self.service.turn.state.items() if k not in ('businessEvidence', 'materialQueryRoles')}, before)
         unscoped = deepcopy(request)
         unscoped.pop('scope')
         unscoped['intentDraft']['sharedConditions'] = []

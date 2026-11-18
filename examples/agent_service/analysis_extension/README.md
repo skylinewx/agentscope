@@ -82,17 +82,17 @@ Native analysis is the first choice. `AnalysisBuild.operations` supports `DESCRI
 
 The public `AnalysisPython` tool now requires `fallbackReason` alongside `purpose`: the missing capability and the processing performed. There is no new model approval or fixed scenario workflow. Each actual attempt stores a `capabilityDecision`, source code, input lineage, outputs, status and timing, including failures. Old internal calls are explicitly `UNDECLARED`; no historical reason is inferred. Administrators can export these records on demand using `scripts/export_analysis_capability_usage.py --data-dir <analysis-data> --agent-id <id> --session-id <id> [--include-code]`. Export reads the existing index; it adds no per-question directory scan.
 
-`AnalysisPython` accepts normal `import` and `from ... import ...` from the host catalog. Standard calculation modules use the bounded local worker; pandas, NumPy, SciPy and statsmodels run only in a disposable Docker container. The server prepares a pinned image automatically and reuses it. Prewarm during deployment to keep package installation outside a user question:
+`AnalysisPython` accepts ordinary Python syntax, methods and imports from installed modules. Every execution uses the same disposable Docker backend, including scripts that do not import scientific libraries. The catalog describes available libraries; it is not a method allowlist. Prepare the pinned image explicitly during deployment; a user query never builds or installs it:
 
 ```sh
-PYTHONPATH=src:examples/agent_service python -m analysis_extension.python_environment
+PYTHONPATH=src:examples/agent_service python -m analysis_extension.execution_environment --prepare
 ```
 
 On Windows use the service Python and `PYTHONPATH=src;examples/agent_service`. The service identity needs access to Docker; this is independent from whether the CLI is installed. No fallback enables unrestricted host execution. `python-environment/requirements.lock` pins the complete dependency set with wheel hashes; the Dockerfile pins the base image digest. Catalog expansion is a server change, never a package name supplied by model code.
 
-Each library execution has no network, a read-only root, no capabilities, no privilege escalation, the service UID/GID on Linux (to read owner-only captured grid files) or a non-root user on Windows, 1 GiB memory, two CPUs and one numerical-library thread. Only worker source and explicitly authorized grid files are mounted read-only. Input facts/files are passed as frozen JSON. Timeout or cancellation removes the container. The local standard worker remains at 256 MiB. This does not turn the entire AgentScope workspace into a container; it applies only to AnalysisPython.
+Every execution has no external network, a read-only root, no capabilities or privilege escalation, and a fixed non-root identity. There are no host mounts. The host supplies authorized frozen inputs over a bounded channel and records PENDING/SENT independently of the script. `inputDeliverySummary` describes data provided, not data actually used by the algorithm. Resource limits and cross-worker admission are deployment settings; defaults for the 8 CPU/16 GiB target are 2 GiB/2 CPU per job, at most three jobs and one numerical-library thread per job. Timeout/cancellation removes the entire container; failed cleanup retains its resource lease for recovery. The Agent workspace remains Local. See [deployment, input and recovery settings](python-environment/README.md).
 
-Money stays Decimal with 128-digit context. pandas uses Decimal/object; normal sum/groupby calls default to min_count=1/dropna=False. Exported missing values are null and Decimal values use plain notation. Finite binary-float outputs are rejected rather than labeled exact; scientific estimation with float output is outside this release. Existing product structures remain SCALAR/TABLE/CHART_DATA/DIAGNOSTIC/FILE. Records include environmentId, imageId when applicable, libraries, prepareMs and executeMs. Exact requestKey retries preserve their original execution even after an environment upgrade.
+Money stays Decimal with a 128-digit context and ROUND_HALF_UP; 1.005 rounded to two places is 1.01. pandas uses Decimal/object; supported direct sum/groupby calls default to min_count=1/dropna=False; aliases and custom aggregators must specify their intended policy. Missing values remain null and Decimal values use plain notation. Finite binary-float outputs are rejected rather than labeled exact; scientific estimation with float output is outside this release. SCALAR/TABLE/CHART_DATA/DIAGNOSTIC/FILE products remain available. Records contain environment/numeric versions, imageId, host delivery evidence and phase timings. Failed attempts can use `retryOfRunRef` with corrected code and a new requestKey to reuse complete frozen inputs. New requests include environment and numeric policy identity; historical records remain readable without being upgraded to new provenance guarantees.
 
 API change: AnalysisBuild returns revision instead of baseRevision; AnalysisPublish no longer accepts expectedBaseRevision. Frozen preview repair and confirmPublish use only the returned references. Stored artifacts retain a private concurrency baseline, not another model-facing revision scheme. Old published snapshots remain immutable.
 
@@ -137,3 +137,44 @@ Input identity includes immutable sources, selections, roles and member referenc
 Formula selection errors return bounded candidates from the selected metric and rows, together with the exact host read tool. Display names are not fact references. The host never selects a candidate automatically or replaces source nulls with inferred values.
 
 Resuming a pending task traces only its explicitly selected base contexts to recognize replaced business wording. Its updated intent cannot revive an older metric through the still-selected member source. Native business result origins also bound answer candidates and source views for unfiltered queries: successful runtime probes that contributed no final facts are excluded, while final nulls and all returned metric columns remain available.
+
+
+### Frozen analysis inputs and independent review
+
+`AnalysisBuild` returns `inputSetRef`. `AnalysisTask(action="prepare_inputs")` prepares explicit files, grids or confirmed captures without selecting the latest source implicitly. `AnalysisPython` accepts `inputSetRef` or `retryOfRunRef`, code, purpose, fallbackReason and requestKey. Native prerequisites, workPlan, multiple products, answerOutputs and explicit supersession remain supported. Internal composition helpers still receive resolved selections; these are not a second public tool interface.
+
+TABLE/CHART_DATA, SORT/RANK and DESCRIBE use BUSINESS_DATASET_V1: columns have stable `name`, rows contain `rowRef/values/valueStates/metadata?`. Read `row.values[column.name]`; formula trees, scalars, diagnostic objects and grid cells retain their native types. Exactly aligned arrays can be converted at a boundary without inferring business meaning. AI tool/review views use lossless Markdown tables; Python and UI receive structured data.
+
+Calculation review runs independently before final content confirmation when selected code products enter delivery. It sees the user intent, full related frozen data, executed code and outputs; final confirmation sees business results, stage findings and the actual candidate. Review failures retain current results and stage state. No automatic replacement with an older report. Internal immutable references and historical read-only content remain.
+
+Review configuration is deployment-specific, separate from Agent memory compression. The current profile defaults to 1,048,576 context tokens, 1.0 estimated tokens per serialized character, 8,192 safety tokens, and the actual model max_tokens for output (65,536 fallback). Change the context profile when changing providers/models; this is an estimate, not a provider tokenizer. Supported environment overrides:
+
+| Variable | Purpose |
+| --- | --- |
+| ANALYSIS_REVIEW_CONTEXT_TOKENS | Review model context capacity |
+| ANALYSIS_REVIEW_TOKENS_PER_CHAR | Positive character coefficient |
+| ANALYSIS_REVIEW_OUTPUT_TOKENS | Actual max_tokens sent to review and reserved in budget |
+| ANALYSIS_REVIEW_SAFETY_TOKENS | Protocol/estimation margin |
+| ANALYSIS_REVIEW_CALL_TIMEOUT_SECONDS | Per-call maximum, default 600 seconds |
+| ANALYSIS_REVIEW_FINAL_RESERVE_SECONDS | Time retained for final confirmation, default 600 seconds |
+| ANALYSIS_REVIEW_TOTAL_SECONDS | Total review time per turn, default 1800 seconds |
+| ANALYSIS_REPAIR_TOTAL_SECONDS | Elapsed time from the first repair, default 3600 seconds; includes subsequent computing, writing and review |
+| ANALYSIS_REVIEW_MIN_RETRY_SECONDS | Minimum remaining time for a retry, default 45 seconds |
+
+The full request (prompt, material, output schema) is checked before sending; provider usage and estimated usage are recorded separately. Oversize inputs are not silently truncated or narrowed through another Python execution. Resource limits on files, worker memory and rows remain independent of the review context estimate. Model/prompt/config changes invalidate review receipts; exact unchanged report content reuses its review.
+
+Execution time budgets (2026-11-18): `AnalysisPython.timeoutSeconds` defaults to 60 seconds, with a maximum of 300 seconds. Docker admission waits up to 300 seconds (`ANALYSIS_PYTHON_QUEUE_SECONDS`), preparation up to 60 seconds (`ANALYSIS_PYTHON_PREPARE_SECONDS`); execution cancellation and cleanup remain bounded. Local page checks allow 120 seconds; external HTTP checks allow 130 seconds inside a 150-second request deadline. These are maximum allowances, not mandatory waits.
+
+Budget query execution defaults to 1800 seconds (`BUDGET_QUERY_ACTIVE_SECONDS` in this host, `BUDGET_QUERY_ACTIVE_MILLIS=1800000` in the ontology service). Material preparation retains twice that allowance. The host adds 90 seconds for completion/status delivery. Configure both sides together when changing this execution budget. The ontology long-poll window defaults to 300 seconds (`BUDGET_QUERY_WAIT_TIMEOUT`); its MCP timeout and advertised client wait derive from that window, with transport margins. Query context lifetime defaults to four hours (`BUDGET_QUERY_CONTEXT_LIFETIME`) so a longer material query does not expire its context mid-flight. Raising time limits does not change repair counts, source semantics or previously completed review identities.
+
+### Analysis materials and continued review
+
+`AnalysisTask.mode` expresses the delivery task (`DIRECT`, `ANALYSIS`, `REPORT`). Its single `materials` plan declares `VALUES` and/or `FORMULAS` separately for `PRIMARY`, `REFERENCE` and `STRUCTURE`. The host derives the native query purpose (`QUERY` or `PREPARE_MATERIALS`); the model does not maintain another execution-purpose parameter. Value filtering precedes formula preparation for the selected subjects. Successful empty results and actual formula boundaries remain valid evidence.
+
+For review or wording changes to an existing report, declare its `analysisRef` to adopt the whole frozen input set, including roles, rows, columns and grain. Do not reconstruct the report from a single metric view. Explicit scope changes require new selections; the host still rejects genuinely different inputs. `executionPolicy` continues to enforce user-requested limits on querying and computing.
+
+Calculation identity uses the artifact's frozen execution intent and grouping requirements, together with the actual source, scope, roles, inputs, code and outputs. Clearing current-turn grouping during a review-only follow-up does not invalidate that computation. Final business review separately checks the current request and report. Full material preparation runs outside the asynchronous event loop so it does not block model streaming or session checkpoints.
+
+Review materials include a Chinese period legend before the evidence, such as `2026J0002 → 2026年第2季度`. Original codes and Python inputs remain unchanged. Opening periods, actual data periods and cumulative ranges retain their distinct meaning; the legend does not infer or alter query scope. Model review returns coverage of the user's key requirements independently of the model's material plan. Coverage validation checks reference identities and verdict consistency, not arbitrary business semantics.
+
+Reviewer Markdown has four business sections: the user request, complete query data and actual inputs, executed code/rules, and outputs/current delivery. Repeated input values share their source table only when their original identities and business fields match; differing values, types, ordering, roles and supplemental code inputs remain explicit. Host storage keeps the full canonical evidence. Reviewer locations such as `表1第1行`, `Python脚本1` and `结果1` resolve through a frozen map to canonical references; captions and matching amounts are never used to guess identity. Unused metric dictionaries and physical query-batch repetition are omitted, while actual selections, exclusions and group membership remain readable.

@@ -15,14 +15,24 @@ def scope_phrase_terms(selector):
 def selected_result_sets(receipt, selection=None, result_set=None):
     """Resolve selected native identities once for targets and scope provenance."""
     sets = receipt.get('data', {}).get('resultSets', [])
+    result_set = result_set or (selection or {}).get('resultSetId')
     if result_set:
         sets = [item for item in sets if item.get('resultSetId') == result_set]
     elif selection and sets:
+        # Native exact-cell results live in cellResults, not the empty legacy
+        # rows array. Their origin carries targetRef instead of rowIndex.
+        from .adapters.budget_batch import tables
+        exact_indices = {(step, table['batchId'], row.get('targetRef')): index
+                         for step, table, _ in tables(receipt)
+                         for index, row in enumerate(table.get('data', {}).get('cellResults', []))}
+        def row_index(origin):
+            return origin.get('rowIndex') if 'rowIndex' in origin else exact_indices.get(
+                (origin.get('stepId'), origin.get('batchId'), origin.get('targetRef')))
         origins = {item['originId'] for item in receipt.get('data', {}).get('origins', [])
                    if all(selection.get(key) is None or item.get(key) == selection[key]
                           for key in ('stepId', 'batchId'))
                    and (selection.get('columnNames') is None or item.get('sourceColumn') in selection['columnNames'])
-                   and (selection.get('rowIndices') is None or item.get('rowIndex') in selection['rowIndices'])}
+                   and (selection.get('rowIndices') is None or row_index(item) in selection['rowIndices'])}
         sets = [item for item in sets if any(origins.intersection(row.get('originRefs', []))
                                            for row in item.get('rows', []))]
     return sets
@@ -32,7 +42,9 @@ def original_request(capture, receipt, selection=None, result_set=None):
     """A FACTS view retains the business request, never its transient value filter."""
     proof = receipt.get('data', {}).get('sourceBasis') or {}
     archived = proof.get('originalRequest') if proof.get('operation') == 'IMMUTABLE_FACT_VIEW' else None
-    result = deepcopy(archived or capture.get('request') or {})
+    from .condition_context import effective_request
+    result = (deepcopy(archived) if archived else
+              effective_request(capture.get('request') or {}, receipt.get('data') or {}))
     if archived:
         draft = result.get('intentDraft') or {}
         draft.pop('valueFilter', None)
@@ -66,7 +78,17 @@ def scope_terms(turn, origin, request, source_ref=None):
             raise AnalysisError('SOURCE_CONNECTION_MISMATCH', '来源引用不属于本次预算工具连接。')
         contexts = source.get('contexts', [])
     elif turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':
-        for selection, capture, table, _ in _inherited_tables(turn, _selectors(turn)):
+        selections = _selectors(turn)
+        for selection in selections:
+            if 'resultSetId' not in selection:
+                continue
+            capture = turn.service.store.get_capture(turn.service.owner, selection['captureRef'])
+            if not _same_source(capture, origin):
+                continue
+            from .empty_sources import result
+            _, item = result(capture, selection)
+            contexts.append(item.get('context', {}))
+        for selection, capture, table, _ in _inherited_tables(turn, selections):
             if not _same_source(capture, origin):
                 continue
             receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
@@ -96,6 +118,37 @@ def scope_terms(turn, origin, request, source_ref=None):
     return list(dict.fromkeys(terms))
 
 
+def restore_shared_conditions(request, previous, released=(), scenario_terms=()):
+    """Reuse only conditions common to every explicitly selected request.
+
+    Different result targets do not imply different shared conditions. Preserve
+    their intersection without choosing a target, form, or a latest source.
+    """
+    draft = request.setdefault('intentDraft', {})
+    if not previous:
+        return
+    groups = []
+    for prior in previous:
+        old = prior.get('intentDraft') or {}
+        phrases = {p['text']: p for p in old.get('sharedConditions', []) if p.get('text')}
+        targets = old.get('targets', [])
+        for scenario in scenario_terms:
+            def contains(items):
+                return any(p.get('text') == scenario or any(scenario in parts for parts in p.get('alternatives', [])) for p in items)
+            if contains(old.get('sharedConditions', [])) or targets and all(contains(t.get('businessPhrases', [])) for t in targets):
+                phrases.setdefault(scenario, {'text': scenario, 'sourceText': scenario})
+        groups.append(phrases)
+    common = set.intersection(*(set(group) for group in groups))
+    evidence = request.get('question', '') + ' ' + request.get('contextText', '')
+    current = draft.setdefault('sharedConditions', [])
+    represented = {p.get('text') for p in current} | {
+        p.get('text') for target in draft.get('targets', []) for p in target.get('businessPhrases', [])}
+    for value, phrase in groups[0].items():
+        if value in common and value in evidence and value not in released and value not in represented:
+            current.append(deepcopy(phrase))
+            represented.add(value)
+
+
 def restore_targets(request, previous, changed, released=()):
     """Fill omitted, confirmed target/condition structure; never copy value filters.
 
@@ -104,15 +157,12 @@ def restore_targets(request, previous, changed, released=()):
     """
     prior = previous.get('intentDraft') or {}
     draft = request.setdefault('intentDraft', {})
-    evidence = request.get('question', '') + ' ' + request.get('contextText', '')
     # Shared conditions are independent of whether the model repeats the target.
-    # Retained evidence has already released changed dimensions/scenarios. An
-    # explicit list (including []) wins, and value filters are never inherited.
-    if 'sharedConditions' not in draft:
-        draft['sharedConditions'] = [deepcopy(phrase) for phrase in prior.get('sharedConditions', [])
-                                      if phrase.get('text') and phrase['text'] in evidence and phrase['text'] not in released]
+    # Changed dimensions were released before this projection; filters never copy.
+    restore_shared_conditions(request, [previous], released)
     if 'metric' in changed or draft.get('targets'):
         return
+    evidence = request.get('question', '') + ' ' + request.get('contextText', '')
     targets = deepcopy(prior.get('targets') or [])
     if not targets:
         return

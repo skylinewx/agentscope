@@ -142,13 +142,14 @@ class WorkspaceManagerBase(ABC):
                 digest_size=8,
             ).hexdigest()
         async with self._bind_locks[(user_id, agent_id)]:
-            for record in await self._storage.list_sessions(
+            for summary in await self._storage.list_session_summaries(
                 user_id,
                 agent_id,
             ):
-                if record.config.workspace_id:
+                workspace_id = summary.session.config.workspace_id
+                if workspace_id:
                     self._reserved.pop((user_id, agent_id), None)
-                    return record.config.workspace_id
+                    return workspace_id
             reserved = self._reserved.get((user_id, agent_id))
             if reserved:
                 return reserved

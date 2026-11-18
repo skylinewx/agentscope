@@ -21,6 +21,21 @@ from agentscope.tool import ToolResponse
 
 
 class FollowupScopeTest(PresentationCase):
+    def test_followup_cell_selectors_load_their_shared_capture_once(self):
+        from unittest.mock import patch
+        from analysis_extension.followup_scope import _tables
+        selections = [{**self.selection, 'rowIndices': [index % 11], 'columnNames': ['metric1']}
+                      for index in range(55)]
+        with patch.object(self.store, 'get_capture', wraps=self.store.get_capture) as reads:
+            result = _tables(self.turn, selections)
+        self.assertEqual(reads.call_count, 1)
+        self.assertEqual([rows for _, _, _, rows in result], [{index % 11} for index in range(55)])
+        # Subsequent independent reads must check the owner again, not reuse a
+        # process-wide receipt with the same capture reference.
+        with patch.object(self.store, 'get_capture', side_effect=AnalysisError('NOT_FOUND', '不同会话不可读')):
+            with self.assertRaises(AnalysisError):
+                _tables(self.turn, selections)
+
     async def test_business_query_followup_review_and_build_use_server_runtime_requests(self):
         from analysis_business_query_test import business_fixture
         from analysis_extension.followup_scope import _query
@@ -299,10 +314,10 @@ class FollowupScopeTest(PresentationCase):
         self.assertEqual(_condition(previous, values), values)
         self.assertEqual(_condition(values, {'dimCode': 'tree'}), values)
 
-    def test_new_topic_clears_old_intent_and_period_change_drops_stale_year(self):
+    def test_new_topic_preserves_organization_and_explicit_period_replaces_old_year(self):
         self.state['request'] = '另查2025年的收入'
-        self.turn.task(mode='ANALYSIS', goal='收入', context={'mode': 'NEW', 'userQuote': '另查2025年的收入'}, intent={'metric': '收入'})
-        self.assertEqual(self.state['queryIntent'], {'metric': '收入'})
+        self.turn.task(mode='ANALYSIS', goal='收入', context={'mode': 'NEW', 'userQuote': '另查2025年的收入'}, intent={'metric': '收入', 'period': '2025年'})
+        self.assertEqual(self.state['queryIntent'], {'metric': '收入', 'population': '二级单位', 'period': '2025年'})
 
     def test_expired_previous_receipt_is_reported_without_breaking_new_topic(self):
         self.state['inheritedScope']['selections'][0]['captureRef'] = 'cap_' + '0' * 64

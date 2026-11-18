@@ -23,6 +23,8 @@ def candidates(turn):
             continue
         if receipt.get('status') not in ('SUCCEEDED', 'PARTIAL'):
             continue
+        from .empty_sources import candidates as empty_candidates
+        result.extend(empty_candidates(capture, receipt))
         for step, table, _ in tables(receipt):
             if table.get('disposition') != 'SUCCEEDED':
                 continue
@@ -31,6 +33,8 @@ def candidates(turn):
             except AnalysisError as error:
                 turn.state.setdefault('querySubjectDiagnostics', {})[ref] = error.code
                 continue
+            from .adapters.budget_exact import view
+            table = view(table)
             ranges = result_ranges(receipt, step, table)
             columns = [name for name, role in table['columnRoles'].items()
                        if role['kind'] == 'METRIC' and (ranges is None or ranges.get(name))]
@@ -70,7 +74,7 @@ def freeze_subject(turn, available, choices):
                  or candidate.get('rowIndices') is not None and not set(rows) <= set(candidate['rowIndices']))):
             invalid = True
             break
-        selected = {key: deepcopy(candidate[key]) for key in ('captureRef', 'stepId', 'batchId', 'columnNames', 'rowIndices')
+        selected = {key: deepcopy(candidate[key]) for key in ('captureRef', 'stepId', 'batchId', 'resultSetId', 'columnNames', 'rowIndices')
                     if key in candidate}
         if rows is not None:
             selected['rowIndices'] = sorted(set(rows))
@@ -93,7 +97,7 @@ def remembered_subject(turn):
         return deepcopy(reviewed)
     available = candidates(turn)
     if len(available) == 1 and not (reviewed or {}).get('invalidSelection'):
-        selected = {key: deepcopy(available[0][key]) for key in ('captureRef', 'stepId', 'batchId', 'columnNames', 'rowIndices')
+        selected = {key: deepcopy(available[0][key]) for key in ('captureRef', 'stepId', 'batchId', 'resultSetId', 'columnNames', 'rowIndices')
                     if key in available[0]}
         return {'selections': [selected], 'basis': 'SOURCE_RANGE_UPPER_BOUND',
                 'boundary': '来源范围上界；具体筛选以本轮已交付结果及意图为准。'}

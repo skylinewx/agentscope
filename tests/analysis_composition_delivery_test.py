@@ -141,8 +141,8 @@ class ReviewedCloseoutTests(PresentationCase):
         fact = artifact['facts'][0]
         from analysis_extension.turn_completion import review_answer
         model_review = patch('analysis_extension.turn_completion._model_review',
-                             AsyncMock(return_value={'issues': [{'severity': 'BLOCKING', **issue}
-                                                                for issue in issues or []]}))
+                             AsyncMock(return_value=with_coverage({'issues': [{'severity': 'BLOCKING', **issue}
+                                                                for issue in issues or []]})))
         model_review.start()
         self.addCleanup(model_review.stop)
         async def review(current):
@@ -165,7 +165,7 @@ class ReviewedCloseoutTests(PresentationCase):
         # 先完成真正的内容审查；随后只修改图形而产生展示错误时，保留已审查的解释。
         checked = await self.service.publish(artifact['analysisRef'], requestKey='checked-preview',
                                             document=document, previewOnly=True, workRefs=work_refs,
-                                            unresolvedItems=[{'requirement': '额外所需查询', 'reason': partial_reason}] if partial_reason else None)
+                                            unresolvedItems=[{'requirement': '额外所需查询', 'reason': partial_reason, 'basis': {'kind': 'USER_REQUIREMENT', 'userQuote': self.service.turn.state['request']}}] if partial_reason else None)
         if not broken:
             return artifact, checked
         for sample in samples:
@@ -215,7 +215,11 @@ class ReviewedCloseoutTests(PresentationCase):
         middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize, self.rules, delivery=self.delivery)
         self.service = middleware.service
         artifact, _ = await self.preview(broken=False)
-        progress(self.turn, lambda state: state['lastPublicationPreview'].update(evidenceDigest='changed'))
+        def invalidate_proofs(state):
+            state['lastPublicationPreview'].update(evidenceDigest='changed')
+            for candidate in state.get('publicationCandidates', []):
+                candidate.update(evidenceDigest='changed')
+        progress(self.turn, invalidate_proofs)
         from types import SimpleNamespace
         from analysis_model_closeout_test import summary_response
         agent = SimpleNamespace(model=SimpleNamespace(generate_structured_output=AsyncMock(side_effect=summary_response)))
@@ -269,16 +273,18 @@ class ReviewedCloseoutTests(PresentationCase):
         self.assertEqual(saved['hostSummary']['content'], 'SOURCE_FACTS_ONLY')
         self.assertNotEqual(saved['hostSummary']['semanticReview'], 'PASS')
 
-    async def test_host_final_status_reports_display_failure_and_actual_review_pass(self):
+    async def test_host_closeout_keeps_current_data_without_replacing_failed_page_with_older_page(self):
         from analysis_extension.middleware import AnalysisMiddleware
         middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize, self.rules, delivery=self.delivery)
         self.service = middleware.service
         artifact, _ = await self.preview()
         answer = await middleware._closeout('REPAIR_LIMIT')
         self.assertEqual(self.turn.state['hostCloseout']['status'], 'PARTIAL', answer)
-        self.assertEqual(self.turn.state['hostCloseout']['semanticReview'], 'PASS')
-        self.assertIn('图表', answer)
-        self.assertNotIn('分析解释尚未完成', answer)
+        self.assertNotEqual(self.turn.state['hostCloseout'].get('reportDelivery', {}).get('mode'), 'REVIEWED_FALLBACK')
+        saved = self.store.get_analysis(OWNER, self.turn.state['analysisRef'])
+        self.assertNotIn('freeDocument', saved)
+        self.assertEqual(saved['facts'], artifact['facts'])
+        self.assertIn('图表', saved['partialReason'])
         self.service.preview_reviewer.assert_awaited_once()
 
     async def test_reference_values_have_their_own_table(self):
@@ -292,3 +298,5 @@ class ReviewedCloseoutTests(PresentationCase):
         saved = self.store.get_analysis(OWNER, result['analysisRef'])
         tables = [view for view in saved['viewPlan'] if view['type'] == 'TABLE']
         self.assertEqual([len(view['valueRefs']) for view in tables], [2, 1])
+
+from analysis_review_fixtures import with_coverage

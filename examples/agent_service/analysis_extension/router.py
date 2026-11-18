@@ -26,11 +26,11 @@ def _error(exc):
     raise HTTPException(status, detail=exc.as_dict()) from exc
 
 
-async def _body(request, allowed):
+async def _body(request, allowed, maximum=65536):
     data = bytearray()
     async for chunk in request.stream():
         data.extend(chunk)
-        if len(data) > 65536:
+        if len(data) > maximum:
             raise HTTPException(413, "展示请求过大。")
     try:
         body = json.loads(data)
@@ -86,7 +86,7 @@ def create_analysis_router(config_path):
 
     @router.post('/preview-check')
     async def preview_check(request: Request, agent_id: str, session_id: str, user_id: str = Depends(get_current_user_id)):
-        body = await _body(request, ('previewRef', 'contentDigest', 'frameKey', 'measurements'))
+        body = await _body(request, ('previewRef', 'contentDigest', 'frameKey', 'measurements'), maximum=2 * 1024 * 1024)
         try:
             delivery = await context(request, user_id, agent_id, session_id)
             from .service import AnalysisService

@@ -45,5 +45,5 @@ def waiting(receipt):
 
 
 def wait_limit(request):
-    configured = float(os.environ.get('BUDGET_QUERY_ACTIVE_SECONDS', '600'))
-    return configured * (2 if request.get('purpose') == 'ANALYZE' else 1) + 90
+    configured = float(os.environ.get('BUDGET_QUERY_ACTIVE_SECONDS', '1800'))
+    return configured * (2 if request.get('purpose') == 'PREPARE_MATERIALS' else 1) + 90

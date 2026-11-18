@@ -142,7 +142,7 @@ class QueryEfficiencyTest(TestCase):
             self.assertIn(table.markdown(), model)
         self.assertEqual(envelope, before)
         self.assertNotIn('"factRows"', model)
-        self.assertIn('"executionScopes"', model)
+        self.assertIn('年度预算；利润表', model)
 
     def test_review_projection_retains_every_value_state_scope_and_failure(self):
         capture, receipt = business_fixture()

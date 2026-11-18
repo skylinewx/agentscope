@@ -5,6 +5,7 @@
 import asyncio
 from types import SimpleNamespace
 from unittest.async_case import IsolatedAsyncioTestCase
+from unittest.mock import AsyncMock
 
 from agentscope.app.workspace_manager._base import (
     IsolationPolicy,
@@ -221,19 +222,13 @@ class TestWorkspacePrewarm(IsolatedAsyncioTestCase):
         manager._start_prewarm()
         await asyncio.sleep(0.05)
 
-        manager.bind_storage(
-            SimpleNamespace(
-                list_sessions=self._sessions_returning("bound-ws"),
-            ),
-        )
+        manager.bind_storage(self._storage_with_bindings(["bound-ws"]))
         returning = await manager.assign_workspace_id(
             user_id="u",
             agent_id="a",
             session_id="s2",
         )
-        manager.bind_storage(
-            SimpleNamespace(list_sessions=self._sessions_returning()),
-        )
+        manager.bind_storage(self._storage_with_bindings([]))
         first_time = await manager.assign_workspace_id(
             user_id="u",
             agent_id="b",
@@ -271,9 +266,7 @@ class TestWorkspacePrewarm(IsolatedAsyncioTestCase):
         )
         manager._start_prewarm()
         await asyncio.sleep(0.05)
-        manager.bind_storage(
-            SimpleNamespace(list_sessions=self._sessions_returning()),
-        )
+        manager.bind_storage(self._storage_with_bindings([]))
 
         first = await manager.assign_workspace_id(
             user_id="u",
@@ -302,9 +295,7 @@ class TestWorkspacePrewarm(IsolatedAsyncioTestCase):
         manager._start_prewarm()
         await asyncio.sleep(0.2)
         bound: list[str] = []
-        manager.bind_storage(
-            SimpleNamespace(list_sessions=self._sessions_from(bound)),
-        )
+        manager.bind_storage(self._storage_with_bindings(bound))
 
         async def create_session() -> str:
             workspace_id = await manager.assign_workspace_id(
@@ -321,37 +312,24 @@ class TestWorkspacePrewarm(IsolatedAsyncioTestCase):
         self.assertListEqual(manager.adopted, ["ws-0"])
 
     @staticmethod
-    def _sessions_from(bound: list[str]) -> object:
-        """Build a ``list_sessions`` double reading a live binding list."""
+    def _storage_with_bindings(bound: list[str]) -> SimpleNamespace:
+        """Build a storage double reading a live list of bindings."""
 
-        async def list_sessions(
+        async def list_session_summaries(
             user_id: str,
             agent_id: str,
         ) -> list[SimpleNamespace]:
             del user_id, agent_id
             return [
                 SimpleNamespace(
-                    config=SimpleNamespace(workspace_id=workspace_id),
+                    session=SimpleNamespace(
+                        config=SimpleNamespace(workspace_id=workspace_id),
+                    ),
                 )
                 for workspace_id in bound
             ]
 
-        return list_sessions
-
-    @staticmethod
-    def _sessions_returning(*workspace_ids: str) -> object:
-        """Build a ``list_sessions`` double yielding those bindings."""
-
-        async def list_sessions(
-            user_id: str,
-            agent_id: str,
-        ) -> list[SimpleNamespace]:
-            del user_id, agent_id
-            return [
-                SimpleNamespace(
-                    config=SimpleNamespace(workspace_id=workspace_id),
-                )
-                for workspace_id in workspace_ids
-            ]
-
-        return list_sessions
+        return SimpleNamespace(
+            get_agent=AsyncMock(return_value=None),
+            list_session_summaries=list_session_summaries,
+        )

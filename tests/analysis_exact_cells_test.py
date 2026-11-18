@@ -129,9 +129,12 @@ class ExactCellsTests(TestCase):
         source = {'source': {'businessQuery': {'purpose': 'QUERY', 'complete': True,
                   'failureSummary': {'outcome': 'NO_DATA'}}}, 'facts': [{'valueState': 'NO_DATA'}]}
         evidence = {'sources': [source]}
+        from analysis_empty_delivery_fixtures import attach_empty_business_view
+        attach_empty_business_view(evidence)
         answer = empty_query_answer(evidence)
         self.assertEqual(answer['reason'], 'NO_DATA')
-        self.assertIn('未返回', answer['answer'])
+        self.assertIn('合成利润表', answer['answer'])
+        self.assertIn('| R1 | 无数据 |', answer['answer'])
         for state in ['PRESENT', 'NULL', 'NO_VALUE', 'ERROR']:
             source['facts'][0]['valueState'] = state
             self.assertIsNone(empty_query_answer(evidence))

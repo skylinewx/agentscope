@@ -16,13 +16,34 @@ def _snapshot(state, status):
     answer = state.get('deliveredAnswer', '') if completed else ''
     captures = state.get('queryCaptureRefs', []) + scope.get('captureRefs', [])
     captures += [selection['captureRef'] for selection in scope.get('selections', [])]
-    from .dimension_scopes import snapshot, retained_scopes
-    dimension_scopes = snapshot(state, scope.get('captureRefs', []) + [item['captureRef'] for item in scope.get('selections', [])] or captures) if completed else retained_scopes(state)
+    from .dimension_scopes import snapshot, retained_scopes, condition_history
+    selected = [item['captureRef'] for item in scope.get('selections', [])] or scope.get('captureRefs', []) or captures
+    dimension_scopes = snapshot(state, selected) if completed else retained_scopes(state)
+    # Sources stay immutable. A separately committed selection receipt can update
+    # condition provenance while the original result remains the factual anchor.
+    native = state.get('nativeConditionHistory', {})
+    selected_history = [item for ref in dict.fromkeys(selected) for item in native.get(ref, [])]
+    if completed and any(ref in native for ref in selected):
+        by_id = {}
+        for item in selected_history:
+            key = item['conditionId']
+            if key not in by_id or item['confirmedTurn'] > by_id[key]['confirmedTurn']:
+                by_id[key] = item
+        history = list(by_id.values())
+    else:
+        history = condition_history(state, dimension_scopes)
+    system_requests = {digest(state['systemRequestCaptures'][ref]): state['systemRequestCaptures'][ref]
+                       for ref in captures if ref in state.get('systemRequestCaptures', {})}
+    system_request = (next(iter(system_requests.values())) if len(system_requests) == 1 else {}
+                      if system_requests else state.get('inheritedSystemRequest', {}))
     return {
         'dimensionScopes': dimension_scopes,
+        'conditionHistory': deepcopy(history),
+        'systemRequest': deepcopy(system_request),
         'contextRef': 'ctx_' + digest(state['turnKey'])[:24],
         'turnKey': state['turnKey'], 'request': state.get('request', ''),
-        'goal': state.get('goal', ''), 'intent': deepcopy(state.get('queryIntent', {})),
+        'goal': state.get('goal', ''), 'intent': deepcopy(state.get('queryIntent') or
+             (state.get('previousQueryIntent', {}) if completed and selected else {})),
         'status': status, 'kind': 'DELIVERED' if completed else 'PENDING',
         'subjectScope': scope,
         'answerPreview': answer[:2000], 'answerPreviewComplete': len(answer) <= 2000,
@@ -47,7 +68,8 @@ def _snapshot(state, status):
 
 def save_context(state, status):
     """成功上下文成为默认锚点；未完成任务另存，供用户继续时显式选用。"""
-    if not state.get('queryIntent') and not state.get('queryCaptureRefs') and not state.get('analysisRef'):
+    if not (state.get('queryIntent') or state.get('queryCaptureRefs') or state.get('analysisRef')
+            or state.get('resolvedSubjectScope', {}).get('selections') or state.get('resolvedSubjectScope', {}).get('captureRefs')):
         return
     record = _snapshot(state, status)
     records = state.setdefault('businessContexts', [])
@@ -73,11 +95,14 @@ def next_context_state(saved):
     active = next((item for item in records if item['contextRef'] == active_ref), None)
     if active is None:
         active = next((item for item in reversed(records) if item['kind'] == 'DELIVERED'), None)
-    result = {'businessContexts': records, 'activeBusinessContextRef': active['contextRef'] if active else None,
+    chronological = next((item for item in reversed(records) if item['kind'] == 'DELIVERED'), {})
+    result = {'conversationConditions': deepcopy([row for row in chronological.get('conditionHistory', []) if row.get('conditionId')]),
+              'businessContexts': records, 'activeBusinessContextRef': active['contextRef'] if active else None,
               'selectedContextRefs': [active['contextRef']] if active else [],
               'previousQueryIntent': deepcopy(active['intent']) if active else {},
               'inheritedScope': deepcopy(active['subjectScope']) if active else {},
-              'inheritedDimensionScopes': deepcopy(active.get('dimensionScopes', [])) if active else []}
+              'inheritedSystemRequest': deepcopy(active.get('systemRequest', {})) if active else {},
+              'inheritedDimensionScopes': _source_scopes(active) if active else []}
     if active and active.get('adoptedInputs'):
         result.update(adoptedInputs=deepcopy(active['adoptedInputs']), inputSetVersion=active.get('inputSetVersion'))
     if not records:
@@ -127,13 +152,19 @@ def select_context(turn, context):
         raise AnalysisError('FOLLOWUP_CHANGE_BASIS_REQUIRED', '选择其他历史结果或恢复未完成任务时，宿主必须保留本轮用户原话作为依据。')
     selected = [known[ref] for ref in refs]
     # 综合时仅继承一致的条件；冲突条件交给模型依据用户意图确定，不做隐式并集。
-    intent = deepcopy(selected[0]['intent']) if selected else {}
+    intent = deepcopy(selected[0]['intent']) if selected else {
+        key: deepcopy(value) for key, value in turn.state.get('previousQueryIntent', {}).items()
+        if mode == 'NEW' and key in ('population', 'scenario', 'period')}
     for item in selected[1:]:
         intent = {key: value for key, value in intent.items() if item['intent'].get(key) == value}
     scopes = [item['subjectScope'] for item in selected]
     scope = deepcopy(scopes[0]) if len(scopes) == 1 else {}
+    inherited = (_confirmed_context_scopes(selected[0], known) if len(selected) == 1 else
+                 deepcopy(turn.state.get('inheritedDimensionScopes', [])) if mode == 'NEW' else [])
     turn.state.update(selectedContextRefs=list(refs), previousQueryIntent=intent, inheritedScope=scope,
-                      inheritedDimensionScopes=_confirmed_context_scopes(selected[0], known) if len(selected) == 1 else [],
+                      inheritedDimensionScopes=inherited,
+                      inheritedSystemRequest=deepcopy(selected[0].get('systemRequest', {})) if len(selected) == 1 else
+                          deepcopy(turn.state.get('inheritedSystemRequest', {})) if mode == 'NEW' else {},
                       basePendingChanges=deepcopy(selected[0].get('pendingChanges', [])) if len(selected) == 1 else [],
                       basePendingDimensions=deepcopy(selected[0].get('pendingDimensions', [])) if len(selected) == 1 else [])
     # 本轮改选依据时清除旧的临时声明，随后由 declare 合并本次显式意图。
@@ -156,12 +187,19 @@ def select_context(turn, context):
             install(turn, list({value['inputRef']: value for value in inputs}.values()))
 
 
+def _source_scopes(record):
+    history = record.get('conditionHistory', [])
+    if any(row.get('conditionId') for row in history):
+        return deepcopy(record.get('dimensionScopes', []))
+    return deepcopy(record.get('conditionHistory', record.get('dimensionScopes', [])))
+
+
 def _confirmed_context_scopes(record, known, visited=()):
     """Restore pre-fix pending contexts only along their explicit base reference."""
     ref = record.get('contextRef')
     if ref in visited:
         return []
-    scopes = deepcopy(record.get('dimensionScopes', []))
+    scopes = _source_scopes(record)
     if record.get('kind') != 'PENDING':
         return scopes
     bases = record.get('baseContextRefs', [])
@@ -276,11 +314,13 @@ def _result_selections(artifact, run, wanted):
         dimension_columns = [(index, column.get('dimCode', column['name']))
                              for index, column in enumerate(table['columns'])
                              if column.get('dimCode', column['name']) in dimension_codes]
+        from .business_dataset import row_values
         for row in table['rows']:
-            matched = [known[cell] for cell in row if isinstance(cell, str) and cell in known]
+            named = row_values(row, table['columns'])
+            matched = [known[cell] for cell in named.values() if isinstance(cell, str) and cell in known]
             if not matched and dimension_columns:
                 matched = [fact for fact in known.values() if all(
-                    code in fact.get('dimensions', {}) and fact['dimensions'][code] == row[index]
+                    code in fact.get('dimensions', {}) and fact['dimensions'][code] == named.get(table['columns'][index]['name'])
                     for index, code in dimension_columns)]
             if not matched:
                 complete = False

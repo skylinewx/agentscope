@@ -1,9 +1,11 @@
+import { useMutation } from '@tanstack/react-query';
 import { format, isToday } from 'date-fns';
 import {
 	BotMessageSquare,
 	Cable,
 	CalendarClock,
 	Ellipsis,
+	Loader2,
 	type LucideIcon,
 	MessageSquareDashed,
 	Pencil,
@@ -12,8 +14,8 @@ import {
 	Trash2,
 	Users,
 } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
-import { useNavigate, useParams } from 'react-router-dom';
+import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useLocation, useNavigate, useParams } from 'react-router-dom';
 
 import { ChatViewport } from './ChatViewport';
 import type { SessionRecord, SessionSourceKind } from '@/api';
@@ -90,6 +92,11 @@ const ChatPageInner = () => {
 	const LAST_AGENT_KEY = `chat_last_agent:${getUserId()}`;
 	const LAST_SESSION_KEY = `chat_last_session:${getUserId()}`;
 	const navigate = useNavigate();
+	const location = useLocation();
+	const activeLocationRef = useRef(location);
+	useLayoutEffect(() => {
+		activeLocationRef.current = location;
+	}, [location]);
 	const {
 		agentId: urlAgentId,
 		sessionId: urlSessionId,
@@ -113,6 +120,9 @@ const ChatPageInner = () => {
 		update: updateSession,
 		remove: removeSession,
 	} = useSessions(urlAgentId ?? null);
+	const { mutate: requestSession, isPending: creatingSession } = useMutation({
+		mutationFn: createSession,
+	});
 
 	const { isMobile, setOpen, setOpenMobile } = useSidebar();
 	const [deleteOpen, setDeleteOpen] = useState(false);
@@ -186,36 +196,31 @@ const ChatPageInner = () => {
 	 * Inherited fields stay omitted so the new session follows Agent defaults.
 	 * Use another session under this agent when no current one is selected.
 	 */
-	const handleCreateSession = async () => {
-		if (!urlAgentId) return;
+	const handleCreateSession = () => {
+		if (!urlAgentId || creatingSession) return;
 		const seedConfig = currentView?.session.config ?? sessions[0]?.session.config;
-		const res = await createSession({
-			agent_id: urlAgentId,
-			...newSessionModelOverrides(seedConfig),
-		});
-		navigate(`/chat/${urlAgentId}/${res.session_id}`);
+		requestSession(
+			{ agent_id: urlAgentId, ...newSessionModelOverrides(seedConfig) },
+			{
+				onSuccess: (res) => {
+					if (activeLocationRef.current !== location) return;
+					navigate(`/chat/${urlAgentId}/${res.session_id}`);
+					setOpenMobile(false);
+				},
+			},
+		);
 	};
 
 	// No session → chat input stays disabled (selectedModel is null).
 	// Auto-create the first session so the composer becomes usable after
 	// picking an agent (especially important inside Nuwa FUNCTAB).
 	useEffect(() => {
-		if (!urlAgentId || sessionsLoading || sessions.length > 0) return;
+		if (!urlAgentId || sessionsLoading || sessions.length > 0 || creatingSession) return;
 		if (autoSessionForAgentRef.current === urlAgentId) return;
 		autoSessionForAgentRef.current = urlAgentId;
-		let cancelled = false;
-		void (async () => {
-			try {
-				const res = await createSession({ agent_id: urlAgentId });
-				if (!cancelled) navigate(`/chat/${urlAgentId}/${res.session_id}`);
-			} catch {
-				if (!cancelled) autoSessionForAgentRef.current = null;
-			}
-		})();
-		return () => {
-			cancelled = true;
-		};
-	}, [urlAgentId, sessionsLoading, sessions.length, createSession, navigate]);
+		// The session-list redirect selects the first view as soon as it is cached.
+		requestSession({ agent_id: urlAgentId });
+	}, [urlAgentId, sessionsLoading, sessions.length, creatingSession, requestSession]);
 
 	const handleAgentDeleted = async () => {
 		navigate('/chat', { replace: true });
@@ -327,9 +332,14 @@ const ChatPageInner = () => {
 						<SidebarGroupContent className="flex min-h-0 flex-1 flex-col">
 							<SidebarGroup>
 								<SidebarMenu className="mb-2">
-									<Button id="tour-create-session" onClick={handleCreateSession}>
-										<Plus />
-										{t('chat.newSession')}
+									<Button
+										id="tour-create-session"
+										disabled={!urlAgentId || creatingSession}
+										aria-busy={creatingSession}
+										onClick={handleCreateSession}
+									>
+										{creatingSession ? <Loader2 className="animate-spin" /> : <Plus />}
+										{t(creatingSession ? 'common.creating' : 'chat.newSession')}
 									</Button>
 								</SidebarMenu>
 							</SidebarGroup>

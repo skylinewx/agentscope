@@ -4,9 +4,11 @@ from .business_tables import escape, text, STATES, DEFAULT_LABELS
 
 def summarize(material, reason):
     facts = material.get('facts', [])
+    from .analysis_inputs import fact_roles
+    has_comparison = any('REFERENCE' in fact_roles(fact) for fact in facts)
     lines = ['已取得以下来源数据。本次分析或答复核对尚未完成，先列示已确认的来源值。',
-             '', '| 对象 | 指标或标题 | 任务／表样 | 实际时期 | 其他维度 | 来源值 | 单位 |',
-             '| --- | --- | --- | --- | --- | ---: | --- |']
+             '', ('| 用途 ' if has_comparison else '') + '| 对象 | 指标或标题 | 任务／表样 | 实际时期 | 其他维度 | 来源值 | 单位 |',
+             ('| --- ' if has_comparison else '') + '| --- | --- | --- | --- | --- | ---: | --- |']
     refs = []
     contexts = {}
     for item in material.get('contexts', []):
@@ -25,9 +27,14 @@ def summarize(material, reason):
                   fact.get('dataPeriod') or fact.get('period') or dims.get('DATATIME', ''),
                   '；'.join(f'{DEFAULT_LABELS.get(key, key)}={names.get(key) or value}' for key, value in dims.items() if key not in ('DATATIME', 'MD_ORG')),
                   text(fact.get('value')) if fact.get('value') is not None else STATES.get(fact.get('valueState'), '状态未确认'), fact.get('unit') or '']
+        if has_comparison:
+            labels = {'PRIMARY': '主体', 'REFERENCE': '对照', 'STRUCTURE': '结构证据'}
+            values.insert(0, '、'.join(labels[role] for role in labels if role in fact_roles(fact)))
         lines.append('| ' + ' | '.join(escape(text(value)) for value in values) + ' |')
         if fact.get('factId'):
             refs.append(fact['factId'])
+    if has_comparison:
+        lines += ['', '主体与对照按各自范围列示，可以包含同一对象；展示行数不能相加作为总对象数，两个群体的金额也不能合并统计。']
     # Only deterministic formula checks are safe here. Unreviewed Python outputs,
     # draft paragraphs and reviewer claims are not promoted to verified results.
     checks = []

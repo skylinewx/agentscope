@@ -2,6 +2,7 @@
 import asyncio
 
 from .models import AnalysisError
+from .render_timing import RENDER_SECONDS, PAGE_STEP_SECONDS
 
 
 class LocalRenderChecker:
@@ -18,8 +19,9 @@ class LocalRenderChecker:
         browser = None
         try:
             async with async_playwright() as playwright:
-                async with asyncio.timeout(35):
-                    browser = await playwright.chromium.launch(headless=True, **({'channel': self.channel} if self.channel else {}))
+                async with asyncio.timeout(RENDER_SECONDS):
+                    browser = await playwright.chromium.launch(headless=True, timeout=60000,
+                                                               **({'channel': self.channel} if self.channel else {}))
                     try:
                         samples = []
                         for width in self.widths:
@@ -31,7 +33,7 @@ class LocalRenderChecker:
                                 page = await context.new_page()
                                 sample = await self.measure(page, document)
                                 from .render_evidence import snapshot
-                                sample['hostRenderedText'] = snapshot(await page.frames[-1].locator('body').inner_text(timeout=2000))
+                                sample['hostRenderedText'] = snapshot(await page.frames[-1].locator('body').inner_text(timeout=10000))
                                 samples.append(sample)
                             finally:
                                 await context.close()
@@ -59,13 +61,24 @@ class LocalRenderChecker:
                 if(event.data.type === 'analysis-document-inspection' && event.data.requestId === 'host-render')
                     window.__analysisMeasurements = event.data.measurements;
             });
-            document.body.appendChild(frame);
             frame.srcdoc = html;
+            // Set the document before attachment so an initial about:blank load
+            // cannot be mistaken for the frozen report's load event.
+            document.body.appendChild(frame);
         }''', {'html': document['html'], 'key': document['frameKey']})
-        await page.wait_for_function('window.__analysisFrameLoaded', timeout=10000)
+        await page.wait_for_function('window.__analysisFrameLoaded', timeout=PAGE_STEP_SECONDS * 1000)
         frame = page.frames[-1]
         await frame.evaluate('() => document.fonts.ready')
+        # Native disclosures are user-accessible report content. Measure their
+        # expanded state in this isolated browser, without modifying the saved
+        # report or its default UI. CSS-hidden content remains hidden.
+        await frame.evaluate('''() => {
+            for (const item of document.querySelectorAll('details')) {
+                if ([...item.children].some(child => child.tagName === 'SUMMARY')) item.open = true;
+            }
+        }''')
+        await frame.evaluate('() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))')
         await page.evaluate('''key => document.querySelector('iframe').contentWindow.postMessage(
             {type:'analysis-document-inspect', key, requestId:'host-render'}, '*')''', document['frameKey'])
-        await page.wait_for_function('window.__analysisMeasurements !== null', timeout=10000)
+        await page.wait_for_function('window.__analysisMeasurements !== null', timeout=PAGE_STEP_SECONDS * 1000)
         return await page.evaluate('window.__analysisMeasurements')

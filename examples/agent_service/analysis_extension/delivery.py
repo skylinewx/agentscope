@@ -158,6 +158,9 @@ class AnalysisDelivery:
     def view(self, path, offset=0, limit=12):
         ref = reference_from_path(path)
         result = page(self._project(ref, parameters()), offset, limit)
+        if result.get('reportDelivery'):
+            from .report_review import current_delivery
+            result['reportDelivery'] = current_delivery(self.store, self.owner, result['reportDelivery'])
         result["capabilities"] = {"cards": self.cards_enabled, "generateReports": self.allow_reports, "followUp": self.actions_enabled}
         result["actionRuns"] = [{k: run[k] for k in ("actionRunId", "actionRef", "status", "resultAnalysisRef", "updatedAt")}
                                 | {"resultNote": {
@@ -189,7 +192,11 @@ class AnalysisDelivery:
         return project(artifact, RuleRegistry(saved["rules"]), params)
 
     def project_view(self, ref, params, offset=0, limit=12):
-        return page(self._project(ref, params), offset, limit)
+        result = page(self._project(ref, params), offset, limit)
+        if result.get('reportDelivery'):
+            from .report_review import current_delivery
+            result['reportDelivery'] = current_delivery(self.store, self.owner, result['reportDelivery'])
+        return result
 
     def render_report(self, analysisRef, requestKey, viewParameters=None, layout="standard"):
         if not self.allow_reports:
@@ -246,4 +253,15 @@ class AnalysisDelivery:
         if hashlib.sha256(content).hexdigest() != result["delivery"]["contentDigest"]:
             raise AnalysisError("DIGEST_MISMATCH", "报告内容与登记不符。")
         self._check(result["delivery"]["path"], content, REPORT_MAX_BYTES)
+        metadata = self._artifact(ref).get('reportDelivery')
+        if metadata:
+            from .report_review import current_delivery, attach_review_notice
+            from copy import deepcopy
+            result = deepcopy(result)
+            metadata = current_delivery(self.store, self.owner, metadata)
+            # The registered bytes remain immutable; attach the current review
+            # record to this exact report version when viewing/downloading it.
+            result['reportDelivery'] = metadata
+            result['html'] = attach_review_notice(result['html'], metadata)
+            result['renderedContentDigest'] = hashlib.sha256(result['html'].encode('utf-8')).hexdigest()
         return result

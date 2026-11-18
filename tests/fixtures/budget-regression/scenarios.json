@@ -1,0 +1,398 @@
+{
+  "schemaVersion": 1,
+  "original": {
+    "id": "USER-ELEVEN",
+    "origin": "user",
+    "execution": "one-session-in-order",
+    "turns": [
+      {
+        "id": "USER-01",
+        "question": "查询一下久其集团26年的净利润预算",
+        "rules": [
+          "TARGET-DISCOVERY",
+          "AMOUNT-UNIT"
+        ]
+      },
+      {
+        "id": "USER-02",
+        "question": "从利润表看下二级单位的净利润，按从大到小排",
+        "rules": [
+          "CONTEXT-MERGE",
+          "QUERY-FULL-SORT"
+        ]
+      },
+      {
+        "id": "USER-03",
+        "question": "从板块口径分析一下这些数据",
+        "rules": [
+          "GROUP-ATTRIBUTE",
+          "SOURCE-SELECTION",
+          "ANALYSIS-MATERIAL-PLAN"
+        ]
+      },
+      {
+        "id": "USER-04",
+        "question": "分析下二级单位中的亏损企业",
+        "rules": [
+          "COHORT-ROLES",
+          "FORMULA-ARITHMETIC",
+          "FORMULA-DISPLAY",
+          "DIMENSION-NAME",
+          "ANALYSIS-MATERIAL-PLAN"
+        ]
+      },
+      {
+        "id": "USER-05",
+        "question": "查询全公司所有单位的26年净利润预算，并降序排列",
+        "rules": [
+          "QUERY-FULL-SORT",
+          "CONTEXT-MERGE"
+        ]
+      },
+      {
+        "id": "USER-06",
+        "question": "按板块口径对数据进行分析",
+        "rules": [
+          "GROUP-ATTRIBUTE",
+          "ANALYSIS-MATERIAL-PLAN"
+        ]
+      },
+      {
+        "id": "USER-07",
+        "question": "看下久其集团26年EVA预算",
+        "rules": [
+          "TARGET-DISCOVERY",
+          "FORMULA-ARITHMETIC"
+        ]
+      },
+      {
+        "id": "USER-08",
+        "question": "查一下26年水泥的销售预算",
+        "rules": [
+          "TARGET-DISCOVERY"
+        ]
+      },
+      {
+        "id": "USER-09",
+        "question": "对比一下党建经费的管理费预算和销售费预算",
+        "rules": [
+          "TARGET-DISCOVERY",
+          "GRID-PYTHON"
+        ]
+      },
+      {
+        "id": "USER-10",
+        "question": "在二级单位中查询一下短期借款>1000并且应收账款>1500的",
+        "rules": [
+          "QUERY-AND-FILTER"
+        ]
+      },
+      {
+        "id": "USER-11",
+        "question": "查询一下社保预算情况",
+        "rules": [
+          "TARGET-DISCOVERY"
+        ]
+      }
+    ]
+  },
+  "additional": [
+    {
+      "id": "ADDED-SCENARIOS",
+      "origin": "additional",
+      "execution": "one-session-in-order",
+      "turns": [
+        {
+          "id": "SCENARIO-DIRECT",
+          "question": "查询久其集团2026年利润表的净利润实际数",
+          "rules": [
+            "SCENARIO-FALLBACK"
+          ]
+        },
+        {
+          "id": "SCENARIO-NULL",
+          "question": "保持机构和时期，查询财务费用实际数",
+          "rules": [
+            "SCENARIO-FALLBACK",
+            "VALUE-NULL"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "ADDED-COHORTS",
+      "origin": "additional",
+      "execution": "one-session-in-order",
+      "turns": [
+        {
+          "id": "COHORT-FILTER",
+          "question": "查询久其集团2026年利润表中二级单位净利润预算小于0的企业",
+          "rules": [
+            "QUERY-AND-FILTER"
+          ]
+        },
+        {
+          "id": "COHORT-ANALYZE",
+          "question": "以刚才亏损企业为主体，全部二级单位为对照分析",
+          "rules": [
+            "COHORT-ROLES",
+            "SOURCE-SELECTION",
+            "ANALYSIS-MATERIAL-PLAN"
+          ]
+        },
+        {
+          "id": "COHORT-REQUERY",
+          "question": "查询这些亏损企业的营业收入预算",
+          "rules": [
+            "SOURCE-SELECTION",
+            "CONTEXT-MERGE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "USER-CEMENT-CHANNELS",
+      "origin": "user-added-20261115",
+      "execution": "one-session-in-order",
+      "turns": [
+        {
+          "id": "CEMENT-CHANNELS",
+          "question": "看下久其集团26年水泥的销售预算，看看那些渠道的数据好，那些渠道数据落后",
+          "rules": [
+            "PLAN-METHOD-REVISION",
+            "GRID-PYTHON",
+            "PERIOD-TASK-GRAIN",
+            "AMOUNT-UNIT",
+            "DELIVERY-COMPLETENESS"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CODEX-RETRY-ORIGINAL-FOUR",
+      "origin": "codex-targeted-retry-of-user-original",
+      "execution": "one-session-in-order",
+      "purpose": "复测原始前四轮的连续范围、板块及亏损公式展示；原始十一轮保持不变。",
+      "turns": [
+        {
+          "id": "USER-01",
+          "question": "查询一下久其集团26年的净利润预算",
+          "rules": [
+            "TARGET-DISCOVERY",
+            "AMOUNT-UNIT"
+          ]
+        },
+        {
+          "id": "USER-02",
+          "question": "从利润表看下二级单位的净利润，按从大到小排",
+          "rules": [
+            "CONTEXT-MERGE",
+            "QUERY-FULL-SORT"
+          ]
+        },
+        {
+          "id": "USER-03",
+          "question": "从板块口径分析一下这些数据",
+          "rules": [
+            "GROUP-ATTRIBUTE",
+            "SOURCE-SELECTION",
+            "ANALYSIS-MATERIAL-PLAN"
+          ]
+        },
+        {
+          "id": "USER-04",
+          "question": "分析下二级单位中的亏损企业",
+          "rules": [
+            "COHORT-ROLES",
+            "FORMULA-ARITHMETIC",
+            "FORMULA-DISPLAY",
+            "DIMENSION-NAME",
+            "ANALYSIS-MATERIAL-PLAN"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "USER-MANUAL-ALL-ORG",
+      "origin": "user",
+      "execution": "one-session-in-order",
+      "sourceSessionId": "d2d1994e6d5c41c0948a6fd858732668",
+      "turns": [
+        {
+          "id": "USER-MANUAL-ALL-ORG-1",
+          "question": "查询全公司所有单位的26年净利润预算，并降序排列",
+          "rules": [
+            "QUERY-FULL-SORT",
+            "GROUP-ATTRIBUTE"
+          ]
+        },
+        {
+          "id": "USER-MANUAL-ALL-ORG-2",
+          "question": "按板块口径对数据进行分析",
+          "rules": [
+            "QUERY-FULL-SORT",
+            "GROUP-ATTRIBUTE"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "USER-MANUAL-CEMENT-REVIEW",
+      "origin": "user",
+      "execution": "one-session-in-order",
+      "sourceSessionId": "bda3491f3bc94e0581b9f59d66c70c45",
+      "turns": [
+        {
+          "id": "USER-MANUAL-CEMENT-REVIEW-1",
+          "question": "看下久其集团26年水泥的销售预算，看看那些渠道的数据好，那些渠道数据落后",
+          "rules": [
+            "GRID-PYTHON",
+            "QUERY-EXECUTION-POLICY"
+          ]
+        },
+        {
+          "id": "USER-MANUAL-CEMENT-REVIEW-2",
+          "question": "继续审核刚才的水泥渠道分析报告，复用已有数据和计算结果，不重新取数、不重新计算。展示审核结论；如需修改表述，基于已有资料修改。",
+          "rules": [
+            "GRID-PYTHON",
+            "QUERY-EXECUTION-POLICY"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "USER-MANUAL-ACTUAL",
+      "origin": "user",
+      "execution": "one-session-in-order",
+      "sourceSessionId": "75c85a19ec8a46aa9a20be85f67bb897",
+      "turns": [
+        {
+          "id": "USER-MANUAL-ACTUAL-1",
+          "question": "查询一下久其集团2026年利润表的净利润实际数",
+          "rules": [
+            "SCENARIO-FALLBACK"
+          ]
+        },
+        {
+          "id": "USER-MANUAL-ACTUAL-2",
+          "question": "再查询同一机构、同一期间的财务费用实际数",
+          "rules": [
+            "SCENARIO-FALLBACK"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "USER-MANUAL-COHORTS",
+      "origin": "user",
+      "execution": "one-session-in-order",
+      "sourceSessionId": "06afb3ae01504e1ebd4308248f8c44b4",
+      "turns": [
+        {
+          "id": "USER-MANUAL-COHORTS-1",
+          "question": "查询一下二级单位2026年净利润预算小于0的企业",
+          "rules": [
+            "COHORT-ROLES",
+            "SOURCE-SELECTION"
+          ]
+        },
+        {
+          "id": "USER-MANUAL-COHORTS-2",
+          "question": "以刚才查到的亏损企业为主体，全部二级单位为对照，分析一下",
+          "rules": [
+            "COHORT-ROLES",
+            "SOURCE-SELECTION",
+            "ANALYSIS-MATERIAL-PLAN"
+          ]
+        },
+        {
+          "id": "USER-MANUAL-COHORTS-3",
+          "question": "1. 查询这些亏损企业的2026年营业收入预算",
+          "rules": [
+            "COHORT-ROLES",
+            "SOURCE-SELECTION"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "CODEX-CONDITION-AGING",
+      "origin": "codex-added-regression-20261118",
+      "execution": "one-session-in-order",
+      "purpose": "复现水泥后的党建经费查询、重复问句及回到产品；不是替换用户原始 11 问。",
+      "turns": [
+        {
+          "id": "AGE-CEMENT",
+          "question": "看下久其集团26年水泥的销售预算",
+          "rules": [
+            "TARGET-DISCOVERY",
+            "CONDITION-AGING"
+          ]
+        },
+        {
+          "id": "AGE-FEES",
+          "question": "对比一下党建经费的管理费预算和销售费预算",
+          "rules": [
+            "CONDITION-AGING"
+          ]
+        },
+        {
+          "id": "AGE-FEES-REPEAT",
+          "question": "对比一下党建经费的管理费预算和销售费预算",
+          "rules": [
+            "CONDITION-AGING"
+          ]
+        },
+        {
+          "id": "AGE-CEMENT-RETURN",
+          "question": "再查询水泥的销售预算",
+          "rules": [
+            "CONDITION-AGING"
+          ]
+        }
+      ]
+    }
+  ],
+  "acceptance": {
+    "modelOutput": "Key coverage, grounded calculations, reasonable explanations; no exact prose/tool-sequence equality",
+    "outcomes": [
+      "FIRST_PASS",
+      "REPAIRED_PASS",
+      "FAILED",
+      "FALSE_BLOCK",
+      "PENDING_REVIEW",
+      "NOT_EVALUATED",
+      "ENVIRONMENT_BLOCKED"
+    ],
+    "layers": [
+      "target",
+      "fetch",
+      "period",
+      "formula",
+      "calculation",
+      "review",
+      "publication",
+      "finalAnswer"
+    ],
+    "missingMock": "COVERAGE_GAP; never auto-pass or classify as model bug"
+  },
+  "environment": {
+    "permissionMode": "bypass",
+    "newSession": true,
+    "sourceAgentId": "5fa05c82019c465794aee1ffa53a3131",
+    "isolateMemory": true
+  },
+  "fixtureCoverage": {
+    "providerVerified": [
+      "period",
+      "batch-query"
+    ],
+    "notYetProviderVerified": [
+      "metadata-discovery",
+      "form-expand",
+      "dimension-initialization",
+      "grid-file-download"
+    ],
+    "note": "Original natural-language questions are registered, not claimed covered by the small synthetic data set."
+  }
+}

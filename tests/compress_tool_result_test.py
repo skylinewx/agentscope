@@ -62,6 +62,22 @@ class ToolResultCompressionTest(IsolatedAsyncioTestCase):
         self.assertEqual(reserved, tool_result)
         self.assertIsNone(offload)
 
+    async def test_saved_source_navigation_keeps_envelope_and_original_intact(self) -> None:
+        """Persisted evidence uses an intact read reference, never cut JSON."""
+        import json
+        navigation = json.dumps({'captureRef': 'saved', 'readTool': 'QueryResultRead'})
+        original = ToolResultBlock(id='saved-source', name='query', state='success',
+            output=[TextBlock(text='完整来源' * 1000)],
+            metadata={'context_projection_text': navigation})
+        before = original.model_dump()
+        async def count_text(messages, tools=None):
+            return sum(len(block.text) for message in messages for block in message.content)
+        self.mock_model.count_tokens = count_text
+        reserved, offload = await self.agent._split_tool_result_for_compression(original)
+        self.assertEqual(json.loads(reserved.output[0].text)['captureRef'], 'saved')
+        self.assertEqual(offload.model_dump(), before)
+        self.assertEqual(original.model_dump(), before)
+
     async def test_equal_to_limit(self) -> None:
         """Test when tool result is exactly at the token limit."""
         tool_result = ToolResultBlock(

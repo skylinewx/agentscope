@@ -1,3 +1,4 @@
+from analysis_extension.review_request import review_material
 """合并分析计算后，核对材料共享输入而不改变执行证据。"""
 from copy import deepcopy
 import json
@@ -111,13 +112,13 @@ class ReviewInputTests(unittest.TestCase):
         payload['derived'] = [{'derivedId': 'result', 'inputRefs': [fact['factId'] for fact in payload['facts']],
                                'pythonRunRef': 'run2', 'value': '42'}]
         before_size = len(json.dumps(payload, ensure_ascii=False))
-        with patch('analysis_extension.turn_completion.QUERY_REVIEW_LIMIT', 30000):
+        with patch('analysis_extension.turn_completion.review_material_limit', return_value=30000):
             parts = analysis_review_payloads(payload)
         self.assertGreater(before_size, 60000)
         self.assertEqual(len(parts), 1)
         self.assertLess(len(parts[0]), 30000)
         from analysis_extension.review_encoding import unpack_review_records
-        actual = unpack_review_records(json.loads(parts[0]))
+        actual = unpack_review_records(review_material(parts[0]))
         self.assertEqual(actual['derived'], payload['derived'])
         self.assertEqual({fact['factId'] for fact in actual['facts']},
                          set(payload['derived'][0]['inputRefs']))

@@ -15,17 +15,15 @@ let linearScaleSequence=0;
 const waterfallBindings=new WeakMap();
 const linearBindings=new WeakMap();
 const registeredCharts=new Set(), valueLabels=new Map();
-// 原生统计和脚本表格使用 columns/rows；排序集使用对象行。两者共享同一读取与测量逻辑。
+// 排序、原生统计和脚本表格都按实际字段名读取，不依赖列下标。
 // 仅接受明确的 factRef/value 列，不猜金额列，也不把空值当成零。
 const setDatum=(setKey,factRef)=>{
     const set=data.sets[setKey];
     if(!set||!Array.isArray(set.rows))return undefined;
-    if(set.kind!=='TABULAR')return set.rows.find(row=>row.factRef===factRef);
     const names=(set.columns||[]).map(column=>column.name);
-    const refIndex=names.indexOf('factRef'),valueIndex=names.indexOf('value');
-    if(refIndex<0||valueIndex<0||names.lastIndexOf('factRef')!==refIndex||names.lastIndexOf('value')!==valueIndex)return undefined;
-    const rows=set.rows.filter(row=>row[refIndex]===factRef);
-    return rows.length===1?{factRef,value:rows[0][valueIndex]}:undefined;
+    if(!names.includes('factRef')||!names.includes('value'))return undefined;
+    const rows=set.rows.filter(row=>row.values?.factRef===factRef);
+    return rows.length===1?rows[0].values:undefined;
 };
 const bindingDatum=binding=>{
     if(binding.valueKey)return data.values[binding.valueKey];
@@ -92,7 +90,9 @@ const bindHorizontalWaterfall=(items,options={})=>{
         if(!Number.isInteger(item.stepIndex)||!step||!(element instanceof HTMLElement)
            ||!(track instanceof HTMLElement)||element.parentElement!==track)
             throw new Error('横向瀑布图每一步需要实际条形、其直接父轨道及有效 stepIndex');
-        return {element,track,step,index:item.stepIndex};
+        if(item.zero!=null&&(!(item.zero instanceof HTMLElement)||item.zero.parentElement!==track))
+            throw new Error('瀑布零线需要属于对应轨道的实际元素');
+        return {element,track,step,index:item.stepIndex,zero:item.zero};
     });
     if(new Set(bindings.map(item=>item.element)).size!==bindings.length)
         throw new Error('横向瀑布图每一步需要独立条形，不能用同一元素覆盖多个贡献');
@@ -100,7 +100,6 @@ const bindHorizontalWaterfall=(items,options={})=>{
         // 专用轨道只负责定位；厚度、标签、颜色和报告布局仍由页面决定。
         if(getComputedStyle(track).position==='static')track.style.position='relative';
         element.style.position='absolute';element.style.display='block';element.style.boxSizing='border-box';
-        element.style.left=(step.geometry.left*100)+'%';element.style.width=(step.geometry.width*100)+'%';
         element.dataset.analysisScale=scale;element.dataset.analysisBarAxis='x';
         element.dataset.analysisWaterfallSet=options.setKey;element.dataset.analysisWaterfallNode=options.nodeRef;
         element.dataset.analysisWaterfallStep=String(index);
@@ -109,6 +108,34 @@ const bindHorizontalWaterfall=(items,options={})=>{
         waterfallBindings.set(element,{track,step,binding:{setKey:options.setKey,nodeRef:options.nodeRef,stepIndex:index}});
         registeredCharts.add(element);
     }
+    // All rows share a real drawing interval, even when a decorated total row
+    // has padding. Keep the report layout; never apply a different scale per row.
+    const draw=()=>{
+        const tracks=bindings.map(({track})=>{
+            const box=track.getBoundingClientRect(),zoom=track.offsetWidth?box.width/track.offsetWidth:0;
+            return {left:box.left+track.clientLeft*zoom,width:track.clientWidth*zoom,zoom};
+        });
+        if(tracks.some(t=>!t.zoom||!t.width))return; // Collapsed content is drawn on resize/show.
+        const left=Math.max(...tracks.map(t=>t.left));
+        const width=Math.min(...tracks.map(t=>t.left+t.width))-left;
+        if(width<=0)throw new Error('同一瀑布图的轨道没有共同绘图区；请保持各步骤纵向对齐，保留全部公式项');
+        bindings.forEach(({element,step,zero},i)=>{
+            const track=tracks[i],binding=waterfallBindings.get(element);
+            const cssLeft=(left-track.left+step.geometry.left*width)/track.zoom;
+            const cssWidth=step.geometry.width*width/track.zoom;
+            element.style.left=cssLeft+'px';element.style.width=cssWidth+'px';
+            Object.assign(binding,{cssLeft,cssWidth});
+            if(zero)zero.style.left=((left-track.left+waterfall.zero*width)/track.zoom)+'px';
+        });
+    };
+    draw();
+    let pendingFrame=null;
+    const observer=typeof ResizeObserver==='function'?new ResizeObserver(()=>{
+        if(pendingFrame!==null)cancelAnimationFrame(pendingFrame);
+        pendingFrame=requestAnimationFrame(()=>{pendingFrame=null;draw();});
+    }):null;
+    for(const {track} of bindings)observer?.observe(track);
+    return ()=>{observer?.disconnect();if(pendingFrame!==null)cancelAnimationFrame(pendingFrame);};
 };
 Object.defineProperty(window,'analysisCharts',{value:Object.freeze({bindLinearBars,bindHorizontalWaterfall,bindValueLabel}),writable:false,configurable:false});
 const send=()=>{
@@ -201,7 +228,14 @@ const measure=()=>{
     const scales=new Map();
     for(const bar of declaredBars.slice(0,1000)){
         const axis=bar.dataset.analysisBarAxis||'x';
-        if(!rendered(bar))continue;
+        if(!rendered(bar)){
+            // Collapsible formula layers remain part of the document. Their
+            // geometry is measured once opened, not fabricated while hidden.
+            if(waterfallBindings.has(bar)&&bar.closest('details:not([open])')){
+                const binding=chartBinding(bar);keep(charted,binding);keep(presented,binding);
+            }
+            continue;
+        }
         numericChecks.linearBars.measured++;
         const numericBinding=chartBinding(bar);
         keep(charted,numericBinding);keep(presented,numericBinding);
@@ -225,14 +259,17 @@ const measure=()=>{
         if(waterfall){
             const {track,step}=waterfall,trackBox=track.getBoundingClientRect();
             const zoom=track.offsetWidth?trackBox.width/track.offsetWidth:0;
-            const expectedLeft=trackBox.left+(track.clientLeft+step.geometry.left*track.clientWidth)*zoom;
-            const expectedWidth=step.geometry.width*track.clientWidth*zoom;
+            const expectedLeft=trackBox.left+(track.clientLeft+waterfall.cssLeft)*zoom;
+            const expectedWidth=waterfall.cssWidth*zoom;
             // 极小贡献可能小于浏览器可绘像素；保留精确标签，不用最小宽度放大。
             subpixel=expectedWidth>0&&expectedWidth<0.5;
-            if(bar.parentElement!==track||bar.offsetParent!==track||!zoom
+            if(bar.parentElement!==track||bar.offsetParent!==track||!zoom||!Number.isFinite(expectedWidth)
                ||Math.abs(box.left-expectedLeft)>0.5||Math.abs(box.width-expectedWidth)>0.5){
                 numericChecks.linearBars.invalid++;
-                mismatch('横向瀑布图累计位置或长度与公式不一致：'+elementPath(bar)+'；保留 bindHorizontalWaterfall 的 left/width，检查轨道宽度及条形 margin、transform、最小宽度。');
+                mismatch('横向瀑布图 '+waterfall.binding.nodeRef+' 第'+waterfall.binding.stepIndex+'步：'+elementPath(bar)+
+                    '；实际 left/width='+box.left.toFixed(2)+'/'+box.width.toFixed(2)+
+                    '，期望='+expectedLeft.toFixed(2)+'/'+expectedWidth.toFixed(2)+
+                    '。保留瀑布及全部公式项，仅修正轨道或覆盖绑定的 margin、transform、最小宽度；不要删图改表。');
                 continue;
             }
         }
@@ -385,6 +422,8 @@ const measure=()=>{
         }
         largest.pop();result.truncated=true;
     }
+    const observedText=document.body.innerText;
+    result.hostRenderedText={text:observedText.length<=262144?observedText:'',complete:observedText.length<=262144};
     return result;
 };
 addEventListener('DOMContentLoaded',()=>{new ResizeObserver(send).observe(document.body);send();});

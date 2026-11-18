@@ -219,7 +219,17 @@ export function useMessages(
 			// reply content — route them to callbacks and skip appendEvent.
 			if (event.type === EventType.CUSTOM) {
 				const custom = event as CustomEvent;
-				if (custom.name === 'agent_progress') {
+				if (custom.name === 'analysis_execution_progress') {
+                    const progress = custom.value as { replyId?: string; revision?: number; version?: number };
+                    const reply = msgsRef.current.find((message) => message.id === progress.replyId);
+                    const old = reply?.metadata?.analysisExecutionProgress as { revision?: number } | undefined;
+                    if (reply && !reply.finished_at && progress.version === 1 && typeof progress.revision === 'number' && progress.revision > (old?.revision ?? -1)) {
+                        const updated = { ...reply, metadata: { ...reply.metadata, analysisExecutionProgress: progress } };
+                        msgsRef.current = msgsRef.current.map((message) => message.id === reply.id ? updated : message);
+                        if (currentReplyRef.current?.id === reply.id) currentReplyRef.current = updated;
+                        scheduleUpdate();
+                    }
+				} else if (custom.name === 'agent_progress') {
 					const replyId = readAgentProgress(custom.value)?.replyId;
 					const reply = msgsRef.current.find((message) => message.id === replyId);
 					if (reply && applyAgentProgress(reply, event)) {

@@ -95,10 +95,8 @@ def grouping_requirements(turn, artifact=None):
         bound_refs = set(artifact['captureRefs'] if artifact is not None else
                          (item['selection']['captureRef'] for item in turn.state.get('adoptedInputs', [])))
         # 这里只做已声明概念的精确对应，不从用户原话猜业务字段或机构类型。
-        intent = turn.state.get('queryIntent', {}).get('grouping')
         selected = {item['captureRef'] for item in candidates
-                    if (item.get('requested') and item['captureRef'] in bound_refs)
-                    or (intent and item.get('keyword') == intent)}
+                    if item.get('requested') and item['captureRef'] in bound_refs}
         for ref in bound_refs:
             capture = turn.service.store.get_capture(turn.service.owner, ref)
             if capture.get('originalToolName') not in ('execute_semantic_plan', 'execute_budget_query'):
@@ -121,8 +119,72 @@ def grouping_requirements(turn, artifact=None):
     return [{**item, 'required': item['captureRef'] in selected} for item in candidates]
 
 
+def identity_grouping_matches(capture, receipt, requirements, artifact):
+    """原生查询已按目标维度返回明细时，不要求再做会丢掉父节点的恒等聚合。
+
+    与 BudgetTargetExecutionService.requiresAggregation 的粒度边界一致；
+    属性分组仍须原生聚合。完整来源可以在代码中筛选；可用数据不等于必须相加的数据。
+    """
+    from .actions import source_identity
+    from .adapters.budget_v2 import data_context
+    from .adapters import budget_batch
+    data = receipt.get('data', {})
+    if (capture.get('originalToolName') != 'execute_budget_query' or receipt.get('status') != 'SUCCEEDED'
+            or data.get('complete') is not True or data.get('unresolvedGroups')
+            or data.get('failureSummary', {}).get('issueCount')):
+        return set()
+    selected = None if artifact is None else {fact['factId'] for fact in artifact.get('facts', [])}
+    catalog = None
+    matched = set()
+    for index, requirement in enumerate(requirements):
+        if (requirement['status'] != 'SUPPORTED' or not requirement['bindingRef']
+                or list(requirement['source']) != list(source_identity(capture))
+                or requirement['context'] != data_context(receipt.get('context'))):
+            continue
+        findings = [item for item in data.get('grouping', [])
+                    if (item.get('bindingRef') or item.get('bindingIri') or item.get('binding')) == requirement['bindingRef']]
+        groups = []
+        valid = bool(findings)
+        for finding in findings:
+            choices = ([finding['groupBy']] if finding.get('groupBy') else
+                       [item['groupBy'] for item in finding.get('candidates', []) if item.get('supported')])
+            if finding.get('status') != 'SUPPORTED' or len(choices) != 1 or choices[0].get('field') is not None:
+                valid = False
+                break
+            groups.append(choices[0])
+        if not valid or not any(item.get('groupingKeyword') == requirement['keyword'] for item in findings):
+            continue
+        if not any(group in groups for group in requirement['candidates']):
+            continue
+        retained = {group.get('dimCode') for group in groups}
+        if None in retained:
+            continue
+        tables = [(step, table) for step, table, _ in budget_batch.tables(receipt)
+                  if any(metric.get('context', {}).get('target', {}).get('formBindingKey') == requirement['bindingRef']
+                         for metric in table.get('metrics', []))]
+        for step, table in tables:
+            request = table.get('request', {})
+            if table.get('disposition') != 'SUCCEEDED' or request.get('aggregation'):
+                valid = False
+                break
+            budget_batch.validate(capture, receipt, step, table)
+        if not valid or not tables:
+            continue
+        if catalog is None:
+            catalog = budget_batch.catalog(capture)
+        facts = [fact for fact in catalog if fact.get('bindingRef') == requirement['bindingRef']]
+        # This checks provenance and availability of the real grouping dimension,
+        # not whether every source row must participate in a calculation. A total
+        # row and its regional details must not be forced into the same sum.
+        relevant = facts if selected is None else [fact for fact in facts if fact['factId'] in selected]
+        if (relevant and all(all({**fact.get('effectiveDimensions', {}), **fact.get('dimensions', {})}.get(dim)
+                                is not None for dim in retained) for fact in relevant)):
+            matched.add(index)
+    return matched
+
+
 def grouping_issues(turn, artifact=None):
-    """选定的预算分组须有原生聚合；未采用的探索候选不阻断交付。"""
+    """选定口径须有真实原生结果；明细已处于分组粒度时保留原生恒等路径。"""
     from .actions import source_identity
     from .adapters.budget_v2 import data_context
     from .adapters import budget_batch
@@ -138,6 +200,7 @@ def grouping_issues(turn, artifact=None):
         receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
         if receipt.get('status') not in ('SUCCEEDED', 'PARTIAL'):
             continue
+        matched.update(identity_grouping_matches(capture, receipt, requirements, artifact))
         for step_id, table, _ in budget_batch.tables(receipt):
             if table.get('disposition') != 'SUCCEEDED' or not table.get('request', {}).get('aggregation'):
                 continue
@@ -152,10 +215,32 @@ def grouping_issues(turn, artifact=None):
                         and any(group in groups for group in requirement['candidates'])):
                     matched.add(index)
     completed_keywords = {requirements[index]['keyword'] for index in matched}
-    return [{'code': 'GROUPING_RESULT_REQUIRED',
-             'message': '本轮要求的分组尚未完成。已有单位明细只能作为参考，不能标记分组分析成功；未识别、元数据不完整与明确不支持须分别说明。',
+    issues = [{'code': 'GROUPING_RESULT_REQUIRED',
+             'message': '本轮要求的分组尚未完成。须采用同来源、任务表样和范围的原生分组结果；直接维度已在完整查询明细中且无需再聚合时可继续分析，属性分组仍须原生聚合。未识别、元数据不完整与明确不支持须分别说明。',
              'groupingStatus': item['status'], 'groupingKeyword': item['keyword'],
              'discoveryCaptureRef': item['captureRef'], 'bindingRef': item['bindingRef'],
              'organizationType': item['organizationType'], 'groupByCandidates': item['candidates']}
             for index, item in enumerate(requirements) if index not in matched
             and (item['status'] == 'SUPPORTED' or item['keyword'] not in completed_keywords)]
+    for entry in issues:
+        # A successful dimension discovery does not imply all requested data
+        # arrived. Report the fetch failure rather than sending the model back
+        # into a loop of changing otherwise valid grouping parameters.
+        if entry['groupingStatus'] != 'SUPPORTED':
+            continue
+        try:
+            capture = turn.service.store.get_capture(turn.service.owner, entry['discoveryCaptureRef'])
+        except AnalysisError:
+            # Keep the original unmet requirement if an older diagnostic's
+            # receipt is unavailable; the optional explanation cannot crash it.
+            continue
+        if capture.get('originalToolName') != 'execute_budget_query':
+            continue
+        receipt = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
+        data = receipt.get('data') or {}
+        failures = data.get('unresolvedGroups') or []
+        if entry['groupingStatus'] == 'SUPPORTED' and failures:
+            entry.update(message='分组维度已确认，但本次来源取数尚未完成。保留已取得数据，按原请求恢复失败取数；不要修改已确认的分组参数来绕过数据缺失。',
+                         recoveryAction='RETRY_INCOMPLETE_SOURCE', sourceIssues=failures,
+                         failureSummary=data.get('failureSummary'))
+    return issues

@@ -9,7 +9,7 @@ from analysis_budget_batch_test import batch_fixture
 from analysis_presentation_fixtures import PresentationCase
 from analysis_extension.models import AnalysisError
 from analysis_extension.python_analysis import execute_python
-from analysis_extension.python_worker import validate_code
+from analysis_extension.python_program import validate_code
 from analysis_extension.tools import AnalysisBuild
 
 
@@ -38,11 +38,11 @@ class IncrementalOptimizationTests(PresentationCase):
                 result = await execute_python(code + '\nresult=[{"value":D("9007199254740993.11") + Decimal("0.02")}]', [], 10)
                 self.assertEqual(result, [{'value': '9007199254740993.13'}])
 
-    def test_non_equivalent_or_indirect_overwrites_remain_rejected(self):
+    def test_local_names_and_parameters_follow_normal_python_scoping(self):
         for code in ('D = 1', 'Decimal = sum', 'D += 1', 'D, x = [Decimal, 1]',
                      'for D in inputs:\n pass', 'def f(D):\n return D', 'def Decimal(x):\n return x',
                      'D = Decimal("1")', 'sum = D', 'from collections import Counter as D'):
-            with self.subTest(code=code), self.assertRaises(ValueError):
+            with self.subTest(code=code):
                 validate_code(code)
 
     def test_schema_allows_adopted_inputs_and_runtime_requires_a_base_or_adoption(self):

@@ -109,7 +109,7 @@ class AutomaticRenderTests(PresentationCase):
         self.service.preview_reviewer.assert_not_awaited()
         from analysis_extension.free_document import compile_document
         compiled = compile_document(self.store.get_analysis(OWNER, self.ref), self.document)
-        refs = [row['factRef'] for row in compiled['datasets']['ranking']['rows']]
+        refs = [row['values']['factRef'] for row in compiled['datasets']['ranking']['rows']]
         self.checker.check.return_value = [measurements(refs, width, static_keys=['v']) for width in (420, 900)]
         self.document['html'] = self.document['html'].replace('<p>', '<p data-analysis-set="ranking">')
         fixed = await self.preview()
@@ -162,7 +162,11 @@ class RenderProtocolTests(IsolatedAsyncioTestCase):
             seen.append(json.loads(request.content))
             self.assertEqual(request.headers['Authorization'],'Bearer private-token')
             return httpx.Response(200,json=answer)
-        def client(**kwargs): return real_client(transport=httpx.MockTransport(respond),**kwargs)
+        def client(**kwargs):
+            from analysis_extension.render_timing import RENDER_SECONDS, RENDER_REQUEST_SECONDS
+            self.assertGreater(kwargs['timeout'].read, RENDER_SECONDS)
+            self.assertLess(kwargs['timeout'].read, RENDER_REQUEST_SECONDS)
+            return real_client(transport=httpx.MockTransport(respond),**kwargs)
         with patch('analysis_extension.render_client.httpx.AsyncClient',client):
             checker = RenderChecker('http://renderer:8932','private-token')
             self.assertEqual(len(await checker.check(document)),2)

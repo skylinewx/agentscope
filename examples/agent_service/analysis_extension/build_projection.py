@@ -13,6 +13,10 @@ def compact_scope(scope, analysis_ref):
         for key in ('members', 'factRefs', 'formulaFactRefs'):
             if isinstance(group.get(key), list):
                 group[key + 'Count'] = len(group.pop(key))
+    for proof in result.get('populationEvidence') or []:
+        for key in ('members', 'factRefs'):
+            if isinstance(proof.get(key), list):
+                proof[key + 'Count'] = len(proof.pop(key))
     # Exclusions, pending members, real scope limitations and group roles remain.
     result['detailRead'] = {'section': 'summary', 'analysisRef': analysis_ref}
     return result
@@ -60,10 +64,17 @@ def project(value, artifact):
     return result
 
 
-def render(value, artifact):
+def catalog_read(catalog):
+    return {key: catalog[key] for key in ('recordCount', 'sampleRead', 'outputContract') if key in catalog}
+
+
+def render(value, artifact, input_markdown=''):
     projected = project(value, artifact)
     materials = projected.pop('formulaMaterials')
-    lines = ['分析构建结果与可直接使用的引用：\n```json\n' + encode(projected) + '\n```']
+    if input_markdown:
+        projected['pythonInputCatalog'] = catalog_read(projected['pythonInputCatalog'])
+    lines = [input_markdown] if input_markdown else []
+    lines.append('分析构建结果与可直接使用的引用：\n' + model_text(projected))
     for view in materials:
         lines.append('公式数据集：' + view['valueRef'] + '\n\n' + model_text(view))
     return '\n\n'.join(lines)

@@ -520,6 +520,8 @@ class BudgetPreparation:
         return form_selector(effective, receipt, target)
 
     async def _fetch(self, turn, part):
+        from .execution_policy import require
+        require(turn, 'sourceQueries', 'prepare_formula_inputs')
         first = part[0]
         capture = self.service.store.get_capture(self.service.owner, first['source'])
         receipt = receipt_from_capture(capture)
@@ -536,7 +538,7 @@ class BudgetPreparation:
             raw = self.service.sources.for_capture(capture).raw_receipt(capture['response'])
             request = {'question': turn.state['request'], 'selection': 'CELLS', 'basis': {
                 'kind': 'FACTS', 'source': source, 'contextId': raw['context']['contextId'], 'querySessionId': raw['querySessionId']}}
-            frozen = {**base, **request, 'purpose': 'ANALYZE'}
+            frozen = {**base, **request, 'purpose': 'PREPARE_MATERIALS'}
             refs, error = await self.runner(turn, capture, 'execute_budget_query', frozen)
             if error and error.get('recoveryAction') == 'RESTART_CONTEXT':
                 # Reopen only a definitively expired context. Never replay an
@@ -585,13 +587,79 @@ class BudgetPreparation:
         return await self.runner(turn, capture, 'execute_semantic_plan',
                                  {**base, 'plan': {'dslVersion': '1.0', 'steps': steps, 'outputStepIds': [step['id'] for step in steps[len(input_ids):]]}})
 
-    async def after_query(self, turn, capture):
-        """A values receipt is sufficient for values work, including analysis and grouping.
-
-        Formula preparation is driven by confirmed formula targets, never by the
-        existence of an aggregation or by the presentation mode of this turn.
-        """
+    async def after_query(self, turn, capture, material_role=None):
+        """A frozen-facts filter is followed by preparation of exactly its result."""
+        from .material_plan import needs_formulas, request_key
+        request = capture.get('request', {})
+        role = material_role or turn.state.get('materialQueryRoles', {}).get(request_key(request), 'PRIMARY')
+        if (needs_formulas(turn.state, role) and request.get('purpose') == 'QUERY'
+                and (request.get('basis') or {}).get('kind') == 'FACTS'
+                and (request.get('intentDraft') or {}).get('valueFilter')):
+            selections = [{**item, 'role': role} for item in self.service.sources.for_capture(capture).selectors(capture)]
+            return await self.prepare_selected(turn, selections)
         return None
+
+    async def prepare_selected(self, turn, selections=None):
+        """Resolve declared materials from real selected rows, never a latest-source guess."""
+        from .material_plan import needs_formulas
+        from .input_state import snapshot, require_unchanged
+        if selections is None:
+            selections = [{**item['selection'], 'role': item['role'], 'inputRef': item['inputRef'],
+                           'sourceRef': item['sourceRef']} for item in turn.state.get('adoptedInputs', [])]
+        state = snapshot(self.service)
+        targets, boundaries = [], []
+        for selection in selections:
+            role = selection.get('role', 'PRIMARY')
+            if not needs_formulas(turn.state, role):
+                continue
+            capture = self.service.store.get_capture(self.service.owner, selection['captureRef'])
+            if 'resultSetId' in selection:  # Verified empty source; no target to expand.
+                continue
+            if 'batchId' not in selection:  # Form inputs already carry their actual formula boundary.
+                continue
+            receipt = receipt_from_capture(capture)
+            matched = [(step, table) for step, table, _ in budget_batch.tables(receipt)
+                       if step == selection.get('stepId') and table['batchId'] == selection['batchId']]
+            if len(matched) != 1:
+                raise AnalysisError('MATERIAL_SOURCE_INVALID', '所选公式材料没有唯一的真实来源表。')
+            step, table = matched[0]
+            budget_batch.validate(capture, receipt, step, table)
+            table = budget_exact.view(table)
+            names, indices = budget_batch.selection_scope(selection, table)
+            for metric in table['metrics']:
+                if metric['name'] not in names:
+                    continue
+                selected = {**selection, 'columnNames': [metric['name']]}
+                refs = []
+                catalog = self.service.sources.catalog(capture)
+                for item in catalog:
+                    if (item.get('stepId') != step or item.get('batchId') != table['batchId']
+                            or item.get('columnName') != metric['name']
+                            or indices is not None and item.get('rowIndex') not in indices):
+                        continue
+                    row_metric = _row_metric(table, item['rowIndex'], metric)
+                    if row_metric.get('scenarioFallback'):
+                        boundaries.append({'factRef': item['factId'], 'status': 'NO_TARGET_CELL', 'role': role})
+                    else:
+                        refs.append(item['factId'])
+                for offset in range(0, len(refs), 100):
+                    for target in formula_subjects(turn, refs[offset:offset + 100], [selected]):
+                        target.update(role=role)
+                        target.update({key: selected[key] for key in ('inputRef', 'sourceRef') if key in selected})
+                        targets.append(target)
+        records = await self.ensure_grouped(turn, targets)
+        require_unchanged(self.service, state)
+        turn.state['budgetFormulaTargets'] = targets
+        turn.state['budgetFormulaPreparation'] = records
+        turn.state['materialBoundaries'] = boundaries
+        errors = [{'subject': row.get('subject'), 'error': row['error']} for row in records if row.get('error')]
+        return {'expected': len(targets), 'ready': len(records) - len(errors), 'complete': not errors,
+                'issues': errors, 'boundaries': boundaries,
+                'targets': [{**{key: row[key] for key in ('subject', 'inputRef', 'sourceRef', 'role') if key in row},
+                    **({'captureRef': row['selection']['captureRef']} if row.get('selection') else {'error': row.get('error')})}
+                    for row in records],
+                'captureRefs': list(dict.fromkeys(row['selection']['captureRef'] for row in records if row.get('selection'))),
+                'meaning': '本次选定对象的材料准备结果；实际分析仍须覆盖用户要求。'}
 
     async def ensure_grouped(self, turn, targets, captures=None):
         groups = {}
@@ -625,6 +693,13 @@ class BudgetPreparation:
         from .input_state import snapshot, require_unchanged
         input_state = snapshot(self.service)
         declared = []
+        from .material_plan import needs_formulas
+        if data_analysis(turn) and needs_formulas(turn.state) and not turn.state.get('budgetFormulaTargets'):
+            chosen = selections
+            if chosen is None and not turn.state.get('adoptedInputs'):
+                chosen = infer_selections(self.service, {ref: effective[ref] for ref in refs}, scope, [])
+            await self.prepare_selected(turn, chosen)
+            require_unchanged(self.service, input_state)
         if data_analysis(turn) and turn.state.get('budgetFormulaTargets'):
             # 准备失败后可能已通过普通表展开补得证据。以本次真实输入重新匹配，避免陈旧失败变成永久缺口。
             declared = await self.ensure_grouped(turn, turn.state['budgetFormulaTargets'], effective)

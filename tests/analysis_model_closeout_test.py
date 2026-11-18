@@ -98,7 +98,7 @@ class ModelCloseoutTests(PresentationCase):
         middleware.service = self.service
         evidence = {'sources': [{'facts': [{'valueState': 'NO_DATA', 'formulaStatus': 'NO_TARGET_CELL',
                     'dimensions': {'MD_SCENE': 'ACTUAL'}}], 'source': {'businessQuery': {
-                    'purpose': 'ANALYZE', 'complete': True, 'failureSummary': {'outcome': 'NO_DATA'}}}}]}
+                    'purpose': 'PREPARE_MATERIALS', 'complete': True, 'failureSummary': {'outcome': 'NO_DATA'}}}}]}
         next_handler = Mock(side_effect=AssertionError('The completed empty scenario must not ask the model to retry.'))
         captures = {'rejected-draft': {'originalToolName': 'execute_budget_query',
                     'request': {'question': turn.state['request']}, 'response': {'status': 'FAILED'}},
@@ -108,6 +108,8 @@ class ModelCloseoutTests(PresentationCase):
         adapter = SimpleNamespace(raw_receipt=lambda response: response)
         def verified_evidence(current):
             self.assertEqual(current.state['queryCaptureRefs'], ['scenario-empty'])
+            from analysis_empty_delivery_fixtures import attach_empty_business_view
+            attach_empty_business_view(evidence)
             return evidence
         with patch('analysis_extension.middleware.query_evidence', side_effect=verified_evidence), \
              patch.object(self.store, 'get_capture', side_effect=lambda owner, ref: captures[ref]), \
@@ -139,13 +141,16 @@ class ModelCloseoutTests(PresentationCase):
                     'source': {'businessQuery': {'purpose': 'QUERY', 'complete': True,
                                                 'failureSummary': {'outcome': 'NO_DATA'}}}}]}
         next_handler = Mock(side_effect=AssertionError('No new model/query is needed for the same confirmed empty scope.'))
+        from analysis_empty_delivery_fixtures import attach_empty_business_view
+        attach_empty_business_view(evidence)
         with patch('analysis_extension.conversation_context.evidence_turn', return_value=previous), \
              patch('analysis_extension.middleware.query_evidence', return_value=evidence), \
              patch.object(self.store, 'get_capture', return_value=capture), \
              patch.object(self.service.sources, 'for_capture', return_value=SimpleNamespace(raw_receipt=lambda response: response)):
             events = [event async for event in middleware.on_reasoning(agent, {}, next_handler)]
         self.assertTrue(events)
-        self.assertIn('本轮未重复取数', turn.state['hostCloseout']['answer'])
+        self.assertIn('合成利润表', turn.state['hostCloseout']['answer'])
+        self.assertIn('实际数（元）', turn.state['hostCloseout']['answer'])
         self.assertEqual(turn.state['queryCaptureRefs'], [])
         next_handler.assert_not_called()
         agent.model.generate_structured_output.assert_not_awaited()
@@ -196,7 +201,8 @@ class ModelCloseoutTests(PresentationCase):
 
     async def test_query_review_respects_shared_exhausted_budget(self):
         turn = self.turn()
-        progress(turn, lambda state: state.update(review={'attempts': 3, 'elapsedMs': 180000, 'unavailable': 0}))
+        progress(turn, lambda state: state.update(review={
+            'attempts': self.store.limits.max_review_attempts, 'elapsedMs': 180000, 'unavailable': 0}))
         with patch('analysis_extension.turn_completion._model_review', new_callable=AsyncMock) as model:
             with self.assertRaises(AnalysisError) as caught:
                 await review_query_answer(None, turn, self.evidence(), '金额0.00')
@@ -245,6 +251,28 @@ class ModelCloseoutTests(PresentationCase):
         with self.assertRaises(AnalysisError) as caught:
             closeout_material(self.turn(), evidence={'sources': []})
         self.assertEqual(caught.exception.code, 'NO_AVAILABLE_FACTS')
+
+    def test_large_scope_and_unreviewed_python_do_not_evict_captured_source_rows(self):
+        facts = self.evidence()['sources'][0]['facts']
+        artifact = {'analysisRef': 'analysis-1', 'facts': facts,
+                    'scope': {'label': '原查询范围', 'members': list(range(5000)),
+                              'populationEvidence': [{'raw': 'x' * 100000}]},
+                    'derivedValues': [{'operator': 'PYTHON', 'derivedId': 'unsafe', 'rows': ['x' * 100000]}]}
+        before = deepcopy(artifact)
+        material = closeout_material(self.turn(), artifact=artifact)
+        self.assertEqual(material['facts'], facts)
+        self.assertEqual(material['scopeDetailRef'], 'analysis-1')
+        self.assertEqual(material['scopeDetailCounts']['members'], 5000)
+        self.assertEqual(material['unreviewedCalculationCount'], 1)
+        self.assertEqual(material['computed'], [])
+        self.assertEqual(artifact, before)
+
+    def test_background_capacity_is_not_misreported_as_missing_source_data(self):
+        turn = self.turn()
+        turn.state['request'] = '背景' * 40000
+        with self.assertRaises(AnalysisError) as caught:
+            closeout_material(turn, evidence=self.evidence())
+        self.assertEqual(caught.exception.code, 'CLOSEOUT_CAPACITY')
 
     def test_oversized_closeout_covers_later_contexts_and_full_state_counts(self):
         facts = [{'factId': f'f-{index}', 'contextRef': f'context-{index // 150}',

@@ -44,6 +44,123 @@
     "technicalDetails"
   ],
   "properties": {
+    "computationIntent": {
+      "type": "object",
+      "description": "Host-frozen user requirement and effective conditions at computation time."
+    },
+    "methodRevisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "revisionId",
+          "taskId",
+          "previousOperator",
+          "operator",
+          "previousRefs",
+          "refs",
+          "targetRefs",
+          "reason",
+          "failureCodes"
+        ],
+        "properties": {
+          "revisionId": {
+            "type": "string"
+          },
+          "taskId": {
+            "type": "string"
+          },
+          "previousOperator": {
+            "type": "string"
+          },
+          "operator": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "targetRefs": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "failureCodes": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "completionContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "userRequest": {
+          "type": "string"
+        },
+        "selectedContextRequests": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "contextRef": {
+                "type": "string"
+              },
+              "request": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "contextRef",
+              "request"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "investigations": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "properties": {
+              "requirementRef": {
+                "type": "string",
+                "minLength": 1
+              },
+              "requirement": {
+                "type": "string",
+                "minLength": 1
+              },
+              "scope": {
+                "type": "string",
+                "minLength": 1
+              },
+              "userQuote": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "required": [
+              "requirementRef",
+              "requirement",
+              "scope",
+              "userQuote"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "userRequest",
+        "selectedContextRequests",
+        "investigations"
+      ]
+    },
     "schemaVersion": {
       "const": 1
     },
@@ -164,7 +281,7 @@
       "properties": {
         "members": {
           "type": "array",
-          "minItems": 1,
+          "minItems": 0,
           "uniqueItems": true,
           "items": {
             "type": "string"
@@ -185,11 +302,29 @@
       "type": "object",
       "anyOf": [
         {
-          "required": ["kind", "sourceId", "snapshotId", "asOf", "schemaHash", "sourceContextIds"],
+          "required": [
+            "kind",
+            "sourceId",
+            "snapshotId",
+            "asOf",
+            "schemaHash",
+            "sourceContextIds"
+          ],
           "properties": {
-            "kind": {"const": "SINGLE_SNAPSHOT"},
-            "sourceId": {"type": "string"},
-            "sourceContextIds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string"}}
+            "kind": {
+              "const": "SINGLE_SNAPSHOT"
+            },
+            "sourceId": {
+              "type": "string"
+            },
+            "sourceContextIds": {
+              "type": "array",
+              "minItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "string"
+              }
+            }
           }
         },
         {
@@ -699,6 +834,88 @@
           "querySessionId"
         ]
       }
+    },
+    "reportDelivery": {
+      "type": "object",
+      "required": [
+        "mode",
+        "analysisRef",
+        "programChecks",
+        "requirementsState",
+        "semanticReview"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "REVIEWED",
+            "REVIEWED_FALLBACK",
+            "PENDING_REVIEW",
+            "REVIEWED_AFTER_RESUME",
+            "REQUIRES_REVISION",
+            "NOT_REVIEWED"
+          ]
+        },
+        "analysisRef": {
+          "type": "string"
+        },
+        "programChecks": {
+          "type": "string"
+        },
+        "requirementsState": {
+          "type": "string"
+        },
+        "semanticReview": {
+          "enum": [
+            "PASS",
+            "PARTIAL",
+            "PENDING",
+            "UNAVAILABLE",
+            "NOT_REVIEWED",
+            "REVISE"
+          ]
+        },
+        "reviewRef": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "review": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "newerCandidate": {
+          "type": "object",
+          "required": [
+            "analysisRef",
+            "previewRef",
+            "programChecks"
+          ],
+          "properties": {
+            "analysisRef": {
+              "type": "string"
+            },
+            "previewRef": {
+              "type": "string"
+            },
+            "programChecks": {
+              "enum": [
+                "PASS",
+                "FAILED"
+              ]
+            },
+            "review": {
+              "type": [
+                "object",
+                "null"
+              ]
+            }
+          }
+        }
+      },
+      "additionalProperties": true
     }
   },
   "$defs": {
@@ -815,18 +1032,39 @@
             "oneOf": [
               {
                 "properties": {
-                  "executionStatus": {"const": "BLOCKED"}
+                  "executionStatus": {
+                    "const": "BLOCKED"
+                  }
                 }
               },
               {
-                "required": ["operator", "executionStatus", "completionReason", "valueState", "value", "sourceConsistency"],
+                "required": [
+                  "operator",
+                  "executionStatus",
+                  "completionReason",
+                  "valueState",
+                  "value",
+                  "sourceConsistency"
+                ],
                 "properties": {
-                  "executionStatus": {"const": "COMPLETED"},
-                  "operator": {"const": "FORMULA_CHECK"},
-                  "completionReason": {"const": "SOURCE_VALUE_MISSING"},
-                  "valueState": {"const": "NO_VALUE"},
-                  "value": {"type": "null"},
-                  "sourceConsistency": {"const": "NOT_CHECKED"}
+                  "executionStatus": {
+                    "const": "COMPLETED"
+                  },
+                  "operator": {
+                    "const": "FORMULA_CHECK"
+                  },
+                  "completionReason": {
+                    "const": "SOURCE_VALUE_MISSING"
+                  },
+                  "valueState": {
+                    "const": "NO_VALUE"
+                  },
+                  "value": {
+                    "type": "null"
+                  },
+                  "sourceConsistency": {
+                    "const": "NOT_CHECKED"
+                  }
                 }
               }
             ]

@@ -13,11 +13,19 @@ def revision_basis(material):
     return digest(source)
 
 
+def review_identity(turn):
+    from .turn_completion import REVIEW_PROMPT
+    from .review_budget import current_budget
+    budget = getattr(turn.service, 'review_budget', None) or current_budget()
+    return digest([REVIEW_PROMPT, budget.identity()])
+
+
 def focus_revision(turn, material):
     previous = progress(turn).get('lastContentReview')
     text = material.get('documentText', '')
     source = material.get('documentSourceText', '')
-    if (not previous or material.get('candidateAnswer') or previous['basis'] != revision_basis(material)
+    if (not previous or previous.get('reviewIdentity') != review_identity(turn)
+            or material.get('candidateAnswer') or previous['basis'] != revision_basis(material)
             or (previous['text'] == text and previous.get('sourceText', '') == source)):
         return material
     changes = []
@@ -30,7 +38,10 @@ def focus_revision(turn, material):
     result = deepcopy(material)
     # 上一次内容审查已完成，且来源、范围、绑定、计算与失败信息逐项摘要相同。
     # 保留全部事实、派生数值、空值、公式差额及当前全文，只省去未变化的执行背景。
-    unchanged_background = ('sourceScopes', 'structureEvidence', 'previousMessages', 'pythonRuns', 'relations')
+    # Python reuse requires the independent completed computation proof. A
+    # completed review that found a code error is not a computation approval.
+    isolated = all(issue.get('impact') == 'REPORT' for issue in previous['issues'])
+    unchanged_background = ('sourceScopes', 'structureEvidence', 'previousMessages', 'relations') if isolated else ('previousMessages',)
     omitted = [field for field in unchanged_background if field in result]
     for field in omitted:
         result.pop(field)
@@ -59,20 +70,24 @@ def remember_review(turn, material, verdict):
     source = material.get('documentSourceText', '')
     if len(text) + len(source) <= 48000:
         progress(turn, lambda state: state.update(lastContentReview={
-            'basis': revision_basis(material), 'text': text, 'sourceText': source, 'issues': verdict['issues']}))
+            'basis': revision_basis(material), 'reviewIdentity': review_identity(turn),
+            'text': text, 'sourceText': source, 'issues': verdict['issues']}))
 
 
 
 def formula_review_trace(trace):
     """仅整理宿主已有核对结果；本层与逐层明确命名，不从缺数推断父层状态。"""
     result = {key: deepcopy(trace[key]) for key in (
-        'value', 'targetLocalCheck', 'differenceOriginRefs', 'pendingDependencies',
+        'value', 'targetFactRef', 'targetLocalCheck', 'differenceOriginRefs', 'pendingDependencies',
         'externalBoundaries', 'meaning', 'boundaryMeaning', 'applicability',
-        'executionStatus', 'completionReason') if key in trace}
+        'executionStatus', 'completionReason', 'arithmeticPolicy', 'structureComplete') if key in trace}
     result['recursiveStatus'] = trace.get('status')
     from .formula_check_summary import summarize
     result['checkSummary'] = summarize(trace)
     result['nodes'] = [{
+        **{key: deepcopy(node[key]) for key in (
+            'address', 'cellKey', 'headers', 'objectLabel', 'expression', 'dependencies',
+            'valueState', 'arithmeticPolicy', 'effectiveSourceValue', 'diagnostics') if key in node},
         'factRef': node['factRef'], 'observed': node.get('observed'),
         'localCheck': deepcopy(node.get('localCheck')),
         'recursiveCheck': {'status': node.get('status'), 'value': node.get('recalculated'),

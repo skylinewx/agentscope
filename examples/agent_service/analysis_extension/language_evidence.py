@@ -22,7 +22,14 @@ def bind(turn, request):
     phrases += [(f'targets/{t["id"]}/businessPhrases/{i}', p) for t in draft.get('targets', [])
                 for i, p in enumerate(t.get('businessPhrases', []))]
     for path, phrase in phrases:
-        phrase['sourceText'] = anchor(phrase.get('text'), path)
+        text = phrase.get('text')
+        if not isinstance(text, str) or not text.strip():
+            raise AnalysisError('QUERY_DRAFT_EVIDENCE_INVALID', '检索表达不能为空。', {'path': path})
+        literal = next((source for _, source in sources if text in source), None)
+        # Retrieval wording is not a quotation. Scope/period/scenario guards still
+        # operate on the immutable question and the confirmed structured context.
+        phrase['sourceText'] = anchor(text if literal is not None else request.get('question', ''), path)
+        records[-1].update(retrievalText=text, bindingKind='LITERAL' if literal is not None else 'RETRIEVAL_EXPRESSION')
     for index, scope in enumerate(draft.get('dimensionScopes', [])):
         path = f'dimensionScopes/{scope.get("id", index)}'
         selector = scope.get('selector') or {}
@@ -51,6 +58,11 @@ def bind(turn, request):
             anchor(root, f'relations/{index}/hierarchy/rootText')
     for index, binding in enumerate(request.get('scope', {}).get('bindings', [])):
         anchor(binding.get('text'), f'scope/bindings/{index}/text')
+    # A retrieval paraphrase is a candidate description, not permission to
+    # introduce an unconfirmed hard task/form restriction.
+    for field in ('taskNames', 'formNames'):
+        for index, name in enumerate(request.get('scope', {}).get(field, [])):
+            anchor(name, f'scope/{field}/{index}')
     # This audit stays in host state. It is not another model payload or another semantic declaration.
     if turn is not None:
         turn.state.setdefault('businessEvidence', {})[digest(request)] = records

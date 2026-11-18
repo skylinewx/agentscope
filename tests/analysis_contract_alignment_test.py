@@ -38,7 +38,7 @@ class RequestAttemptTests(PresentationCase):
     def test_equivalent_failed_business_draft_does_not_create_a_replacement_execution(self):
         from analysis_extension.models import AnalysisError
         origin = {**self.origin, 'originalToolName': 'execute_budget_query'}
-        request = {'contractVersion': '2.0', 'requestId': 'one', 'purpose': 'ANALYZE', 'question': '分析亏损原因',
+        request = {'contractVersion': '2.0', 'requestId': 'one', 'purpose': 'PREPARE_MATERIALS', 'question': '分析亏损原因',
                    'intentDraft': {'sharedConditions': [], 'targets': [{'id': 'one', 'businessPhrases': [{'text': '净利润', 'sourceText': '净利润'}]}]}}
         _, attempt = prepare(self.store, OWNER, 'turn', origin, request)
         self.finish(attempt, retryable=False, action='CORRECT_REQUEST')
@@ -264,6 +264,14 @@ class FormulaCompletionTests(TestCase):
 
 
 class PythonRecoveryTests(IsolatedAsyncioTestCase):
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+        from analysis_execution_fixtures import install_test_backend
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        install_test_backend(self, Path(temporary.name))
+
     async def test_decimal_error_keeps_source_null_and_reports_input_repair(self):
         from analysis_extension.models import AnalysisError
         from analysis_extension.python_analysis import execute_python
@@ -313,7 +321,7 @@ class PythonRecoveryTests(IsolatedAsyncioTestCase):
                   'columns': [{'name': 'name', 'label': '项目', 'type': 'STRING'},
                               {'name': 'amount', 'label': '金额', 'type': 'DECIMAL_STRING'}],
                   'rows': [{'name': '项目甲', 'amount': '1.20'}]}
-        for row in ({'name': '项目甲', 'amount': '1.20'}, ['项目甲']):
+        for row in (['项目甲'], ['项目甲', '1.20', '多余列']):
             output['rows'] = [row]
             with self.assertRaises(AnalysisError) as caught:
                 products([output], {'file': {}}, ['file'], None, 'python')
@@ -323,7 +331,7 @@ class PythonRecoveryTests(IsolatedAsyncioTestCase):
             self.assertFalse(caught.exception.details['requiresSourceQuery'])
         output['rows'] = [['项目甲', '1.20']]
         result = products([output], {'file': {}}, ['file'], None, 'python')
-        self.assertEqual(result[0]['rows'], [['项目甲', '1.20']])
+        self.assertEqual([row['values'] for row in result[0]['rows']], [{'name':'项目甲','amount':'1.20'}])
         self.assertEqual(output['rows'], [['项目甲', '1.20']])
 
 
@@ -361,7 +369,7 @@ class DeliveryContractTests(PresentationCase):
         for field in ('facts', 'derivedValues', 'inputDigest', 'verificationRecords'):
             self.assertEqual(revised[field], original[field])
         self.assertEqual(self.store.get_analysis(OWNER, original['analysisRef']), original)
-        turn.state['requiredEvidence'] = 'FORMULAS'
+        turn.state['materials'] = [{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}]
         self.assertIn('FORMULA_TARGETS_REQUIRED', [item['code'] for item in turn.check()['issues']])
 
     async def test_presentation_revision_survives_preview_repair_and_turn_restoration(self):
@@ -404,9 +412,9 @@ class DeliveryContractTests(PresentationCase):
             self.assertIsNone(middleware._approved_delivery())
         with patch('analysis_extension.turn_completion.document_review', return_value=({}, {'issues': []})):
             self.assertEqual(middleware._approved_delivery(), export['markdown'])
-        turn.state['requiredEvidence'] = 'FORMULAS'
+        turn.state['materials'] = [{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}]
         self.assertIn('FORMULA_TARGETS_REQUIRED', [item['code'] for item in turn.check()['issues']])
-        turn.state.pop('requiredEvidence')
+        turn.state.pop('materials')
         updated = await self.service.build(baseAnalysisRef=artifact['analysisRef'], operations=[], requestKey='new-draft')
         self.observe(turn, 'AnalysisBuild', updated)
         self.assertIsNone(turn.registered_export(updated['analysisRef']))
@@ -445,7 +453,9 @@ class DeliveryContractTests(PresentationCase):
             self.assertEqual(result['continuation']['input'], inputs)
         with self.assertRaises(AnalysisError) as caught:
             await self.service.python(**inputs, code='result=INPUT_FILES', purpose='复用文件', requestKey='file-error')
-        self.assertEqual(caught.exception.details['retryInput'], inputs)
+        self.assertEqual(set(caught.exception.details['retryInput']), {'retryOfRunRef'})
+        retried = await self.service.python(**caught.exception.details['retryInput'], code=code, purpose='复用冻结文件', requestKey='file-retry')
+        self.assertEqual(retried['derivedValues'][0]['value'], first['derivedValues'][0]['value'])
 
     async def test_python_run_reference_is_not_silently_used_as_analysis(self):
         from analysis_extension.models import AnalysisError
@@ -491,10 +501,10 @@ class DeliveryContractTests(PresentationCase):
         self.assertIn('不先抄值逐项 Calculate 再 Build 重算', prompt)
         self.assertNotIn('先用 AnalysisInspect 发现', AnalysisBuild.description)
         from analysis_extension.tools import AnalysisPython
-        self.assertIn('rows 必须是二维数组', AnalysisPython.description)
-        self.assertIn('纯网格只传工具参数 gridInputs', AnalysisPython.description)
-        self.assertIn('ref=inputs[0]["ref"]', AnalysisPython.description)
-        self.assertIn('captureRefs+scope', AnalysisPython.description)
+        self.assertIn('row.values[column.name]', AnalysisPython.description)
+        self.assertIn('AnalysisTask(action=prepare_inputs)', AnalysisPython.description)
+        self.assertIn('grid_rows(input["ref"],where)', AnalysisPython.description)
+        self.assertIn('inputSetRef', AnalysisPython.description)
         self.assertNotIn('完整三字段', AnalysisPython.description)
         self.assertNotIn('代码分析已创建可发布的 analysisRef', AnalysisPython.description)
         self.assertIn('仅文件执行返回 pythonRunRef，不创建 analysisRef', AnalysisPython.description)

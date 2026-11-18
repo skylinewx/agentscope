@@ -272,16 +272,17 @@ class WorkspaceService:
         Raises:
             `HTTPException`: 404 when the session does not exist.
         """
-        session_record = await self._storage.get_session(
+        summary = await self._storage.get_session_summary(
             user_id,
             agent_id,
             session_id,
         )
-        if session_record is None:
+        if summary is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"Session {session_id!r} not found.",
             )
+        session_record = summary.session
         workspace = await self._workspace_manager.get_workspace(
             user_id,
             agent_id,

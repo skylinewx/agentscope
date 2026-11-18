@@ -16,11 +16,11 @@ class BudgetPreparationTests(PresentationCase):
         from analysis_extension.source_views import register
         capture, selection, _, receipt = self.source(False)
         source = register(self.turn, {**selection, 'columnNames': ['metric1']})
-        declared = await self.service.task(mode='ANALYSIS', goal='分析原值和构成', requiredEvidence='VALUES',
+        declared = await self.service.task(mode='ANALYSIS', goal='分析原值和构成', materials=[{'role': 'PRIMARY', 'kinds': ['VALUES']}],
             subjectSources=[{'sourceRef': source['sourceRef']}])
         input_ref = declared['subjectSources'][0]['inputRef']
         self.register_runner(capture, receipt)
-        await self.service.task(mode='ANALYSIS', goal='分析原值和构成', requiredEvidence='FORMULAS',
+        await self.service.task(mode='ANALYSIS', goal='分析原值和构成', materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}],
             formulaSubjects=[{'MD_ORG': '07'}])
         built = await self.service.build(operations=[{'id': 'population-count', 'operator': 'COUNT',
             'select': {'inputRef': input_ref}}], requestKey='population-with-formula')
@@ -60,7 +60,7 @@ class BudgetPreparationTests(PresentationCase):
 
     def setUp(self):
         super().setUp()
-        self.turn = TurnCompletion(self.service, {'turnKey': 'prepared', 'mode': 'ANALYSIS', 'requiredEvidence': 'VALUES',
+        self.turn = TurnCompletion(self.service, {'turnKey': 'prepared', 'mode': 'ANALYSIS', 'materials': [{'role': 'PRIMARY', 'kinds': ['VALUES']}],
                                                    'request': '按实际分类汇总', 'failures': {}, 'buildRefs': []})
         self.service.turn = self.turn
 
@@ -182,7 +182,7 @@ class BudgetPreparationTests(PresentationCase):
                    for index in (0, 1)]
         before = deepcopy(self.turn.state)
         with self.assertRaises(AnalysisError) as caught:
-            await self.service.task(mode='ANALYSIS', goal='解释两组构成', requiredEvidence='FORMULAS',
+            await self.service.task(mode='ANALYSIS', goal='解释两组构成', materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}],
                 subjectSources=[{'sourceRef': source['sourceRef']} for source in sources],
                 formulaSubjects=['展示名称'])
         self.assertEqual(caught.exception.code, 'FORMULA_SOURCE_REQUIRED')
@@ -257,7 +257,7 @@ class BudgetPreparationTests(PresentationCase):
         from analysis_extension.budget_preparation import formula_subjects
         from analysis_extension.prepared_inputs import infer_selections
         capture, receipt = self.row_source('DATATIME', '2026N0001', ['2026N0001', '2025N0001'], 'CELL')
-        self.turn.state.update(requiredEvidence='FORMULAS')
+        self.turn.state.update(materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}])
         target, = formula_subjects(self.turn, [{'MD_ORG': '07'}])
         self.register_runner(capture, receipt)
         form_refs, _ = await self.service.budget_preparation._fetch(self.turn, [target])
@@ -278,7 +278,7 @@ class BudgetPreparationTests(PresentationCase):
     async def test_later_observation_supersedes_failed_subject_preparation(self):
         from analysis_extension.budget_preparation import formula_subjects
         capture, selection, scope, receipt = self.source(False)
-        self.turn.state.update(requiredEvidence='FORMULAS', followupContext={'mode': 'CONTINUE'},
+        self.turn.state.update(materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}], followupContext={'mode': 'CONTINUE'},
                                inheritedScope={'selections': [{**selection, 'columnNames': ['metric1']}]})
         targets = formula_subjects(self.turn, [{'MD_ORG': '07'}])
         self.turn.state['budgetFormulaTargets'] = targets
@@ -298,7 +298,7 @@ class BudgetPreparationTests(PresentationCase):
         from analysis_extension.budget_preparation import formula_subjects
         capture, batch, scope, receipt = self.source(False)
         batch['columnNames'] = ['metric1']
-        self.turn.state.update(requiredEvidence='FORMULAS', followupContext={'mode': 'CONTINUE'},
+        self.turn.state.update(materials=[{'role': 'PRIMARY', 'kinds': ['VALUES', 'FORMULAS']}], followupContext={'mode': 'CONTINUE'},
                                inheritedScope={'selections': [batch]})
         subjects = [{'MD_ORG': '07'}, {'MD_ORG': '05'}]
         targets = formula_subjects(self.turn, subjects)

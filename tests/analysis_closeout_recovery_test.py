@@ -99,18 +99,32 @@ class CloseoutRecoveryTests(PresentationCase):
         self.assertEqual(publication['calls'], 2)
         self.assertEqual(publication['elapsedMs'], 25)
 
-    async def test_optional_new_draft_can_restore_current_question_delivery(self):
+    async def test_new_draft_never_silently_restores_older_report(self):
         turn = self.turn()
         published = await self.published(turn)
-        original_delivery = deepcopy(turn.state['delivery'])
         draft = self.store.build(OWNER, {'kind': 'optional-style'}, deepcopy(published), 'optional-style', published['analysisRef'])
         self.observe(turn, 'AnalysisBuild', {'analysisRef': draft['analysisRef']})
         with patch('analysis_extension.turn_completion.document_review', return_value=('saved', {'issues': []})):
-            self.assertTrue(turn.restore_deliverable())
-        self.assertEqual(turn.state['analysisRef'], published['analysisRef'])
-        self.assertEqual(turn.state['retainedDraftRef'], draft['analysisRef'])
-        self.assertEqual(turn.state['delivery'], original_delivery)
-        self.assertEqual(turn.check()['status'], 'READY')
+            self.assertFalse(turn.restore_deliverable())
+        self.assertEqual(turn.state['analysisRef'], draft['analysisRef'])
+        self.assertNotIn('retainedDraftRef',turn.state)
+
+    async def test_native_prerequisite_and_python_result_survive_stale_background_state(self):
+        from analysis_fixtures import saved_fixture
+        turn = self.turn()
+        capture, selections, scope = saved_fixture(self.store, ('2', '5'))
+        built = await self.service.build([capture], selections, scope, [], 'input-for-background')
+        stale = deepcopy(turn.state)
+        stale['buildRefs'] = [built['analysisRef']]
+        result = await self.service.python(inputSetRef=built['inputSetRef'], requestKey='background-python',
+            purpose='以原生排序作为自由计算的前置输入', operations=[{'id':'order','operator':'SORT'}],
+            code="order=next(v for v in inputs if v.get('operator')=='SORT')\nresult=[{'name':'first','label':'首项','value':order['rows'][0]['values']['value'],'unit':'元','inputRefs':[order['ref']]}]")
+        stale['analysisRef'] = result['analysisRef']
+        restored = TurnCompletion(self.service, stale)
+        self.assertNotIn('ANALYSIS_NOT_BUILT', [i['code'] for i in restored.check()['issues']])
+        other = self.turn()
+        other.state['analysisRef'] = result['analysisRef']
+        self.assertIn('ANALYSIS_NOT_BUILT', [i['code'] for i in other.check()['issues']])
 
     async def test_new_required_work_or_changed_fact_cannot_restore_old_delivery(self):
         for change in ('work', 'fact'):

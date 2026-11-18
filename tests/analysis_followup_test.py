@@ -87,7 +87,7 @@ class MiddlewareFollowupTests(ActionCase):
             _check_permission=AsyncMock(return_value=SimpleNamespace(behavior=PermissionBehavior.DENY, updated_input=None)))
         turn = SimpleNamespace(state={'turnKey': 'readonly-query'})
         with self.assertRaises(AnalysisError) as failure:
-            await middleware._call_readonly_source(agent, turn, origin, 'execute_budget_query', {'purpose': 'ANALYZE'})
+            await middleware._call_readonly_source(agent, turn, origin, 'execute_budget_query', {'purpose': 'PREPARE_MATERIALS'})
         self.assertEqual(failure.exception.code, 'PREPARATION_PERMISSION_REQUIRED')
         agent._check_permission.assert_awaited_once()
         definition.meta['risk'] = 'WRITE'

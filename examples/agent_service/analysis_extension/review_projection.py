@@ -11,6 +11,8 @@ def _references(value, known):
 
 def project_analysis_review(material):
     """保留主体概览和错误；只剔除无交付引用、无计算依赖的探索性表格。"""
+    from .execution_evidence import project_execution_material
+    material = project_execution_material(material)
     derived = {item['derivedId']: item for item in material.get('derived', [])}
     runs = {item['runRef']: item for item in material.get('pythonRuns', []) if item.get('runRef')}
     known = set(derived) | set(runs)
@@ -18,17 +20,29 @@ def project_analysis_review(material):
     if not roots:
         # 无结构化交付引用时，不能凭文字、金额相似或最近执行顺序猜测材料范围。
         return material
+    # Preserve the difference between a delivered result and execution context.
+    # An old exploratory mistake is only blocking if it affects the selected
+    # result. The reviewer still gets the full conservative dependency chain.
+    material = {**material, 'reviewTargets': sorted(roots)}
     required = set(roots)
+    superseded = {ref for run in runs.values() if run.get('status') == 'COMPLETED'
+                  for ref in run.get('supersedesRunRefs', [])}
     # 正文可能直接提及标量；错误、空值及诊断也不能因未展示而隐藏。
     for reference, item in derived.items():
+        if item.get('operator') == 'PYTHON' and item.get('pythonRunRef') in superseded:
+            continue  # Explicit replacement; delivery roots/dependencies still win.
         if item.get('outputKind') != 'TABLE' or item.get('executionStatus') != 'COMPLETED' or item.get('diagnostics'):
             required.add(reference)
-    required.update(reference for reference, run in runs.items() if run.get('status') not in (None, 'COMPLETED'))
+    required.update(reference for reference, run in runs.items() if reference not in superseded and run.get('status') not in (None, 'COMPLETED'))
     pending = list(required)
     while pending:
         reference = pending.pop()
         record = derived.get(reference, runs.get(reference, {}))
-        dependencies = _references(record, known) - required
+        # Snapshot inputs are retained for auditing. Only declared output/input
+        # identities establish execution dependencies, not incidental IDs in
+        # an unused table, old purpose text or a replacement change ledger.
+        fields = ('inputRefs', 'sourceFactIds', 'pythonRunRef') if reference in derived else ('inputRefs',)
+        dependencies = _references({key: record.get(key) for key in fields}, known) - required
         required.update(dependencies)
         pending.extend(dependencies)
     kept_derived = [item for item in material.get('derived', []) if item['derivedId'] in required]
@@ -43,6 +57,9 @@ def project_analysis_review(material):
         'omittedExploratoryTableCount': len(derived) - len(kept_derived),
         'omittedPythonRunCount': len(material.get('pythonRuns', [])) - len(kept_runs),
         'allSelectedFactsPreserved': True,
+        'supersededRuns': [{'runRef': ref, 'supersededBy': [run['runRef'] for run in runs.values()
+                           if ref in run.get('supersedesRunRefs', []) and run.get('status') == 'COMPLETED']}
+                          for ref in superseded if ref not in required],
         'meaning': '完整主体事实、范围、空值、诊断和实际执行输入仍保留；仅未被交付或计算引用的探索表格不进入本次核对，原产物未删除。',
     }
     return result

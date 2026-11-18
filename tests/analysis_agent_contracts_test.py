@@ -119,7 +119,7 @@ class InspectionRecoveryTests(PresentationCase):
         doc = {'title': '已取得的结果', 'html': '<html><head></head><body><p>{{v}}</p><p>{{analysisPartialReason}}</p></body></html>',
                'bindings': [{'key': 'v', 'valueRef': self.fact}]}
         preview = await self.service.publish(self.ref, requestKey='preview',
-            document=doc, unresolvedItems=[{'requirement': '汇总核对', 'reason': reason}], previewOnly=True, renderCheckUnavailableReason='本单元测试不调用浏览器')
+            document=doc, unresolvedItems=[{'requirement': '汇总核对', 'reason': reason, 'basis': {'kind': 'USER_REQUIREMENT', 'userQuote': '汇总核对'}}], previewOnly=True, renderCheckUnavailableReason='本单元测试不调用浏览器')
         complete = preview['summary']['completion']
         self.assertEqual(complete['state'], 'INCOMPLETE')
         self.assertEqual(complete['declaredWorkState'], 'UNDECLARED')

@@ -31,7 +31,9 @@ export function documentInspection(data: unknown, expectedKey: string, requestId
     if (m.type !== 'analysis-document-inspection' || m.key !== expectedKey || m.requestId !== requestId
         || !m.measurements || typeof m.measurements !== 'object' || Array.isArray(m.measurements)) return null;
     try {
-        if (new TextEncoder().encode(JSON.stringify(m.measurements)).length > 60000) return null;
+        const { hostRenderedText, ...diagnostics } = m.measurements as Record<string, unknown>;
+        if (new TextEncoder().encode(JSON.stringify(diagnostics)).length > 60000) return null;
+        if (new TextEncoder().encode(JSON.stringify(m.measurements)).length > 2 * 1024 * 1024) return null;
     } catch { return null; }
     return m.measurements;
 }

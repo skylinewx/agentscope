@@ -2,6 +2,76 @@
 from copy import deepcopy
 
 from .models import AnalysisError
+from .material_plan import needs_formulas
+
+
+def task_basis(service):
+    """Bind input preparation to actual intent/roles, not mutable display labels."""
+    from .models import digest
+    state = service.turn.state if service.turn else {}
+    # Grouping/order describe use of the frozen data, not its identity. A real
+    # selection change still changes inputSetVersion/adoptedInputs/scopeEdits.
+    intent = {key: value for key, value in state.get('queryIntent', {}).items()
+              if key not in ('grouping', 'order')}
+    return digest({**{key: state.get(key) for key in ('turnKey', 'request',
+                   'inputSetVersion', 'adoptedInputs', 'scopeEdits')}, 'queryIntent': intent})
+
+
+def freeze_input_set(service, artifact=None, *, files=(), examples=2):
+    """Freeze the complete confirmed set; scripts choose their calculation subset."""
+    from .python_analysis import input_record
+    from .input_contract import field_catalog
+    records = []
+    unavailable = []
+    for value in (artifact or {}).get('facts', []) + (artifact or {}).get('derivedValues', []):
+        ref = value.get('factId', value.get('derivedId'))
+        if (value.get('calculationValidation', 'PASS') != 'PASS' or value.get('precision') == 'display_only'
+                or value.get('valueState') not in ('PRESENT', 'NO_VALUE', 'NOT_APPLICABLE')):
+            unavailable.append({'ref': ref, 'valueState': value.get('valueState'),
+                                'calculationValidation': value.get('calculationValidation')})
+        else:
+            records.append(input_record(ref, value, (artifact or {}).get('facts')))
+    files = [{key: deepcopy(value) for key, value in item.items() if key != '_path'} for item in files]
+    captures = list(dict.fromkeys([*(artifact or {}).get('captureRefs', []),
+                                  *(item['captureRef'] for item in files if item.get('captureRef'))]))
+    record = {'contract': 'ANALYSIS_INPUT_SET_V1', 'analysisRef': (artifact or {}).get('analysisRef'),
+              'taskBasis': task_basis(service), 'records': records, 'files': files,
+              'captureRefs': captures, 'unavailable': unavailable,
+              'scope': deepcopy((artifact or {}).get('scope', {}))}
+    ref = service.store.save_input_set(service.owner, record)
+    catalog = field_catalog(records + files, examples=examples)
+    catalog['sampleRead'] = {'section': 'inputFields', 'inputSetRef': ref, 'limit': 2}
+    return {'inputSetRef': ref, 'inputCount': len(records) + len(files),
+            'pythonInputCatalog': catalog, 'unavailableInputs': unavailable}
+
+
+async def prepare_input_set(service, *, analysisRef=None, captureRefs=None, selections=None,
+                            scope=None, operations=None, fileInputs=None, gridInputs=None,
+                            requestKey=None):
+    from .python_products import load_files
+    from .grid_files import resolve_input
+    from .input_state import snapshot, require_unchanged, validate_analysis
+    expected = snapshot(service)
+    if analysisRef and any(value is not None for value in (captureRefs, selections, scope)):
+        raise AnalysisError('INPUT_SET_SELECTION', '已有分析与新的来源选择二选一。')
+    if captureRefs is not None or operations:
+        if not requestKey:
+            raise AnalysisError('INPUT_SET_SELECTION', '准备新的来源或前置运算时提供 requestKey。')
+        built = await service.build(captureRefs, selections, scope, operations or [],
+                                    'prepare-input:' + requestKey, baseAnalysisRef=analysisRef)
+        analysisRef = built['analysisRef']
+    artifact = service.store.get_analysis(service.owner, analysisRef) if analysisRef else None
+    if artifact:
+        validate_analysis(service, artifact)
+    if gridInputs is not None and (not isinstance(gridInputs, list) or not 1 <= len(gridInputs) <= 20):
+        raise AnalysisError('GRID_INPUT_LIMIT', '准备 1—20 个已捕获网格。')
+    files = load_files(service, fileInputs or []) + [resolve_input(service, item) for item in gridInputs or []]
+    if not artifact and not files:
+        raise AnalysisError('INPUT_SET_SELECTION', '请先明确来源；不会自动选择最近一次查询。')
+    if len({item['ref'] for item in files}) != len(files):
+        raise AnalysisError('INPUT_SET_SELECTION', '同一文件不能重复准备。')
+    require_unchanged(service, expected)
+    return freeze_input_set(service, artifact, files=files)
 
 
 def prepared_forms(capture):
@@ -198,14 +268,17 @@ def infer_selections(service, captures, scope, declared=()):
     inherited = _selectors(turn) if turn is not None else []
     if scope.get('referenceMembers'):
         raise AnalysisError('PREPARATION_NEEDS_SELECTION', '对照输入需要用 selections 指定实际来源和用途。')
-    chosen, batches, form_steps, observed_steps = [], [], set(), set()
+    chosen, batches, form_steps, observed_steps, empty = [], [], set(), set(), []
     declared_inputs = {(record['selection']['captureRef'], record['selection']['stepId'], record['selection']['observationId'])
-                       for record in declared if 'selection' in record}
+                       for record in declared if 'observationId' in record.get('selection', {})}
     form_contexts = {}
     for ref, capture in captures.items():
         if service.sources.for_capture(capture).adapter_id != 'budget-v2':
             raise AnalysisError('PREPARATION_NEEDS_SELECTION', '该来源请使用它返回的显式选择器。')
         receipt = receipt_from_capture(capture)
+        from .empty_sources import candidates as empty_candidates
+        empty.extend({key: value for key, value in item.items() if key not in ('candidateRef', 'rowCount', 'grain')}
+                     for item in empty_candidates(capture, receipt))
         for item in budget_batch.selectors(capture):
             prior = [selection for selection in inherited if selection.get('captureRef') == ref
                      and selection.get('stepId') == item['stepId'] and selection.get('batchId') == item['batchId']]
@@ -246,7 +319,7 @@ def infer_selections(service, captures, scope, declared=()):
     missing = sorted(step for plan_id, step in form_steps - observed_steps)
     if missing:
         raise AnalysisError('PREPARATION_INCOMPLETE', '以下预期表展开尚无可用准备目录。', {'missingSteps': missing})
-    if len(batches) > 1 or (batches and chosen and not (turn and turn.state.get('requiredEvidence') == 'FORMULAS')):
+    if len(batches) > 1 or (batches and chosen and not (turn and needs_formulas(turn.state))):
         raise AnalysisError('PREPARATION_NEEDS_SELECTION', '多个数据来源的主体或对照用途需要明确。', {'section': 'selectors'})
     if batches and chosen:
         from .batch_scope import selected_tables
@@ -277,6 +350,8 @@ def infer_selections(service, captures, scope, declared=()):
             item['grain'] = selection.get('grain', list(grain))
     elif chosen and not scope.get('memberDimension') and not all(item.get('grain') for item in chosen):
         raise AnalysisError('PREPARATION_NEEDS_SELECTION', '请按已确认的分析对象提供 scope.memberDimension 或显式 grain。')
-    if not chosen and not batches and not declared_inputs:
+    if empty and (len(empty) > 1 or chosen or batches):
+        raise AnalysisError('PREPARATION_NEEDS_SELECTION', '存在多个来源，请选择本次实际需要的来源；空结果也是有效来源。', {'section': 'sources'})
+    if not chosen and not batches and not declared_inputs and not empty:
         raise AnalysisError('PREPARATION_INCOMPLETE', '所选回执没有准备完成的数据目标。')
-    return batches + chosen
+    return batches + chosen + empty

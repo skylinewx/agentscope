@@ -4,15 +4,19 @@ from copy import deepcopy
 import json
 import logging
 import sys
-from time import perf_counter
+from time import perf_counter, time
 from uuid import uuid4
 
 from .models import AnalysisError, canonical, digest, now
-from .python_worker import MAX_BYTES, GRID_WHERE_FIELDS, validate_code
+from .grid_contract import GRID_WHERE_FIELDS
+from .numeric_policy import NUMERIC_POLICY
+from .execution_evidence import delivery_projection
+from .execution_recovery import remove_archived_journal
+from .execution_resources import PYTHON_DEFAULT_TIMEOUT_SECONDS, PYTHON_MAX_TIMEOUT_SECONDS
 from .python_products import bind_single_grid, load_files, products, deliver_files
 
 
-def input_record(ref, value):
+def input_record(ref, value, facts=None):
     """执行与复用使用同一输入投影，补核验引用不应使未改变的数据重新计算。"""
     record = {'ref': ref, **{key: deepcopy(value[key]) for key in
         ('value', 'valueState', 'unit', 'scale', 'period', 'executionPeriod', 'dimensions', 'dimensionNames',
@@ -21,6 +25,17 @@ def input_record(ref, value):
          'stepId', 'bindingRef', 'observationId', 'batchId', 'rowIndex', 'columnName', 'cellKey',
          'operator', 'checkScope', 'sourceValue', 'localValue', 'localDifference', 'difference', 'formulaTrace',
          'outputKind', 'columns', 'rows', 'data', 'text', 'filename', 'sourceFactIds', 'kind', 'contentDigest') if key in value}}
+    # New business fields survive without maintaining a closed schema. Only
+    # host evidence/validation bookkeeping is excluded from executable inputs.
+    host_fields = {'factId', 'derivedId', 'scopeId', 'captureRef', 'captureRefs', 'sourceOrigins',
+                   'sourceContextId', 'receiptVerification', 'verificationRecords', 'verificationStatus',
+                   'calculationValidation', 'sourceConsistency', 'diagnostics', 'pythonRunRef',
+                   'inputRefs', 'reviewInputRefs', 'objectLabelState', 'objectLabelCaptureRefs', 'recordKey', 'recordTable'}
+    host_fields.add('expression')  # Source-address syntax stays in immutable evidence.
+    record.update({key: deepcopy(item) for key, item in value.items() if key not in record and key not in host_fields})
+    from .business_records import record_identity
+    identity = record_identity(value)
+    if identity: record['recordTable'] = identity['table']
     if value.get('operator') and value['operator'] != 'PYTHON':
         # COUNT、SORT、公式等算子结构不同，完整保留其业务输出，避免脚本再查一次派生详情。
         record.update({key: deepcopy(item) for key, item in value.items()
@@ -30,7 +45,12 @@ def input_record(ref, value):
         from .validation import executable_field, selected_value
         for field in ('sourceValue', 'localValue', 'localDifference', 'difference'):
             record[field] = selected_value(value, field) if executable_field(value, field) else None
-    return record
+    if value.get('operator') in ('SORT', 'RANK') and facts is not None and value.get('calculationValidation') == 'PASS':
+        from .document_data import compile_datasets
+        datasets, _ = compile_datasets({'facts': facts, 'derivedValues': [value]}, [{'key': 'input', 'valueRef': ref}])
+        record.update(datasets['input'])
+    from .business_dataset import project
+    return project(record)
 
 
 def file_continuation(grid_inputs, file_inputs):
@@ -40,67 +60,23 @@ def file_continuation(grid_inputs, file_inputs):
             'hint': '这是文件执行记录，未创建 analysisRef。若还需计算，沿用 input 中的文件引用并提交新代码和 requestKey；不要把 pythonRunRef 填入 analysisRef。'}
 
 
-async def execute_python(code, inputs, timeout_seconds):
+async def execute_python(code, inputs, timeout_seconds, *, execution_context=None):
+    from .execution_runner import execute
     try:
-        tree = validate_code(code)
-    except (ValueError, SyntaxError) as error:
-        raise AnalysisError('PYTHON_CODE_INVALID', str(error)) from error
-    payload = canonical({'code': code, 'inputs': inputs, 'timeoutSeconds': timeout_seconds})
-    if len(payload) > MAX_BYTES:
-        raise AnalysisError('PYTHON_INPUT_LIMIT', '输入超出 Python 单次处理容量；保留完整业务范围，选择必要字段和引用。')
-    from .python_environment import execution_plan, cleanup
-    prepared = perf_counter()
-    try:
-        plan = await execution_plan(tree, inputs)
-    except (OSError, asyncio.TimeoutError) as error:
-        raise AnalysisError('PYTHON_ENVIRONMENT_UNAVAILABLE', '分析执行环境暂不可用；已保留原输入，不能在宿主开放执行。') from error
-    payload = canonical({'code': code, 'inputs': plan['inputs'], 'timeoutSeconds': timeout_seconds})
-    metadata = {**plan['metadata'], 'prepareMs': round((perf_counter() - prepared) * 1000, 2)}
-    process = None
-    execution_started = perf_counter()
-    try:
-        process = await asyncio.create_subprocess_exec(*plan['command'],
-            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            **({'creationflags': 0x08000000} if sys.platform == 'win32' else {}))
-        output, errors = await asyncio.wait_for(process.communicate(payload), timeout=timeout_seconds)
-    except (asyncio.TimeoutError, asyncio.CancelledError):
-        if process is not None and process.returncode is None:
-            process.kill()
-            await process.communicate()
-        if asyncio.current_task().cancelling():
-            raise
-        raise AnalysisError('PYTHON_TIMEOUT', 'Python 分析超时，子进程已终止；原始数据未改变。') from None
-    finally:
-        await cleanup(plan)
-    metadata['executeMs'] = round((perf_counter() - execution_started) * 1000, 2)
-    if len(output) > MAX_BYTES or len(errors) > MAX_BYTES:
-        raise AnalysisError('PYTHON_OUTPUT_LIMIT', 'Python 输出超过容量上限。')
-    try:
-        result = json.loads(output)
-    except (ValueError, UnicodeError):
-        raise AnalysisError('PYTHON_EXECUTION_FAILED', 'Python 子进程异常退出，可能触发资源限制。',
-                            {'exitCode': process.returncode, 'runtime': metadata, 'diagnostic': errors.decode('utf-8', errors='replace')[-1200:]}) from None
-    if process.returncode or result.get('error'):
-        details = {**result.get('error', {}), 'runtime': metadata}
-        if details.get('type') == 'NameError':
-            details.update(requiresSourceQuery=False, nextAction='FIX_CODE_NAME',
-                           inputVariable='inputs', outputVariable='result',
-                           hint='宿主提供 inputs 数组、grid_rows、D/Decimal；result 由代码赋值。输入文件也在 inputs 中，用实际 inputs 项的 ref 读取；其他名称须由代码自己定义，不要重新取数。')
-        elif details.get('type') == 'InvalidOperation':
-            details.update(requiresSourceQuery=False, nextAction='CHECK_DECIMAL_INPUT',
-                           hint='网格包含文本表头，先用实际 measureCode 或 cellKeys 选中业务数据格，再转换 cell["value"]；null 保留为空。已选数据格仍无法转换时保留原值并报告异常，不把异常当 0 或静默丢弃，不重新取数。')
-        elif details.get('type') == 'ValueError' and details.get('message', '').startswith('grid_rows 筛选字段'):
-            details.update(requiresSourceQuery=False, nextAction='FIX_GRID_FILTER',
-                           availableWhereFields=sorted(GRID_WHERE_FIELDS),
-                           hint='mapTypes 是数组；measureCode 使用实际指标标识。只修改过滤参数，复用原 gridInputs。')
-        raise AnalysisError('PYTHON_EXECUTION_FAILED', 'Python 分析未执行完成。', details)
-    class Outputs(list):
-        pass
-    outputs = Outputs(result['result'])
-    outputs.file_reads = result.get('fileReads', [])
-    metadata['interpreter'] = result.get('interpreter', {})
-    outputs.runtime_metadata = metadata
-    return outputs
+        return await execute(code, inputs, timeout_seconds, execution_context)
+    except AnalysisError as error:
+        from .input_contract import field_catalog
+        error.details = {**(error.details or {}), 'inputCatalog': field_catalog(inputs, examples=0),
+                         'requiresSourceQuery': False}
+        if error.details.get('type') == 'NameError':
+            error.details.update(nextAction='FIX_CODE_NAME', inputVariable='inputs', outputVariable='result',
+                hint='宿主提供 inputs、grid_rows、D/Decimal；其他名称由代码定义。修正代码后复用冻结输入，不重新取数。')
+        elif error.details.get('type') == 'InvalidOperation':
+            error.details.update(nextAction='CHECK_DECIMAL_INPUT',
+                hint='先按实际 measureCode 或 cellKeys 选择业务格再转换 value；保留空值和异常原值，不把读取失败当 0。')
+        elif error.details.get('type') == 'InputRequestError' or 'grid_rows 筛选字段' in error.details.get('message', ''):
+            error.details.update(nextAction='FIX_GRID_FILTER', availableWhereFields=sorted(GRID_WHERE_FIELDS))
+        raise
 
 
 def validate_python_work_plan(work_plan, operations, base=None):
@@ -124,14 +100,48 @@ def validate_python_work_plan(work_plan, operations, base=None):
                  'hint': '脚本自行计算比例或合计时使用 kind=COMPUTATION、operator=PYTHON，refs 填 result.name；FORMULA_CHECK/RECONCILE 等原生检查继续保留原算子并在 operations 中声明，不能用脚本替代来源公式检查。'})
 
 
-async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRefs=None, timeoutSeconds=10,
+async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRefs=None, timeoutSeconds=PYTHON_DEFAULT_TIMEOUT_SECONDS,
                   captureRefs=None, selections=None, scope=None, fileInputs=None, gridInputs=None, workPlan=None,
-                  answerOutputs=None, operations=None, fallbackReason=None):
+                  answerOutputs=None, operations=None, fallbackReason=None, supersedesRunRefs=None, retryOfRunRef=None,
+                  inputSetRef=None):
     await service.authorize()
+    from .execution_policy import require
+    require(service.turn, 'computations', 'AnalysisPython')
+    prepared = None
+    if inputSetRef is not None:
+        if any(value is not None for value in (analysisRef, inputRefs, captureRefs, selections, scope,
+                                               fileInputs, gridInputs, retryOfRunRef)):
+            raise AnalysisError('INPUT_SET_SELECTION', 'inputSetRef 使用已冻结的完整输入，不与其他输入选择或失败重试混用。')
+        from .prepared_inputs import task_basis
+        prepared = service.store.get_input_set(service.owner, inputSetRef)
+        if prepared['taskBasis'] != task_basis(service):
+            raise AnalysisError('STALE_INPUT_SET', '用户条件或采用用途已变化，请按当前条件重新准备输入；原集合仍保留。')
+        analysisRef = prepared['analysisRef']
+        inputRefs = [item['ref'] for item in prepared['records']]
+        gridInputs = [{'captureRef': item['captureRef'], 'fileRef': item['ref']}
+                      for item in prepared['files'] if item.get('kind') == 'GRID_FILE'] or None
     from .code_decisions import decision, log_decision
     capability_decision = decision(fallbackReason, purpose, code)
-    if type(timeoutSeconds) is not int or not 1 <= timeoutSeconds <= 60:
-        raise AnalysisError('PYTHON_TIMEOUT_LIMIT', '执行时间限定为 1—60 秒。')
+    if type(timeoutSeconds) is not int or not 1 <= timeoutSeconds <= PYTHON_MAX_TIMEOUT_SECONDS:
+        raise AnalysisError('PYTHON_TIMEOUT_LIMIT', f'执行时间限定为 1—{PYTHON_MAX_TIMEOUT_SECONDS} 秒。')
+    retry = None
+    if retryOfRunRef is not None:
+        if (not isinstance(retryOfRunRef, str) or any(value is not None for value in
+                (analysisRef, inputRefs, captureRefs, selections, scope, fileInputs, gridInputs)) or operations):
+            raise AnalysisError('PYTHON_RETRY_INPUT', 'retryOfRunRef 使用原冻结输入，不与新的输入选择或 operations 混用。')
+        retry = service.store.get_python_run(service.owner, retryOfRunRef)
+        if retry.get('status') not in ('FAILED', 'CANCELLED') or not isinstance(retry.get('inputRecords'), list):
+            raise AnalysisError('PYTHON_RETRY_INPUT', '仅可重试本会话保存了完整输入的失败或取消运行。')
+        analysisRef = retry.get('sourceAnalysisRef')
+        inputSetRef = retry.get('inputSetRef')
+        if inputSetRef:
+            from .prepared_inputs import task_basis
+            prepared = service.store.get_input_set(service.owner, inputSetRef)
+            if prepared['taskBasis'] != task_basis(service):
+                raise AnalysisError('STALE_INPUT_SET', '当前条件已变化，不能将旧冻结输入重试为本轮结果。')
+        inputRefs = [item['ref'] for item in retry['inputRecords']]
+        gridInputs = [{'captureRef': item['captureRef'], 'fileRef': item['ref']}
+                      for item in retry.get('fileInputs', []) if item.get('kind') == 'GRID_FILE'] or None
     if isinstance(analysisRef, str) and analysisRef.startswith('python_'):
         raise AnalysisError('PYTHON_INPUT_REFS', 'pythonRunRef 是执行记录，不能作为 analysisRef。',
                             {'requiresSourceQuery': False, 'field': 'analysisRef',
@@ -165,6 +175,12 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
         analysisRef = built['analysisRef']
     elif analysisRef and operations:
         pending_work = deepcopy(workPlan)
+        # A method replacement is committed only after the Python result exists.
+        # Native prerequisites may run first without replacing the failed task.
+        previous_tasks = {task['taskId']: task for task in service.store.get_analysis(service.owner, analysisRef)['plan'].get('workPlan', [])}
+        pending_work = [task for task in pending_work or [] if not
+                        (isinstance(task, dict) and task.get('operator') == 'PYTHON' and task.get('taskId') in previous_tasks
+                         and previous_tasks[task['taskId']].get('operator') != 'PYTHON')]
         for task in pending_work or []:
             if isinstance(task, dict) and task.get('kind') == 'COMPUTATION' and task.get('operator') in (None, 'PYTHON'):
                 task['refs'] = []
@@ -206,10 +222,15 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
     elif operations and isinstance(inputRefs, list):
         inputRefs = ['derived_' + reference if isinstance(reference, str) and 'derived_' + reference in operation_ids else reference
                      for reference in inputRefs]
-    if (not isinstance(inputRefs, list) or len(inputRefs) > 5000
+        if prepared:
+            inputRefs = list(dict.fromkeys(inputRefs + [ref for ref in operation_ids if ref in known and usable_input(known[ref])]))
+            excluded_operations = [{'ref': ref, 'valueState': known[ref].get('valueState')}
+                                   for ref in operation_ids if ref in known and not usable_input(known[ref])]
+    max_refs = service.store.limits.max_facts + service.store.limits.max_operations if prepared else 5000
+    if (not isinstance(inputRefs, list) or len(inputRefs) > max_refs
             or any(not isinstance(ref, str) for ref in inputRefs) or len(set(inputRefs)) != len(inputRefs)
             or any(ref not in known for ref in inputRefs)):
-        raise AnalysisError('PYTHON_INPUT_REFS', 'inputRefs 必须引用当前分析内最多 5000 个不重复的真实事实或派生值；仅使用文件时可显式传空数组。')
+        raise AnalysisError('PYTHON_INPUT_REFS', f'冻结输入必须是当前分析内不重复的真实事实或派生值；当前资源上限为 {max_refs} 项。')
     inputs = []
     for ref in inputRefs:
         value = known[ref]
@@ -220,12 +241,26 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
                                  'calculationValidation': value.get('calculationValidation'),
                                  'nextRead': {'section': 'derived' if 'derivedId' in value else 'facts',
                                               'analysisRef': analysisRef}})
-        inputs.append(input_record(ref, value))
-    files = load_files(service, [] if fileInputs is None else fileInputs)
-    from .grid_files import resolve_input, read_summary
+        inputs.append(input_record(ref, value, base['facts'] if base else None))
+    if retry is not None:
+        extras = retry.get('inputRecordExtras', {})
+        inputs = [{key: value for key, value in deepcopy(item).items() if key not in extras.get(item['ref'], [])}
+                  for item in retry['inputRecords']]
+        files = deepcopy([item for item in retry.get('fileInputs', []) if item.get('kind') != 'GRID_FILE'])
+    elif prepared is not None:
+        files = deepcopy([item for item in prepared['files'] if item.get('kind') != 'GRID_FILE'])
+    else:
+        files = load_files(service, [] if fileInputs is None else fileInputs)
+    from .grid_files import resolve_input
     if gridInputs is not None and (not isinstance(gridInputs, list) or not 1 <= len(gridInputs) <= 20):
         raise AnalysisError('GRID_INPUT_LIMIT', 'gridInputs 指定 1—20 个已捕获的网格文件。')
     grids = [resolve_input(service, specification) for specification in gridInputs or []]
+    if retry is not None or prepared is not None:
+        frozen_files = retry.get('fileInputs', []) if retry is not None else prepared['files']
+        frozen = {item['ref']: item for item in frozen_files if item.get('kind') == 'GRID_FILE'}
+        if any(frozen[item['ref']]['sha256'] != item['sha256'] for item in grids):
+            raise AnalysisError('PYTHON_RETRY_INPUT_CHANGED', '原冻结网格摘要发生变化，不能用新来源替换后重试。')
+        grids = [{**deepcopy(frozen[item['ref']]), '_path': item['_path']} for item in grids]
     if service.turn is not None:
         for value in grids:
             service.turn._add_query_capture(value['captureRef'])
@@ -237,9 +272,42 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
     inputRefs = inputRefs + [value['ref'] for value in files]
     if not inputs:
         raise AnalysisError('PYTHON_INPUT_REFS', '需要分析事实、查询回执或工作区数据文件作为输入。')
-    request = {'python': {'analysisRef': analysisRef, 'inputRefs': inputRefs, 'code': code,
+    superseded_runs = []
+    if supersedesRunRefs is not None:
+        previous_runs = {run['runRef']: run for run in (base or {}).get('pythonRuns', [])}
+        if retry is not None:
+            # The explicitly selected failed attempt has already passed owner,
+            # frozen-input and task-basis validation. It need not have produced
+            # a successful artifact to be named by its own corrective retry.
+            previous_runs[retryOfRunRef] = retry
+        if prepared and isinstance(supersedesRunRefs, list):
+            # InputSet keeps its original base immutable. An explicitly named
+            # later run belongs to the same input set even though it is absent
+            # from that original artifact. Never substitute the latest run.
+            for ref in supersedesRunRefs:
+                if not isinstance(ref, str) or ref in previous_runs:
+                    continue
+                try:
+                    prior = service.store.get_python_run(service.owner, ref)
+                except AnalysisError:
+                    continue
+                if prior.get('inputSetRef') == inputSetRef and prior.get('status') == 'COMPLETED':
+                    previous_runs[ref] = prior
+        if (not isinstance(supersedesRunRefs, list) or len(supersedesRunRefs) > 20
+                or any(not isinstance(ref, str) or ref not in previous_runs
+                       for ref in supersedesRunRefs)):
+            raise AnalysisError('INVALID_SUPERSEDED_RUN', '替代声明须明确引用本分析或同一冻结输入集中的旧执行；不能跨分析替换。')
+        superseded_runs = [previous_runs[ref] for ref in dict.fromkeys(supersedesRunRefs)]
+    from .execution_environment import image_fingerprint
+    request = {'numericPolicyVersion': NUMERIC_POLICY, 'runtimeVersion': image_fingerprint(),
+               'python': {'analysisRef': analysisRef, 'inputRefs': inputRefs, 'code': code,
                          'purpose': purpose, 'timeoutSeconds': timeoutSeconds}, 'inputDigest': digest(inputs)}
+    if retryOfRunRef:
+        request['python']['retryOfRunRef'] = retryOfRunRef
+    if inputSetRef:
+        request['python']['inputSetRef'] = inputSetRef
     request['python']['capabilityDecision'] = capability_decision
+    if supersedesRunRefs: request['python']['supersedesRunRefs'] = list(dict.fromkeys(supersedesRunRefs))
     if workPlan is not None:
         request['python']['workPlan'] = deepcopy(workPlan)
     key = 'python:' + requestKey
@@ -250,9 +318,10 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
             execution = service.store.get_python_run(service.owner, reused_run)
             from .query_result_evidence import bind_answer_outputs
             return {'pythonRunRef': reused_run, 'status': 'COMPLETED', 'derivedValues': compact_derived(execution['outputs']),
+                    **({'inputSetRef': inputSetRef} if inputSetRef else {}),
                     **bind_answer_outputs(service, execution, answerOutputs),
-                    'continuation': file_continuation(gridInputs, fileInputs),
-                    'fileReads': read_summary(execution.get('fileReads', []))}
+                    'continuation': {'input': {'inputSetRef': inputSetRef}} if inputSetRef else file_continuation(gridInputs, fileInputs),
+                    **delivery_projection(execution)}
     reused = service.store.find_request(service.owner, 'build', key, digest(request)) if base else None
     if reused:
         artifact = service.store.get_analysis(service.owner, reused)
@@ -264,48 +333,75 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
     started = perf_counter()
     # 每次实际执行有独立记录；同参数的新请求或失败重试不能覆盖旧执行证据。
     run_ref = 'python_' + uuid4().hex
+    from .execution_policy import record
+    record(service.turn, 'PYTHON_EXECUTION', run_ref, status='STARTED')
+    from .execution_resources import ExecutionPolicy
+    policy = ExecutionPolicy.configured()
     saved_files = [{key: value for key, value in item.items() if key != '_path'} for item in files]
     execution = {'runRef': run_ref, 'code': code, 'purpose': purpose, 'inputRefs': inputRefs,
+                 'inputSetRef': inputSetRef,
+                 'supersedesRunRefs': list(dict.fromkeys(supersedesRunRefs or [])),
                  'capabilityDecision': capability_decision,
                  'excludedOperationInputs': excluded_operations,
                  'inputDigest': digest(inputs), 'startedAt': now(), 'timeoutSeconds': timeoutSeconds,
-                 'memoryLimitBytes': 256 * 1024 * 1024, 'sourceAnalysisRef': analysisRef,
-                 'fileInputs': saved_files, 'precisionPolicy': 'DECIMAL_128', 'nullPolicy': 'EXPLICIT_IN_CODE',
+                 'sourceAnalysisRef': analysisRef, 'parentAttemptRef': retryOfRunRef,
+                 'fileInputs': saved_files, 'precisionPolicy': NUMERIC_POLICY, 'numericPolicyVersion': NUMERIC_POLICY,
+                 'nullPolicy': 'EXPLICIT_IN_CODE',
+                 'executionDeadline': time() + policy.queue_seconds + 2 * policy.prepare_seconds
+                    + timeoutSeconds + 3 * policy.cleanup_seconds + 60,
                  # 来源凭据单独冻结，不参与计算输入摘要；补充同值来源不会使旧计算失效。
                  'inputRecords': [{**deepcopy(value), **{key: deepcopy(known[value['ref']][key]) for key in
                     ('pythonRunRef', 'captureRef', 'captureRefs', 'sourceContextId', 'taskName', 'formName', 'cellKey')
                     if key in known[value['ref']]}} for value in inputs if value['ref'] not in {item['ref'] for item in files}],
-                 'businessValidation': 'NOT_REVIEWED', 'runtime': 'RESTRICTED_PYTHON'}
+                 'businessValidation': 'NOT_REVIEWED', 'runtime': 'ISOLATED_PYTHON'}
+    from .computation_replacement import replacement_changes
+    execution['replacementChanges'] = [replacement_changes(prior, execution) for prior in superseded_runs]
+    by_ref = {value['ref']: value for value in inputs}
+    execution['inputRecordExtras'] = {item['ref']: sorted(set(item) - set(by_ref[item['ref']]))
+                                      for item in execution['inputRecords']}
     # 先保存执行请求。取消、超时、代码错误仍有独立记录，不伪造成功分析版本。
     service.store.save_python_run(service.owner, run_ref, {**execution, 'status': 'RUNNING'})
     try:
-        outputs = await execute_python(code, inputs, timeoutSeconds)
+        outputs = await execute_python(code, inputs, timeoutSeconds, execution_context={
+            'runRef': run_ref, 'sessionKey': service.owner.key,
+            'journalRoot': service.store.root / 'python-input-journals' / digest(service.owner.key)})
         execution.update(getattr(outputs, 'runtime_metadata', {}))
-        execution['fileReads'] = getattr(outputs, 'file_reads', [])
-        positions = bind_single_grid(outputs, inputs, execution['fileReads'])
+        execution['inputDeliveryManifest'] = outputs.input_delivery_manifest
+        execution['inputDeliverySummary'] = outputs.input_delivery_summary
+        positions = bind_single_grid(outputs, inputs, execution['inputDeliveryManifest'])
         if positions:
             execution['singleGridSourceBinding'] = {'ref': inputs[0]['ref'], 'outputIndices': positions}
         values = products(outputs, known, inputRefs, base['scope']['scopeId'] if base else run_ref, run_ref)
+        for value in values:
+            value['reviewInputRefs'] = list(inputRefs)
         deliver_files(service, values)
         execution.update(status='COMPLETED', outputs=values, elapsedMs=round((perf_counter()-started)*1000, 2))
+        record(service.turn, 'PYTHON_EXECUTION', run_ref, status='COMPLETED')
         service.store.save_python_run(service.owner, run_ref, execution)
+        remove_archived_journal(service.store, service.owner, run_ref)
         logging.getLogger(__name__).info('代码分析 执行=%s 环境=%s 输入=%d 产物=%d 准备毫秒=%.2f 执行毫秒=%.2f 总耗时毫秒=%.2f',
                                         run_ref, execution['runtime'], len(inputs), len(values),
                                         execution.get('prepareMs', 0), execution.get('executeMs', 0), execution['elapsedMs'])
     except BaseException as error:
+        record(service.turn, 'PYTHON_EXECUTION', run_ref, status='FAILED', errorCode=getattr(error, 'code', type(error).__name__))
+        evidence = getattr(error, 'execution_evidence', {})
+        execution.update(evidence.get('runtime', {}))
+        if evidence.get('inputDeliveryManifest') is not None:
+            execution['inputDeliveryManifest'] = evidence['inputDeliveryManifest']
         execution.update(status='CANCELLED' if isinstance(error, asyncio.CancelledError) else 'FAILED',
                          error=error.as_dict() if isinstance(error, AnalysisError) else {'type': type(error).__name__},
                          elapsedMs=round((perf_counter()-started)*1000, 2))
         service.store.save_python_run(service.owner, run_ref, execution)
+        if execution.get('inputDeliveryManifest'):
+            # Failed/cancelled attempts keep partial evidence in the run too.
+            # The WAL is redundant only after that durable write succeeds.
+            remove_archived_journal(service.store, service.owner, run_ref)
         if isinstance(error, AnalysisError):
             error.details = {**(error.details or {}), 'pythonRunRef': run_ref,
                              'nextRead': {'section': 'python', 'pythonRunRef': run_ref}}
+            error.details.update(requiresSourceQuery=False, retryInput={'retryOfRunRef': run_ref})
             if analysisRef:
-                error.details.update(analysisRef=analysisRef, requiresSourceQuery=False,
-                                     retryInput={'analysisRef': analysisRef, 'inputRefs': [ref for ref in inputRefs if ref in known and ref not in {item['ref'] for item in files}],
-                                                 **file_continuation(gridInputs, fileInputs)['input']})
-            else:
-                error.details.update(requiresSourceQuery=False, retryInput=file_continuation(gridInputs, fileInputs)['input'])
+                error.details['analysisRef'] = analysisRef
         raise
     finally:
         log_decision(execution)
@@ -315,22 +411,25 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
                       pythonRunRef=run_ref, status=execution['status'], inputCount=len(inputs),
                       outputCount=len(execution.get('outputs', [])), codeChars=len(code),
                       prepareMs=execution.get('prepareMs'), executeMs=execution.get('executeMs'),
-                      fileReadCount=len(execution.get('fileReads', [])))
+                      inputDeliveryCount=len(execution.get('inputDeliveryManifest', {}).get('reads', [])))
     if base is None:
         service.store.complete_python_request(service.owner, key, digest(request), run_ref)
         from .service import compact_derived
         from .query_result_evidence import bind_answer_outputs
         return {'pythonRunRef': run_ref, 'status': 'COMPLETED', 'derivedValues': compact_derived(values),
+                **({'inputSetRef': inputSetRef} if inputSetRef else {}),
                 **bind_answer_outputs(service, execution, answerOutputs),
-                'continuation': file_continuation(gridInputs, fileInputs),
-                'fileReads': read_summary(execution.get('fileReads', [])),
-                'boundary': ('网格来源及完整文件已绑定；fileReads 记录实际扫描范围。公式和业务聚合仍沿用预算口径。'
+                'continuation': {'input': {'inputSetRef': inputSetRef}} if inputSetRef else file_continuation(gridInputs, fileInputs),
+                **delivery_projection(execution),
+                'boundary': ('网格来源及冻结文件已绑定；inputDeliverySummary 记录宿主实际提供范围，不证明算法使用正确。公式和业务聚合仍沿用预算口径。'
                              if grids else '工作区文件已冻结并执行；文件内容不是预算来源核验证据。')}
     require_unchanged(service, input_state)
     artifact = deepcopy(base)
     artifact['captureRefs'] = list(dict.fromkeys([*artifact['captureRefs'], *[value['captureRef'] for value in grids]]))
     artifact['derivedValues'] += values
-    artifact['pythonRuns'] = [*artifact.get('pythonRuns', []), execution]
+    existing_runs = {run['runRef']: run for run in artifact.get('pythonRuns', [])}
+    existing_runs.update({run['runRef']: run for run in superseded_runs})
+    artifact['pythonRuns'] = [*existing_runs.values(), execution]
     artifact.update(claims=[], viewPlan=[], findings=[], actions=[], baseAnalysisRef=analysisRef)
     for field in ('freeDocument', 'delivery'):
         artifact.pop(field, None)
@@ -352,6 +451,9 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
             artifact.pop('workRefs', None)
             completion_summary(artifact)
             validate_target_continuity(base, artifact)
+            from .plan_revisions import record_revisions, prune_replaced_failures
+            record_revisions(base, artifact)
+            prune_replaced_failures(artifact)
         artifact = service.store.build(service.owner, request, artifact, key, analysisRef)
     except AnalysisError as error:
         execution['registrationError'] = error.as_dict()

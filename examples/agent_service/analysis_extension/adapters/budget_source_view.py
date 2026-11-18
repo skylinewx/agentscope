@@ -86,4 +86,9 @@ def validate_view(capture, receipt, validate):
     native_data = {**data, 'question': original['question'], 'purpose': original['purpose'],
                    'resultSets': [{**data['resultSets'][0], 'rows': selected}]}
     native_data.pop('sourceBasis', None)
+    # This envelope describes the new FACTS request. The archived request is
+    # already the effective source scope, so it must not be compared to this envelope.
+    native_data.pop('effectiveRequest', None)
+    native_data.pop('conditionRecovery', None)
+    native_data.pop('conditionState', None)
     return validate({**capture, 'request': original}, {**receipt, 'context': base, 'data': native_data})

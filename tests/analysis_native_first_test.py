@@ -80,13 +80,13 @@ class NativeAnalysisTests(PresentationCase):
         self.assertEqual(dataset['statistics']['negativeSum'], '-1')
         self.assertEqual(dataset['counts']['total'], 3)
         self.assertNotIn('pythonRunRef', dataset)
-        self.assertEqual([row[3] for row in dataset['rows']], ['3', '-1', None])
+        self.assertEqual([row['values']['value'] for row in dataset['rows']], ['3', '-1', None])
         self.assertIn('"unit":"项"', compiled['html'])
         self.assertIn('"unit":"%"', compiled['html'])
         page = await self.service.inspect(section='products', analysisRef=artifact['analysisRef'],
                                           derivedId='derived_distribution', limit=1)
-        self.assertEqual(page['rows']['items'][0][3], '3')
-        self.assertEqual(page['rows']['total'], 3)
+        self.assertEqual(page['rows'][0]['values']['value'], '3')
+        self.assertEqual(page['rowPage']['total'], 3)
 
     async def test_select_batch_column_and_role_excludes_other_material(self):
         _, artifact = await self.build_values(('1', '2'))
@@ -214,7 +214,7 @@ class CustomCodeDecisionTests(PresentationCase):
         self.assertEqual(run['capabilityDecision']['reason'], '现有算子不能表达所需诊断')
 
     def test_public_tool_requires_reason_without_guessing_legacy_reason(self):
-        payload = dict(code='result=[]', purpose='处理', requestKey='test')
+        payload = dict(inputSetRef='inputs_frozen', code='result=[]', purpose='处理', requestKey='test')
         validator = Draft202012Validator(AnalysisPython.input_schema)
         self.assertTrue(any('fallbackReason' in error.message for error in validator.iter_errors(payload)))
         payload['fallbackReason'] = '需要现有算子不支持的文件透视'

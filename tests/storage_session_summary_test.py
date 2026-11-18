@@ -46,6 +46,14 @@ class SessionSummaryTests(IsolatedAsyncioTestCase):
         record = await self.create()
         summary_key = self.storage._summary_key(self.user, record.id)
         await self.storage._client.delete(summary_key)
+        summary = await self.storage.get_session_summary(
+            self.user, self.agent, record.id,
+        )
+        self.assertEqual(summary.session.id, record.id)
+        other_session = (self.user, 'other-agent', record.id)
+        self.assertIsNone(await self.storage.get_session_summary(*other_session))
+        self.assertFalse(await self.storage.delete_session(*other_session))
+        await self.storage._client.delete(summary_key)
         summaries = await self.storage.list_session_summaries(self.user, self.agent)
         self.assertEqual(len(summaries), 1)
         self.assertTrue(await self.storage._client.exists(summary_key))
@@ -55,6 +63,37 @@ class SessionSummaryTests(IsolatedAsyncioTestCase):
         full_key = self.storage._key(self.storage.key_config.session, user_id=self.user, session_id=record.id)
         await self.storage._client.delete(full_key)
         self.assertEqual(await self.storage.list_session_summaries(self.user, self.agent), [])
+        summary = await self.storage.get_session_summary(
+            self.user, self.agent, record.id,
+        )
+        self.assertIsNone(summary)
+
+    async def test_legacy_session_can_be_deleted_when_redis_is_full(self):
+        from redis.exceptions import OutOfMemoryError
+
+        record = await self.create()
+        identity = (self.user, self.agent, record.id)
+        summary_key = self.storage._summary_key(self.user, record.id)
+        await self.storage._client.delete(summary_key)
+        original_pipeline = self.storage._client.pipeline
+
+        def limited_pipeline(*args, **kwargs):
+            pipeline = original_pipeline(*args, **kwargs)
+            original_set = pipeline.set
+
+            def reject_summary(key, *args, **kwargs):
+                if key == summary_key:
+                    pipeline.execute = AsyncMock(side_effect=OutOfMemoryError)
+                return original_set(key, *args, **kwargs)
+
+            pipeline.set = reject_summary
+            return pipeline
+
+        with patch.object(
+            self.storage._client, 'pipeline', side_effect=limited_pipeline,
+        ):
+            self.assertTrue(await self.storage.delete_session(*identity))
+        self.assertIsNone(await self.storage.get_session(*identity))
 
     async def test_read_timeout_retries_once_and_then_reports_unavailable(self):
         from redis.exceptions import TimeoutError

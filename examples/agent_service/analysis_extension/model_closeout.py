@@ -16,7 +16,7 @@ def artifact_closeout_records(artifact):
     from .review_revision import formula_review_trace
     from .formula_check_summary import summarize
     fields = ('factId', 'sourceContextId', 'objectId', 'objectLabel', 'objectLabelState', 'sourceObjectId',
-              'objectModelCode', 'inputRole', 'headers', 'measureCode', 'period', 'dataPeriod', 'executionPeriod',
+              'objectModelCode', 'inputRole', 'inputMemberships', 'headers', 'measureCode', 'period', 'dataPeriod', 'executionPeriod',
               'dimensions', 'effectiveDimensions', 'dimensionNames', 'value', 'valueType', 'valueState',
               'unit', 'unitBasis', 'scale', 'scaleBasis', 'precision', 'formula', 'formulaStatus', 'expression',
               'taskName', 'formName', 'cellAddress')
@@ -65,7 +65,16 @@ def closeout_material(turn, evidence=None, artifact=None):
                 'facts': [], 'computed': [], 'contexts': [], 'calculations': [], 'omittedCount': 0,
                 'reviewIssues': [item for review in turn.state.get('reviews', [])[-1:] for item in review.get('issues', [])]}
     if artifact:
-        material.update(scope=artifact.get('scope'), checks=artifact.get('checks'), partialReason=artifact.get('partialReason'))
+        # The fallback only lists source rows, never recomputes scope aggregates.
+        # Keep the scope's meaning/status and link its full membership evidence;
+        # otherwise large repeated population lists can consume the row budget.
+        scope = artifact.get('scope') or {}
+        details = ('sourceScopes', 'populationEvidence', 'members', 'observedMembers', 'referenceMembers',
+                   'observedReferenceMembers', 'excludedMembers', 'pendingMembers', 'pendingReferenceMembers')
+        material.update(scope={key: deepcopy(value) for key, value in scope.items() if key not in details},
+                        scopeDetailRef=artifact.get('analysisRef'),
+                        scopeDetailCounts={key: len(scope[key]) for key in details if isinstance(scope.get(key), (list, dict))},
+                        checks=artifact.get('checks'), partialReason=artifact.get('partialReason'))
         facts, computed = artifact_closeout_records(artifact)
         material['projection'] = 'All business facts and per-layer checks retained; repeated transport metadata omitted.'
         material['reviewIssues'].extend(deepcopy(progress(turn).get('lastContentReview', {}).get('issues', [])))
@@ -76,11 +85,17 @@ def closeout_material(turn, evidence=None, artifact=None):
         roots = set(evidence.get('resultRoots', []))
         computed = [output for run in evidence.get('pythonRuns', []) for output in run.get('outputs', [])
                     if output.get('derivedId') in roots]
-        material['calculations'] = [{key: run.get(key) for key in ('runRef', 'purpose', 'code', 'inputRefs', 'fileReads')}
+        from .execution_evidence import delivery_projection
+        material['calculations'] = [{**{key: run.get(key) for key in ('runRef', 'purpose', 'code', 'inputRefs')},
+                                     **delivery_projection(run)}
                                     for run in evidence.get('pythonRuns', [])
                                     if any(output.get('derivedId') in roots for output in run.get('outputs', []))]
+    # Source-only delivery never prints unreviewed scripts or their results.
+    # They remain in the artifact, and must not displace the source rows here.
+    material['unreviewedCalculationCount'] = sum(value.get('operator') != 'FORMULA_CHECK' for value in computed)
+    computed = [value for value in computed if value.get('operator') == 'FORMULA_CHECK']
     # 先无损共享重复字段，让主体概览和构成同时进入材料，避免逐条加长字段导致只剩首张表。
-    if not facts and not computed:
+    if not facts and not computed and not material['unreviewedCalculationCount']:
         raise AnalysisError('NO_AVAILABLE_FACTS', '当前尚无足够的已取得数据用于解释本题。')
     full = json_values({**material, 'facts': facts, 'computed': computed})
     if len(json.dumps(pack_review_records(full), ensure_ascii=False, separators=(',', ':'))) <= 60000:
@@ -99,6 +114,8 @@ def closeout_material(turn, evidence=None, artifact=None):
         group['valueStates'][state] += 1
     material['factCoverage'] = list(coverage.values())
     material_size = len(json.dumps(json_values(material), ensure_ascii=False))
+    if material_size > 60000:
+        raise AnalysisError('CLOSEOUT_CAPACITY', '已有来源数据，但必要背景超过收尾容量；完整资料已保存。')
     def round_robin():
         pending = deque(groups.values())
         while pending:

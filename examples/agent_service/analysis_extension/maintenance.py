@@ -23,7 +23,11 @@ def run_maintenance(config_path, stop, poll_seconds=30):
             # 空服务不创建数据库；首个会话创建后，下次巡检即可维护。
             if enabled and root.is_dir():
                 started = perf_counter()
-                result = AnalysisStore(root, Limits(**config.get('limits', {}))).collect_expired_if_due(stop=stop)
+                store = AnalysisStore(root, Limits(**config.get('limits', {})))
+                from .execution_recovery import reap_expired_containers
+                store.recover_expired_python()
+                asyncio.run(reap_expired_containers())
+                result = store.collect_expired_if_due(stop=stop)
                 if result.get('performed'):
                     logger.info('分析存储后台维护 耗时毫秒=%.2f 结果=%s',
                                 (perf_counter() - started) * 1000, result)

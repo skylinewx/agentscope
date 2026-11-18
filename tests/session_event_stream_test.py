@@ -14,7 +14,7 @@ from agentscope.app.message_bus import InMemoryMessageBus
 class _Storage:
     """Return one session for the route ownership check."""
 
-    async def get_session(self, *_: object) -> object:
+    async def get_session_summary(self, *_: object) -> object:
         """Return a sentinel existing session."""
         return object()
 

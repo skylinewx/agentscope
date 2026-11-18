@@ -60,8 +60,18 @@ class AnalysisStore:
                 CREATE INDEX IF NOT EXISTS action_runs_owner ON action_runs(owner,origin);
                 CREATE TABLE IF NOT EXISTS python_runs(owner TEXT NOT NULL, ref TEXT NOT NULL,
                     digest TEXT NOT NULL, PRIMARY KEY(owner,ref));
+                CREATE TABLE IF NOT EXISTS python_pending(owner TEXT NOT NULL, ref TEXT NOT NULL,
+                    deadline REAL NOT NULL, PRIMARY KEY(owner,ref));
                 CREATE TABLE IF NOT EXISTS semantic_reviews(owner TEXT NOT NULL, key TEXT NOT NULL,
                     digest TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(owner,key));
+                CREATE TABLE IF NOT EXISTS report_reviews(owner TEXT NOT NULL, ref TEXT NOT NULL,
+                    analysis TEXT NOT NULL, digest TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(owner,ref));
+                CREATE TABLE IF NOT EXISTS report_review_history(owner TEXT NOT NULL, ref TEXT NOT NULL,
+                    digest TEXT NOT NULL, created REAL NOT NULL, PRIMARY KEY(owner,ref,digest));
+                CREATE TABLE IF NOT EXISTS review_materials(owner TEXT NOT NULL, ref TEXT NOT NULL,
+                    digest TEXT NOT NULL, PRIMARY KEY(owner,ref));
+                CREATE TABLE IF NOT EXISTS input_sets(owner TEXT NOT NULL, ref TEXT NOT NULL,
+                    digest TEXT NOT NULL, PRIMARY KEY(owner,ref));
                 CREATE TABLE IF NOT EXISTS turn_progress(owner TEXT NOT NULL, turn_key TEXT NOT NULL,
                     data TEXT NOT NULL, updated REAL NOT NULL, PRIMARY KEY(owner,turn_key));
                 CREATE TABLE IF NOT EXISTS native_results(owner TEXT NOT NULL, ref TEXT NOT NULL,
@@ -134,9 +144,9 @@ class AnalysisStore:
                 os.fsync(stream.fileno())
             db.blob_write_marker = path
 
-    def _put(self, db, data: dict) -> str:
+    def _put(self, db, data: dict, max_bytes=None) -> str:
         content = canonical(data)
-        if len(content) > self.limits.max_receipt_bytes:
+        if len(content) > (self.limits.max_artifact_bytes if max_bytes is None else max_bytes):
             raise AnalysisError("INPUT_TOO_LARGE", "分析输入超过配置上限；未保存截断内容。")
         content_digest = hashlib.sha256(content).hexdigest()
         path = self._blob_path(content_digest)
@@ -167,7 +177,7 @@ class AnalysisStore:
             content = self._blob_path(content_digest).read_bytes()
         except FileNotFoundError as exc:
             raise AnalysisError("MISSING_CONTENT", "已登记的分析内容不可用。") from exc
-        if len(content) > self.limits.max_receipt_bytes or hashlib.sha256(content).hexdigest() != content_digest:
+        if len(content) > max(self.limits.max_receipt_bytes, self.limits.max_artifact_bytes) or hashlib.sha256(content).hexdigest() != content_digest:
             raise AnalysisError("DIGEST_MISMATCH", "分析内容与登记摘要不一致。")
         return json.loads(content)
 
@@ -189,13 +199,31 @@ class AnalysisStore:
             if row:
                 self._read(row["digest"])
                 return ref
-            blob = self._put(db, payload)
+            blob = self._put(db, payload, self.limits.max_receipt_bytes)
             db.execute("INSERT INTO captures VALUES(?,?,?,?)", (ref, owner.key, blob, time.time()))
         return ref
 
     def find_request(self, owner, phase, key, request_digest):
         with closing(self._connect()) as db:
             return self._request(db, owner, phase, key, request_digest)
+
+    def save_input_set(self, owner, record):
+        ref = 'inputs_' + digest([owner.key, record])[:32]
+        with self._transaction() as db:
+            blob = self._put(db, record)
+            db.execute('INSERT OR IGNORE INTO input_sets VALUES(?,?,?)', (owner.key, ref, blob))
+            for capture in record.get('captureRefs', []):
+                if not db.execute('SELECT 1 FROM captures WHERE owner=? AND ref=?', (owner.key, capture)).fetchone():
+                    raise AnalysisError('INPUT_SET_SOURCE_MISSING', '冻结输入的来源不属于当前会话。')
+                db.execute('INSERT OR IGNORE INTO pins VALUES(?,?)', (ref, capture))
+        return ref
+
+    def get_input_set(self, owner, ref):
+        with closing(self._connect()) as db:
+            row = db.execute('SELECT digest FROM input_sets WHERE owner=? AND ref=?', (owner.key, ref)).fetchone()
+        if row is None:
+            raise AnalysisError('INPUT_SET_NOT_FOUND', '输入集合不存在或不属于当前会话。')
+        return self._read(row['digest'])
 
     def get_semantic_review(self, owner, key):
         """按当前会话和审查材料摘要复用结果，不依赖后台调用所在实例的内存。"""
@@ -249,8 +277,13 @@ class AnalysisStore:
             existing = db.execute("SELECT digest,created FROM semantic_reviews WHERE owner=? AND key=?",
                                   (owner.key, key)).fetchone()
             if existing and existing['created'] >= time.time() - self.limits.retention_seconds:
-                # 并发审查同一材料时以首个完整结果为准，避免相同内容来回通过、驳回。
-                return self._read(existing['digest'])
+                previous = self._read(existing['digest'])
+                incomplete = ('PENDING', 'UNAVAILABLE', 'NOT_REVIEWED')
+                # An unavailable attempt is not a completed verdict. A later
+                # completed review may replace it, but never replace the first
+                # completed verdict or downgrade it after another timeout.
+                if previous.get('status') not in incomplete or verdict.get('status') in incomplete:
+                    return previous
             blob = self._put(db, verdict)
             db.execute("INSERT OR REPLACE INTO semantic_reviews VALUES(?,?,?,?)",
                        (owner.key, key, blob, time.time()))
@@ -269,14 +302,26 @@ class AnalysisStore:
 
     def save_source_view(self, owner: Owner, record: dict) -> dict:
         """Immutable selector index; the original capture remains the only data copy."""
-        capture = record['selection']['captureRef']
-        self.get_capture(owner, capture)
-        ref = 'src_' + digest([owner.key, record['selection']])[:32]
-        value = {**record, 'sourceRef': ref, 'sourceViewVersion': 1}
+        return self.save_source_views(owner, [record])[0]
+
+    def save_source_views(self, owner: Owner, records: list[dict]) -> list[dict]:
+        """Check each capture once and atomically register its column selectors."""
+        values = []
         with self._transaction() as db:
-            db.execute('INSERT OR IGNORE INTO source_views VALUES(?,?,?,?,?)',
-                       (ref, owner.key, capture, json.dumps(value, ensure_ascii=False, allow_nan=False), time.time()))
-        return self.get_source_view(owner, ref)
+            for capture in dict.fromkeys(record['selection']['captureRef'] for record in records):
+                row = db.execute('SELECT digest FROM captures WHERE ref=? AND owner=?', (capture, owner.key)).fetchone()
+                if row is None:
+                    raise AnalysisError('NOT_FOUND', '当前会话没有该输入引用。')
+                self._read(row['digest'])
+            for record in records:
+                capture = record['selection']['captureRef']
+                ref = 'src_' + digest([owner.key, record['selection']])[:32]
+                value = {**record, 'sourceRef': ref, 'sourceViewVersion': 1}
+                db.execute('INSERT OR IGNORE INTO source_views VALUES(?,?,?,?,?)',
+                           (ref, owner.key, capture, json.dumps(value, ensure_ascii=False, allow_nan=False), time.time()))
+                saved = db.execute('SELECT data FROM source_views WHERE ref=? AND owner=?', (ref, owner.key)).fetchone()
+                values.append(json.loads(saved['data']))
+        return values
 
     def pin_source_views(self, owner: Owner, references):
         records = [self.get_source_view(owner, ref) for ref in references]
@@ -347,6 +392,16 @@ class AnalysisStore:
             blob = self._put(db, {**record, **owner.fields()})
             db.execute('INSERT INTO python_runs VALUES(?,?,?) ON CONFLICT(owner,ref) DO UPDATE SET digest=excluded.digest',
                        (owner.key, ref, blob))
+            if record.get('status') == 'RUNNING' and record.get('executionDeadline'):
+                db.execute('INSERT INTO python_pending VALUES(?,?,?) ON CONFLICT(owner,ref) DO UPDATE SET deadline=excluded.deadline',
+                           (owner.key, ref, record['executionDeadline']))
+            else:
+                db.execute('DELETE FROM python_pending WHERE owner=? AND ref=?', (owner.key, ref))
+
+    def recover_expired_python(self, timestamp=None):
+        """Expired RUNNING attempts never become successes after host restart."""
+        from .execution_recovery import recover_expired_runs
+        return recover_expired_runs(self, time.time() if timestamp is None else timestamp)
 
     def get_python_run(self, owner, ref):
         with closing(self._connect()) as db:
@@ -452,6 +507,7 @@ class AnalysisStore:
             ref = f"{aid}:{revision}"
             result = {**artifact, **owner.fields(), "analysisId": aid, "analysisRef": ref,
                       "revision": revision, "baseRevision": base_revision, "createdAt": now(), "publicationState": "DRAFT"}
+            result.pop('reportDelivery', None)
             # 血缘取自本次已校验的基准，不继承复制对象中的过期父引用。
             if base_ref:
                 result['baseAnalysisRef'] = base_ref
@@ -484,9 +540,19 @@ class AnalysisStore:
                 raise self._version_conflict(db, owner, row, head)
             # Do not trust a caller to change identity or numerical facts on publish.
             original = self._read(row["digest"])
-            for field in set(original) - {"claims", "viewPlan", "findings", "actions", "technicalDetails",
+            expected = original
+            if result.get('methodRevisions') != original.get('methodRevisions'):
+                # Re-derive the permitted plan change from the stored execution
+                # and request. Never whitelist arbitrary plan/result mutations.
+                from copy import deepcopy
+                from .completion import apply_publication_completion
+                expected = deepcopy(original)
+                apply_publication_completion(expected, request)
+                if result.get('methodRevisions') != expected.get('methodRevisions'):
+                    raise AnalysisError('IMMUTABLE_FACTS', '方法修订必须来自已保存执行和本次明确请求。')
+            for field in set(expected) - {"claims", "viewPlan", "findings", "actions", "technicalDetails",
                                           "workRefs", "unresolvedItems", "partialReason"}:
-                if original[field] != result.get(field):
+                if expected[field] != result.get(field):
                     raise AnalysisError("IMMUTABLE_FACTS", "发布不能改变已构建的事实和范围。")
             for capture_ref in original["captureRefs"]:
                 self.get_capture(owner, capture_ref)
@@ -593,6 +659,48 @@ class AnalysisStore:
         for run in self.list_action_runs(owner):
             if run["status"] == "RUNNING":
                 self.update_action_run(owner, run["actionRunId"], "PARTIAL", "HOST_RESTART_OR_PREVIOUS_TURN_INTERRUPTED", only_running=True)
+
+    def save_review_material(self, owner, ref, prompt, payload):
+        from .review_request import ReviewRequest
+        if isinstance(payload, ReviewRequest): payload = payload.stored()
+        with self._transaction() as db:
+            blob = self._put(db, {'prompt': prompt, 'payload': payload})
+            old = db.execute('SELECT digest FROM review_materials WHERE owner=? AND ref=?', (owner.key, ref)).fetchone()
+            if old and old['digest'] != blob:
+                raise AnalysisError('IMMUTABLE_REVIEW_INPUT', '同一审查材料引用不能改变原始输入。')
+            db.execute('INSERT OR IGNORE INTO review_materials VALUES(?,?,?)', (owner.key, ref, blob))
+
+    def get_review_material(self, owner, ref):
+        with closing(self._connect()) as db:
+            row = db.execute('SELECT digest FROM review_materials WHERE owner=? AND ref=?', (owner.key, ref)).fetchone()
+        if not row:
+            raise AnalysisError('REVIEW_MATERIAL_UNAVAILABLE', '该版本未保存可恢复的审查材料，不能冒充已经完成。')
+        result = self._read(row['digest'])
+        from .review_request import make_review_request
+        if isinstance(result.get('payload'), dict) and result['payload'].get('format') == 'REVIEW_REQUEST_MARKDOWN_V1':
+            result['payload'] = make_review_request(result['payload'])
+        return result
+
+    def save_report_review(self, owner, ref, analysis_ref, record):
+        self.get_analysis(owner, analysis_ref)
+        if record.get('analysisRef') != analysis_ref or record.get('reviewRef') != ref:
+            raise AnalysisError('INVALID_REVIEW_VERSION', '审查记录必须绑定同一分析及报告版本。')
+        with self._transaction() as db:
+            old = db.execute('SELECT analysis FROM report_reviews WHERE owner=? AND ref=?', (owner.key, ref)).fetchone()
+            if old and old['analysis'] != analysis_ref:
+                raise AnalysisError('INVALID_REVIEW_VERSION', '审查记录不能跨报告版本覆盖。')
+            blob = self._put(db, record)
+            db.execute('INSERT INTO report_reviews VALUES(?,?,?,?,?) ON CONFLICT(owner,ref) '
+                       'DO UPDATE SET digest=excluded.digest,updated=excluded.updated',
+                       (owner.key, ref, analysis_ref, blob, time.time()))
+            db.execute('INSERT OR IGNORE INTO report_review_history VALUES(?,?,?,?)',
+                       (owner.key, ref, blob, time.time()))
+        return record
+
+    def get_report_review(self, owner, ref):
+        with closing(self._connect()) as db:
+            row = db.execute('SELECT digest FROM report_reviews WHERE owner=? AND ref=?', (owner.key, ref)).fetchone()
+        return self._read(row['digest']) if row else None
 
     def get_presentation(self, owner, kind, ref):
         with closing(self._connect()) as db:

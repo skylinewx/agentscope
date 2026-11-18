@@ -2,6 +2,7 @@
 import json
 
 from .models import AnalysisError
+from .business_dataset import row_values
 
 
 def reference(document, binding):
@@ -12,11 +13,8 @@ def reference(document, binding):
         identity = [value['valueRef'], value.get('field', 'value'), value.get('nodeRef')]
     elif set(binding) == {'setKey', 'factRef'}:
         dataset = document['datasets'][binding['setKey']]
-        if dataset['kind'] == 'TABULAR':
-            index = [column['name'] for column in dataset['columns']].index('factRef')
-            matches = [row for row in dataset['rows'] if row[index] == binding['factRef']]
-        else:
-            matches = [row for row in dataset['rows'] if row['factRef'] == binding['factRef']]
+        matches = [row for row in dataset['rows']
+                   if row_values(row, dataset.get('columns', [])).get('factRef') == binding['factRef']]
         if len(matches) != 1:
             raise ValueError('row is not unique')
         identity = [binding['factRef'], 'value', None]
@@ -56,11 +54,29 @@ def evaluate(document, observation):
             names = [column['name'] for column in dataset['columns']]
             if 'factRef' not in names or 'value' not in names:
                 continue
-            refs = [row[names.index('factRef')] for row in dataset['rows'] if row[names.index('value')] is not None]
+            refs = [values['factRef'] for row in dataset['rows']
+                    if (values := row_values(row, dataset['columns'])).get('value') is not None]
         elif dataset.get('kind') == 'ORDERED':
-            refs = [row['factRef'] for row in dataset['rows'] if row.get('value') is not None]
+            refs = [values['factRef'] for row in dataset['rows']
+                    if (values := row_values(row, dataset.get('columns', []))).get('value') is not None]
         else:
             continue
         source.update(reference(document, {'setKey': key, 'factRef': ref}) for ref in refs)
     result['sourceRefs'] = sorted(source)
+    required = required_formula_steps(document)
+    result['requiredFormulaSteps'] = sorted(required)
+    result['missingFormulaSteps'] = sorted(required - set(result['charted']))
     return result
+
+
+def required_formula_steps(document):
+    """Expected steps are determined by the frozen document, not observations."""
+    required = set()
+    for key, dataset in document.get('datasets', {}).items():
+        if dataset.get('kind') != 'FORMULA': continue
+        for node in dataset.get('nodes', []):
+            steps = (node.get('waterfall') or {}).get('steps', [])
+            if len(steps) < 3: continue  # A single-input transfer does not require a waterfall.
+            required.update(reference(document, {'setKey': key, 'nodeRef': node['factRef'], 'stepIndex': i})
+                            for i in range(len(steps)))
+    return required

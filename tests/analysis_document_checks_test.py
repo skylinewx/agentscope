@@ -50,7 +50,7 @@ class DocumentCheckTests(PresentationCase):
                     'datasets':[{'key':'ranking','valueRef':'derived_s'}]}
         artifact = self.store.get_analysis(OWNER,self.ref)
         self.compiled = compile_document(artifact,self.doc)
-        self.refs = [row['factRef'] for row in self.compiled['datasets']['ranking']['rows']]
+        self.refs = [row['values']['factRef'] for row in self.compiled['datasets']['ranking']['rows']]
         self.preview = await self.service.publish(self.ref,requestKey='p',document=self.doc,previewOnly=True)
 
     async def record(self, observation):

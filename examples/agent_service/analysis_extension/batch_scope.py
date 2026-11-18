@@ -8,6 +8,10 @@ def selected_tables(captures, selections):
     """只接受真实批量身份；不按显示名称或数组顺序猜表。"""
     from .adapters.budget_batch import tables, validate, selection_scope
     from .adapters.budget_v2 import receipt_from_capture
+    # One invocation reads immutable captures. A selected cell can have its
+    # own selector; decoding and validating the entire receipt per selector
+    # makes follow-up checks quadratic in the size of a large result.
+    indexed, prepared = {}, {}
     for selection in selections:
         if 'batchId' not in selection:
             continue
@@ -15,15 +19,24 @@ def selected_tables(captures, selections):
         if ref not in captures:
             raise AnalysisError('UNKNOWN_CAPTURE', '选择器引用的回执未纳入本次分析。')
         capture = captures[ref]
-        receipt = receipt_from_capture(capture)
-        matches = [(step, table, path) for step, table, path in tables(receipt)
-                   if step == selection.get('stepId') and table.get('batchId') == selection['batchId']]
+        if ref not in indexed:
+            receipt = receipt_from_capture(capture)
+            by_identity = {}
+            for step, table, path in tables(receipt):
+                by_identity.setdefault((step, table.get('batchId')), []).append((step, table, path))
+            indexed[ref] = receipt, by_identity
+        receipt, by_identity = indexed[ref]
+        identity = selection.get('stepId'), selection['batchId']
+        matches = by_identity.get(identity, [])
         if len(matches) != 1:
             raise AnalysisError('UNKNOWN_BATCH', '请使用 selectors 返回的 stepId 与 batchId。')
         step, table, path = matches[0]
-        validate(capture, receipt, step, table)
-        from .adapters.budget_exact import view
-        table = view(table)
+        key = ref, *identity
+        if key not in prepared:
+            validate(capture, receipt, step, table)
+            from .adapters.budget_exact import view
+            prepared[key] = view(table)
+        table = prepared[key]
         columns, rows = selection_scope(selection, table)
         yield selection, table, path, columns, rows
 
@@ -53,17 +66,25 @@ def resolve_members(registry, captures, selections, scope, max_members):
         columns = table['data']['columns']
         index = next((i for i, column in enumerate(columns) if column['name'] == dimension
                       and table['columnRoles'][dimension]['kind'] in ('DIMENSION', 'PROPERTY')), None)
-        if index is None and dimension not in table['data'].get('fixedDimValMap', {}):
-            raise AnalysisError('BATCH_GRAIN_MISMATCH', '分析主体必须是实际返回的维度或属性列。',
-                                {'path': '/scope/memberDimension', 'memberDimension': dimension,
-                                 'availableDimensions': [name for name, role in table['columnRoles'].items()
-                                                         if role['kind'] in ('DIMENSION', 'PROPERTY')]})
         capture = captures[selection['captureRef']]
         namespace = registry.for_capture(capture).member_namespace(capture, dimension)
-        for row_index, row in enumerate(table['data']['rows']):
-            if rows is not None and row_index not in rows:
-                continue
-            raw = row[index] if index is not None else table['data']['fixedDimValMap'][dimension]
+        if index is None and dimension not in table['data'].get('fixedDimValMap', {}):
+            # A budget metric column can carry its own real dimension (e.g.
+            # account or channel). Read the validated cell coordinates, not
+            # just the matrix row headers, and retain the selection boundary.
+            from .adapters.budget_batch import catalog
+            cells = catalog(capture, [selection], max_members)
+            available = set.intersection(*(set(item['dimensions']) for item in cells)) if cells else set()
+            if dimension not in available:
+                raise AnalysisError('BATCH_GRAIN_MISMATCH', '分析主体必须来自所选数据的真实行维度、列固定维度或表外维度。',
+                                    {'path': '/scope/memberDimension', 'memberDimension': dimension,
+                                     'availableDimensions': sorted(available)})
+            raw_members = [item['dimensions'][dimension] for item in cells]
+        else:
+            raw_members = [row[index] if index is not None else table['data']['fixedDimValMap'][dimension]
+                           for row_index, row in enumerate(table['data']['rows'])
+                           if rows is None or row_index in rows]
+        for raw in raw_members:
             ref = member_ref(namespace, raw)
             if ref not in references and raw not in references:
                 members[ref] = None

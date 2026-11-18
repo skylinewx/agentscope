@@ -38,7 +38,11 @@ def render(document, layout="standard"):
         if layout != 'standard':
             raise AnalysisError('DOCUMENT_SCOPE_FIXED', '自由页面按原版导出；调整布局需发布新版本。')
         from .free_document import standalone_html
-        return standalone_html(document['freeDocument'])
+        html = standalone_html(document['freeDocument'])
+        if document.get('reportDelivery'):
+            from .report_review import attach_review_notice
+            html = attach_review_notice(html, document['reportDelivery'])
+        return html
     e = escape
     title = e(document['reportTitle'] or ("筛选范围分析报告" if document["isFiltered"] else "完整分析报告"))
     from .report_scenes import render_sections, render_claims
@@ -77,6 +81,9 @@ def render(document, layout="standard"):
 {source_section}
 <footer class="note report-footer">分析版本：{e(document['analysisRef'].rsplit(':', 1)[-1])} · 发布时刻：{e(document.get('publishedAt') or '未记录')}</footer>
 </main></body></html>'''
+    if document.get('reportDelivery'):
+        from .report_review import attach_review_notice
+        html = attach_review_notice(html, document['reportDelivery'])
     if len(html.encode("utf-8")) > REPORT_MAX_BYTES:
         raise AnalysisError("REPORT_TOO_LARGE", "完整报告超过 10 MiB，未交付；请显式选择较小范围生成另一个报告。")
     return html

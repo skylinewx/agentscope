@@ -11,7 +11,9 @@ from .models import digest
 RETAINED_BLOBS = ('SELECT digest FROM captures UNION SELECT digest FROM analyses '
                   'UNION SELECT digest FROM presentations UNION SELECT digest FROM publication_proposals '
                   'UNION SELECT digest FROM document_checks UNION SELECT digest FROM python_runs '
-                  'UNION SELECT digest FROM semantic_reviews UNION SELECT digest FROM native_results')
+                  'UNION SELECT digest FROM semantic_reviews UNION SELECT digest FROM native_results '
+                  'UNION SELECT digest FROM report_reviews UNION SELECT digest FROM report_review_history '
+                  'UNION SELECT digest FROM review_materials UNION SELECT digest FROM input_sets')
 BATCH_SIZE = 32
 BATCH_SECONDS = 0.025
 

@@ -8,14 +8,18 @@ def model_schema(native):
     props = schema.get('properties', {})
     props.pop('sourceSelection', None)
     props.pop('contextText', None)
+    props.pop('conditionContext', None)
     props.pop('requestId', None)
-    schema['required'] = [key for key in schema.get('required', []) if key != 'requestId']
+    props.pop('purpose', None)
+    props['materialRole'] = {'enum': ['PRIMARY', 'REFERENCE', 'STRUCTURE'],
+        'description': '本次查询的资料用途，默认 PRIMARY；对照取数使用 REFERENCE。材料种类仅由 AnalysisTask.materials 声明，底层 purpose 由宿主生成。'}
+    schema['required'] = [key for key in schema.get('required', []) if key not in ('requestId', 'purpose')]
     scope = props.get('scope', {}).get('properties', {})
     scope['bindings'] = {'type': 'array', 'maxItems': 32, 'items': {
         'type': 'object', 'additionalProperties': False, 'required': ['text', 'candidateRef'],
         'properties': {'text': {'type': 'string', 'minLength': 1},
                        'candidateRef': {'type': 'string', 'minLength': 1}}},
-        'description': '任务或表样简称先 search_entities，选择 scopeCandidates 的 candidateRef，text 保留用户原话；多候选结合上下文选择，不默认第一条。'}
+        'description': '任务或表样简称先 search_entities，选择 scopeCandidates 的 candidateRef，text 保留用户原话；多候选结合上下文选择，不默认第一条。若发现本轮曾把同一检索词误填为未经确认的维度成员，用 AnalysisTask.scopeEdits 明确撤回该维度猜测后再绑定。'}
     props['basis'] = {'type': 'object', 'additionalProperties': False, 'required': ['kind'],
                      'properties': {'kind': {'type': 'string', 'enum': ['INTENT', 'FACTS', 'MEMBERS']},
                                     'sourceRef': {'type': 'string', 'minLength': 1}},
@@ -37,6 +41,10 @@ def model_schema(native):
     strip_evidence(props.get('intentDraft', {}))
     draft = props.get('intentDraft', {})
     draft['required'] = [key for key in draft.get('required', []) if key not in ('targets', 'sharedConditions')]
+    if 'sharedConditions' in draft.get('properties', {}):
+        draft['properties']['sharedConditions']['description'] = (
+            '本次共享条件。省略、[] 或非空列表均保留仍适用的已确认条件；非空列表补充本次条件。'
+            '更换或解除情景、机构等条件使用 AnalysisTask.intent/scopeEdits，宿主同步释放旧条件及其校验上下文。')
     if 'targets' in draft.get('properties', {}):
         targets = draft['properties']['targets']
         targets['description'] = targets.get('description', '') + ' 继续同一指标只改范围/排序/分组时可省略，宿主复用已确认目标；更换指标必须填写。'
@@ -44,7 +52,8 @@ def model_schema(native):
     dimension_scopes = draft.get('properties', {}).get('dimensionScopes')
     if dimension_scopes:
         dimension_scopes['description'] += (' 仅本次查询改变范围时填写；已在 AnalysisTask.scopeEdits 声明的相同选择器由宿主注入，无需重复。'
-                                            'dimensionHint 只写维度名，范围放 selector；不写“组织机构（全部单位）”。')
+                                            'dimensionHint 只写维度名，范围放 selector；不写“组织机构（全部单位）”。'
+                                            '继续同一范围时 HIERARCHY 省略的 level/where/rootText 沿用；解除层级或其他限制使用 scopeEdits 完整替换选择器，不能靠漏填清除。')
     return schema
 
 

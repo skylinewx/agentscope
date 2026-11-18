@@ -179,6 +179,8 @@ class _NumericTool(ToolBase):
 
     async def call(self, **kwargs):
         try:
+            from analysis_extension.value_references import check_calculation
+            check_calculation(self.name, kwargs)
             requests = kwargs.get('requests')
             references = kwargs.get('valueRefs') is not None or (isinstance(requests, list) and any(isinstance(r, dict) and 'valueRefs' in r for r in requests))
             if self.name == 'Calculate' and references:

@@ -32,15 +32,38 @@ from ...message import Msg
 from ...sop import SOPPhase, SOPRunState
 from ...state import AgentState
 from ._model._message_queue import MessageQueueRecord
+from ._session_summary import SessionSummary
 
 
 class StorageBase(ABC):
     """The storage abstract base class."""
 
-    async def list_session_summaries(self, user_id: str, agent_id: str):
-        """Read sidebar projections without changing the internal full-record API."""
-        from ._session_summary import SessionSummary
-        return [SessionSummary.from_record(record) for record in await self.list_sessions(user_id, agent_id)]
+    async def list_session_summaries(
+        self,
+        user_id: str,
+        agent_id: str,
+    ) -> list[SessionSummary]:
+        """Read the metadata and parked status of an agent's sessions."""
+        return [
+            SessionSummary.from_record(record)
+            for record in await self.list_sessions(user_id, agent_id)
+        ]
+
+    async def get_session_summary(
+        self,
+        user_id: str,
+        agent_id: str,
+        session_id: str,
+        *,
+        refresh_legacy: bool = False,
+    ) -> SessionSummary | None:
+        """Read metadata and parked status after checking ownership.
+
+        ``refresh_legacy`` asks backends that cache summaries to update old
+        ones before returning fields such as team and background state.
+        """
+        record = await self.get_session(user_id, agent_id, session_id)
+        return SessionSummary.from_record(record) if record else None
 
     async def get_message_queue(self, user_id: str, session_id: str) -> MessageQueueRecord | None:
         """Read a durable queue. Custom backends may opt out of this feature."""

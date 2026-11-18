@@ -100,7 +100,16 @@ class SharedDefaultsCases:
                                  headers=self.headers, json=fields)
 
     def test_create_list_read_and_runtime_use_shared_defaults(self):
-        sid = self.create(name="Stable test name")
+        response = self.client.post(
+            "/sessions/", headers=self.headers,
+            json={"agent_id": "shared", "name": "Stable test name"},
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        created = response.json()
+        sid = created["session_id"]
+        initial = created["view"]
+        self.assertEqual(initial["session"]["id"], sid)
+        self.assertEqual(initial["status"], "idle")
         session = self.read(sid)
         self.assertEqual(session.user_id, "viewer")
         self.assertEqual(session.config.chat_model_config, self.model)
@@ -110,6 +119,8 @@ class SharedDefaultsCases:
         listing = self.client.get("/sessions/", params={"agent_id": "shared"}, headers=self.headers)
         self.assertEqual(listing.status_code, 200, listing.text)
         listed = listing.json()["sessions"][0]["session"]
+        self.assertEqual(initial["session"]["config"], listed["config"])
+        self.assertEqual(initial["session"]["state"]["permission_context"]["mode"], "bypass")
         self.assertEqual(listed["config"]["chat_model_config"]["model"], "shared-model")
         self.assertEqual(listed["state"]["permission_context"]["mode"], "bypass")
 

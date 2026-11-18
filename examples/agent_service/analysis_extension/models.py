@@ -49,16 +49,20 @@ class Owner:
 class Limits:
     # Baseline: historical largest complete response is below 1 MiB UTF-8.
     max_receipt_bytes: int = 16 * 1024 * 1024
+    # A frozen analysis contains source facts plus execution snapshots. Its
+    # storage bound is independent of the original provider receipt bound.
+    max_artifact_bytes: int = 128 * 1024 * 1024
     max_store_bytes: int = 512 * 1024 * 1024
     retention_seconds: int = 7 * 24 * 3600
     max_facts: int = 50000
     max_selections: int = 1000
     max_operations: int = 100
     page_size: int = 100
-    max_review_attempts: int = 3
-    review_budget_seconds: int = 180
+    max_review_attempts: int = 5
+    max_review_output_repairs: int = 2
+    review_budget_seconds: int = 1800
     max_analysis_repairs: int = 4
-    repair_budget_seconds: int = 300
+    repair_budget_seconds: int = 3600
     max_query_retries: int = 1
 
     def __post_init__(self):

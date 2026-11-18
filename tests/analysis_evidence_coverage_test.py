@@ -35,6 +35,6 @@ class EvidenceCoverageTest(TestCase):
         self.assertIn('应收票据 &gt; 1000 且 短期借款 &gt; 1000', markdown)
         self.assertIn('命中目标组合：2', markdown)
         self.assertNotIn('0 项来源值', markdown)
-        turn = SimpleNamespace(state={'mode': 'ANALYSIS', 'requiredEvidence': 'VALUES', 'request': '对比预算金额'})
-        result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'ANALYZE'})
+        turn = SimpleNamespace(state={'mode': 'ANALYSIS', 'materials': [{'role': 'PRIMARY', 'kinds': ['VALUES']}], 'request': '对比预算金额'})
+        result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'PREPARE_MATERIALS'})
         self.assertEqual(result['purpose'], 'QUERY')

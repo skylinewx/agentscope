@@ -183,7 +183,7 @@ class PublicationFlowTests(PresentationCase):
         rendering = asyncio.Event()
         async def review(artifact):
             self.assertTrue(rendering.is_set(), '页面测量应先于内容审查完成')
-            return {'issues': [{'code': 'UNSUPPORTED_CAUSE', 'message': '缺少原因证据。'}]}
+            return with_coverage({'issues': [{'code': 'UNSUPPORTED_CAUSE', 'message': '缺少原因证据。'}]})
         async def render(document):
             samples = [measurements(width=width, static_keys=document.get('staticBindingKeys', [])) for width in (420, 900)]
             for sample in samples:
@@ -271,7 +271,7 @@ class PublicationFlowTests(PresentationCase):
                 if field in restored:
                     restored[field] = {**common, **restored[field]}
             self.assertEqual(restored, old)
-        with patch('analysis_extension.turn_completion._model_review', new=AsyncMock(return_value={'issues': []})) as model:
+        with patch('analysis_extension.turn_completion._model_review', new=AsyncMock(return_value=with_coverage({'issues': []}))) as model:
             await review_answer(None, turn, artifact, '')
             await review_answer(None, turn, artifact, '')
             await review_answer(None, turn, artifact, '[结果](saved-report)')
@@ -282,3 +282,5 @@ class PublicationFlowTests(PresentationCase):
             self.assertEqual(model.await_count, 2)
         self.assertEqual(turn.state['analysisReviewTotals']['attempts'], 3)
         self.assertEqual(turn.state['analysisReviewTotals']['reusedPartCount'], 1)
+
+from analysis_review_fixtures import with_coverage

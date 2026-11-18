@@ -29,6 +29,7 @@ from agentscope.app.storage import (
     SessionRecord,
     UserOrigin,
 )
+from agentscope.app.storage._session_summary import SessionSummary
 from agentscope.agent import ContextConfig, ReActConfig
 from agentscope.state import AgentState
 from agentscope.tool import DirEntry
@@ -193,14 +194,15 @@ class _FakeStorage:
     def __init__(self, records: list[SessionRecord]) -> None:
         self._records = {(r.user_id, r.agent_id, r.id): r for r in records}
 
-    async def get_session(
+    async def get_session_summary(
         self,
         user_id: str,
         agent_id: str,
         session_id: str,
-    ) -> SessionRecord | None:
-        """Look up a seeded session record by composite key."""
-        return self._records.get((user_id, agent_id, session_id))
+    ) -> SessionSummary | None:
+        """Look up session metadata by composite key."""
+        record = self._records.get((user_id, agent_id, session_id))
+        return SessionSummary.from_record(record) if record else None
 
 
 def _make_session(

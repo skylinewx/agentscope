@@ -26,6 +26,7 @@ from agentscope.app.storage import (
     SessionRecord,
     UserOrigin,
 )
+from agentscope.app.storage._session_summary import SessionSummary
 from agentscope.state import AgentState
 from agentscope.tool import ExecResult
 
@@ -101,15 +102,17 @@ class _FakeStorage:
     def __init__(self, record: SessionRecord) -> None:
         self._record = record
 
-    async def get_session(
+    async def get_session_summary(
         self,
         user_id: str,
         agent_id: str,
         session_id: str,
-    ) -> SessionRecord | None:
-        """Return the seeded record, or None for any other id."""
+    ) -> SessionSummary | None:
+        """Return the metadata for the seeded session."""
         _ = user_id, agent_id
-        return self._record if session_id == self._record.id else None
+        if session_id == self._record.id:
+            return SessionSummary.from_record(self._record)
+        return None
 
 
 def _make_session(cwd: str | None = None) -> SessionRecord:

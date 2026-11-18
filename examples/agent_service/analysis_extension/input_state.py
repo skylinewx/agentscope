@@ -17,4 +17,19 @@ def validate_analysis(service, artifact):
     turn = service.turn
     if (turn and turn.state.get('adoptedInputs')
             and artifact.get('plan', {}).get('inputSetVersion') != turn.state.get('inputSetVersion')):
-        raise AnalysisError('STALE_INPUT_SET', '分析属于另一组输入；按当前已采用来源重新构建，不能继续旧计算或发布。')
+        plan = artifact.get('plan', {})
+        if plan.get('selections'):
+            # Re-indexing a complete report can change adoption metadata, but
+            # not its inputs. Prove exact source/row/column/grain/role equality;
+            # a matching label, value or metric code is never sufficient.
+            from .source_views import selection_identity
+            current = [item['selection'] for item in turn.state['adoptedInputs']]
+            if selection_identity(turn, plan['selections']) == selection_identity(turn, current):
+                return
+        raise AnalysisError('STALE_INPUT_SET', '当前采用的输入与报告完整来源不同。若仍处理原报告，按 analysisRef 重新采用其完整输入；只有确实改变范围才需要重新构建。',
+            {'analysisRef': artifact['analysisRef'], 'restoreOriginalReportInputs': {
+                'tool': 'AnalysisTask', 'arguments': {'action': 'declare',
+                    'mode': turn.state.get('mode') or 'ANALYSIS',
+                    'goal': turn.state.get('goal') or turn.state.get('request'),
+                    'analysisRef': artifact['analysisRef']},
+                'meaning': '仅在用户仍要处理原报告时选择；不会重查或重算，也不自动改变当前采用范围。'}})

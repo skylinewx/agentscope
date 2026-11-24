@@ -8,6 +8,15 @@ import { analysisPath, remarkWorkspaceAnalyses, parseDelivery, parseSnapshot, va
 import { remarkWorkspaceReports } from '../src/lib/workspace-reports.ts';
 
 const path = './analysis/ana_0123456789abcdef0123456789abcdef/revisions/3/analysis.json';
+test('structured period trends accept host line and point primitives', () => {
+  const scene = { type: 'PERIOD_TREND', viewId: 'summary', width: 620, height: 210, zeroBaseline: 0,
+    description: '季度收入', rowKeys: ['first', 'second'], primitives: [
+      {kind: 'line', x1: 80, y1: 162, x2: 540, y2: 26, tone: 'positive'},
+      {kind: 'rect', x: 78, y: 160, width: 4, height: 4, tone: 'positive', rowKey: 'first'}
+    ] };
+  assert.doesNotThrow(() => validateScene(scene));
+  assert.throws(() => validateScene({...scene, primitives: [{...scene.primitives[0], x2: NaN}]}));
+});
 test('report status is version bound and historical absence never invents a pass', () => {
   const fixture = JSON.parse(readFileSync(new URL('../../../agent_service/analysis_extension/presentation-v1.example.json', import.meta.url), 'utf8'));
   assert.equal(parseSnapshot(fixture).reportDelivery, undefined);
@@ -26,6 +35,14 @@ test('current engine and frozen historical reports remain readable', () => {
   const fixture = JSON.parse(readFileSync(new URL('../../../agent_service/analysis_extension/presentation-v1.example.json', import.meta.url), 'utf8'));
   for (const engineVersion of ['2.0.0', '1.5.0']) assert.equal(parseSnapshot({ ...fixture, engineVersion }).engineVersion, engineVersion);
   assert.throws(() => parseSnapshot({ ...fixture, engineVersion: 'unknown' }));
+});
+test('a published report with all values compiled into HTML opens from the chat snapshot', () => {
+  const fixture = JSON.parse(readFileSync(new URL('../../../agent_service/analysis_extension/presentation-v1.example.json', import.meta.url), 'utf8'));
+  const freeDocument = {version: 'free-html-1', title: '渠道收入', html: '<html><head></head><body><p>年度收入 1,200 元</p></body></html>',
+    contentDigest: 'a'.repeat(64), frameKey: 'b'.repeat(64), bindingCount: 0, datasetCount: 0};
+  assert.deepEqual(parseSnapshot({...fixture, freeDocument}).freeDocument, freeDocument);
+  assert.throws(() => parseSnapshot({...fixture, freeDocument: {...freeDocument, html: ''}}), /INVALID_VIEW/);
+  assert.throws(() => parseSnapshot({...fixture, schemaVersion: 2, freeDocument: {}}), /UNSUPPORTED_VERSION/);
 });
 function render(text, source = text) {
   return renderToStaticMarkup(React.createElement(Streamdown, {

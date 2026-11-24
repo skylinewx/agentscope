@@ -107,7 +107,7 @@ def register_selections(turn, selections, *, _inputs=None):
     return turn.service.store.save_source_views(turn.service.owner, result)
 
 
-def directory(turn, search=None, offset=0, limit=6, context_refs=None):
+def directory(turn, search=None, offset=0, limit=6, context_refs=None, *, source_ref=None, scope_kind=None):
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 20:
         raise AnalysisError('INVALID_PAGE', '来源目录使用非负 offset 和 1 至 20 的 limit。')
     selections = []
@@ -136,17 +136,46 @@ def directory(turn, search=None, offset=0, limit=6, context_refs=None):
             selections.extend(scope_selections(scope, scope.get('captureRefs', [])))
         selections.extend(item['selection'] for item in turn.state.get('adoptedInputs', []))
     records = {}
+    roles = {}
     diagnostics = []
     inputs = _SourceInputs(turn)
     for selection in selections:
         try:
             for record in register_selections(turn, [selection], _inputs=inputs):
                 records[record['sourceRef']] = record
+                if selection.get('role') and selection.get('sourceRef') == record['sourceRef']:
+                    roles.setdefault(record['sourceRef'], set()).add(selection['role'])
         except AnalysisError as error:
             diagnostics.append({'captureRef': selection.get('captureRef'), 'code': error.code})
     items = list(records.values())
+    if source_ref is not None:
+        items = [item for item in items if item['sourceRef'] == source_ref]
+    if scope_kind in ('TASK', 'FORM'):
+        field = 'task' if scope_kind == 'TASK' else 'form'
+        paths = {}
+        for item in items:
+            for ctx in item['contexts']:
+                code = (ctx.get('target') or {}).get(field + 'Code')
+                if code:
+                    identity = (tuple(sorted(item['sourceIdentity'].items())), code)
+                    paths.setdefault(identity, {'code': code, 'name': ctx.get(field + 'Name') or code,
+                                     'sourceRef': item['sourceRef']})
+        return list(paths.values())
     if search:
-        items = [item for item in items if search.casefold() in (item['label'] + item['question']).casefold()]
+        term = search.casefold()
+        # A comparison can reuse its subject from an older query and fetch its
+        # reference in the comparison turn. Both belong to that report.
+        inherited_ref = turn.state.get('inheritedScope', {}).get('scopeRef')
+        contextual_sources = set()
+        for context in turn.state.get('businessContexts', []):
+            scope = context.get('subjectScope', {})
+            selected = (context.get('contextRef') in context_refs if context_refs is not None
+                        else bool(inherited_ref and scope.get('scopeRef') == inherited_ref))
+            if selected and term in (context.get('request') or '').casefold():
+                contextual_sources.update(s['sourceRef'] for s in scope.get('selections', [])
+                                          if s.get('role') and s.get('sourceRef') in roles)
+        items = [item for item in items if item['sourceRef'] in contextual_sources
+                 or term in (item['label'] + item['question']).casefold()]
     page = items[offset:offset+limit]
     def safe(value):
         return str(value or '').replace('|', '\\|').replace('\n', ' ')[:300]
@@ -155,15 +184,24 @@ def directory(turn, search=None, offset=0, limit=6, context_refs=None):
             (ctx.get('taskName'), ctx.get('formName'), ctx.get('period'), ctx.get('effectiveDimensions', {}).get('MD_SCENE')) if value)
             for ctx in item['contexts']))
     markdown = ['| 来源引用 | 指标/内容 | 已选行数 | 时期/口径 | 原查询 |', '|---|---|---:|---|---|']
-    markdown.extend(f"| {item['sourceRef']} | {safe(item['label'])} | {item['rowCount'] if item['rowCount'] is not None else '按单元格选择'} | {safe(context_label(item))} | {safe(item['question'])} |" for item in page)
-    markdown.append(f'本页 {len(page)} 个，共 {len(items)} 个来源。' + (f'下一页 offset={offset+limit}。' if offset+limit < len(items) else ''))
-    return {'viewType': 'result_sources', 'sources': [{key: value for key, value in item.items() if key not in ('selection', 'sourceIdentity')}
-                        for item in page], 'markdown': '\n'.join(markdown), 'total': len(items),
+    labels = {'PRIMARY': '主体', 'REFERENCE': '对照', 'STRUCTURE': '结构'}
+    for item in page:
+        usage = '、'.join(labels[role] for role in labels if role in roles.get(item['sourceRef'], ()))
+        title = f"{item['label']}（{usage}）" if usage else item['label']
+        markdown.append(f"| {item['sourceRef']} | {safe(title)} | {item['rowCount'] if item['rowCount'] is not None else '按单元格选择'} | {safe(context_label(item))} | {safe(item['question'])} |")
+    markdown.extend(['', f'本页 {len(page)} 个，共 {len(items)} 个来源。' + (f'下一页 offset={offset+limit}。' if offset+limit < len(items) else '')])
+    if len({role for item in items for role in roles.get(item['sourceRef'], ())}) > 1:
+        markdown.append('同一分析可以采用不同来源。引用某组成员时，按该组在原分析中的用途和已选行数选取。')
+    sources = [{key: value for key, value in item.items() if key not in ('selection', 'sourceIdentity')} for item in page]
+    for row in sources:
+        if row['sourceRef'] in roles:
+            row['roles'] = sorted(roles[row['sourceRef']])
+    return {'viewType': 'result_sources', 'sources': sources, 'markdown': '\n'.join(markdown), 'total': len(items),
             'nextOffset': offset+limit if offset+limit < len(items) else None,
             'diagnostics': diagnostics, 'boundary': '目录不改变采用范围；不能按工具完成顺序选择主体。'}
 
 
-def select(turn, choices):
+def select(turn, choices, *, require_primary=True):
     if not isinstance(choices, list) or not choices or len(choices) > turn.service.store.limits.max_selections:
         raise AnalysisError('INVALID_SUBJECT_SOURCES', 'subjectSources 使用非空的来源列表；不是全部历史来源的通配符。')
     inputs, identities = [], set()
@@ -186,9 +224,10 @@ def select(turn, choices):
         selection.update(role=role, inputRef=input_ref, sourceRef=source['sourceRef'],
                          selectionReason=turn.state.get('goal') or turn.state.get('request') or '明确采用来源')
         inputs.append({'inputRef': input_ref, 'sourceRef': source['sourceRef'], 'role': role,
+                       **({'baseSourceRef': choice['sourceRef']} if choice.get('membersFrom') else {}),
                        'membersFrom': choice.get('membersFrom'), 'selection': selection,
                        'label': source['label'], 'rowCount': source['rowCount'], 'contexts': source['contexts']})
-    if not any(item['role'] == 'PRIMARY' for item in inputs):
+    if require_primary and not any(item['role'] == 'PRIMARY' for item in inputs):
         raise AnalysisError('PRIMARY_INPUT_REQUIRED', '分析至少明确采用一个主体来源。')
     return inputs
 
@@ -218,8 +257,16 @@ def adopt_analysis(turn, artifact):
         choices.extend({'sourceRef': item['sourceRef'], 'role': role}
                        for item in register_selections(turn, group))
     install(turn, select(turn, choices))
+    turn.state['adoptedReportRef'] = artifact['analysisRef']
+    progress = {}
+    if artifact.get('reportDelivery'):
+        from .report_review import current_delivery
+        saved = current_delivery(turn.service.store, turn.service.owner, artifact['reportDelivery'])
+        review = saved.get('review') or {}
+        progress = {'reviewStatus': saved.get('semanticReview'), 'completedParts': review.get('completedPartCount'),
+                    'totalParts': len(review.get('parts', []))}
     return {'analysisRef': artifact['analysisRef'], 'sourceCount': len(choices),
-            'factCount': len(artifact.get('facts', [])), 'roles': sorted(groups),
+            'factCount': len(artifact.get('facts', [])), 'roles': sorted(groups), **progress,
             'meaning': '已采用该报告完整的冻结来源，保留行列、粒度和用途；没有取数或重算。'}
 
 
@@ -248,6 +295,10 @@ def input_version(turn, inputs):
         # A saved conversation may already own an artifact with this version.
         # Unchanged facts keep that identity when the analysis goal is reworded.
         return turn.state['inputSetVersion']
+    saved = {record['inputSetVersion'] for record in turn.state.get('businessContexts', [])
+             if record.get('inputSetVersion') and input_identity(record.get('adoptedInputs', [])) == identity}
+    if len(saved) == 1:
+        return saved.pop()
     return digest(identity)
 
 
@@ -262,7 +313,9 @@ def install(turn, inputs):
     if not changed:
         return
     # New input sets never inherit readiness or calculations of a replaced set.
-    for key in ('budgetFormulaTargets', 'budgetFormulaPreparation', 'analysisRef', 'report', 'hostCloseout'):
+    from .prepared_inputs import clear_formula_inputs
+    clear_formula_inputs(turn.state)
+    for key in ('analysisRef', 'report', 'hostCloseout', 'adoptedReportRef'):
         turn.state.pop(key, None)
 
 
@@ -383,6 +436,9 @@ def query_basis(turn, origin, request):
     raw = turn.service.sources.for_capture(capture).raw_receipt(capture['response'])
     dimensions = (member_dimensions(table, columns, receipt, selection.get('grain'))
                   if basis['kind'] == 'MEMBERS' else [])
+    if basis['kind'] == 'MEMBERS':
+        from .condition_context import previous_target_scopes
+        turn.state['memberBasisTargetScopes'] = previous_target_scopes(raw, native, request, capture.get('request'))
     if basis['kind'] == 'FACTS':
         from .query_lineage import fact_draft
         request = fact_draft(request)

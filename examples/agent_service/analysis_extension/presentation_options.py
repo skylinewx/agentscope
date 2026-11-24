@@ -72,9 +72,7 @@ def validate_presentation(artifact, options, views, claims=None):
     return deepcopy(options)
 
 
-def prepare_views(artifact):
-    """Attach a private lookup only to the rendering copy, after validation."""
-    artifact = deepcopy(artifact)
+def label_resolver(artifact):
     from .tables import measure_key
     from .models import digest
     known = {f['factId']: f for f in artifact['facts']}
@@ -101,6 +99,13 @@ def prepare_views(artifact):
         refs = set(known) | {entry['valueRef'] for entry in entries}
         return {role: {ref: by_identity[identity(ref, role)] for ref in refs if identity(ref, role) in by_identity}
                 for role in ('object', 'measure')}
+    return expand
+
+
+def prepare_views(artifact):
+    """Attach a private lookup only to the rendering copy, after validation."""
+    artifact = deepcopy(artifact)
+    expand = label_resolver(artifact)
     shared = expand(artifact.get('presentation', {}).get('labels', []), '/presentation/labels')
     from .identity import display_names
     defaults = display_names(artifact['facts'], artifact['scope'].get('memberDimension'))

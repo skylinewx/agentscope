@@ -12,6 +12,21 @@ from analysis_extension.tools import AnalysisPublish
 
 
 class FreeDocumentTests(PresentationCase):
+    async def test_existing_table_cell_can_supply_a_numeric_slot(self):
+        req = await self.request()
+        artifact = self.store.get_analysis(OWNER, self.ref)
+        value = {'derivedId': 'saved-table', 'operator': 'PYTHON', 'calculationValidation': 'PASS',
+                 'outputKind': 'TABLE', 'columns': [{'name': 'balance', 'label': '余额', 'type': 'DECIMAL_STRING', 'unit': '元'}],
+                 'rows': [{'rowRef': 'selected-row', 'values': {'balance': '35.01'}}]}
+        artifact['derivedValues'].append(value)
+        bind = {'key': 'amount', 'valueRef': 'saved-table', 'rowRef': 'selected-row', 'column': 'balance'}
+        req['document']['bindings'] = [bind]
+        self.assertIn('35.01', compile_document(artifact, req['document'])['html'])
+        for diff in ({'column': '余额'}, {'rowRef': 'unknown'}, {'field': 'value'}):
+            req['document']['bindings'] = [{**bind, **diff}]
+            with self.assertRaises(AnalysisError):
+                compile_document(artifact, req['document'])
+
     async def request(self):
         cap, selections, scope = saved_fixture(self.store, ('1234567890.123456', '-7', '0'), unit='')
         built = await self.service.build([cap], selections, scope, [], 'build-free')
@@ -61,6 +76,16 @@ class FreeDocumentTests(PresentationCase):
         with self.assertRaises(AnalysisError):self.delivery.project_view(self.ref,{'filter':'negative'})
         with self.assertRaises(AnalysisError):self.delivery.render_report(self.ref,'table-free',layout='table')
 
+    async def test_static_markdown_uses_source_facts_and_unbound_html_is_rejected(self):
+        req = await self.request()
+        artifact = self.store.get_analysis(OWNER, self.ref)
+        doc = compile_document(artifact, {'title': '范围说明', 'markdown': '详见来源明细。'})
+        self.assertEqual((doc['bindingCount'], doc['datasetCount']), (0, 0))
+        self.assertEqual(set(doc['valueRefs']), {fact['factId'] for fact in artifact['facts']})
+        with self.assertRaises(AnalysisError) as caught:
+            compile_document(artifact, {'title': '范围说明', 'html': '<html><head></head><body>详见来源明细。</body></html>'})
+        self.assertEqual(caught.exception.code, 'INVALID_DOCUMENT')
+
     async def test_bad_reference_is_located_repairable_and_does_not_publish(self):
         req=await self.request();req['document']['bindings'][0]['valueRef']='fact_not_current'
         response=await AnalysisPublish(self.service).call(**req,previewOnly=True)
@@ -71,6 +96,35 @@ class FreeDocumentTests(PresentationCase):
             repairs=[{'op':'replace','path':'/document/bindings/0/valueRef','value':self.fact}])
         self.assertTrue(fixed['previewOnly'])
         self.assertEqual(fixed['summary']['document']['bindingCount'],1)
+
+    async def test_fresh_document_accepts_misplaced_binding_and_dataset_arrays(self):
+        cap, selectors, scope = saved_fixture(self.store)
+        built = await self.service.build([cap], selectors, scope, [{'id': 'order', 'operator': 'SORT'}], 'build-arrays')
+        ref = built['analysisRef']
+        fact = self.store.get_analysis(OWNER, ref)['facts'][0]['factId']
+        document = {'title': '来源值', 'html': '<html><head></head><body><p>{{original}} {{extra}}</p></body></html>',
+                    'bindings': [{'key': 'original', 'valueRef': fact}]}
+        extra_binding = {'key': 'extra', 'valueRef': fact}
+        dataset = {'key': 'order', 'valueRef': 'derived_order'}
+        response = await AnalysisPublish(self.service).call(analysisRef=ref, requestKey='preview-arrays',
+            document=document, bindings=[extra_binding], datasets=[dataset], previewOnly=True)
+        preview = json.loads(response.content[0].text)
+        self.assertTrue(preview['previewOnly'])
+        saved = self.store.get_publication_proposal(OWNER, preview['repairRef'])
+        self.assertEqual(saved['document']['bindings'], [*document['bindings'], extra_binding])
+        self.assertEqual(saved['document']['datasets'], [dataset])
+        self.assertEqual(len(document['bindings']), 1)
+        self.assertNotIn('datasets', document)
+        self.assertEqual(self.store.get_analysis(OWNER, ref)['publicationState'], 'DRAFT')
+
+    async def test_misplaced_bindings_still_require_valid_source_references(self):
+        req = await self.request()
+        bindings = req['document'].pop('bindings')
+        bindings[0]['valueRef'] = 'fact_not_current'
+        response = await AnalysisPublish(self.service).call(**req, bindings=bindings, previewOnly=True)
+        error = json.loads(response.content[0].text)['error']
+        self.assertEqual(error['details']['path'], '/document/bindings/0/valueRef')
+        self.assertEqual(self.store.get_analysis(OWNER, self.ref)['publicationState'], 'DRAFT')
 
     async def test_external_resources_bad_paths_and_unknown_slots_rejected(self):
         req=await self.request();artifact=self.store.get_analysis(OWNER,self.ref)

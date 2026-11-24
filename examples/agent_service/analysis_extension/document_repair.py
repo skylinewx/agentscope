@@ -62,14 +62,26 @@ class _TextNodes(HTMLParser):
         self._append(len(raw) + int(self.source[end:end + 1] == ';'))
 
 
-def text_targets(source, statement):
+def markdown_nodes(source):
+    nodes, start = [], 0
+    source_digest = digest(source)
+    for line in source.splitlines(keepends=True):
+        raw = line.rstrip('\r\n')
+        if raw:
+            nodes.append({'text': raw, 'start': start, 'end': start + len(raw),
+                          'textRef': 'text_' + digest([source_digest, start, raw])[:24]})
+        start += len(line)
+    return nodes
+
+
+def text_targets(source, statement, field='html'):
     """为单个静态文本节点中真实存在的原句提供定位。"""
     if not statement:
         return []
     return [{'textRef': node['textRef'], 'oldText': statement,
              'context': node['text'][max(0, node['text'].index(statement) - 120):
                                      node['text'].index(statement) + len(statement) + 120]}
-            for node in _TextNodes(source).nodes
+            for node in (markdown_nodes(source) if field == 'markdown' else _TextNodes(source).nodes)
             if statement in node['text'] and len(node['text']) <= 12000]
 
 
@@ -117,13 +129,16 @@ def statement_fragments(source, statement, compiled_document):
 def attach_text_targets(issues, document, compiled_document=None):
     """定位只添加提示，不能因为无法定位而改变业务审查结论。"""
     result = deepcopy(issues)
-    source = (document or {}).get('html')
+    field = 'markdown' if 'markdown' in (document or {}) else 'html'
+    source = (document or {}).get(field)
     if not isinstance(source, str):
         return result
     for issue in result:
         targets = []
         for statement in [issue.get('statement', ''), *issue.get('relatedStatements', [])]:
-            located = text_targets(source, statement) or statement_fragments(source, statement, compiled_document)
+            located = text_targets(source, statement, field)
+            if not located and field == 'html':
+                located = statement_fragments(source, statement, compiled_document)
             for target in located:
                 same_node = [item for item in targets if item['textRef'] == target['textRef']]
                 if any(item['oldText'] == target['oldText'] or item.get('matchMode') == 'STATEMENT_FRAGMENT'
@@ -136,14 +151,15 @@ def attach_text_targets(issues, document, compiled_document=None):
         issue['textRepairable'] = bool(targets)
         if targets:
             issue['textTargets'] = targets
+            issue['repairPath'] = '/document/' + field
     return result
 
 
-def apply_text_repairs(source, edits, available_bindings=()):
+def apply_text_repairs(source, edits, available_bindings=(), *, field='html'):
     """所有匹配都基于同一冻结源码，全部校验成功后一次应用，禁止半批修改。"""
     if not isinstance(source, str):
         raise AnalysisError('INVALID_REPAIR', '文字修正需要已冻结的 HTML 页面。')
-    nodes = _TextNodes(source).nodes
+    nodes = markdown_nodes(source) if field == 'markdown' else _TextNodes(source).nodes
     replacements = {}
     for edit_index, edit in edits:
         def fail(message, **details):
@@ -151,26 +167,26 @@ def apply_text_repairs(source, edits, available_bindings=()):
                                 {'path': f'/repairs/{edit_index}', **details})
 
         value = edit.get('value')
-        if (set(edit) != {'op', 'path', 'value'} or edit['path'] != '/document/html'
+        if (set(edit) != {'op', 'path', 'value'} or edit['path'] != '/document/' + field
                 or not isinstance(value, dict) or set(value) - {'oldText', 'newText', 'textRef'}
                 or not {'oldText', 'newText'} <= set(value)
                 or not isinstance(value['oldText'], str) or not value['oldText'].strip()
                 or not isinstance(value['newText'], str) or not value['newText'].strip()
                 or max(len(value['oldText']), len(value['newText'])) > 12000
                 or 'textRef' in value and not isinstance(value['textRef'], str)):
-            fail('replaceText 使用 /document/html，value 提供非空 oldText/newText；textRef 可选。')
+            fail('replaceText 使用 /document/' + field + '，value 提供非空 oldText/newText 和可选 textRef。')
         old, new = value['oldText'], value['newText']
         old_slots, new_slots = Counter(SLOT.findall(old)), Counter(SLOT.findall(new))
         # 允许补充引用冻结页面已有的金额（如差额），无需仅为复用已知数据改写整页。
         # 原有数值仍须保留；新字段或绑定定义变化交由原发布修复入口处理。
         if old_slots - new_slots or set(new_slots - old_slots) - set(available_bindings):
-            fail('文字修正须保留原数值占位符；可补充引用页面已有绑定，新绑定请使用原发布修复入口。')
+            fail('文字修正须保留原数值占位符。新占位符可在同批修订中添加对应的数据绑定。')
         candidates = [node for node in nodes if old in node['text']
                       and ('textRef' not in value or value['textRef'] == node['textRef'])]
         count = sum(len(re.findall('(?=' + re.escape(old) + ')', node['text'])) for node in candidates)
         if count != 1:
             fail('原文不存在或出现多次，未应用任何修改；使用当前 textTargets 定位，或合并为完整原段落。',
-                 matchCount=count, textTargets=text_targets(source, old))
+                 matchCount=count, textTargets=text_targets(source, old, field))
         node = candidates[0]
         start = node['text'].index(old)
         changes = replacements.setdefault(node['textRef'], (node, []))[1]
@@ -187,5 +203,5 @@ def apply_text_repairs(source, edits, available_bindings=()):
         text = node['text']
         for start, end, new in sorted(changes, reverse=True):
             text = text[:start] + new + text[end:]
-        result = result[:node['start']] + escape(text, quote=False) + result[node['end']:]
+        result = result[:node['start']] + (text if field == 'markdown' else escape(text, quote=False)) + result[node['end']:]
     return result

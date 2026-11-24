@@ -9,6 +9,7 @@ import { setAuth, type AuthSession } from '@/api/auth-state';
 import { ChatContent } from '@/components/chat/ChatContent';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import { useMessages } from '@/hooks/useMessages';
+import { useSessions, useSessionUpdates } from '@/hooks/useSessions';
 import i18n from '@/i18n';
 import '@/index.css';
 
@@ -41,6 +42,10 @@ let shortHeartbeat = false;
 let root: ReturnType<typeof createRoot> | null = null;
 let state: ReturnType<typeof useMessages>;
 const streams: { url: URL; signal: AbortSignal; send: (...events: object[]) => void; close: () => void; fail: () => void; heartbeat: () => void }[] = [];
+const titleStreams: typeof streams = [];
+let sessionTitles = new Map<string, { name: string; auto: boolean }>();
+let holdTitleList = false;
+let releaseTitleList: (() => void) | null = null;
 const originalTimeout = window.setTimeout.bind(window);
 window.setTimeout = ((fn: TimerHandler, ms?: number, ...args: unknown[]) =>
 	originalTimeout(fn, shortHeartbeat && ms === 90_000 ? 150 : ms, ...args)) as typeof window.setTimeout;
@@ -61,6 +66,16 @@ const json = (value: unknown, status = 200) => new Response(JSON.stringify(value
 window.fetch = async (input, init) => {
 	const url = new URL(String(input), location.origin);
 	const signal = init?.signal as AbortSignal;
+	if (url.pathname === '/api/sessions/') {
+		const sessions = Array.from(sessionTitles, ([id, { name, auto }]) => ({
+			session: { id, config: { name, naming: { auto } } },
+		}));
+		if (holdTitleList) {
+			holdTitleList = false;
+			await new Promise<void>((resolve) => { releaseTitleList = resolve; });
+		}
+		return json({ sessions, total: sessions.length });
+	}
 	if (url.pathname === '/api/chat/') {
 		posts++;
         if (delaySend) await new Promise<void>((resolve) => { releaseSend = resolve; });
@@ -73,8 +88,10 @@ window.fetch = async (input, init) => {
 		if (delayHistory) await new Promise<void>((resolve) => { delayedHistory = resolve; });
 		return json(value);
 	}
-	if (url.pathname.endsWith('/stream')) {
+	const isTitleStream = url.pathname === '/api/sessions/updates';
+	if (isTitleStream || url.pathname.endsWith('/stream')) {
 		if (streamFailure) return json({ detail: 'Unavailable' }, streamFailure);
+		const connections = isTitleStream ? titleStreams : streams;
 		let ended = false;
 		const encoder = new TextEncoder();
 		return new Response(new ReadableStream<Uint8Array>({
@@ -85,7 +102,7 @@ window.fetch = async (input, init) => {
 					if (error) controller.error(error); else controller.close();
 				};
 				signal.addEventListener('abort', () => finish(signal.reason), { once: true });
-				streams.push({
+				connections.push({
 					url, signal,
 					send: (...events) => controller.enqueue(encoder.encode(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(''))),
 					heartbeat: () => controller.enqueue(encoder.encode(':\n\n')),
@@ -114,6 +131,20 @@ export function Probe({ sessionId }: { sessionId: string }) {
 function render(sessionId = 'fixture') {
 	flushSync(() => root!.render(<Probe sessionId={sessionId} />));
 }
+
+function SessionTitles() {
+	useSessionUpdates();
+	const { sessions } = useSessions('fixture-agent');
+	return <output>{sessions.map(({ session }) => session.config.name).join(' / ')}</output>;
+}
+
+function renderWithTitles(sessionId: string) {
+	flushSync(() => root!.render(<QueryClientProvider client={queryClient}>
+		<SessionTitles />
+		<Probe sessionId={sessionId} />
+	</QueryClientProvider>));
+}
+
 function reset(value = snapshot()) {
 	if (root) flushSync(() => root!.unmount());
 	root = createRoot(harness);
@@ -134,6 +165,38 @@ const live = async () => {
 };
 
 const tests: [string, () => Promise<void>][] = [
+	['切走后异步刷新会话标题，断线重连后补齐', async () => {
+		reset();
+		queryClient.removeQueries({ queryKey: ['sessions', 'fixture-agent'] });
+		sessionTitles = new Map([
+			['fixture', { name: '会话 A 的临时标题', auto: true }],
+			['another', { name: '会话 B 的临时标题', auto: true }],
+		]);
+		titleStreams.length = 0;
+		holdTitleList = false;
+		releaseTitleList = null;
+		renderWithTitles('fixture');
+		await until(() => titleStreams.length === 1 && streams.length === 1 &&
+			harness.textContent?.includes('会话 A 的临时标题'), '初次读取标题');
+		holdTitleList = true;
+		titleStreams[0].send({ type: 'ready' });
+		await until(() => releaseTitleList !== null, '挂起包含旧标题的请求');
+
+		renderWithTitles('another');
+		await until(() => streams.length === 2 && streams[0].signal.aborted, '切到另一个会话');
+		assert(titleStreams.length === 1, '切换不应重建标题订阅');
+		sessionTitles.set('fixture', { name: '后台已生成的标题', auto: false });
+		titleStreams[0].send({ type: 'title_updated', agent_id: 'fixture-agent' });
+		await new Promise(requestAnimationFrame);
+		releaseTitleList!();
+		await until(() => harness.textContent?.includes('后台已生成的标题'), '背景会话更新');
+
+		titleStreams[0].close();
+		sessionTitles.set('another', { name: '断线期间生成的标题', auto: false });
+		await until(() => titleStreams.length === 2, '重新连接标题订阅');
+		titleStreams[1].send({ type: 'ready' });
+		await until(() => harness.textContent?.includes('断线期间生成的标题'), '重连同步标题');
+	}],
     ['刷新恢复运行中的摘要，使用快照游标续接并忽略结束后迟到的摘要', async () => {
         const progress = {version: 1, replyId: 'reply', revision: 3, steps: [{
             id: 'stage-1', sequence: 1, status: 'running',

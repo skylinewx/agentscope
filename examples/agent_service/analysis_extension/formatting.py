@@ -1,10 +1,43 @@
 """Small presentation capabilities; choices and narrative belong to the model."""
-from collections import Counter
 from html import escape
 import re
 
 from .formulas import Expression
 from .models import AnalysisError
+
+
+NUMERIC_TYPES = frozenset({'DECIMAL_STRING', 'INTEGER', 'NUMBER'})
+_DECIMAL_PARTS = re.compile(r'([+−-]?)([0-9]+)(\.[0-9]+)?')
+
+
+def grouped_value(value):
+    """Group only the integer part of a display value. Keep signs and source scale verbatim."""
+    raw = str(value)
+    parts = _DECIMAL_PARTS.fullmatch(raw)
+    if not parts and 'e' in raw.lower():
+        from .models import NUMBER
+        if NUMBER.fullmatch(raw):
+            try:
+                return number_text(raw, grouping=True)
+            except AnalysisError:
+                return raw
+    if not parts or len(parts[2]) <= 3:
+        return raw
+    whole = parts[2]
+    first = len(whole) % 3 or 3
+    groups = [whole[:first], *(whole[i:i + 3] for i in range(first, len(whole), 3))]
+    return parts[1] + ','.join(groups) + (parts[3] or '')
+
+
+_PROSE_UNIT = r'(?:[万亿千百]?(?:美元|港元|欧元|日元|英镑|元)|[%％]|个百分点)'
+_QUANTITY_IN_TEXT = re.compile(
+    r'(?<![A-Za-z0-9_.,])([+−-]?[0-9]{4,}(?:\.[0-9]+)?)'
+    r'(?=(?:\s*(?:[~～–—]|至|到)\s*[+−-]?[0-9][0-9,]*(?:\.[0-9]+)?)?\s*' + _PROSE_UNIT + r')')
+
+
+def group_written_amounts(text):
+    """Only explicit monetary/percentage quantities in prose, never bare identifiers or years."""
+    return _QUANTITY_IN_TEXT.sub(lambda match: grouped_value(match[1]), text)
 
 
 def unit_for(value, view):
@@ -43,17 +76,8 @@ def formula_text(tree, names, minimum=0):
 def formula_labels(trace, known, view):
     """One label map for diagrams, waterfalls and details; aliases remain model-authored."""
     facts = [known[n['factRef']] for n in trace['nodes'] if n['factRef'] in known]
-    headers = [set(f.get('headers', [])) for f in facts]
-    common = set.intersection(*headers) if headers else set()
-    labels = {f['factId']: view_label(view, f['factId'],
-              ' / '.join(h for h in f.get('headers', []) if h not in common)
-              or ' / '.join(f.get('headers', [])) or '相关项目') for f in facts}
-    counts = Counter(labels.values())
-    for fact in facts:
-        ref = fact['factId']
-        if counts[labels[ref]] > 1:
-            labels[ref] = ' · '.join(str(x) for x in (fact.get('objectLabel'), fact.get('period'), labels[ref]) if x)
-    return labels
+    from .formula_labels import component_labels
+    return component_labels(facts, {f['factId']: view_label(view, f['factId'], '') for f in facts})
 
 
 def business_formula(node, known, view=None, labels=None):

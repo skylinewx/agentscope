@@ -39,7 +39,7 @@ def merge_intent(state, context, intent, *, context_supplied=False):
         # Invalidate history only when establishing the base, never the already
         # confirmed patches from the current user turn.
         effective = ({key: deepcopy(value) for key, value in previous.items()
-                      if key not in changes and key not in PRESENTATION_FIELDS}
+                      if key not in changes and key not in (*PRESENTATION_FIELDS, 'task', 'form')}
                      if context['mode'] == 'CONTINUE' else
                      {key: deepcopy(value) for key, value in previous.items()
                       if context['mode'] == 'NEW' and key in ('population', 'scenario', 'period') and key not in changes})
@@ -203,7 +203,7 @@ def apply_scope_edits(turn, edits):
 
 def _validate_selector(selector):
     kind = selector.get('type')
-    allowed = {'VALUES': {'type', 'members'}, 'ALL': {'type'},
+    allowed = {'VALUES': {'type', 'members'}, 'ALL': {'type', 'rootText'},
                'HIERARCHY': {'type', 'rootText', 'level', 'where'}, 'FILTER': {'type', 'where'}}
     if kind not in allowed or set(selector) - allowed[kind]:
         raise AnalysisError('INVALID_SCOPE_EDIT', '选择器字段与 VALUES/ALL/HIERARCHY/FILTER 类型不一致。')
@@ -211,9 +211,9 @@ def _validate_selector(selector):
         members = selector.get('members')
         if not isinstance(members, list) or not members or any(not isinstance(v, str) or not v.strip() for v in members):
             raise AnalysisError('INVALID_SCOPE_EDIT', 'VALUES 需要非空成员原文。')
+    if 'rootText' in selector and (not isinstance(selector['rootText'], str) or not selector['rootText'].strip()):
+        raise AnalysisError('INVALID_SCOPE_EDIT', '机构或层级根使用非空业务原文。')
     if kind == 'HIERARCHY':
-        if 'rootText' in selector and (not isinstance(selector['rootText'], str) or not selector['rootText'].strip()):
-            raise AnalysisError('INVALID_SCOPE_EDIT', '层级根使用非空业务原文。')
         if not selector.get('rootText') and selector.get('level') is None:
             raise AnalysisError('INVALID_SCOPE_EDIT', '层级需要根或绝对层级。')
         if 'level' in selector and (type(selector['level']) is not int or not 1 <= selector['level'] <= 64):

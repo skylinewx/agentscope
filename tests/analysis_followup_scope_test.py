@@ -46,6 +46,7 @@ class FollowupScopeTest(PresentationCase):
         selection = {'captureRef': ref, 'stepId': 'batch', 'batchId': 'batch-A', 'role': 'PRIMARY',
                      'columnNames': ['metric1', 'metric2']}
         self.turn.state['inheritedScope'] = {'scopeRef': 'business', 'selections': [selection]}
+        self.turn.state['selectedContextRefs'] = [self.previous['businessContexts'][-1]['contextRef']]
         expected = receipt['data']['runtimeRequests'][0]['batchQuery']
         self.assertEqual(_query(capture, 'batch'), expected)
         context = review_context(self.turn)
@@ -86,6 +87,7 @@ class FollowupScopeTest(PresentationCase):
             with self.assertRaises(AnalysisError) as error:
                 prepare(wrong)
             self.assertEqual(error.exception.code,'FORM_EXECUTION_PERIOD_CONFLICT')
+            self.assertIn('数据加载时期', str(error.exception))
 
     def setUp(self):
         super().setUp()
@@ -257,6 +259,37 @@ class FollowupScopeTest(PresentationCase):
             self.turn.task(mode='ANALYSIS', goal='全集团', context={'mode': 'CONTINUE', 'changedFields': ['population'], 'userQuote': '所有单位'})
         self.assertEqual(self.state, before)
 
+    def test_native_member_proof_checks_selected_fact_ids_and_member_coordinates(self):
+        from unittest.mock import patch
+        from analysis_business_query_test import business_fixture
+        from analysis_extension.followup_scope import _grouped_selected_members
+        original, receipt = business_fixture()
+        table = receipt['data']['stepResults'][0]['batchResults'][0]
+        selection = {'stepId': 'batch', 'batchId': table['batchId'], 'columnNames': ['metric1']}
+        first, second = receipt['data']['resultSets'][0]['rows']
+        source = {'executionId': receipt['executionId'], 'resultSetId': 'r0', 'factIds': [first['factId']]}
+        proof = {'basis': {'kind': 'MEMBERS', 'source': source, 'memberDimensions': ['MD_ORG'],
+                           'querySessionId': receipt['querySessionId'], 'contextId': receipt['context']['contextId']},
+                 'selectedFactIds': source['factIds'], 'memberTuples': [{'MD_ORG': first['dimensions']['MD_ORG']}]}
+        grouped = {'data': {'sourceBasis': proof}}
+        query = {'batchDimensions': [{'dimCode': 'MD_ORG', 'values': [first['dimensions']['MD_ORG']]}]}
+        def within():
+            with patch('analysis_extension.adapters.budget_v2.receipt_from_capture',
+                       side_effect=lambda cap: receipt if cap is original else grouped):
+                return _grouped_selected_members(original, selection, table, {0}, {}, query)
+        self.assertTrue(within())
+        query['batchDimensions'][0]['values'].append(second['dimensions']['MD_ORG'])
+        self.assertFalse(within())
+        query['batchDimensions'][0]['values'].pop()
+        proof['memberTuples'] = [{'MD_ORG': second['dimensions']['MD_ORG']}]
+        self.assertFalse(within())
+        source['factIds'] = proof['selectedFactIds'] = [second['factId']]
+        self.assertFalse(within())
+        source['factIds'] = [first['factId']]
+        proof['memberTuples'] = [{'MD_ORG': first['dimensions']['MD_ORG']}]
+        source['executionId'] = 'different-execution'
+        self.assertFalse(within())
+
     def test_grouped_result_must_keep_original_population_conditions(self):
         facts = self.facts(self.ref)
         fact = deepcopy(facts[0])
@@ -320,13 +353,14 @@ class FollowupScopeTest(PresentationCase):
         self.assertEqual(self.state['queryIntent'], {'metric': '收入', 'population': '二级单位', 'period': '2025年'})
 
     def test_expired_previous_receipt_is_reported_without_breaking_new_topic(self):
+        self.state['selectedContextRefs'] = [self.previous['businessContexts'][-1]['contextRef']]
         self.state['inheritedScope']['selections'][0]['captureRef'] = 'cap_' + '0' * 64
         result = self.turn.task(mode='ANALYSIS', goal='继续原来的分析', context={'mode': 'CONTINUE'})
         self.assertEqual(result['followupScope']['unavailable']['code'], 'NOT_FOUND')
         self.state['request'] = '换个问题查询收入'
         result = self.turn.task(mode='ANALYSIS', goal='收入', context={'mode': 'NEW', 'userQuote': '换个问题'})
         self.assertNotIn('unavailable', result['followupScope'])
-        self.assertEqual(result['followupScope']['inheritedSubject'], [])
+        self.assertFalse(result['followupScope'].get('inheritedSubject'))
 
     def test_task_change_does_not_merge_independent_organization_categories(self):
         self.state['request'] = '换到管理架构任务下的单位'
@@ -358,6 +392,8 @@ class FollowupScopeTest(PresentationCase):
         saved = current_turn(state, user)
         self.assertEqual(saved['inheritedScope'], self.previous['resolvedSubjectScope'])
         self.assertIs(saved, current_turn(state, []))
+        self.assertNotIn('inheritedSubject', review_context(TurnCompletion(self.service, saved)))
+        saved['selectedContextRefs'] = [saved['activeBusinessContextRef']]
         context = review_context(TurnCompletion(self.service, saved))
         self.assertEqual(context['inheritedSubject'][0]['selectedRowCount'], 11)
         self.assertNotIn('rows', context['inheritedSubject'][0])

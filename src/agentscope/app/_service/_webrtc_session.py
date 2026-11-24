@@ -21,6 +21,8 @@ from ..message_bus import MessageBus, MessageBusKeys
 from ..storage import StorageBase
 from ._webrtc_audio_transport import WebRTCAudioTransport
 from ._resources import close_resource_toolkit
+from ._session import SessionStatus
+from ._session_activity import SessionActivity, latest_question_title, parked_session_status
 
 _CHECKPOINT_LOCK_TTL_SECS = (
     MessageBusKeys.SESSION_EVENT_CHECKPOINT_LOCK_TTL_SECS
@@ -125,11 +127,28 @@ class WebRTCSession:
     async def _run(self) -> None:
         """Hold the session lock while forwarding events to the SSE log."""
         try:
-            async with self.message_bus.acquire_lock(
-                MessageBusKeys.session_lock(self.session_id),
-                ttl_secs=MessageBusKeys.SESSION_RUN_TTL_SECS,
+            async with (
+                self.message_bus.acquire_lock(
+                    MessageBusKeys.session_lock(self.session_id),
+                    ttl_secs=MessageBusKeys.SESSION_RUN_TTL_SECS,
+                ),
+                SessionActivity(
+                    self.message_bus, self.user_id, self.agent_id, self.session_id,
+                ) as activity,
             ):
                 self._lock_acquired.set()
+                active_reply: str | None = None
+                finished_replies: set[str] = set()
+
+                async def announce_saved_replies(state: AgentState) -> None:
+                    if not finished_replies:
+                        return
+                    for reply in state.context:
+                        if reply.id in finished_replies and reply.role == "assistant":
+                            finished_replies.remove(reply.id)
+                            title = "" if self._open_user_replies else latest_question_title(state)
+                            await activity.reply_finished(reply, title)
+
                 try:
                     self.agent = await self._agent_factory()
                     self._persisted_messages = {
@@ -175,10 +194,16 @@ class WebRTCSession:
                                     self._open_user_replies.add(
                                         event.reply_id,
                                     )
+                                elif isinstance(event, ReplyStartEvent) and event.role == "assistant":
+                                    active_reply = event.reply_id
+                                    await activity.set_status(SessionStatus.RUNNING)
                                 elif isinstance(event, ReplyEndEvent):
                                     self._open_user_replies.discard(
                                         event.reply_id,
                                     )
+                                    if event.reply_id == active_reply:
+                                        finished_replies.add(event.reply_id)
+                                        active_reply = None
                                 if (
                                     checkpoint is not None
                                     and not self._open_user_replies
@@ -188,6 +213,12 @@ class WebRTCSession:
                                             entry_id,
                                             checkpoint,
                                         )
+                                        await announce_saved_replies(checkpoint)
+                                        if active_reply is not None:
+                                            parked = parked_session_status(checkpoint)
+                                            await activity.set_status(
+                                                SessionStatus.RUNNING if parked == SessionStatus.IDLE else parked,
+                                            )
                                     except Exception as exc:
                                         logger.warning(
                                             "Failed to checkpoint WebRTC "
@@ -212,6 +243,10 @@ class WebRTCSession:
                                 await self._set_checkpoint_cursor(
                                     self._last_entry_id,
                                 )
+                        if self.agent is not None:
+                            await announce_saved_replies(self.agent.state)
+                        if active_reply is not None:
+                            await activity.set_status(SessionStatus.IDLE)
                     except Exception as exc:
                         logger.exception(
                             "Failed to persist WebRTC session %r: %s",

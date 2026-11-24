@@ -1,13 +1,15 @@
 """从已交付的来源范围承接追问；不靠业务关键词猜测用户是否换题。"""
 from copy import copy, deepcopy
 from datetime import date
+from itertools import product
+from math import prod
 import re
 
 from .models import AnalysisError, digest
 from .receipt_reads import receipt_read_scope
 
 
-INTENT_FIELDS = ('metric', 'task', 'period', 'formExecutionYear', 'scenario', 'population', 'grouping',
+INTENT_FIELDS = ('metric', 'task', 'form', 'period', 'formExecutionYear', 'scenario', 'population', 'grouping',
                  'order', 'analysisFocus', 'referencePopulation')
 # 意图与变化字段共用同一契约；分组、排序变化不解除主体或时期边界。
 CHANGE_FIELDS = INTENT_FIELDS
@@ -191,7 +193,7 @@ def _single_annual_code(period_request):
 
 
 def _apply_form_year(request, year):
-    """限定年度表内查询：表外执行期与批量结果的数据期各自约束，实际维值由预算展开核对。"""
+    """限定年度表内查询：数据加载时期与批量结果的实际数据时期各自约束，实际维值由预算展开核对。"""
     expected = year + 'N0001'
     result = deepcopy(request)
     for step in result.get('plan', {}).get('steps', []):
@@ -216,7 +218,7 @@ def _apply_form_year(request, year):
                     or (structured is not None and _single_annual_code(structured) != expected)
                     or selection.get('periodText')):
                 raise AnalysisError('FORM_EXECUTION_PERIOD_CONFLICT',
-                    f'本轮已确定按 {year} 年度开表，请在该执行期展开，并按实际格内时期筛选。')
+                    f'本轮已将数据加载时期限定为 {year} 年。请按该年度加载，再按单元格的实际数据时期筛选。')
             if code is None and dimension is None and structured is None:
                 selection['periodCode'] = expected
             if data_period is not None:
@@ -227,31 +229,79 @@ def _apply_form_year(request, year):
     return result
 
 
-def prepare_request(turn, origin, request, *, host_prepared=False):
+def prepare_request(turn, origin, request, *, host_prepared=False, comparison_read=False):
     from .execution_policy import check_query
-    check_query(turn, origin, request)
+    if origin.get('originalToolName') != 'execute_budget_query':
+        check_query(turn, origin, request)
     if origin.get('originalToolName') == 'execute_budget_query':
         if 'sourceSelection' in request:
             raise AnalysisError('QUERY_CONTRACT_CHANGED', '采用结果使用 basis.kind 与真实 sourceRef；执行和事实凭据由宿主绑定。')
+        from .dimension_scopes import recover_metric_proof
+        recover_metric_proof(turn)
         # Validate the whole request before installing derived scope/evidence state.
         original_turn = turn
         turn = copy(turn)
         turn.state = deepcopy(original_turn.state)
         request = deepcopy(request)
+        if comparison_read:
+            from .query_comparison import apply_item_intent
+            apply_item_intent(turn.state, request)
+        if turn.state.get('request'):
+            request['question'] = turn.state['request']
         from .material_plan import query_purpose
         # Host retries carry a frozen request and bypass this model-input path.
+        objective = None
         if not host_prepared:
-            request['purpose'] = query_purpose(turn.state, request)
+            from .objectives import query_objective
+            objective = query_objective(turn.state, request)
+            if objective:
+                from .objectives import material_plan_for
+                request['materialRole'] = objective['role']
+            purpose_state = {'materials': material_plan_for([objective])} if objective else turn.state
+            request['purpose'] = query_purpose(purpose_state, request)
         material_role = request.pop('materialRole', 'PRIMARY')
+        def remember_query(prepared):
+            from .material_plan import request_key
+            key = request_key(prepared)
+            roles = original_turn.state.setdefault('materialQueryRoles', {})
+            roles[key] = material_role
+            if objective:
+                original_turn.state.setdefault('materialQueryObjectives', {})[key] = objective['objectiveRef']
+            while len(roles) > 128:
+                expired = next(iter(roles))
+                del roles[expired]
+                original_turn.state.get('materialQueryObjectives', {}).pop(expired, None)
+            return prepared
+        adopted = [ref for ref in turn.state.get('historyReferences', [])
+                   if ref['use'] in ('FACTS', 'MEMBERS') and ref['role'] == material_role]
+        if objective and objective.get('membersFromObjective'):
+            from .objectives import resolve_dependencies
+            resolve_dependencies(turn)
+            cohort = objective.get('resolvedMemberSource')
+            if not cohort:
+                raise AnalysisError('OBJECTIVE_MEMBERS_PENDING', '先执行选定的取值目标，取得实际筛选结果后再沿用这些成员。',
+                                    {'objectiveRef': objective['membersFromObjective']})
+            adopted = [{'use': 'MEMBERS', 'sourceRef': cohort}]
+        if not host_prepared and adopted and not request.get('basis'):
+            if len(adopted) != 1:
+                raise AnalysisError('HISTORY_SOURCE_SELECTION', '这项查询有多个已选来源，请在 basis 指定本次使用的来源。',
+                    {'candidates': [{'kind': ref['use'], 'sourceRef': ref['sourceRef']} for ref in adopted]})
+            request['basis'] = {'kind': adopted[0]['use'], 'sourceRef': adopted[0]['sourceRef']}
+        elif not host_prepared and adopted and not any(
+                request['basis'].get('kind') == ref['use'] and request['basis'].get('sourceRef') == ref['sourceRef']
+                for ref in adopted):
+            raise AnalysisError('HISTORY_SOURCE_CONFLICT', '查询用途或来源与本轮已选对象不一致。省略 basis 可沿用唯一选择，调整对象请更新任务声明。',
+                                {'candidates': [{'kind': ref['use'], 'sourceRef': ref['sourceRef']} for ref in adopted]})
+        check_query(turn, origin, request)
         model_request = request
         from .scope_candidates import bind as bind_scope_candidates
         request = bind_scope_candidates(turn, origin, request)
+        from .history_references import apply_source_paths
+        path_terms = apply_source_paths(turn, origin, request, material_role)
         if any(b.get('recoveryExecutionId') for b in request.get('scope', {}).get('bindings', [])):
             from .condition_context import prepare
-            prepare(turn, request)
-            from .material_plan import request_key
-            original_turn.state.setdefault('materialQueryRoles', {})[request_key(request)] = material_role
-            return request
+            prepare(turn, request, origin)
+            return remember_query(request)
         from .source_views import query_basis
         from .query_lineage import scope_terms
         model_basis = request.get('basis') or {}
@@ -275,9 +325,13 @@ def prepare_request(turn, origin, request, *, host_prepared=False):
         from .dimension_scopes import inherit, check_scope_evidence
         result = _inherit_business_request(turn, origin, request, source_ref=model_basis.get('sourceRef'))
         if (result.get('basis') or {}).get('kind') != 'FACTS':
+            from .dimension_scopes import current_organization
+            for scope in (result.get('intentDraft') or {}).get('dimensionScopes', []):
+                current_organization(scope, result.get('question', ''))
             result = inherit(turn, result)
             terms = retained_selector_terms(turn.state, result)
             terms.extend(basis_scope_terms)
+            terms.extend(path_terms)
             if terms:
                 result['contextText'] = ' '.join(dict.fromkeys([result.get('contextText', ''), *terms])).strip()
             from .language_evidence import bind
@@ -291,16 +345,11 @@ def prepare_request(turn, origin, request, *, host_prepared=False):
             result['intentDraft'].setdefault('sharedConditions', [])
             result['intentDraft'].setdefault('targets', [])
         from .condition_context import prepare as prepare_conditions
-        prepare_conditions(turn, result)
+        prepare_conditions(turn, result, origin)
         # A speculative query has a local scope. Only explicit declaration/adoption
         # changes the analysis base; asynchronous completions cannot overwrite it.
         original_turn.state.setdefault('businessEvidence', {}).update(turn.state.get('businessEvidence', {}))
-        from .material_plan import request_key
-        roles = original_turn.state.setdefault('materialQueryRoles', {})
-        roles[request_key(result)] = material_role
-        while len(roles) > 128:
-            del roles[next(iter(roles))]
-        return result
+        return remember_query(result)
     result = _inherit_request(turn, origin, request)
     year = turn.state.get('queryIntent', {}).get('formExecutionYear')
     if year and origin.get('originalToolName') == 'execute_semantic_plan':
@@ -339,7 +388,7 @@ def _inherit_business_request(turn, origin, request, source_ref=None):
         changes = _changes(turn)
         previous_intent = turn.state.get('previousQueryIntent', {})
         terms = [value for field, value in previous_intent.items()
-                 if field in ('metric', 'population', 'scenario', 'period', 'task') and field not in changes
+                 if field in ('metric', 'population', 'scenario', 'period') and field not in changes
                  and isinstance(value, str) and value.strip() and value not in result.get('question', '')]
         # Changing root -> children changes population, but retains the declared root.
         # Only an explicit hierarchy relation may reuse that prior root, never an arbitrary contextText.
@@ -359,18 +408,8 @@ def _inherit_business_request(turn, origin, request, source_ref=None):
         confirmed_requests = []
         confirmed = _confirmed_business_terms(turn, origin, changes, released, source_texts, confirmed_requests,
                                               result.get('intentDraft', {}).get('dimensionScopes', []), retained_scenarios)
-        explicit_names = {name for prior in confirmed_requests
-                          for field, role in (('taskNames', 'task'), ('taskCodes', 'task'),
-                                              ('formNames', 'metric'), ('formCodes', 'metric')) if role not in changes
-                          for name in prior.get('scope', {}).get(field, [])}
-        # A model summary may label "EVA预算" as a task. Only a confirmed
-        # business phrase or explicit task/form scope can retain that wording.
-        unconfirmed_task = previous_intent.get('task') if confirmed_requests else None
-        if unconfirmed_task in confirmed or unconfirmed_task in explicit_names:
-            unconfirmed_task = None
         terms = [term for term in terms if term not in released
-                 and (not source_texts or any(term in source for source in source_texts))
-                 and term != unconfirmed_task]
+                 and (not source_texts or any(term in source for source in source_texts))]
         # A summary such as "指标名+旧情景" is not a new business atom. If the
         # server already split it, retain those verified atoms after a value switch.
         terms = [term for term in terms if term in confirmed or not (
@@ -424,8 +463,18 @@ def _inherit_business_request(turn, origin, request, source_ref=None):
         prior = next(iter(previous.values()))
         changed = _changes(turn)
         from .query_lineage import restore_targets
-        supplied_targets = bool((result.get('intentDraft') or {}).get('targets'))
         restore_targets(result, prior, changed, released)
+        if any(item['use'] == 'REQUERY' for item in turn.state.get('historyReferences', [])):
+            prior_scope = prior.get('scope') or {}
+            replay_scope = result.setdefault('scope', {})
+            for role, names in (('task', ('taskCodes', 'taskNames')), ('form', ('formCodes', 'formNames'))):
+                if role not in changed and not any(replay_scope.get(name) for name in names):
+                    replay_scope.update({name: deepcopy(prior_scope[name]) for name in names if prior_scope.get(name)})
+            from .scope_candidates import inherit
+            inherit(replay_scope, prior_scope, changed)
+            original_filter = (prior.get('intentDraft') or {}).get('valueFilter')
+            if original_filter and 'metric' not in changed and not (result.get('basis') or {}).get('kind'):
+                result.setdefault('intentDraft', {}).setdefault('valueFilter', deepcopy(original_filter))
         # A confirmed scenario may originally have been written inside every
         # target instead of sharedConditions. Its native dimension establishes
         # the same condition either way. Retain only a unique unchanged scenario;
@@ -438,49 +487,41 @@ def _inherit_business_request(turn, origin, request, source_ref=None):
             if not any(scenario == phrase.get('text') or any(scenario in parts for parts in phrase.get('alternatives', []))
                        for phrase in phrases):
                 draft.setdefault('sharedConditions', []).append({'text': scenario, 'sourceText': scenario})
-        # Explicit MEMBERS conditions may deliberately query a different metric.
-        # Reuse a prior form/task only with the restored unchanged query, or an
-        # actual CONTINUE declaration; otherwise explicit source scopes are needed.
-        member_scope_reuse = ((result.get('basis') or {}).get('kind') != 'MEMBERS'
-                              or not supplied_targets and bool((result.get('intentDraft') or {}).get('targets'))
-                              or turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE'
-                              and bool(turn.state.get('previousQueryIntent')))
         scope = result.setdefault('scope', {})
-        for field, intent in (('periodCode', 'period'), ('periodRequest', 'period'),
-                              ('taskCodes', 'task'), ('taskNames', 'task'), ('formCodes', 'metric'), ('formNames', 'metric')):
+        for field, intent in (('periodCode', 'period'), ('periodRequest', 'period')):
             if intent == 'period' and any(t.get('periodText') for t in result.get('intentDraft', {}).get('targets', [])):
                 continue
             if intent in changed or field not in prior.get('scope', {}):
                 continue
-            if intent in ('task', 'metric') and not member_scope_reuse:
-                continue
             value = prior['scope'][field]
-            if field in ('formCodes', 'formNames') and (scope.get('formCodes') or scope.get('formNames')):
-                # A form explicitly named in this turn may narrow a previous multi-form answer.
-                continue
             if field in scope and _business_scope_key(scope[field]) != _business_scope_key(value):
                 raise AnalysisError('FOLLOWUP_SCOPE_CONFLICT', '关联追问改变了未声明变化的查询范围。')
             scope.setdefault(field, deepcopy(value))
-        from .scope_candidates import inherit
-        inherit(scope, prior.get('scope', {}), changed if member_scope_reuse else changed | {'task', 'metric'})
-    # Automatically discovered tasks are provenance, not user constraints. Explicit
-    # Prior request scopes were inherited above; exact fact follow-ups use FACTS.
+    # Only this turn's explicit source names constrain discovery. Adopted
+    # historical task/form pairs travel independently as verified preferences.
+    for name, field, model in (('task', 'taskNames', 'BUDGET_TASK'), ('form', 'formNames', 'BUDGET_FORM_TEMPLATE')):
+        term = turn.state.get('queryIntent', {}).get(name)
+        scope = result.get('scope') or {}
+        if (term and term in result.get('question', '') and not scope.get(field)
+                and not scope.get(field.replace('Names', 'Codes'))
+                and not any(b.get('modelCode') == model for b in scope.get('bindings', []))):
+            result.setdefault('scope', {})[field] = [term]
     year = turn.state.get('queryIntent', {}).get('formExecutionYear')
     if year and not any(t.get('periodText') for t in result.get('intentDraft', {}).get('targets', [])):
         scope = result.setdefault('scope', {})
         expected = f'{year}N0001'
         if scope.get('periodCode', expected) != expected:
-            raise AnalysisError('FORM_EXECUTION_PERIOD_CONFLICT', '执行期与本轮已声明年度不一致。')
+            raise AnalysisError('FORM_EXECUTION_PERIOD_CONFLICT', '数据加载时期与本轮明确限定的年度不一致。')
         if not scope.get('periodRequest'):
             scope.setdefault('periodCode', expected)
-    if turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':
+    if any(item['use'] == 'REQUERY' for item in turn.state.get('historyReferences', [])) and turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':
         # Scope and its provenance travel together. Only retain explicit, confirmed
         # fields actually present in this request; never reintroduce an old form
         # after a user changes the metric/form or selects a different binding.
         changed = _changes(turn)
         evidence = [name for prior in confirmed_requests
                     for field, role in (('taskNames', 'task'), ('taskCodes', 'task'),
-                                        ('formNames', 'metric'), ('formCodes', 'metric')) if role not in changed
+                                        ('formNames', 'form'), ('formCodes', 'form')) if role not in changed
                     for name in prior.get('scope', {}).get(field, [])
                     if name in result.get('scope', {}).get(field, [])]
         evidence.extend(binding['text'] for prior in confirmed_requests
@@ -555,11 +596,9 @@ def _inherit_confirmed_period(result, requests):
         target['periodText'] = period
     # An explicitly annual request must not drift to January through a model's
     # synthetic periodRequest. Nonannual periods remain with the budget resolver.
-    annual = re.fullmatch(r'\s*((?:20)?\d{2})\s*年\s*', period)
-    if annual and not explicit:
-        year = int(annual[1])
-        if year < 100:
-            year += 2000
+    from .budget_period_selection import annual_caption_year
+    year = annual_caption_year(period)
+    if year and not explicit:
         scope = result.setdefault('scope', {})
         scope.pop('periodRequest', None)
         scope['periodCode'] = f'{year}N0001'
@@ -890,6 +929,46 @@ def _preserves_query(previous, current, changes, period_dimensions=()):
     return True
 
 
+def _grouped_selected_members(original, selection, table, rows, grouped, query):
+    """A group's result rows lose their input keys. Check the executed MEMBERS basis against the saved selection."""
+    from .adapters.budget_v2 import receipt_from_capture
+    from .query_lineage import batch_origin_ids
+    from .source_views import member_dimensions
+    receipt = receipt_from_capture(original)
+    proof = receipt_from_capture(grouped)['data'].get('sourceBasis') or {}
+    basis = proof.get('basis') or {}
+    source = basis.get('source') or {}
+    if (basis.get('kind') != 'MEMBERS' or not receipt.get('executionId')
+            or source.get('executionId') != receipt['executionId']
+            or basis.get('querySessionId') != receipt.get('querySessionId')
+            or basis.get('contextId') != receipt.get('context', {}).get('contextId')):
+        return False
+    columns = selection.get('columnNames') or [name for name, role in table['columnRoles'].items() if role['kind'] == 'METRIC']
+    try:
+        dimensions = member_dimensions(table, columns, receipt, selection.get('grain'))
+    except AnalysisError:
+        return False
+    if set(dimensions) != set(basis.get('memberDimensions') or []):
+        return False
+    origins = batch_origin_ids(receipt, {**selection, 'columnNames': columns, 'rowIndices': rows})
+    requested = set(source.get('factIds') or [])
+    selected = {row['factId']: row.get('dimensions', {}) for rs in receipt['data'].get('resultSets', [])
+                if rs.get('resultSetId') == source.get('resultSetId') for row in rs['rows']
+                if row.get('factId') in requested and origins.intersection(row.get('originRefs', []))}
+    if not requested or set(selected) != requested or any(not set(dimensions) <= coords.keys() for coords in selected.values()):
+        return False
+    expected = {tuple(coords[d] for d in dimensions) for coords in selected.values()}
+    if expected != {tuple(coords.get(d) for d in dimensions) for coords in proof.get('memberTuples', [])}:
+        return False
+    # The ontology may split a composite cohort across native batches. Each
+    # batch must be a subset of the original tuples, including cross-dimension pairings.
+    constraints = {item['dimCode']: item for item in query.get('batchDimensions', [])}
+    axes = [constraints.get(d, {}).get('values') for d in dimensions]
+    if any(not isinstance(axis, list) or not axis for axis in axes):
+        return False
+    return prod(map(len, axes)) <= len(expected) and all(point in expected for point in product(*axes))
+
+
 def _formula_dependencies(facts, accepted):
     """范围内目标可引用同一真实观察的依赖；不能凭同名坐标跨表借值。"""
     from .formulas import Expression
@@ -937,6 +1016,7 @@ def validate_primary(turn, data):
     prepared = [(selection, capture, table, rows, *_row_keys(table, rows, changes))
                 for selection, capture, table, rows in anchors]
     own_captures_by_ref = {}
+    grouped_scopes = {}
     invalid, accepted_refs = [], set()
     for fact in data.get('facts', []):
         if fact.get('inputRole', 'PRIMARY') != 'PRIMARY' or not fact.get('captureRefs'):
@@ -965,11 +1045,23 @@ def validate_primary(turn, data):
             actual = fact.get('dimensions', {})
             if all(dimension in actual for dimension in dimensions):
                 accepted = digest([actual[dimension] for dimension in dimensions]) in allowed
-            if not accepted and fact.get('batchId') and rows is None:
-                # 聚合结果可能不再展示原维度；须由真实执行条件证明保留原范围。
-                previous = _query(capture, selection['stepId'])
-                period_dimensions = {period['dimCode'] for period in table['data'].get('resolvedPeriods', [])}
-                accepted = any(_preserves_query(previous, _query(own, fact['stepId']), changes, period_dimensions) for own in own_captures)
+            if not accepted and fact.get('batchId'):
+                for own in own_captures:
+                    if not _same_source(capture, own):
+                        continue
+                    current = _query(own, fact['stepId'])
+                    if (own.get('request', {}).get('basis') or {}).get('kind') == 'MEMBERS':
+                        if (current.get('aggregation') or {}).get('groupBy'):
+                            key = (id(selection), own['captureRef'], fact['stepId'])
+                            if key not in grouped_scopes:
+                                grouped_scopes[key] = _grouped_selected_members(capture, selection, table, rows, own, current)
+                            accepted = grouped_scopes[key]
+                    elif rows is None:
+                        previous = _query(capture, selection['stepId'])
+                        period_dimensions = {period['dimCode'] for period in table['data'].get('resolvedPeriods', [])}
+                        accepted = _preserves_query(previous, current, changes, period_dimensions)
+                    if accepted:
+                        break
             if accepted:
                 break
         if accepted:
@@ -987,35 +1079,105 @@ def validate_primary(turn, data):
                              'path': '/selections'})
 
 
+def _confirmed_primary_rows(turn, artifact, inputs):
+    """Reconnect a continued cohort only when the previous members and the report objectives agree."""
+    from .source_views import match_members, register_selections
+    if turn.state.get('followupContext', {}).get('mode', 'CONTINUE') != 'CONTINUE':
+        return None
+    primary = [item for item in inputs if item.get('role') == 'PRIMARY']
+    if len(primary) != 1:
+        return None
+    item = primary[0]
+    ref = item.get('sourceRef')
+    if not ref or not item['selection'].get('batchId') or not any(
+            peer.get('role') == 'REFERENCE' and peer.get('sourceRef') == ref for peer in inputs):
+        return None
+    objectives = [o for o in (artifact.get('computationIntent') or {}).get('objectives', [])
+                  if o.get('role', 'PRIMARY') == 'PRIMARY']
+    if not objectives or any(o.get('sourceRef') != ref or not o.get('factRefs') for o in objectives):
+        return None
+    aliases = {}
+    selection = item['selection']
+    for fact in artifact.get('facts', []):
+        if (type(fact.get('rowIndex')) is not int or selection['captureRef'] not in fact.get('captureRefs', [])
+                or fact.get('stepId') != selection['stepId'] or fact.get('batchId') != selection['batchId']
+                or fact.get('columnName') not in selection['columnNames']):
+            continue
+        for membership in fact.get('inputMemberships', []):
+            if membership.get('inputRef') != item.get('inputRef') or membership.get('inputRole') != 'PRIMARY':
+                continue
+            for key in (fact['factId'], membership.get('memberRef')):
+                if key:
+                    aliases.setdefault(key, set()).add(fact['rowIndex'])
+    refs = {key for o in objectives for key in o['factRefs']}
+    if any(len(aliases.get(key, ())) != 1 for key in refs):
+        return None
+    rows = sorted(set.union(*(aliases[key] for key in refs)))
+    if not item.get('rowCount') or len(rows) >= item['rowCount']:
+        return None
+    inherited = [s for s in turn.state.get('inheritedScope', {}).get('selections', [])
+                 if s.get('role', 'PRIMARY') == 'PRIMARY' and s.get('batchId')]
+    if not inherited:
+        return None
+    source = turn.service.store.get_source_view(turn.service.owner, ref)
+    try:
+        cohorts = [s for s in register_selections(turn, inherited) if s.get('rowCount')]
+        if len(cohorts) == 1 and match_members(turn, source, cohorts[0]).get('rowIndices') == rows:
+            return item['inputRef'], rows
+    except AnalysisError:
+        # Distinct or unproven value domains do not establish a population identity.
+        pass
+    return None
+
+
 def remember_subject(turn, status):
     """仅在最终交付通过后替换主体，失败、中途查询和参考数据不覆盖上轮主体。"""
     if status.get('status') not in ('DIRECT', 'READY', 'PARTIAL'):
         return
+    if not (status.get('analysisRef') or turn.state.get('queryCaptureRefs') or turn.state.get('adoptedInputs')
+            or turn.state.get('queryResultRefs') or turn.state.get('selectedContextRefs')):
+        return
     from .conversation_context import result_subject, save_context
-    selected_results = result_subject(turn)
+    from .form_history import remember as remember_forms
+    adopted = turn.state.get('adoptedInputs') or []
+    partial_analysis = (turn.state.get('mode') == 'ANALYSIS' and status.get('status') == 'PARTIAL'
+                        and not status.get('analysisRef') and any(item.get('role') == 'PRIMARY' for item in adopted))
+    selected_results = None if partial_analysis else result_subject(turn)
     if selected_results is not None and not status.get('analysisRef'):
         turn.state['resolvedSubjectScope'] = selected_results
         _remember_sources(turn, selected_results.get('selections', []))
+        remember_forms(turn)
         save_context(turn.state, status['status'])
         return
     # A DIRECT query may adopt the old source to establish its context, then
     # deliver a different reviewed population. Freeze that actual answer below;
     # the earlier adoption is the query base, not the delivered result.
     answer_subject = None
-    if not status.get('analysisRef') and turn.state.get('queryCaptureRefs'):
+    if not partial_analysis and not status.get('analysisRef') and turn.state.get('queryCaptureRefs'):
         from .query_subject import remembered_subject
         answer_subject = remembered_subject(turn)
     has_query_subject = bool(answer_subject and (answer_subject.get('selections') or answer_subject.get('candidateCount')))
-    # Metadata/failed probes do not replace an explicitly adopted fact source.
-    if turn.state.get('adoptedInputs') and (status.get('analysisRef') or not has_query_subject):
+    # A partial analysis can deliver source data without publishing a document.
+    # Its confirmed roles still identify the subjects of a follow-up. DIRECT
+    # queries continue to inherit the population actually returned to the user.
+    if adopted and (status.get('analysisRef') or partial_analysis or not has_query_subject):
         selections = [deepcopy(item['selection']) for item in turn.state['adoptedInputs']]
         captures = list(dict.fromkeys(item['captureRef'] for item in selections))
         if status.get('analysisRef'):
             artifact = turn.service.store.get_analysis(turn.service.owner, status['analysisRef'])
             captures = list(dict.fromkeys(captures + artifact['captureRefs']))
+            subset = _confirmed_primary_rows(turn, artifact, turn.state['adoptedInputs'])
+            if subset:
+                input_ref, rows = subset
+                for selection in selections:
+                    if selection.get('inputRef') == input_ref:
+                        selection['rowIndices'] = rows
+                _remember_sources(turn, selections)
+                selections = [deepcopy(item['selection']) for item in turn.state['adoptedInputs']]
         turn.state['resolvedSubjectScope'] = {'scopeRef': 'scope_' + digest(selections)[:24],
             'selections': selections, 'captureRefs': captures,
             'inputSetVersion': turn.state['inputSetVersion'], 'analysisRef': status.get('analysisRef')}
+        remember_forms(turn)
         save_context(turn.state, status['status'])
         return
     selectors, artifact = [], None
@@ -1080,6 +1242,7 @@ def remember_subject(turn, status):
         scope['captureRefs'] = list(dict.fromkeys(scope.get('captureRefs', []) + artifact.get('captureRefs', [])))
         scope['analysisRef'] = status['analysisRef']
     _remember_sources(turn, scope.get('selections', []))
+    remember_forms(turn)
     save_context(turn.state, status['status'])
 
 
@@ -1114,6 +1277,10 @@ def review_context(turn):
         scopes = {digest(scope): scope for ref in turn.state.get('queryCaptureRefs', [])
                   for scope in actual.get(ref, [])}
         return {'effectiveScopes': list(scopes.values()), **protected}
+    if not (turn.state.get('selectedContextRefs') or turn.state.get('historyReferences') or turn.state.get('adoptedInputs')):
+        return {'context': turn.state.get('followupContext', {}), **protected,
+                'scopeEdits': deepcopy(turn.state.get('scopeEdits', [])),
+                'intentDecisions': deepcopy(turn.state.get('intentDecisions', {}))}
     summaries = []
     for selection, capture, table, rows in _inherited_tables(turn, turn.state.get('inheritedScope', {}).get('selections', [])):
         query = _query(capture, selection['stepId'])

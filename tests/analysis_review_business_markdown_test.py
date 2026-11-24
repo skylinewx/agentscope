@@ -17,6 +17,96 @@ def parsed_tables(markdown):
 
 
 class ReviewBusinessMarkdownTests(unittest.TestCase):
+    def test_report_names_remain_available_without_python_or_names_in_the_report(self):
+        from analysis_extension.review_business_projection import report_source_tables
+        from analysis_extension.computation_review import business_material
+        pairs = report_source_tables([{'taskName': '审批后版本', 'formName': '经营情况'},
+                                     {'taskName': '审批后版本', 'formName': '经营情况'},
+                                     {'taskName': '工作稿', 'formName': '经营情况'}, {'value': 2}])
+        self.assertEqual(len(pairs), 2)
+        source = {'reportSourceTables': pairs, 'facts': [], 'derived': [], 'documentText': '任务为预算'}
+        markdown = make_review_request(business_material(source)).markdown
+        rows = [row for table in parsed_tables(markdown) for row in table]
+        self.assertEqual(rows.count(['审批后版本', '经营情况']), 1)
+        self.assertEqual(rows.count(['工作稿', '经营情况']), 1)
+
+    def test_only_measured_blank_columns_are_flagged_without_treating_zero_as_missing(self):
+        from analysis_extension.review_business_markdown import render_business_markdown
+        text = '单位\t余额\t增幅\n\t0\t—\n\t12.5\t—\n合计\t12.5\t100%'
+        for basis in ('STATIC_SOURCE', 'HOST_RENDERED'):
+            markdown = render_business_markdown({'documentText': text, 'documentTextBasis': basis}, {})
+            self.assertEqual('实测页面中的空列' in markdown, basis == 'HOST_RENDERED')
+            if basis == 'HOST_RENDERED':
+                self.assertIn('单位（2/3 行', markdown)
+                self.assertIn('增幅（2/3 行', markdown)
+                self.assertNotIn('余额（', markdown)
+                self.assertIn('来源确实为空时按空值接受', markdown)
+
+    def test_only_identical_output_table_bodies_share_a_display_location(self):
+        first = {'derivedId': 'v1', 'outputKind': 'TABLE', 'columns': [{'name': 'x', 'label': '数量', 'unit': '件'}],
+                 'rows': [{'rowRef': 'row-a', 'values': {'x': '11'}, 'valueStates': {'x': 'PRESENT'}}]}
+        second = deepcopy(first)
+        second.update(derivedId='v2', label='另一项计算')
+        second['rows'][0]['rowRef'] = 'row-b'
+        material = {'derived': [first, second]}
+        request = make_review_request(material)
+        self.assertIn('与结果1相同', request.markdown)
+        self.assertEqual(request.wire_references['结果1'], 'v1')
+        self.assertEqual(request.wire_references['结果2'], 'v2')
+        second['columns'][0]['unit'] = '千件'
+        self.assertNotIn('与结果1相同', make_review_request(material).markdown)
+
+    def test_loading_period_is_labeled_in_the_execution_scope_only(self):
+        material = {'evidence': {'sources': [{'executionScopes': [
+            {'formName': '费用表', 'period': '2026N0001'}]}]},
+            'pythonRuns': [{'code': 'result = inputs', 'inputRecords': [
+                {'executionPeriod': '2026N0001', 'period': '2025J0004', 'value': '18'}]}]}
+        original = deepcopy(material)
+        body = make_review_request(material).markdown
+        self.assertIn('### 数据加载条件', body)
+        rows = [row for table in parsed_tables(body) for row in table]
+        self.assertIn(['数据加载时期', '2026N0001（2026年）'], rows)
+        self.assertIn(['时期', '2025J0004（2025年第4季度）'], rows)
+        self.assertEqual(material, original)
+
+    def test_exact_header_join_is_explained_once_but_different_script_labels_remain_visible(self):
+        facts = [dict(factId=f'f{i}', headers=['渠道', str(i)], value=str(i)) for i in range(4)]
+        inputs = [dict(ref=row['factId'], headers=row['headers'], value=row['value'],
+                       label='_'.join(row['headers'])) for row in facts]
+        material = {'facts': facts, 'pythonRuns': [{'code': 'result = inputs', 'inputRecords': inputs}]}
+        body = make_review_request(material).markdown
+        self.assertIn('按顺序用 `_` 连接', body)
+        self.assertNotIn('脚本输入的附加业务数据', body)
+        inputs[0]['label'] = '渠道中特殊的指标名'
+        body = make_review_request(material).markdown
+        self.assertIn('渠道中特殊的指标名', body)
+        self.assertNotIn('按顺序用 `_` 连接', body)
+
+    def test_second_script_reuses_an_exact_block_without_losing_extra_inputs(self):
+        rows = [{'ref':'one', 'value':'9', 'label':'甲'}, {'ref':'two', 'value':'9', 'label':'乙'}]
+        more = [{'ref':'before', 'value':'0', 'label':'前置结果'}, *deepcopy(rows),
+                {'ref':'after', 'value':None, 'label':'后置空结果'}]
+        runs = [{'runRef':'r1','code':'result = inputs','inputRecords':rows},
+                {'runRef':'r2','code':'result = list(inputs)','inputRecords':more}]
+        body = make_review_request({'pythonRuns':runs}).markdown
+        self.assertIn('输入第 2 至 3 行与第 1 段', body)
+        self.assertIn('原输入行号为 1、4', body)
+        for text in ('前置结果', '后置空结果', 'result = inputs', 'result = list(inputs)'):
+            self.assertIn(text, body)
+        for field, value in [('value', 9), ('label', '另一科目'), ('ref','another')]:
+            with self.subTest(field=field):
+                changed = deepcopy(runs)
+                changed[1]['inputRecords'][1][field] = value
+                self.assertNotIn('输入第 2 至 3 行与第 1 段', make_review_request({'pythonRuns':changed}).markdown)
+
+    def test_reuse_keeps_metadata_newly_read_by_a_later_script(self):
+        rows = [{'ref':'one','value':'7','rowIndex':27}]
+        runs = [{'runRef':'r1','code':'result = inputs','inputRecords':rows},
+                {'runRef':'r2','code':"result = inputs[0]['rowIndex']",'inputRecords':rows}]
+        body = make_review_request({'pythonRuns':runs}).markdown
+        self.assertNotIn('输入第 1 至 1 行与第 1 段', body)
+        self.assertIn('27', body)
+
     def test_role_material_choices_remain_model_plan_without_replacing_user_request(self):
         material = {'userRequest': '解释异常对象的形成并与全体比较',
                     'analysisRequirement': {'origin': 'MODEL_PLAN', 'materials': [
@@ -106,6 +196,13 @@ class ReviewBusinessMarkdownTests(unittest.TestCase):
         self.assertNotIn('/recordRow',request.markdown)
         self.assertNotIn('逐行相同的列',request.markdown)
         self.assertEqual(material,before)
+
+    def test_dimension_headers_follow_this_sources_metadata(self):
+        rows = [self.fact('f1','2026J0001','1','1'), self.fact('f2','2026J0001','2','2')]
+        def headers(material):
+            return next(t[0] for t in parsed_tables(make_review_request(material).markdown) if t[0][0]=='行号')
+        self.assertIn('MD_QD', headers({'facts': rows}))
+        self.assertIn('结算方式', headers({'facts': rows, 'sourceScopes': [{'dimCode': 'MD_QD', 'label': '结算方式'}]}))
 
     def test_identical_names_and_values_keep_distinct_dimension_codes(self):
         facts=[self.fact('f1','2026J0002','1','5'),self.fact('f2','2026J0002','2','5')]

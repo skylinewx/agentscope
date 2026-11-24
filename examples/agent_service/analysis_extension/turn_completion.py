@@ -17,6 +17,7 @@ from agentscope.message import Msg, SystemMsg, UserMsg, ToolResultState
 from agentscope.model._diagnostics import error_diagnostics
 from agentscope.tool import ToolResponse
 
+from .business_tables import HIERARCHY_SCOPE_GUIDANCE
 from .completion import completion_summary, formula_target_refs
 from .review_output import ReviewOutputUnavailable
 from .models import AnalysisError, digest, json_values
@@ -52,19 +53,14 @@ MONEY_UNIT_POLICY = """金额类型结合用户问题、指标或科目含义、
 业务语义支持的金额默认元是已确认规则，审查不得仅因来源 unit 为空将其判为臆造单位；金额分类错误、换算错误或与明确来源矛盾仍须纠正。"""
 
 
-def _public_reply_text(message):
-    parts = []
-    for block in message.content:
-        if block.type in ("tool_call", "tool_result"):
-            parts = []
-        elif block.type == "hint" and block.source == json.dumps({'label': 'System', 'sublabel': 'Completion check'}):
-            parts = []
-        elif block.type == "text":
-            parts.append(block.text)
-    return "\n".join(parts)
+def _referenced_questions(state):
+    wanted = set(state.get('selectedContextRefs', []))
+    wanted.update(item['contextRef'] for item in state.get('historyReferences', []))
+    return [{'role': 'user', 'text': record['request']} for record in state.get('businessContexts', [])
+            if record['contextRef'] in wanted and record.get('request')]
 
 
-def current_turn(state, inputs):
+def current_turn(state, inputs, service=None):
     """Reset on a real new user message, retain across HITL and compression."""
     messages = inputs if isinstance(inputs, list) else [inputs]
     users = [m for m in messages if isinstance(m, Msg) and m.role == "user"]
@@ -73,14 +69,14 @@ def current_turn(state, inputs):
     if key and (not saved or saved.get("turnKey") != key):
         from .conversation_context import next_context_state
         business_context = next_context_state(saved)
+        if service is not None and saved and 'formHistory' not in saved:
+            from .form_history import restore_prior
+            history = restore_prior(service, saved, business_context.get('businessContexts', []))
+            business_context.update(priorFormHistory=history, formHistory=deepcopy(history))
         from .condition_context import advance
         business_context.update(advance(saved, key))
-        input_ids = {m.id for m in users}
-        previous = [{"role": m.role, "text": _public_reply_text(m)} for m in state.context
-                    if m.role in ("user", "assistant") and m.id not in input_ids]
-        previous = [m for m in previous if m["text"].strip()]
-        saved = {"turnKey": key, "request": "\n".join(m.get_text_content() or "" for m in users),
-                 "previousMessages": previous[-4:], "earlierContextOmitted": len(previous) > 4,
+        saved = {"turnKey": key, "userMessageIds": [m.id for m in users],
+                 "request": "\n".join(m.get_text_content() or "" for m in users),
                  "mode": None, "nudges": 0, "failures": {}, "buildRefs": [], "reviews": [],
                  'budgetFormCapabilities': dict((saved or {}).get('budgetFormCapabilities', {})),
                  'budgetPreparedObservations': dict((saved or {}).get('budgetPreparedObservations', {})),
@@ -216,7 +212,7 @@ class TurnCompletion:
             self.state['toolPerformance'] = progress['tools']
 
     @receipt_read_scope()
-    def task(self, action="declare", mode=None, goal=None, reason=None, failedToolCallIds=None, delivery=None, evidenceCaptureRefs=None, intent=None, materials=None, context=None, resultRefs=None, search=None, offset=0, limit=6, groupingCaptureRefs=None, executionPolicy=None):
+    def task(self, action="declare", mode=None, goal=None, reason=None, failedToolCallIds=None, delivery=None, evidenceCaptureRefs=None, intent=None, materials=None, context=None, resultRefs=None, search=None, offset=0, limit=6, groupingCaptureRefs=None, executionPolicy=None, objectives=None, queryTargets=None, toolName=None):
         if action == 'contexts':
             from .conversation_context import context_directory
             return context_directory(self.state, search, offset, limit)
@@ -224,13 +220,17 @@ class TurnCompletion:
             from .query_result_evidence import select_results
             return select_results(self, resultRefs)
         if action == "declare":
+            if goal is None:
+                goal = self.state.get('goal') or self.state.get('request')
             if mode not in MODES or not isinstance(goal, str) or not goal.strip():
                 raise AnalysisError("TASK_DECLARATION_REQUIRED", "根据本轮真实用户要求声明 mode 与 goal；不要从数值或名称推断任务类型。")
             previous = self.state.get("mode")
             if previous and previous != mode and previous != "DIRECT":
                 raise AnalysisError("TASK_DOWNGRADE", "同一用户轮不能改写已声明的分析或报告任务来绕过完成检查。")
             from .material_plan import normalize, needs_formulas
-            material_plan = normalize(materials, self.state.get('materials'))
+            from .objectives import merge, material_plan_for
+            proposed = merge(self.state, objectives)
+            material_plan = material_plan_for(proposed) if proposed else normalize(materials, self.state.get('materials'))
             document_required = mode in ('ANALYSIS', 'REPORT') or needs_formulas({'materials': material_plan})
             delivery = delivery or ('DOCUMENT' if document_required else self.state.get('deliveryMode', 'TEXT'))
             if self.state.get('deliveryMode') == 'DOCUMENT' and delivery != 'DOCUMENT':
@@ -244,11 +244,11 @@ class TurnCompletion:
             intent = normalize_intent({} if intent is None and 'queryIntent' not in self.state else intent)
             form_year = (intent or {}).get('formExecutionYear')
             if form_year is not None and not re.fullmatch(r'[1-9][0-9]{3}', form_year):
-                raise AnalysisError('INVALID_QUERY_INTENT', 'formExecutionYear 只能填写用户明确的四位开表年份。')
+                raise AnalysisError('INVALID_QUERY_INTENT', 'formExecutionYear 只能填写用户明确限定的数据加载年份，格式为四位数字。')
             from .execution_policy import install
             install(self.state, executionPolicy)
             from .followup_scope import declare_context, review_context, query_anchors
-            from .conversation_context import select_context, context_directory, selected_contexts
+            from .conversation_context import select_context, selected_contexts
             followup_context = declare_context(self.state, context)
             from .grouping_policy import validate_grouping_selection
             validate_grouping_selection(self, groupingCaptureRefs)
@@ -258,9 +258,19 @@ class TurnCompletion:
             followup_context = intent_context(self.state, followup_context, intent)
             effective_intent = merge_intent(self.state, followup_context, intent, context_supplied=context is not None)
             self.state.update(mode=mode, goal=goal, deliveryMode=delivery, followupContext=followup_context)
-            if material_plan != self.state.get('materials'):
-                self.state.pop('budgetFormulaTargets', None)
-                self.state.pop('budgetFormulaPreparation', None)
+            if queryTargets is not None:
+                if mode != 'DIRECT' or delivery != 'TEXT':
+                    raise AnalysisError('INVALID_QUERY_DELIVERY', 'queryTargets 用于全部目标取值后直接交付的普通查询。分析请使用 objectives。')
+                self.state['queryTargets'] = list(queryTargets)
+            else:
+                self.state.pop('queryTargets', None)
+            if proposed != self.state.get('objectives', []):
+                for field in ('hostCloseout', 'currentReportReviewRef', 'delivery', 'report'):
+                    self.state.pop(field, None)
+            if material_plan != self.state.get('materials') or proposed != self.state.get('objectives', []):
+                from .prepared_inputs import clear_formula_inputs
+                clear_formula_inputs(self.state)
+            self.state['objectives'] = proposed
             self.state['materials'] = material_plan
             if intent is not None:
                 self.state.setdefault('intentHistory', []).append(intent)
@@ -280,6 +290,7 @@ class TurnCompletion:
                 "直接完成本轮查询、简单统计或一般答复。" if mode == "DIRECT" and delivery == 'TEXT' else
                 "复用已捕获数据，完成本题所需取值、计算与核验，首次交付图文和明细。构成查询只解释所需构成；按现有模板预览发布，不额外导出。"),
                 "delivery": delivery,
+                'objectives': deepcopy(proposed),
                 'executionPolicy': deepcopy(self.state.get('executionPolicy', {})),
                 'intent': self.state.get('queryIntent', {}),
                 'intentSummary': presentation_summary(self.state),
@@ -290,10 +301,9 @@ class TurnCompletion:
                                      'selector': item['draft']['selector'], 'captureRef': item.get('captureRef')}
                                     for item in retained_scopes(self.state)],
                 'followupScope': review_context(self),
-                'queryAnchors': query_anchors(self),
+                'queryAnchors': query_anchors(self) if self.state.get('selectedContextRefs') else [],
                 'selectedContexts': selected_contexts(self.state),
-                'availableContexts': context_directory(self.state),
-                'analysisCoverage': ('按用户原意覆盖必要构成。解释已查明细的形成原因时，materials 按用途声明 FORMULAS，宿主为实际选定对象展开；formulaSubjects 仅在需要缩小目标时填写真实引用；展示名称不能代替引用。分布分析用 VALUES，以已完成的原生分组数据分析，不自动增加公式展开；空属性组照常参与其适用口径。'
+                'analysisCoverage': ('解释具体数值时选 DATA_COMPOSITION，按口径比较选 VALUES。已有材料直接使用，只有新的业务问题才追加目标。'
                                      if mode in ('ANALYSIS', 'REPORT') else None),
                 "boundary": "声明不代表已完成；结束前宿主检查当前轮实际产物及证据。"}
         if action == "blocked":
@@ -322,9 +332,23 @@ class TurnCompletion:
                                      "hint": "failedToolCallIds 使用 failedToolCalls 的键；不要改写查询条件或创建替代请求来制造失败证据。"})
             self.state["blocked"] = {"reason": reason, "failedToolCallIds": refs, 'evidenceCaptureRefs': receipts}
             return {"status": "BLOCKED", **self.state["blocked"], "next": "向用户说明未完成范围与实际障碍，不宣称分析或报告已完成。"}
+        if action == 'tools':
+            if not self.state.get('mode'):
+                raise AnalysisError('TASK_DECLARATION_REQUIRED', '先登记本轮目标，再查看可用工具。')
+            names = self.state.get('availableCatalogNames', [])
+            if toolName or self.state.get('mode') == 'DIRECT' and names:
+                if toolName:
+                    if toolName not in names:
+                        raise AnalysisError('UNKNOWN_TOOL', '请选择可用目录中的工具。', {'tools': names})
+                    from .model_materials import remember_catalog_tool
+                    remember_catalog_tool(self.state, toolName)
+                return {'status': 'READY', 'tools': [toolName] if toolName else names,
+                        'next': '使用已启用的工具。其他能力可通过 action=tools 和 toolName 指定。'}
+            self.state['expandedToolCatalog'] = True
+            return {'status': 'READY', 'next': '下一次调用显示完整工具目录。预算任务会保留你选用的工具，需要其他能力可再次展开。'}
         if action == "status":
             return self.check()
-        raise AnalysisError("INVALID_TASK_ACTION", "action 使用 declare、contexts、status、select_results 或 blocked。")
+        raise AnalysisError("INVALID_TASK_ACTION", "请使用工具 Schema 中列出的 action。")
 
     def observe_background(self, source):
         """后台通知只提供索引；审查始终读取当前用户、智能体和会话下的原始回执。"""
@@ -368,12 +392,12 @@ class TurnCompletion:
 
     def _add_query_capture(self, capture_ref):
         """通知重投、同步返回和显式读取共享同一份证据索引。"""
-        refs = self.state.setdefault('queryCaptureRefs', [])
-        if capture_ref not in refs:
-            refs.append(capture_ref)
         from .grouping_policy import remember_grouping
         from .budget_preparation import remember_capability
         capture = self.service.store.get_capture(self.service.owner, capture_ref)
+        refs = self.state.setdefault('queryCaptureRefs', [])
+        if capture_ref not in refs:
+            refs.append(capture_ref)
         remember_grouping(self, capture)
         remember_capability(self, capture)
         from .dimension_scopes import remember
@@ -427,15 +451,10 @@ class TurnCompletion:
             return
         if response.state != ToolResultState.SUCCESS:
             return
-        capture_ref = response.metadata.get('analysisCaptureRef')
         if call.name == 'QueryResultRead':
-            # Successful reads have already checked ownership and integrity.
-            try:
-                capture_ref = json.loads(call.input).get('captureRef')
-            except (ValueError, TypeError, AttributeError):
-                capture_ref = None
-        if isinstance(capture_ref, str):
-            self._add_query_capture(capture_ref)
+            # A successful batch envelope may contain only rejected reads.
+            for read_ref in response.metadata.get('analysisReadCaptureRefs', []):
+                self._add_query_capture(read_ref)
         if call.name not in NATIVE_RESULT_TOOLS:
             return
         try:
@@ -525,6 +544,17 @@ class TurnCompletion:
             facts = artifact['facts']
             targets = formula_target_refs(artifact)
             selected_facts = [fact for fact in facts if needs_formulas(self.state, fact.get('inputRole', 'PRIMARY'))]
+            if self.state.get('objectives'):
+                from .objectives import coverage
+                for row in coverage(self.state, artifact):
+                    if (row['capability'] == 'DATA_COMPOSITION' and not row.get('exploratory')
+                            and (row.get('missingTargets') or row['failedTargets']
+                                 or not (row['formulaRefs'] or row['boundaryRefs'] or row['empty']))
+                            and not completion_summary(artifact)['unresolvedItems']):
+                        issues.append(issue('FORMULA_TARGETS_REQUIRED', '此对象尚未关联来源构成或已确认的来源边界。',
+                                            objectiveRef=row['objectiveRef'], missingTargetCount=row.get('missingTargets', 0),
+                                            requiresBuild=True, requiresSourceQuery=bool(row['failedTargets'])))
+                selected_facts = [fact for fact in selected_facts if fact['factId'] in targets]
             boundary_refs = {item['factRef'] for item in self.state.get('materialBoundaries', [])
                              if item.get('status') == 'NO_TARGET_CELL'}
             unbounded_facts = [fact for fact in selected_facts if fact['factId'] not in boundary_refs]
@@ -623,6 +653,25 @@ class TurnCompletion:
                 and resumed.get('reviewRef') == delivery.get('reviewRef')
                 and resumed.get('contentDigest') == delivery.get('contentDigest'))
 
+    def review_target_issue(self, ref):
+        if not self.state.get('adoptedReportRef'):
+            return None
+        from .review_control import progress
+        saved = progress(self)
+        receipts = saved.get('resumedReportRefs', {})
+        if (receipts.get(ref, {}).get('action') == 'RECHECK'
+                or ref in saved.get('presentationRevisionRefs', {}) or ref in saved.get('completedBuildRefs', [])):
+            return None
+        family = ref.partition(':')[0]
+        reviewed = [other for other, receipt in receipts.items()
+                    if other.partition(':')[0] == family and receipt.get('action') == 'RECHECK']
+        if reviewed:
+            return issue('REPORT_REVIEW_TARGET_MISMATCH',
+                         '本轮复核的正文与要交付的正文不同。可以交付已复核的报告；若要交付当前报告的独立复核结论，'
+                         '对该报告调用 AnalysisPublish，选择 RECHECK。已有数据和计算可以复用。',
+                         reviewedAnalysisRefs=reviewed, deliveryAnalysisRef=ref)
+        return None
+
     def check(self, analysis_ref=None, delivery=None):
         mode = self.state.get("mode")
         if not mode:
@@ -632,6 +681,8 @@ class TurnCompletion:
         if mode == "DIRECT" and self.state.get('deliveryMode', 'TEXT') == 'TEXT':
             return {"status": "DIRECT", "issues": []}
         ref = analysis_ref or self.state.get("analysisRef")
+        if ref and (target_issue := self.review_target_issue(ref)):
+            return {'status': 'INCOMPLETE', 'analysisRef': ref, 'issues': [target_issue]}
         # 以实际成功登记的导出为准，不因模型将导出声明为 ANALYSIS 而强迫重建。
         # 后续范围、待办、来源和内容检查仍照常进行，不把导出本身当成新分析完成。
         if (not ref or mode == "ANALYSIS" and ref not in self.state["buildRefs"]
@@ -651,11 +702,11 @@ class TurnCompletion:
         partial = completion['unresolvedItems'] or review_pending
         document_required = mode == 'REPORT' or self.state.get('deliveryMode') == 'DOCUMENT'
         if document_required and artifact["publicationState"] != "PUBLISHED":
-            issues.append(issue("RESULT_NOT_PUBLISHED", "完成证据与工作项后，自由编写 HTML，经预览检查再正式发布。"))
+            issues.append(issue("RESULT_NOT_PUBLISHED", "完成证据与工作项后，提交 Markdown 正文并发布，宿主会生成报告页面。"))
         elif document_required and not (delivery if delivery is not None else self.state.get("delivery", {})).get("registered") and self.state.get("report", {}).get("analysisRef") != ref:
             issues.append(issue("DELIVERY_NOT_REGISTERED", "当前结果尚无成功登记的交付入口，请重试交付。"))
         if mode == "REPORT" and self.state.get("report", {}).get("analysisRef") != ref:
-            issues.append(issue("REPORT_NOT_DELIVERED", "按报告 Skill 导出并交付本轮选择的已发布版本。"))
+            issues.append(issue("REPORT_NOT_DELIVERED", "当前报告尚未登记导出。用 AnalysisRenderReport 导出此 analysisRef 的已发布正文，再交付返回的入口。", analysisRef=ref))
         return {"status": "INCOMPLETE" if issues else "PARTIAL" if partial else "READY", "analysisRef": ref,
                 "issues": issues, "completion": completion,
                 "boundary": "机器检查已声明范围、来源证据与执行状态；不证明自然语言解释或视觉布局正确。"}
@@ -714,6 +765,7 @@ def _business_review_failure(failure):
 
 def review_payload(turn, artifact, answer):
     from .followup_scope import review_context
+    from .review_business_projection import report_source_tables
     from .review_materials import failure_summary
     from .aggregation_explanation import annotate
     parser = _VisibleText()
@@ -736,7 +788,10 @@ def review_payload(turn, artifact, answer):
             from .review_revision import formula_review_trace
             item["formulaTrace"] = formula_review_trace(value["formulaTrace"])
         derived.append(item)
+    from .objectives import coverage
+    objectives = coverage(turn.state, artifact) if turn.state.get('objectives') else artifact.get('objectiveCoverage')
     payload = {"userRequest": turn.state["request"], "taskMode": turn.state["mode"],
+               **({'objectiveCoverage': objectives} if objectives else {}),
                'agentPlan': {'goal': turn.state['goal'], 'declaredGoals': turn.state.get('declaredGoals', [])},
                'methodRevisions': artifact.get('methodRevisions', []),
                'computationIntent': deepcopy(artifact.get('computationIntent')),
@@ -751,9 +806,9 @@ def review_payload(turn, artifact, answer):
                'evidenceCoverage': artifact.get('evidenceCoverage'),
                'structureEvidence': artifact.get('structureEvidence', []),
                "scope": {key: value for key, value in artifact['scope'].items() if key != 'sourceScopes'},
-               "previousMessages": turn.state.get("previousMessages", []),
-               "earlierContextOmitted": turn.state.get("earlierContextOmitted", False),
+               "previousMessages": _referenced_questions(turn.state),
                "sourceContexts": artifact.get("sourceContexts", []),
+               "reportSourceTables": report_source_tables(artifact["facts"]),
                "sourceScopes": annotate(artifact['scope'].get('sourceScopes', [])),
                # 展示过程的失败仍留在执行日志；最终页面及绑定才是审查依据。
                # 查询失败继续保留，避免把来源缺失误当成已完成取数。
@@ -830,8 +885,8 @@ def query_evidence(turn):
                 status_reads.append((saved, registry.for_capture(saved).raw_receipt(saved['response'])))
         except AnalysisError:
             pass  # The ordinary evidence path below preserves the original diagnostic.
-    from .query_waiting import superseded_status_reads
-    superseded = superseded_status_reads(status_reads)
+    from .query_waiting import superseded_query_reads
+    superseded = superseded_query_reads(status_reads)
     fields = ('factId', 'sourceContextId', 'objectId', 'objectLabel', 'sourceObjectId', 'selectionExecutionPeriod', 'selectionDataPeriod',
               'headers', 'measureCode', 'period', 'executionPeriod', 'dimensions',
               'effectiveDimensions', 'value', 'valueType', 'valueState', 'unit', 'scale', 'formula',
@@ -983,7 +1038,7 @@ resultReviewPhase=DEPENDENCY 时核对当前完整执行依赖与输出，不把
 sourceData.rowEncoding=SHARED_GRID_FIELDS_V1 是无损网格：每行先按 columns 解开，再补 fixedCellFields；dimensions 数组按 dimensionColumns 对应维度，dimensionColumns=null 时该格仍是维度对象，维值整数通过 dimensionValueDictionary 还原后合并 fixedDimensions；missingDimensionRef=-1 仅表示该格没有此维度，真实 null 仍保留为字典值；headers 内每个整数按 headerDictionary 还原标题。每个原始单元格、精确金额、null、维度组合及公式仍在，不把共同字段未逐行重复当成缺失，也不能把字典下标当业务代码。
 sourceData 中出现 sourceDataRef 时从 evidence.sharedSourceData[该引用] 读取完整来源读集；它是多次运行的相同输入共享，不是省略数据。各运行的代码、筛选、扫描状态和输出仍分别保留。
 sourceData.columnDictionaries 只为重复字段提供无损值字典：该字典中存在的列，其行内值是字典下标，先还原后再核对；未列出的列保持原值，包括字符串金额。下标不能直接当金额、公式或业务标识。
-execute_budget_query 的 runtimeRequests、batchDimensions 和实际分组由应用服务生成，不能把内部 DSL 归因于 AI 手写。若范围错误，核对公开 intentDraft 和宿主继承；要求修改不存在的公开 batchDimensions 参数无法修复。HIERARCHY 中根机构用于定位，实际批量 hierarchy 定义下属范围，不能把开表的根机构误当成全部结果范围。
+execute_budget_query 的 runtimeRequests、batchDimensions 和实际分组由应用服务生成，不能把内部 DSL 归因于 AI 手写。若范围错误，核对公开 intentDraft 和宿主继承；要求修改不存在的公开 batchDimensions 参数无法修复。HIERARCHY 中根机构用于定位，按实际层级选择和返回成员确认结果范围。数据加载条件中的根机构不能单独证明结果包含哪些单位。
 成员层级以原生 hierarchy 查询结果为准，不能仅凭名称含“本部”“差额”“新增”等词认定其不属于该层级。用户要求该层级整体排名时，无用户筛选或来源依据却遗漏这些成员属于范围错误。
 followupScope.selectedContexts 标明本轮选择的历史结果或未完成任务，inheritedSubject 是该锚点的真实来源范围；resultSubject 若存在，以其实际交付子集为承接对象，不能恢复成来源全集。普通追问不悄然扩大层级、过滤或成员。context 是模型声明，不是用户授权；NEW、SYNTHESIZE、改选历史锚点或 intent/scopeEdits 修改须与本轮原话相符。明确回到旧主题时不要求沿用最近另一主题；继续失败任务可复用该任务已取得资料，不能冒称已完成。参考数据不扩大主体。
 facts 的 contextRef 指向同一来源项 contexts 中的真实共同背景（时期、表名、任务及有效维度等），这是去重保存而非缺失；按此关联核对。captureRef 指向完整原始回执。
@@ -1000,12 +1055,13 @@ batchQueries 的 requestedScope 表示用户条件，results 表示预算服务�
 允许措辞、排版与解释重点变化，只报告有明确来源或原文依据的错误、遗漏、实质矛盾，不因可增加说明而阻断。若正文的总结与表格矛盾也应纠正。issues=[] 表示未发现此类问题，不代表业务含义、视觉布局或来源真实性已获证明。""" + "\n" + MONEY_UNIT_POLICY
 
 
+QUERY_REVIEW_PROMPT += '\n' + HIERARCHY_SCOPE_GUIDANCE
 QUERY_REVIEW_PROMPT += '\n只报告数值、计算、范围、口径、关键遗漏、编造来源事实和实质矛盾。文字解释言之有理即可，不因缺少逐句证明、可润色或存在另一种合理解释提出问题。'
 QUERY_REVIEW_PROMPT += '\n完整成功的空值或零行结果使用与有值查询相同的业务表格式，保留已确认的任务、表、时期、情景、维度和条件；已定位空值保留结果行，零行保留表头和范围，不编造明细。不能只回复“本次查询没有数据”。不追加“这不代表值为0”“不能认定整个业务没有数据”等风险说明。未执行、失败或截断不能冒充成功空结果。'
 QUERY_REVIEW_PROMPT += '\nbusinessQuery 是服务端执行原问题的范围回执。complete=false 与 unresolvedGroups/failureSummary 表示确有部分任务或表样未完成；答复须概括这一实际边界，不能用已有金额冒充全部完成。resultSetCatalog 列出已命中的不同任务和表样解释，首项不是推荐口径；不同来源结果不一致而用户未指定时应保留差异，不能自行宣布某项为唯一正确值。可合并展示相同口径且相同数值的任务，但保留来源，不重复加总相同事实。合理的简洁概括即可，不要求逐项堆砌技术错误。'
 QUERY_REVIEW_PROMPT += '\nbusinessQuery.presentValueGroups 是程序按相同表样、标题、实际维度、原值和单位整理的已有数值目录，没有求和；tasks 是该项实际金额对应的任务列表，不是该表全部候选任务。用它核对金额归属，NULL/未加载及真实失败仍见 resultSetCatalog、unresolvedGroups 和 facts。'
 QUERY_REVIEW_PROMPT += '\nentityKind=SCHEMA 的条目证明模型或字段定义存在，entityKind=MEMBER 的条目证明检索到来源成员；二者都不证明运行格存在或已有数值。审查应认可这些实际来源证据，不因其不是数值事实就判为无依据；运行取数失败也不能据此断言定义不存在。'
-QUERY_REVIEW_PROMPT += '\n用户明确要求某一开表年度的表内数值时，批量事实的 selectionExecutionPeriod（实际打开的表）与 selectionDataPeriod（该表中定位格的数据期）须同时符合问题。period 是结果数据期。其他执行年度的金额或跨期切片不能证明本张表有该格。完整展开没有对应格时可回答未匹配，已匹配格的 null 则是空值。'
+QUERY_REVIEW_PROMPT += '\n用户明确限定从某一年度的表内取数时，同时核对 selectionExecutionPeriod（所选表的数据加载时期）和 selectionDataPeriod（所选单元格的实际数据时期）。period 是结果的数据时期。其他加载年度的金额或跨期切片不能证明本张表有该格。完整展开没有对应格时可回答未匹配，已匹配格的 null 则是空值。'
 QUERY_REVIEW_PROMPT += '\nverifiedDependencyUnitRefs 表示宿主已核对相同代码、完整实际输入/读集和输出的依赖单元；本次不重复附这些明细。executionScopes 仍是运行级范围，不是逐产物血缘。FINAL 阶段继续核对本轮问题、实际选定结果、范围及新答复，不能把计算通过当成新问题已回答。DEPENDENCY 阶段不接收本轮问题或 candidateAnswer，只核对不可变代码、实际输入/完整读集与所列输出的对应关系和计算，不以缺少问题、答复或其他探索输出作为缺口。'
 HOST_DELIVERY_GUIDE = '\nprovenanceMode=HOST_RECORDED_DELIVERY 时，sourceData 和 inputDeliverySummary 表示宿主提供给本次运行的数据。scanComplete/sendComplete 分别证明扫描和发送完成，不证明脚本逐项使用或计算正确；脚本可能只取一个已发送块的首行。结合代码、实际输入和结果核对覆盖范围，不因传输完成直接判全量分析，也不因保守输入多于输出声明的 inputRefs 直接判错。旧 LEGACY_WORKER_REPORTED 记录保留原含义，不升级为宿主证明。'
 QUERY_REVIEW_PROMPT += HOST_DELIVERY_GUIDE
@@ -1017,7 +1073,7 @@ BUSINESS_MATERIAL_GUIDE = ('\n材料按四类业务内容组织：用户要求�
 QUERY_REVIEW_PROMPT += BUSINESS_MATERIAL_GUIDE
 QUERY_REVIEW_PROMPT += '\nsubjectCandidates 是本题成功查询的候选范围。核对最终答复时同时用 subjectSelections 指明答复实际作为主体的 candidateRef；完整表用 rowIndices=null，仅部分成员用原表零基行号。探索、验证或对比数据不自动成为主体，尤其不能默认最后一次查询。多个候选时根据答复及实际数据选择；无法确定则返回空数组，不猜。依赖分段不选择主体，最终段再选择。这是同次核对的范围记录，不新增查询或改写用户要求。'
 QUERY_REVIEW_PROMPT += '\nVERIFIED_BUSINESS_ROWS 保留全部已校验的业务行（含 NULL、NOT_LOADED 和 ERROR）；contextRef 对应同一来源的 contexts，runtimeContextRef 对应 source.runtimeContexts。valueType 为 STRING、BOOLEAN 或日期时按原类型解释，不能因为文本看起来像数字就转成金额。原生回执及重复定位参数已由程序校验并保存，不要求为了补齐这些技术参数重新查询。'
-QUERY_REVIEW_PROMPT += '\n输入还可附完整业务 Markdown 表格，按 captureRef 和 T 表号区分来源，固定条件位于表前，R 行号与 C 列标识是稳定引用。它与原生事实一一对应，仅调整排布，没有加总；factReferences 关联原事实标识。ZB_JE2 按实际情景列显示，技术指标标题省略；空值、未取得与0分别保留。实际时期来自每格坐标，不能改成开表年度。referencedCalculations 保存 Calculate 使用原始表格引用的精确计算及完整读集，按其真实范围与结果核对。不得为恢复已经程序校验并保存的原始参数要求重复取数。'
+QUERY_REVIEW_PROMPT += '\n业务 Markdown 按来源列示原值。单值查询用“项目／内容”表说明条件，按业务表核对各自的结果。tableDefinitions 和 factReferences 提供内部表、行、列定位，业务答复可省略这些编号。ZB_JE2 按实际情景列显示，技术指标标题省略；空值、未取得与0分别保留。实际数据时期来自每格坐标，数据加载时期来自执行上下文。referencedCalculations 保存 Calculate 使用原始表格引用的精确计算及完整读集，按其真实范围与结果核对。不得为恢复已经程序校验并保存的原始参数要求重复取数。'
 QUERY_REVIEW_PROMPT += '\nfocusComparison 保存本地整理前的代码、产物和发生变化的产物名。它不是错误判定：诊断字段或结构变化不等于业务结果改变。结合当前完整输入、代码、用户问题及前后产物，在本次核对中判断数值、必要构成或范围是否有实质错误；不能因哈希不同就阻断，也不能仅因总额相同忽略必要范围或构成丢失。旧输出不是正确答案，发现修正后的结果符合当前完整来源时允许通过。'
 
 async def review_query_answer(agent, turn, evidence, answer):
@@ -1043,9 +1099,13 @@ async def _review_query_answer(agent, turn, evidence, answer):
         'queryIntent': turn.state.get('queryIntent', {}),
         'previousQueryIntent': turn.state.get('previousQueryIntent', {}),
         'followupScope': review_context(turn),
-        'previousMessages': turn.state.get('previousMessages', []),
-        'earlierContextOmitted': turn.state.get('earlierContextOmitted', False),
+        'previousMessages': _referenced_questions(turn.state),
         'candidateAnswer': answer, 'subjectCandidates': available_subjects}
+    from .review_materials import ranked_list_source
+    native_lists = ranked_list_source(evidence)
+    if native_lists:
+        envelope['completeRankedListsAvailable'] = True
+    list_choices = []
     completed, issues = 0, []
     charged, unavailable, completed_verdict = False, False, None
     cached_parts = turn.state.setdefault('queryReviewParts', {})
@@ -1088,7 +1148,7 @@ async def _review_query_answer(agent, turn, evidence, answer):
                 verdict = await call_review_model(turn, lambda: _model_review(agent, QUERY_REVIEW_PROMPT, model_payload),
                     phase='CALCULATION' if phase == 'DEPENDENCY' else 'QUERY', input_chars=len(model_payload), round_started=started, material_key=key)
                 from jsonschema import validate
-                validate(verdict, QUERY_REVIEW_SCHEMA)
+                validate(verdict, RANKED_QUERY_REVIEW_SCHEMA if payload_value.get('completeRankedListsAvailable') else QUERY_REVIEW_SCHEMA)
                 turn.service.store.save_semantic_review(turn.service.owner, key, verdict)
             else:
                 progress['reusedPartCount'] += 1
@@ -1100,6 +1160,8 @@ async def _review_query_answer(agent, turn, evidence, answer):
                 progress['dependencyReviewedCount'] += 1
             if phase != 'DEPENDENCY':
                 subject_choices.extend(verdict.get('subjectSelections', []))
+                if native_lists:
+                    list_choices.append(verdict.get('rankedDelivery'))
             completed += 1
             progress['completedPartCount'] = completed
             for finding in verdict['issues']:
@@ -1108,6 +1170,8 @@ async def _review_query_answer(agent, turn, evidence, answer):
         progress['phase'] = 'REVISE' if issues else 'COMPLETED'
         completed_verdict = {'issues': issues[:8]}
         if not issues:
+            if list_choices and all(choice == 'SOURCE_TABLES' for choice in list_choices):
+                completed_verdict['rankedDelivery'] = 'SOURCE_TABLES'
             for unit in units:
                 if unit['unitRef'] not in verified_dependencies:
                     save_dependency_verdict(turn, unit, dependency_policy)
@@ -1255,6 +1319,10 @@ QUERY_REVIEW_SCHEMA['properties']['subjectSelections'] = {'type': 'array', 'item
         'rowIndices': {'anyOf': [{'type': 'null'}, {'type': 'array', 'items': {'type': 'integer', 'minimum': 0}, 'minItems': 1}]}},
     'required': ['candidateRef', 'rowIndices'], 'additionalProperties': False}}
 
+RANKED_QUERY_REVIEW_SCHEMA = deepcopy(QUERY_REVIEW_SCHEMA)
+RANKED_QUERY_REVIEW_SCHEMA['properties']['rankedDelivery'] = {'enum': ['SOURCE_TABLES', 'CANDIDATE']}
+RANKED_QUERY_REVIEW_SCHEMA['required'].append('rankedDelivery')
+
 # 分析允许合理解释和不同写法；只有影响事实或结论正确性的错误才进入补做流程。
 # 普通查数沿用原契约，分析审查的建议仅留作内部诊断，不作为智能体整改任务。
 REVIEW_SCHEMA['properties']['issues']['items']['properties']['code']['enum'].append('CHECK_STATUS_MISMATCH')
@@ -1274,6 +1342,8 @@ ANALYSIS_REVIEW_SCHEMA['properties']['issues']['items']['properties']['code']['e
 ANALYSIS_REVIEW_SCHEMA['properties']['coverage'] = {'type': 'array', 'minItems': 1, 'maxItems': 16, 'items': {
     'type': 'object', 'additionalProperties': False,
     'properties': {'requirement': {'type': 'string', 'minLength': 1, 'maxLength': 200},
+                   'objective': {'type': 'integer', 'minimum': 1, 'maximum': 20,
+                                 'description': '核对材料列出的数据构成目标时填写该目标编号。'},
                    'status': {'enum': ['COVERED', 'MISSING', 'SOURCE_LIMITED']},
                    'location': {'type': 'string', 'maxLength': 300},
                    'evidenceRefs': {'type': 'array', 'maxItems': 12, 'items': {'type': 'string'}}},
@@ -1296,7 +1366,7 @@ REVIEW_PROMPT = """你负责独立审查一个数据分析答复。输入 Markdo
 先核对本次待交付全文是否覆盖用户请求及当前适用的交付要求，包括所需列表、排序、图表、公式构成和关键说明。修正后这些必要内容仍须存在，不能只判断剩余内容是否正确。工具结果、已取得的数据集及本轮被拦截的草稿不能代替实际交付；声称“上表不变”或“如下图”也不能证明对应内容已经交付。发布前的冻结页面 documentText 是本次候选交付，允许 candidateAnswer 为空，不因尚未发布而阻断；发布后的内容以真实 deliveryEvidence 对应的报告入口计入，不要求把报告中的表格或图表重复贴进聊天。用户明确只要求修正历史已交付内容时按本轮要求核对，不机械重发历史全文。
 必要图表结合当前页面正文、图注、绑定及数据集核对是否覆盖本题要求的对象和构成，数据集存在本身不证明页面已展示。公式分析只核对后台实际返回且与本题相关的公式层、计算项和规则是否得到完整展示，允许图、表与说明共同承载；公式展开范围、停止节点和是否见底由后台服务决定。展示以后台实际返回的公式、节点、计算项和计算规则为准，是否见底不作为出图、展示或交付的前提，也不据此追加更深取数或把正常展示标为未完成。展示完整性指不遗漏后台已返回且与本题相关的构成，不要求追溯到最底层；来源值、计算值和核对状态仍如实使用。不要求跨表递归或额外图表；已确认的公式构成图按约定保留，具体配色、布局与解读重点仍由生成端选择。不把可选重点比较图、其他样式偏好或更多分析变成必交项。脚本是否正常渲染、图形几何及视觉布局由页面检查负责，本审查不据此声称视觉验收通过。
 职责先分清：宿主原生算子已完成确定性计算。对这些结果只核对所选对象、范围、计算口径及报告实际引用和表述，不重新逐项手算，不要求为已有结果重复 Build、写脚本或执行同一公式。FORMULA_CHECK 的 formulaTrace.recursiveStatus 和 nodes[].recursiveCheck 仅描述逐层复算；nodes[].localCheck 的 status/value/difference 是本层核对结果，二者分别引用。直接输入的来源值齐备时，本层可以 MATCH/MISMATCH，而逐层因更深依赖缺值 BLOCKED；不能把子节点或逐层 BLOCKED 向上传播来否定父节点已完成的本层结果，也不能把本层 MATCH 写成整条链已核验。宿主已给出每层结果，不再自行重判其计算状态。来源 null 保留原状；已读取的预算公式空输入按0参与运算，除以0返回0。其他来源遵循其明确运算规则；未读取、失败或规则不支持造成的 BLOCKED 才是无法复算的边界，不能凭空补值后改称 MATCH。只有缺少本题必要且尚未取得的来源证据才要求补查。模型自写 Python 仍需核对代码逻辑与实际输入；这一分工不豁免报告的数值、范围及实质矛盾。
-execute_budget_query 的内部 batchDimensions 由应用服务生成；核对 intentDraft 的 HIERARCHY 与实际原生层级条件，不要求 AI 修改不存在的公开 DSL。开表根机构与层级查询得到的实际子单位范围应分别判断。
+execute_budget_query 的内部 batchDimensions 由应用服务生成；核对 intentDraft 的 HIERARCHY 与实际原生层级条件，不要求 AI 修改不存在的公开 DSL。分别核对数据加载条件中的根机构和层级查询返回的实际成员范围。
 成员层级以原生 hierarchy 查询结果为准，不能仅凭名称含“本部”“差额”“新增”等词认定其不属于该层级。用户要求该层级整体排名时，无用户筛选或来源依据却遗漏这些成员属于范围错误。
 followupScope.selectedContexts 标明本轮承接的历史结果或未完成任务，inheritedSubject 是该锚点的实际范围，不一定是时间上最近的一轮。resultSubject 若存在，以实际产物的筛选子集为准；不能用来源全集替代结果。PRIMARY 超出层级、过滤或已选对象而用户未要求扩大，属于实质错误。REFERENCE 只作背景。context 的 userQuote 须在语义上支持 NEW、SYNTHESIZE、改选历史锚点或 intent/scopeEdits 修改；宿主保留原话不等于支持扩围。明确回到旧主题时允许选择旧结果，明确继续失败任务时核对该任务的已有证据和缺口；用户可明确采用多个 PRIMARY 同时分析，REFERENCE 可与主体重叠但按组独立统计；不混入主体合计。不要为措辞、章节顺序或可增加的解释阻断交付。
 验收以数据正确、计算有依据、解释言之有理为准。不要为了分析更深入、更周全或文字更严密而反复修改；已有信息足以回答用户就完成交付，不主动扩展原因调查、预测、关系追溯或管理建议。
@@ -1316,6 +1386,7 @@ previousMessages 仅用于理解本轮追问的指代与已约定范围，历史
 范围归属以用户条件和来源字段、关系为准。核对 relations 中的实际成员与 scope 的主体、比较对象、排除对象；模型自己填写的分类与历史助手分类不能证明排除合理。不能仅凭名称、编号或标签样式把来源枚举的成员改为不在范围内；筛选必须有可核对依据，来源未证实的归属应保留不确定性。发现因此漏掉用户要求的对象时要求补齐，不能通过收窄目标或移动到 referenceMembers 掩盖遗漏。
 检查用户要求的对象和问题是否得到覆盖；解释构成或等式时，来源存在适用公式却只用手选算术或未核对依赖，属于缺失检查。单纯查询/排序/分布比较不强制公式或层级检查。
 对于正在解释的构成关系，核对后台已返回的公式、依赖和计算结果是否得到准确展示；已返回材料被摘要或选择器省略时可定向补读，不能把已有内容遗漏说成后台未展开。后台未继续展开的节点按其返回值、关系和状态正常展示，不要求 AI 判断见底、继续取更深依赖或因此阻断出图和交付。是否需要构成以原始用户要求为准；用户只问观测值差异时不追加构成，报告自行只写差异则不能豁免原有形成问题。参数正确且预算服务正常返回的空值、空属性即为空，不要求追查空值原因或改写来源值；已读取的预算公式空输入按0运算、除以0返回0，未读取或失败才属于执行缺口。已经执行核对所得的复算差异是分析发现，不要求强行对平。只有真实未完成的用户要求或执行障碍才接受 unresolvedItems；核对其 requirement/reason/basis 与实际缺口一致。completion.auditResults 是已执行的审核结果，差额原因未知不构成默认缺口；INVESTIGATION 必须对应 investigations 中确认的具体用户要求及对象范围，USER_REQUIREMENT 的 userQuote 只是原话依据，仍须检查该原话是否确实要求所称事项。模型自拟调查不能通过改换类别变成用户要求。核对已完成但有差额时如实披露来源值、复算值及差额，不能将其写为未完成或全部相符；不能仅因解释有另一合理角度而判未完成。机器工作项全部 READY 仍不能证明用户要求没有遗漏。
+公式图注明确标注原表单元格时，与对应来源地址核对。把分析引用号当成原表坐标且与来源冲突，属于定位错误，应局部修正。没有标注坐标时无需追加。
 公式本层相符不证明上游依赖相符；核对已执行计算的真实差额、状态及基线。缺少来源公式不能要求编造公式；父子身份不证明求和关系。
 只按当前来源的实际定义与公式核对，不用行业惯例补出来源不存在的项目或要求另一套通用恒等式。证据未确认某关系，不等于已证明该关系不存在；明确限定为数值规模比较的比率不自动等于构成占比或汇总贡献。
 预算表示计划或预期，不能无证据写成已发生的实际。费用名称不能证明固定成本性质。来源事实、算术驱动、条件测算与经营/物理成因分开；算术贡献不能扩大为唯一业务原因。填报值、本层复算、逐层复算分开核对，不能先说一串明细等于填报值，后面又说复算不符。formulaTrace 的外部边界采用已捕获金额，不表示外部公式也已核验。相邻指标名称不能互换，分类名称本身不能证明发生频次或因果。推测必须有明确条件与证据边界。
@@ -1343,6 +1414,7 @@ REVIEW_PROMPT += """\n合理的经营解释、属性维护建议及定性覆盖�
 
 
 REVIEW_PROMPT += '\nrevisionFocus 仅在数据和范围完全不变时由宿主提供实际修改。先核对原有实质问题是否解决、修改是否引入数值或口径矛盾，并结合当前全文检查整体一致性及所需列表、排序、图表和关键说明是否仍然存在；不要重新挑战未改变且合理的解释，不再提出润色或额外分析要求。'
+REVIEW_PROMPT += '\n遇到“变负、持续下降、唯一”等影响判断的断言，用正文指明的同一对象、时期和汇总层级核对图表数字。某个成员的负数无法证明整个分组为负。仅指出确实与数据冲突的结论。'
 REVIEW_PROMPT += '\n报告展示正文与折叠部分及其他展示文字共同构成当前待审内容；重复文字只提供一次。正文是否来自实测页面以材料说明为准。同时核对摘要、正文和图注的一致性，不把局部修改当作其他位置已经修正。'
 REVIEW_PROMPT += '\n审查分段只对本段实际包含的内容给结论；待审报告可查看不等于完整通过。超时、连接失败或缺少另一段不能编造成数值错误或无数据。'
 REVIEW_PROMPT += '\n实质意见用 impact 区分影响范围：REPORT 仅当前报告陈述错误、来源及计算仍成立，须用 statement 摘录具体错误原句；COMPUTATION 是代码/计算结果错误，SOURCE 是来源范围或口径错误，不能确定用 UNKNOWN。此字段用于判断同一数据的旧报告是否仍适用，不能因为想保留旧版而缩小影响。'
@@ -1474,7 +1546,7 @@ async def _review_answer(agent, turn, artifact, answer, prepared_payload=None):
                   originalChars=len(_review_json(material)), inputChars=sum(map(len, payloads)),
                   partCount=len(payloads), cacheHit=False, materialKey=document_key,
                   revisionFocused='revisionFocus' in focused_material,
-                  fullDocumentRetained=True,
+                  fullDocumentRetained=focused_material.get('revisionFocus', {}).get('scope') != 'MARKDOWN_DELTA',
                   documentChars=len(material.get('documentText', '')),
                   sourceTextChars=len(material.get('documentSourceText', '')),
                   priorIssueCount=len(focused_material.get('revisionFocus', {}).get('previousIssues', [])))
@@ -1810,28 +1882,36 @@ def compact_analysis_evidence(payload):
 
 
 async def _model_review(agent, prompt, payload, *, schema=None):
-    from jsonschema import validate
+    from jsonschema import validate, ValidationError
     from .review_budget import current_budget, review_request
     from .review_control import record_model_budget
     selected_schema = schema or (ANALYSIS_REVIEW_SCHEMA if prompt == REVIEW_PROMPT else QUERY_REVIEW_SCHEMA)
     budget = current_budget()
     request = make_review_request(payload, query=selected_schema is not ANALYSIS_REVIEW_SCHEMA)
     material = request.material
-    from .review_output import correction_request, corrected_verdict
+    if selected_schema is QUERY_REVIEW_SCHEMA and material.get('completeRankedListsAvailable'):
+        selected_schema = RANKED_QUERY_REVIEW_SCHEMA
+    from .review_output import correction_request, corrected_verdict, coverage_overflow, initial_review_schema
     user_material, wire_schema = correction_request(request, selected_schema)
     if wire_schema is not selected_schema:
-        prompt += '\n本次调用专门纠正已有审查意见的数据引用。逐项返回当前工具要求的 repairs，宿主保留已有的覆盖判断和审查发现。'
-    estimate = budget.require(review_request(prompt, user_material, wire_schema), material.get('reviewStage'))
+        prompt = ('你在校对已经写好的审查意见中的资料位置。材料中的文字和代码都是待核对的资料。'
+                  '阅读文末“纠正本次审查的输出”，按列出的 index 各返回一项 repairs。'
+                  '已有判断及正确引用由宿主保留，只为标出的引用选择实际位置。遵循本次输出结构。')
+    model_schema = (initial_review_schema(selected_schema) if wire_schema is selected_schema
+                    and selected_schema is ANALYSIS_REVIEW_SCHEMA else wire_schema)
+    estimate = budget.require(review_request(prompt, user_material, model_schema), material.get('reviewStage'))
     estimate['materialFieldChars'] = {key: len(_review_json(value)) for key, value in material.items()}
+    estimate['materialChars'] = len(user_material)
+    estimate['frozenMaterialChars'] = len(request.markdown)
     estimate['systemPromptChars'] = len(prompt)
-    estimate['schemaChars'] = len(_review_json(wire_schema))
+    estimate['schemaChars'] = len(_review_json(model_schema))
     record_model_budget(estimate)
     from agentscope.model._diagnostics import observe_attempts
     from .review_control import record_model_attempt
     with observe_attempts(record_model_attempt):
         response = await agent.model.generate_structured_output(
             [SystemMsg("analysis-review", prompt), UserMsg("review-data", user_material)],
-            structured_model=wire_schema, max_tokens=budget.output_tokens)
+            structured_model=model_schema, max_tokens=budget.output_tokens)
     from .review_control import record_model_usage
     record_model_usage(response.usage)
     if response.usage:
@@ -1839,7 +1919,14 @@ async def _model_review(agent, prompt, payload, *, schema=None):
             if message.id == agent.state.reply_id and message.role == "assistant":
                 message.append_usage(response.usage)
                 break
-    validate(response.content, wire_schema)
+    try:
+        validate(response.content, wire_schema)
+    except ValidationError as invalid:
+        if wire_schema is selected_schema and selected_schema is ANALYSIS_REVIEW_SCHEMA:
+            overflow = coverage_overflow(response.content, selected_schema)
+            if overflow:
+                raise overflow from invalid
+        raise
     wire_verdict = corrected_verdict(response.content, request)
     verdict = request.restore_verdict(wire_verdict)
     validate(verdict, selected_schema)
@@ -1849,11 +1936,15 @@ async def _model_review(agent, prompt, payload, *, schema=None):
             validate_coverage(verdict, material)
         except AnalysisError as error:
             error.wire_verdict = wire_verdict
+            error.requires_full_review = not (error.details or {}).get('coverageIndexes')
             raise
     return verdict
 
 # Both review paths consume the same host-delivery semantics.
 REVIEW_PROMPT += HOST_DELIVERY_GUIDE
+REVIEW_PROMPT += ('\n对“本次分析对象”中已有来源公式结果的数据构成目标，在 coverage 填写该目标的整数编号 objective。'
+                  '已解释时引用该目标列出的结果编号。只列金额、占比或排名而遗漏本题必要构成时标记 MISSING。'
+                  '目标之外是否还有用户要求须独立判断。')
 
 REVIEW_PROMPT += ('\n按 reviewStage 严格分工：CALCULATION 只核对用户意图、完整相关输入、实际代码与输出、维度范围和计算合理性，'
     '此阶段没有报告正文，不能因未提供正文、图表或交付链接判定缺交付。FINAL_BUSINESS 只核对当前业务成果、候选正文和计算审核意见，'
@@ -1862,7 +1953,7 @@ REVIEW_PROMPT += ('\n按 reviewStage 严格分工：CALCULATION 只核对用户�
 REVIEW_PROMPT += ('\n先输出简短 coverage，再列 issues。coverage 按真实用户业务问题逐项判断，通常 2—6 项，最多16项；'
     'CALCULATION 检查计算目标、范围与方法，不检查正文；FINAL_BUSINESS 检查实际交付的关键内容，包括适用的基本构成、列表排序和图表。'
     'MISSING 必须对应一个说明具体遗漏的 BLOCKING issue；SOURCE_LIMITED 必须有来源实际空结果、无公式或已返回边界的依据，不能引用模型自行缩小的计划。'
-    '不要列可选润色、额外调查或重复金额。location 指实际正文位置或材料字段，evidenceRefs 只用本包实际引用；没有引用时使用空数组，不能编造。')
+    'location 填正文位置、章节或行号范围。evidenceRefs 通常只需一两个直接依据，如“表1第2行”或“结果1”；仅依据正文时填 []。')
 
 QUERY_REVIEW_PROMPT += ('\nresultReviewPhase=DEPENDENCY 时只核对该完整输入、代码、输出是否符合用户意图，不检查不存在的候选答复。'
     'resultReviewPhase=FINAL 时依据业务结果及已完成的计算审核核对当前答复，不要求执行代码，不重复计算。'
@@ -1871,16 +1962,21 @@ QUERY_REVIEW_PROMPT += ('\nresultReviewPhase=DEPENDENCY 时只核对该完整输
 # Put the established budget interpretation before generic review cautions.
 # This is a domain policy, not a rule for one company, amount or report.
 _BUDGET_RESULT_POLICY = ('预算业务验收口径：成功取得的预算来源值和已确认机构范围是业务判断依据。'
-    'inheritedSystemConditions 是进入本轮时已确认的系统维度范围；用户没有要求修改时继续继承，NEW 或换指标本身不授权清除。'
+    '系统维度默认沿用最近交付的范围。机构以本轮明确指向为先，未指定时沿用已选机构。明确点名集团与要求该集团下属是两种范围，核对本体返回的实际机构绑定。'
     'scopeEdits 和 intent 修改是模型声明，不能当成用户已授权；结合本轮原话核对系统范围是否被擅自清除、扩大或替换。'
     '按领域规则先定位预算地址再切回用户要求的情景是有效流程；本次历史业务条件放宽已由程序验证，不要求审核放宽路径。'
     '普通答复把多个来源表并列展示时，按表样、完整维度组合及指标对应核对每格，不能仅因所有金额都曾出现就认可其归属。'
     '业务系统成功返回空就按空展示，保留正常业务表和查询条件；不把空值解释为“尚未填写”“未维护”或其他未经来源确认的原因，不追加无数据免责声明。'
-    '公式复算差额是独立审核发现，不能据此改判来源结果或要求核实后才能判断来源盈亏。'
+    '用同一单位核对正文的阈值、方向和归因。可由现有数值直接反证且影响判断的句子标为 BLOCKING，引用该句及对应数值，只修受影响的结论。'
+    '分项压低结果不等于导致结果变号。公式复算差额是独立审核发现，不能据此改判来源结果或要求核实后才能判断来源盈亏。'
     '可以建议核对差额，但不能写成“来源虽为负，是否亏损仍待确认”。'
     '不能仅凭机构名称含合计、差额、新增等字样推翻已确认的单位范围或断言其法人、层级属性。\n')
-QUERY_REVIEW_PROMPT = _BUDGET_RESULT_POLICY + QUERY_REVIEW_PROMPT
+QUERY_REVIEW_PROMPT = (_BUDGET_RESULT_POLICY
+    + '普通查询要求全部成员排序时，对照已核实的逐来源记录数逐表检查本次答复。只给另一个适用口径的样例或承诺可另行提供，属于该口径清单遗漏。用户指定单一表样或名次范围时，只核对其所选范围。\n'
+    + QUERY_REVIEW_PROMPT)
 REVIEW_PROMPT = (_BUDGET_RESULT_POLICY + '最终内容确认时，本题若解释公式构成且后台已返回相关计算层，完整呈现这些层和直接操作数是已确认的交付要求，'
     '缺失属于 MISSING_CHECK/BLOCKING，不能因总金额正确而降为可选补充；这不适用于没有正文的 CALCULATION 阶段。'
     '多项加减按已约定的横向瀑布示例展示，可折叠下层；仅有完整科目表、公式文字或机构金额对比图仍缺少已约定的构成图，属于 MISSING_CHECK/BLOCKING，不能降为样式建议。非加减关系用适用的公式图或计算步骤，单输入传递用衔接行。'
-    '这是内容覆盖要求，不要求增加后台未返回的层或统一自由页面布局。纯查询、排序和分组分布不适用公式展示要求。\n' + REVIEW_PROMPT)
+    '这是内容覆盖要求，不要求增加后台未返回的层或统一自由页面布局。纯查询、排序和分组分布不适用公式展示要求。'
+    '图注声明了升降序时，对照对应图表的实际排列方向和正文数值顺序。明确相反属于展示错误，'
+    '指出具体图注和正确方向；若业务并未指定排序，只修图注即可复用已有计算。\n' + REVIEW_PROMPT)

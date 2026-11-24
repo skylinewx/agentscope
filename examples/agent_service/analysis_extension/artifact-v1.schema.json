@@ -770,6 +770,23 @@
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
         },
+        "markdown": {"type": "string", "maxLength": 524288},
+        "figureSources": {"type": "array", "items": {"type": "string"}},
+        "sourceTableCounts": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "tables": {"type": "integer", "minimum": 0},
+            "rows": {"type": "integer", "minimum": 0},
+            "records": {"type": "integer", "minimum": 0},
+            "numeric": {"type": "integer", "minimum": 0}
+          }
+        },
+        "periodTrendRefs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^trend_[0-9a-f]{14}$" }
+        },
         "bindings": {
           "type": "array",
           "maxItems": 2000,

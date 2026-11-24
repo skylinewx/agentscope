@@ -122,6 +122,8 @@ class MessageBusKeys:  # pylint: disable=too-many-public-methods
     # ------------------------------------------------------------------
 
     _SESSION_EVENTS = "agentscope:session:events:{sid}"
+    _SESSION_TITLE_UPDATES = "agentscope:user:{uid}:session_title_updates"
+    SESSION_COMPLETION_REPLAY_MAX_LEN = 256
 
     SESSION_REPLAY_MAX_LEN = 1000
     """Replay log length cap; older events are trimmed on append."""
@@ -137,6 +139,16 @@ class MessageBusKeys:  # pylint: disable=too-many-public-methods
     def session_events(cls, session_id: str) -> str:
         """Replay log + live pub/sub channel key for a session."""
         return cls._SESSION_EVENTS.format(sid=session_id)
+
+    @classmethod
+    def session_title_updates(cls, user_id: str) -> str:
+        """Live title changes for all sessions owned by one user."""
+        return cls.session_updates(user_id)
+
+    @classmethod
+    def session_updates(cls, user_id: str) -> str:
+        """Account-scoped session events (including the existing title feed)."""
+        return cls._SESSION_TITLE_UPDATES.format(uid=user_id)
 
     @classmethod
     def session_event_checkpoint(cls, session_id: str) -> str:

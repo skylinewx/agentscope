@@ -29,5 +29,7 @@ async def prepare(service, turn, declaration):
     evidence = deepcopy(candidate.state['materials'])
     assessment = {'origin': 'MODEL_PLAN', 'materials': evidence, 'investigations': checked,
                   'basis': payload, 'explanation': 'AI 本次声明的数据需求；不代表查询失败或用户要求已全部覆盖。'}
+    if candidate.state.get('objectives'):
+        assessment['objectives'] = deepcopy(candidate.state['objectives'])
     assessment['assessmentKey'] = digest(assessment)
     return declaration, assessment

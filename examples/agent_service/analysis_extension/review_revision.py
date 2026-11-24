@@ -9,7 +9,7 @@ from .review_control import progress
 
 def revision_basis(material):
     source = {key: value for key, value in material.items()
-              if key not in ('documentText', 'documentSourceText', 'candidateAnswer', 'deliveryEvidence', 'reviewHistory', 'failures')}
+              if key not in ('documentText', 'documentSourceText', 'candidateAnswer', 'deliveryEvidence', 'reviewHistory')}
     return digest(source)
 
 
@@ -36,12 +36,28 @@ def focus_revision(turn, material):
             if operation != 'equal':
                 changes.append({'field': field, 'before': before[old_start:old_end], 'after': after[new_start:new_end]})
     result = deepcopy(material)
+    if (material.get('documentTextBasis') == 'VERIFIED_MARKDOWN' and previous['issues']
+            and all(item.get('impact') == 'REPORT' for item in previous['issues'])
+            and all(change['field'] == 'documentText' and len(change['before']) == len(change['after']) == 1
+                    and all(line.strip() and not line.lstrip().startswith(('#', '|', '![', '```'))
+                            for line in change['before'] + change['after']) for change in changes)):
+        before, after = previous['text'].splitlines(), text.splitlines()
+        indexes = [i for i, (old, new) in enumerate(zip(before, after)) if old != new]
+        paragraphs = [f'第 {i+1} 行\n原文：{before[i]}\n修订：{after[i]}' +
+                      ('\n上文：' + after[i-1] if i else '') +
+                      ('\n下文：' + after[i+1] if i+1 < len(after) else '') for i in indexes]
+        edit_text = '\n\n'.join(paragraphs)
+        if indexes and len(indexes) <= 3 and len(edit_text) < len(text) / 2:
+            result['documentText'] = '已全文审核，来源、计算、图表及其余段落完全相同。请核对以下局部修改。\n\n' + edit_text
+            result['revisionFocus'] = {'scope': 'MARKDOWN_DELTA', 'previousIssues': previous['issues'],
+                                       'sameDataAndScope': True, 'unchangedEvidenceDigest': previous['basis']}
+            return result
     # 上一次内容审查已完成，且来源、范围、绑定、计算与失败信息逐项摘要相同。
     # 保留全部事实、派生数值、空值、公式差额及当前全文，只省去未变化的执行背景。
     # Python reuse requires the independent completed computation proof. A
     # completed review that found a code error is not a computation approval.
     isolated = all(issue.get('impact') == 'REPORT' for issue in previous['issues'])
-    unchanged_background = ('sourceScopes', 'structureEvidence', 'previousMessages', 'relations') if isolated else ('previousMessages',)
+    unchanged_background = ('structureEvidence', 'previousMessages', 'relations') if isolated else ('previousMessages',)
     omitted = [field for field in unchanged_background if field in result]
     for field in omitted:
         result.pop(field)

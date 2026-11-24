@@ -88,7 +88,8 @@ def evaluate(document, observations):
                 or not isinstance(item['refs'], list) or len(item['refs']) > 2000 or not all(text(ref, 200) for ref in item['refs'])):
             invalid('集合顺序诊断格式无效。')
         dataset = sets.get(item['key'])
-        if not dataset or dataset['kind'] != 'ORDERED':
+        if not dataset or not (dataset['kind'] == 'ORDERED' or
+                dataset['kind'] == 'TABULAR' and dataset.get('direction') in ('asc', 'desc')):
             orders.append({'key': item['key'], 'status': 'UNSUPPORTED_MARKER', 'partial': item['partial']})
             continue
         seen.add(item['key'])
@@ -98,7 +99,8 @@ def evaluate(document, observations):
         subsequence = [ref for ref in expected if ref in selected]
         correct = item['refs'] == (subsequence if item['partial'] else expected)
         status = 'TRUNCATED' if item['truncated'] else 'EMPTY' if not item['refs'] and expected else 'PASS' if correct else 'MISMATCH'
-        orders.append({'key': item['key'], 'status': status, 'partial': item['partial'], 'observedCount': len(item['refs']), 'totalCount': len(expected)})
+        orders.append({'key': item['key'], 'status': status, 'partial': item['partial'],
+                       'direction': dataset.get('direction'), 'observedCount': len(item['refs']), 'totalCount': len(expected)})
     unmeasured = [key for key, data in sets.items() if data['kind'] == 'ORDERED' and key not in seen]
     blocking = bool(observations['errors']) or any(o['status'] == 'MISMATCH' for o in orders) or any(c['status'] == 'FAIL' for c in numeric_checks.values())
     warnings = bool(observations['pageOverflow'] or observations['overflow'] or observations['overlaps'] or observations['smallText'] or observations['clippedText'] or observations['truncated'] or unmeasured or any(o['status'] != 'PASS' for o in orders) or any(c['status'] in ('PARTIAL', 'NOT_MEASURED') for c in numeric_checks.values()))
@@ -135,6 +137,18 @@ def require_publication_checks(document, records, unavailable_reason=None, requi
         identities.update(reference(document, {'valueKey': key}) for key in
                           set(document.get('staticBindingKeys', [])) & set(document.get('numericBindingKeys', [])))
     current = [record.get('valueCoverage') for record in records]
+    if not current and (identities or (requirements or {}).get('coverage-v4')):
+        raise AnalysisError('DOCUMENT_NOT_CHECKED', '修订稿尚无对应的页面测量。请用宿主预览并核对修订后的图表，然后发布。',
+                            {'path': '/document', 'renderChecks': checks, 'nextAction': 'RUN_RENDER_CHECKS',
+                             'requiresBuild': False})
+    trend_refs = document.get('periodTrendRefs', [])
+    if records and trend_refs:
+        needed = {reference(document, {'trendRef': key}): key for key in trend_refs}
+        missing = min((set(needed) - set((item or {}).get('charted', [])) for item in current), key=len)
+        if missing:
+            raise AnalysisError('DOCUMENT_TREND_COVERAGE_MISSING', '已选时期折线图的可见折线或数据点不完整。',
+                                {'missingTrendRefs': sorted(needed[key] for key in missing), 'requiresBuild': False,
+                                 'hint': '在正文保留可见的 data-analysis-trend 容器，直接使用宿主绘制的图形；复用已取得的数据。'})
     from .document_coverage import required_formula_steps
     expected_formula_steps=required_formula_steps(document)
     formula_checks = [item for item in current if item is not None]
@@ -142,9 +156,13 @@ def require_publication_checks(document, records, unavailable_reason=None, requi
             item['complete'] and expected_formula_steps<=set(item['charted']) for item in formula_checks):
         missing = min((expected_formula_steps-set(item['charted']) for item in formula_checks),key=len,
                       default=expected_formula_steps)
-        raise AnalysisError('DOCUMENT_FORMULA_COVERAGE_MISSING', '已采用的多项公式构成尚未完整绑定为瀑布图。',
-                            {'missingFormulaSteps': sorted(missing), 'requiresBuild': False,
-                             'hint': '保留现有模板及全部公式项，仅补齐对应节点的 waterfall.steps 绑定；科目表或企业比较图不能替代本次公式瀑布。下层允许放在可展开区域。'})
+        from .document_coverage import formula_step_groups, WATERFALL_BINDING_HELP
+        nodes = [{'setKey': key, 'nodeRef': node, 'expectedSteps': len(refs),
+                  'missingSteps': len(missing.intersection(refs))}
+                 for key, node, refs in formula_step_groups(document) if not missing.isdisjoint(refs)]
+        raise AnalysisError('DOCUMENT_FORMULA_COVERAGE_MISSING', '公式数据已取得，以下节点的瀑布图仍缺少已绑定的条形。',
+                            {'missingFormulaNodes': nodes, 'requiresBuild': False, 'path': '/document/html',
+                             'hint': WATERFALL_BINDING_HELP})
     if current and all(item is not None for item in current):
         identities.update(ref for item in current for ref in item['charted'])
         if not any(item['complete'] and identities <= set(item['presented']) for item in current):

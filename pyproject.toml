@@ -37,6 +37,7 @@ dependencies = [
     "opentelemetry-semantic-conventions>=0.60b0",
     "python-socketio",
     "rich",
+    "markdown-it-py>=3,<5",
     "shortuuid",
     "python-frontmatter",
     "jinja2",

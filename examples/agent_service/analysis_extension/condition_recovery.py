@@ -8,7 +8,11 @@ from .models import AnalysisError
 from .query_results import encode
 
 
-LOCATION_FAILURES = frozenset(('BUDGET_TARGET_UNRESOLVED', 'DIMENSION_SCOPE_UNRESOLVED'))
+def scope_recovery(receipt):
+    if (receipt and receipt.get('status') == 'FAILED'
+            and (receipt.get('error') or {}).get('code') == 'DIMENSION_SCOPE_UNRESOLVED'):
+        return (receipt.get('data') or {}).get('conditionRecovery')
+    return None
 
 
 def plans(request, descriptor):
@@ -48,9 +52,8 @@ async def run(capture, agent, input_kwargs, next_handler):
         adapter = capture.sources.for_capture(record)
         return record, adapter.raw_receipt(record['response'])
     record, receipt = saved(first)
-    descriptor = (receipt or {}).get('data', {}).get('conditionRecovery')
-    if (not descriptor or not record or record.get('originalToolName') != 'execute_budget_query'
-            or (receipt.get('error') or {}).get('code') not in LOCATION_FAILURES):
+    descriptor = scope_recovery(receipt)
+    if not descriptor or record.get('originalToolName') != 'execute_budget_query':
         yield first
         return
     initial = deepcopy(record['request'])
@@ -62,7 +65,7 @@ async def run(capture, agent, input_kwargs, next_handler):
         if descriptor['tier'] <= previous_tier:
             raise AnalysisError('CONDITION_RECOVERY_CYCLE', '历史条件恢复没有前进，已停止重复查询。')
         previous_tier = descriptor['tier']
-        events, later, all_unlocated = [], None, True
+        events, later, all_recoverable = [], None, True
         next_receipt = None
         for request in plans(initial, descriptor):
             if 'groups' in descriptor:
@@ -82,15 +85,15 @@ async def run(capture, agent, input_kwargs, next_handler):
             branch, result = saved(response)
             if branch:
                 probes.append(branch['captureRef'])
-            unlocated = bool(result and (result.get('error') or {}).get('code') in LOCATION_FAILURES)
-            all_unlocated &= unlocated
-            if unlocated and result['data'].get('conditionRecovery'):
-                next_plan = result['data']['conditionRecovery']
+            next_plan = scope_recovery(result)
+            if next_plan:
                 if later is not None and later != next_plan:
                     raise AnalysisError('CONDITION_RECOVERY_CONFLICT', '同层查询返回了不一致的后续条件计划。')
                 later = next_plan
                 next_receipt = result
-        if all_unlocated and later:
+            else:
+                all_recoverable = False
+        if all_recoverable and later:
             descriptor, plan_receipt = later, next_receipt
             continue
         if len(events) == 1:

@@ -21,6 +21,7 @@ def composition_materials(artifact, limit=8, node_limit=24, character_limit=1600
             local = node.get('localCheck') or {}
             dependencies = [dep['factRef'] for dep in node.get('dependencies', []) if dep.get('factRef')]
             nodes.append({'factRef': node['factRef'], 'headers': fact.get('headers', node.get('headers', [])),
+                          **({'cellAddress': fact['cellAddress']} if node.get('expression') and fact.get('cellAddress') else {}),
                           'sourceValue': fact.get('value'), 'valueState': fact.get('valueState'), 'unit': fact.get('unit'),
                           'formulaStatus': fact.get('formulaStatus'), 'expression': node.get('expression'),
                           'dependencyRefs': dependencies, 'localCheck': local,

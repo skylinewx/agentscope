@@ -26,7 +26,7 @@ class AggregationExplanationTests(TestCase):
             self.assertIn(expected, text)
         self.assertNotIn('42 个有值', text)
         self.assertEqual(source, before)
-        self.assertIn('289929166.64', text)
+        self.assertIn('289,929,166.64', text)
 
     def test_filter_stage_counts_are_separate_and_nulls_are_preserved(self):
         counts = self.counts()

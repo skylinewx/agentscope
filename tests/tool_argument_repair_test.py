@@ -315,6 +315,30 @@ class ToolCallArgumentRepairTest(IsolatedAsyncioTestCase):
         """Test that nested validation errors identify their instance paths."""
         cases = [
             (
+                "missing_input_form_omits_script_body",
+                {"oneOf": [
+                    {"title": "new input", "required": ["inputs"]},
+                    {"title": "reuse input", "required": ["retry"]},
+                ]},
+                json.dumps({"value": {"code": "sensitive-payload" * 60}}),
+                "Match exactly one of the allowed forms: new input / required fields inputs "
+                "| reuse input / required fields retry (at $.value)",
+            ),
+            (
+                "ambiguous_input_form_does_not_choose_one",
+                {"oneOf": [{"required": ["before"]}, {"required": ["after"]}]},
+                '{"value":{"before":1,"after":2}}',
+                "Match exactly one of the allowed forms: required fields before "
+                "| required fields after (at $.value)",
+            ),
+            (
+                "nested_large_value_keeps_rule_and_path",
+                {"type": "object", "properties": {"limit": {"type": "integer"}}},
+                json.dumps({"value": {"limit": "encoded-data" * 80}}),
+                "Value violates schema rule type (integer). Check this field in the tool schema "
+                "(at $.value.limit)",
+            ),
+            (
                 "nested_type",
                 {
                     "type": "object",
@@ -323,6 +347,13 @@ class ToolCallArgumentRepairTest(IsolatedAsyncioTestCase):
                 },
                 '{"value": {"city": "many"}}',
                 "'many' is not of type 'integer' (at $.value.city)",
+            ),
+            (
+                "case_sensitive_direction",
+                {"enum": ["asc", "desc"]},
+                '{"value":"DESC"}',
+                "'DESC' is not one of ['asc', 'desc'] (at $.value). "
+                'Retry with $.value set to "desc". Keep the other arguments.',
             ),
             (
                 "array_item",

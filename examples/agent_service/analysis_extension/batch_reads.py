@@ -9,7 +9,7 @@ MAX_REQUESTS = 12
 MAX_CHARS = 24000
 MAX_PAGES = 100
 CAPTURE_SECTIONS = ('materials', 'inventory', 'entities', 'selectors', 'capture', 'receipt', 'rows', 'gridFiles')
-ANALYSIS_SECTIONS = ('facts', 'derived', 'formulas', 'summary', 'claims', 'verificationRecords', 'relations', 'order', 'products', 'inputFields')
+ANALYSIS_SECTIONS = ('facts', 'derived', 'formulas', 'summary', 'claims', 'verificationRecords', 'relations', 'order', 'products', 'inputFields', 'periodTrends')
 
 
 def validate_inspect_requests(requests):

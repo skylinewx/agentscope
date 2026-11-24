@@ -1,5 +1,6 @@
 """按已解析的运行上下文组织审查资料；原始回执和业务数据均保持完整。"""
 from copy import deepcopy
+from .budget_dimensions import SYSTEM_DIMENSION_LABELS, dimension_labels, source_models
 
 
 def business_query_projection(capture, receipt, source):
@@ -24,9 +25,16 @@ def business_query_projection(capture, receipt, source):
         context['target'] = target(actual.get('target', {}))
         context.update({key: deepcopy(result[key]) for key in
                         ('targetId', 'interpretationId', 'resolvedTerms', 'resolvedTitleTerms', 'grain') if key in result})
+        rows = result.get('rows', [])
+        labels = dimension_labels(data.get('dimensionCatalog') or [], models=source_models(rows), context=actual)
+        used = set(actual.get('effectiveDimensions') or {})
+        used.update(code for row in rows for code in row.get('dimensions', {}))
+        named = {code: labels[code] for code in sorted(used) if code in labels and labels[code] != SYSTEM_DIMENSION_LABELS.get(code)}
+        if named:
+            context['dimensionLabels'] = named
         context_ref = digest(context)[:24]
         contexts[context_ref] = context
-        for row in result.get('rows', []):
+        for row in rows:
             fact = {key: deepcopy(row[key]) for key in
                     ('factId', 'title', 'objectLabel', 'measureCode', 'dimensions', 'dimensionNames', 'dataPeriod',
                      'value', 'valueType', 'valueState', 'unit', 'unitBasis', 'originRefs') if key in row}
@@ -72,16 +80,61 @@ def business_query_projection(capture, receipt, source):
 def business_table_view(receipt):
     """One complete business presentation for query, empty closeout and review."""
     from .business_tables import build_tables, state_markdown, catalog
+    from .single_value_presentation import source_name
+    from .display_tables import aligned_filter_view, public_query_markdown
     tables = build_tables(receipt)
+    definitions = catalog(tables)
+    single = bool(tables) and tables[0].single_value_target is not None
+    if single:
+        for table, definition in zip(tables, definitions):
+            definition['sourceName'] = source_name(table)
+            if table.rows:
+                definition['rowRef'] = table.rows[0]['id']
     locations = {}
     for table in tables:
         for fact, places in table.locations.items():
             locations.setdefault(fact, []).extend(places)
-    return {
-        'markdown': state_markdown(receipt) + '\n\n' + '\n\n'.join(t.markdown() for t in tables),
-        'tables': catalog(tables), 'factLocations': locations,
+    view = {
+        'tables': definitions, 'factLocations': locations,
         'allFactsIncluded': sum(len(t.facts) for t in tables) == sum(
             len(result.get('rows', [])) for result in receipt.get('data', {}).get('resultSets', []))}
+    data = receipt.get('data') or {}
+    order = data.get('presentation') or {}
+    proofs = order.get('resultSets') or []
+    if (receipt.get('status') == 'SUCCEEDED' and data.get('purpose') == 'QUERY' and data.get('complete') is True
+            and order.get('verified') is True and order.get('scope') == 'EACH_RESULT_SET'
+            and order.get('valueOrder') in ('ASC', 'DESC') and len(proofs) == len(tables) > 1):
+        by_id = {item['resultSetId']: item for item in proofs}
+        for table in tables:
+            proof = by_id.pop(table.set_id, {})
+            displayed = [fact['factId'] for row in table.rows for fact in row['cells'].values()]
+            if (len(table.columns) != 1 or len(displayed) != len(table.rows)
+                    or proof.get('rowCount') != len(displayed) or proof.get('orderedFactIds') != displayed):
+                break
+        else:
+            if not by_id:
+                view['completeRankedLists'] = True
+    # These complete presentations can be delivered verbatim. Other review
+    # packets keep the addressable source rows and their loading context.
+    if single or view.get('completeRankedLists') or not any(f.get('valueState') == 'PRESENT' for t in tables for f in t.facts):
+        aligned = aligned_filter_view(data, tables)
+        view['markdown'] = state_markdown(receipt, aligned=bool(aligned)) + '\n\n' + public_query_markdown(tables, aligned)
+    else:
+        view['markdown'] = state_markdown(receipt) + '\n\n' + '\n\n'.join(t.markdown() for t in tables)
+    return view
+
+
+def ranked_list_source(evidence):
+    """Offer a complete native answer only when one unambiguous business receipt supplies the data."""
+    if evidence.get('pythonRuns') or evidence.get('referencedCalculations'):
+        return None
+    sources = [s for s in evidence.get('sources', []) if (s.get('facts') or s.get('factRows')
+               or any(s.get('source', {}).get(key) for key in ('businessTableView', 'gridFiles', 'batchQueries')))]
+    if len(sources) == 1 and sources[0].get('captureRef'):
+        view = sources[0].get('source', {}).get('businessTableView') or {}
+        if view.get('completeRankedLists') and view.get('allFactsIncluded') and view.get('markdown'):
+            return sources[0]
+    return None
 
 
 def markdown_review_material(value):

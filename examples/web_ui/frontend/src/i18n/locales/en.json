@@ -300,7 +300,42 @@
 			"emptyNoAgent": "Select an agent first.",
 			"emptyHasAgent": "Create a session to start chatting.",
 			"today": "Today",
-			"earlier": "Earlier"
+			"earlier": "Earlier",
+			"actions": "Session actions",
+			"bulkDelete": {
+				"enter": "Bulk delete",
+				"exit": "Exit bulk delete",
+				"selectAll": "Select all",
+				"selectAllLabel": "Select all sessions for the current agent",
+				"selected": "{{count}} selected",
+				"deleteSelected": "Delete selected",
+				"title_one": "Delete {{count}} session?",
+				"title_other": "Delete {{count}} sessions?",
+				"description": "The selected sessions and their message history will be permanently deleted. The system will attempt to remove their session-specific temporary files.",
+				"preview": "Sessions to delete",
+				"current": "Current session",
+				"more_one": "{{count}} more session",
+				"more_other": "{{count}} more sessions",
+				"running_one": "{{count}} session is running. Confirming deletion will request its cancellation.",
+				"running_other": "{{count}} sessions are running. Confirming deletion will request their cancellation.",
+				"team": "Deleting a team leader session also dissolves its team and deletes the associated member sessions.",
+				"confirm": "Confirm deletion",
+				"deleting": "Deleting…",
+				"success_one": "Deleted {{count}} session",
+				"success_other": "Deleted {{count}} sessions",
+				"partial": "Deleted {{removed}}. Could not delete {{failed}}. You can retry the remaining selection.",
+				"failed_one": "Could not delete the selected session. You can retry.",
+				"failed_other": "Could not delete the {{count}} selected sessions. You can retry."
+			},
+			"status": {
+				"running": "Running",
+				"awaiting_permission": "Waiting for confirmation",
+				"awaiting_external_result": "Waiting for external results"
+			},
+			"unreadResult": "Unread result",
+			"untitledQuestion": "This request",
+			"replyCompleted": "completed",
+			"openReply": "View result"
 		}
 	},
 	"dialog-agent-create": {
@@ -1047,7 +1082,8 @@
 		"memberPageInfo": "Members {{start}}–{{end}} of {{total}}; related details stay together",
 		"title": "Published analysis",
 		"loading": "Loading registered results…",
-		"unsupported": "This result uses an unsupported data protocol and needs to be generated again. Saved messages have not been deleted.",
+		"unsupported": "This page does not support this report format version.",
+		"invalidView": "The report could not be opened because its display data failed validation.",
 		"activationRequired": "Analysis is unavailable. Check the selected data-analysis Skill and the global analysis setting.",
 		"changed": "The display file is missing or changed. Restore the registered version.",
 		"noAccess": "This analysis is unavailable to this session. Check the session and access.",

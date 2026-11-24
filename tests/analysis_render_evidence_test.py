@@ -36,6 +36,22 @@ class RenderEvidenceTests(TestCase):
         self.assertIn('尚无当前页面', result['documentObservation'])
         self.assertEqual(snapshot('长' * (TEXT_LIMIT + 1)), {'text': '', 'complete': False})
 
+    def test_business_reviewer_can_compare_the_caption_with_the_measured_native_order(self):
+        from analysis_extension.review_request import make_review_request
+        artifact = {'analysisRef': 'ref', 'freeDocument': {'contentDigest': 'current', 'datasets': {
+            'units': {'valueRef': 'desc_all'}}}, 'derivedValues': [
+                {'derivedId': 'desc_all', 'operator': 'DESCRIBE', 'direction': 'asc'}]}
+        record = {'runner': 'headless-service', 'contentDigest': 'current', 'blocking': False,
+                  'viewport': {'width': 900}, 'hostRenderedText': snapshot('标题写着从大到小'),
+                  'orders': [{'key': 'units', 'status': 'PASS'}]}
+        material = review_text(self.fixture([record]), artifact, '')
+        review = make_review_request({'reviewStage': 'FINAL_BUSINESS', **material})
+        self.assertIn('标题写着从大到小', review.markdown)
+        self.assertIn('| units | 从小到大 |', review.markdown)
+        for unusable in ({**record, 'orders': [{'key': 'units', 'status': 'UNSUPPORTED_MARKER'}]},
+                         {**record, 'contentDigest': 'stale'}, {**record, 'runner': 'browser'}):
+            self.assertNotIn('documentOrders', review_text(self.fixture([unusable]), artifact, ''))
+
     def test_manual_measurement_cannot_submit_host_text_and_invalid_host_payload_rejected(self):
         diagnostic = evaluate({'contentDigest': 'current'}, {**measurements(), 'hostRenderedText': snapshot('自述内容')})
         self.assertNotIn('hostRenderedText', diagnostic)

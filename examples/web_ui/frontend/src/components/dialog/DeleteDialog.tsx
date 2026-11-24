@@ -19,7 +19,11 @@ interface Props {
 	onOpenChange: (open: boolean) => void;
 	title: string;
 	description?: ReactNode;
+	children?: ReactNode;
 	confirmLabel?: string;
+	pendingLabel?: string;
+	confirmDisabled?: boolean;
+	onCloseAutoFocus?: (event: Event) => void;
 	onConfirm: () => Promise<void>;
 }
 
@@ -28,12 +32,17 @@ export function DeleteDialog({
 	onOpenChange,
 	title,
 	description,
+	children,
 	confirmLabel,
+	pendingLabel,
+	confirmDisabled = false,
+	onCloseAutoFocus,
 	onConfirm,
 }: Props) {
 	const { t } = useTranslation();
 	const [deleting, setDeleting] = useState(false);
 	const [error, setError] = useState('');
+	const label = confirmLabel ?? t('common.confirm');
 	const changeOpen = (next: boolean) => {
 		if (deleting) return;
 		setError('');
@@ -55,11 +64,17 @@ export function DeleteDialog({
 
 	return (
 		<Dialog open={open} onOpenChange={changeOpen}>
-			<DialogContent className="max-w-sm">
+			<DialogContent
+				className="max-w-sm"
+				aria-busy={deleting}
+				showCloseButton={!deleting}
+				onCloseAutoFocus={onCloseAutoFocus}
+			>
 				<DialogHeader>
 					<DialogTitle>{title}</DialogTitle>
 					{description && <DialogDescription>{description}</DialogDescription>}
 				</DialogHeader>
+				{children}
 				{error && (
 					<Alert variant="destructive">
 						<AlertDescription>{error}</AlertDescription>
@@ -79,14 +94,14 @@ export function DeleteDialog({
 						type="button"
 						variant="destructive"
 						onClick={handleConfirm}
-						disabled={deleting}
+						disabled={deleting || confirmDisabled}
 					>
 						{deleting ? (
 							<Loader2 className="size-3.5 animate-spin" />
 						) : (
 							<CheckCircle className="size-3.5" />
 						)}
-						{confirmLabel ?? t('common.confirm')}
+						{deleting ? (pendingLabel ?? label) : label}
 					</Button>
 				</DialogFooter>
 			</DialogContent>

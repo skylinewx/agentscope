@@ -13,8 +13,8 @@ class SessionSummary(BaseModel):
     @classmethod
     def from_record(cls, record: SessionRecord):
         # Reuse the execution status rule; derive before dropping the context.
-        from .._service._session import SessionService
-        status = SessionService.derive_parked_status(record.state.context).value
+        from .._service._session_activity import parked_session_status
+        status = parked_session_status(record.state).value
         state = record.state.model_copy(update={
             'context': [], 'summary': '', 'tool_context': ToolContext(), 'middle_context': {},
         })

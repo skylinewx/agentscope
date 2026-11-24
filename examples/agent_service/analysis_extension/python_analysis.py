@@ -100,14 +100,41 @@ def validate_python_work_plan(work_plan, operations, base=None):
                  'hint': '脚本自行计算比例或合计时使用 kind=COMPUTATION、operator=PYTHON，refs 填 result.name；FORMULA_CHECK/RECONCILE 等原生检查继续保留原算子并在 operations 中声明，不能用脚本替代来源公式检查。'})
 
 
-async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRefs=None, timeoutSeconds=PYTHON_DEFAULT_TIMEOUT_SECONDS,
+async def analyze(service, code=None, purpose=None, requestKey=None, analysisRef=None, inputRefs=None, timeoutSeconds=PYTHON_DEFAULT_TIMEOUT_SECONDS,
                   captureRefs=None, selections=None, scope=None, fileInputs=None, gridInputs=None, workPlan=None,
                   answerOutputs=None, operations=None, fallbackReason=None, supersedesRunRefs=None, retryOfRunRef=None,
-                  inputSetRef=None):
+                  inputSetRef=None, dimensionFilter=None, filterInputRef=None, registerRunRef=None):
     await service.authorize()
+    if registerRunRef is not None:
+        if any(arg is not None for arg in (code, purpose, fallbackReason, analysisRef, inputRefs, captureRefs,
+                                           selections, scope, fileInputs, gridInputs, operations, retryOfRunRef,
+                                           supersedesRunRefs, inputSetRef, dimensionFilter, filterInputRef)):
+            raise AnalysisError('PYTHON_REGISTRATION', '登记已完成运行只提交 registerRunRef、requestKey、workPlan 和需要的 answerOutputs。')
+        execution = service.store.get_python_run(service.owner, registerRunRef)
+        if execution.get('status') != 'COMPLETED' or not execution.get('registrationError') or not execution.get('sourceAnalysisRef'):
+            raise AnalysisError('PYTHON_REGISTRATION', '只有执行成功且工作项登记失败的运行可重新登记。')
+        if not isinstance(requestKey, str) or not requestKey or not isinstance(workPlan, list) or not workPlan:
+            raise AnalysisError('PYTHON_REGISTRATION', '请提供本次登记的 requestKey 和修正后的工作项。')
+        base = service.store.get_analysis(service.owner, execution['sourceAnalysisRef'])
+        validate_python_work_plan(workPlan, [], base)
+        expected = {t['taskId']: t for t in execution.get('registrationPlan', []) if isinstance(t, dict) and isinstance(t.get('taskId'), str)}
+        if any(not isinstance(t, dict) or not isinstance(t.get('taskId'), str) for t in workPlan):
+            raise AnalysisError('INVALID_WORK_PLAN', '每个工作项需要 taskId。')
+        actual = {t['taskId']: t for t in workPlan}
+        for task_id, previous in expected.items():
+            updated = actual.get(task_id, {})
+            if (not updated or any(previous.get(k) != updated.get(k) for k in ('kind', 'operator', 'objectiveRef', 'requiredEvidence'))
+                    or not set(previous.get('targetRefs', [])) <= set(updated.get('targetRefs', []))):
+                raise AnalysisError('PYTHON_REGISTRATION', '仅修正结果绑定时须保留原工作项和目标。', {'taskId': task_id})
+        seed = {'registerRunRef': registerRunRef, 'workPlan': workPlan, 'answerOutputs': answerOutputs}
+        return register_outputs(service, base, execution, workPlan, answerOutputs, seed, 'register-python:' + requestKey)
     from .execution_policy import require
     require(service.turn, 'computations', 'AnalysisPython')
     prepared = None
+    if filterInputRef is not None and dimensionFilter is None:
+        raise AnalysisError('INPUT_SET_SELECTION', '筛选某个已采用的输入组时，同时提供 dimensionFilter。')
+    if dimensionFilter is not None and not inputSetRef:
+        raise AnalysisError('INPUT_SET_SELECTION', '维度筛选适用于本次已冻结的 inputSetRef。')
     if inputSetRef is not None:
         if any(value is not None for value in (analysisRef, inputRefs, captureRefs, selections, scope,
                                                fileInputs, gridInputs, retryOfRunRef)):
@@ -118,6 +145,25 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
             raise AnalysisError('STALE_INPUT_SET', '用户条件或采用用途已变化，请按当前条件重新准备输入；原集合仍保留。')
         analysisRef = prepared['analysisRef']
         inputRefs = [item['ref'] for item in prepared['records']]
+        if dimensionFilter is not None:
+            if prepared['files'] or not analysisRef or not dimensionFilter:
+                raise AnalysisError('INPUT_SET_SELECTION', '维度筛选需要有结构化事实的输入集，文件使用其网格读取条件。')
+            from .member_filters import select_facts
+            artifact = service.store.get_analysis(service.owner, analysisRef)
+            usable = set(inputRefs)
+            facts = [f for f in artifact['facts'] if f['factId'] in usable]
+            inputs = {m['inputRef']: m.get('inputRole') for f in facts for m in f.get('inputMemberships', [])}
+            if filterInputRef is not None:
+                if filterInputRef not in inputs:
+                    raise AnalysisError('INPUT_GROUP_REQUIRED', '所选输入组不在当前冻结结果中。', {'inputRefs': inputs})
+                facts = [f for f in facts if any(m['inputRef'] == filterInputRef for m in f.get('inputMemberships', []))]
+            elif len(set(inputs.values())) > 1:
+                raise AnalysisError('INPUT_GROUP_REQUIRED', '已采用多个不同用途的输入组，按维度筛选时用 filterInputRef 指定用途。',
+                                    {'inputRefs': inputs, 'requiresSourceQuery': False})
+            selected = select_facts(facts, dimensionFilter, artifact['scope'].get('sourceScopes', []))
+            inputRefs = [f['factId'] for f in selected]
+            if not inputRefs:
+                raise AnalysisError('EMPTY_INPUT', '已确认的维值组合没有匹配行。', {'requiresSourceQuery': False})
         gridInputs = [{'captureRef': item['captureRef'], 'fileRef': item['ref']}
                       for item in prepared['files'] if item.get('kind') == 'GRID_FILE'] or None
     from .code_decisions import decision, log_decision
@@ -130,10 +176,21 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
                 (analysisRef, inputRefs, captureRefs, selections, scope, fileInputs, gridInputs)) or operations):
             raise AnalysisError('PYTHON_RETRY_INPUT', 'retryOfRunRef 使用原冻结输入，不与新的输入选择或 operations 混用。')
         retry = service.store.get_python_run(service.owner, retryOfRunRef)
+        if retry.get('status') == 'COMPLETED':
+            if retry.get('registrationError'):
+                raise AnalysisError('PYTHON_REGISTRATION', '这次脚本已执行成功。用 registerRunRef 修正工作项登记即可。',
+                                    {'pythonRunRef': retryOfRunRef, 'executionStatus': 'COMPLETED',
+                                     'requiresSourceQuery': False, 'recovery': {'tool': 'AnalysisPython', 'registerRunRef': retryOfRunRef}})
+            raise AnalysisError('PYTHON_RETRY_INPUT', '这次 Python 已完成。用 AnalysisInspect 查看已存结果，再用 AnalysisTask(action=select_results) 选取答复产物。',
+                                {'pythonRunRef': retryOfRunRef, 'executionStatus': 'COMPLETED', 'requiresSourceQuery': False,
+                                 'nextRead': {'section': 'python', 'pythonRunRef': retryOfRunRef,
+                                              'pythonPath': '/outputs', 'fields': ['derivedId']}})
         if retry.get('status') not in ('FAILED', 'CANCELLED') or not isinstance(retry.get('inputRecords'), list):
             raise AnalysisError('PYTHON_RETRY_INPUT', '仅可重试本会话保存了完整输入的失败或取消运行。')
         analysisRef = retry.get('sourceAnalysisRef')
         inputSetRef = retry.get('inputSetRef')
+        dimensionFilter = retry.get('dimensionFilter')
+        filterInputRef = retry.get('filterInputRef')
         if inputSetRef:
             from .prepared_inputs import task_basis
             prepared = service.store.get_input_set(service.owner, inputSetRef)
@@ -306,10 +363,15 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
         request['python']['retryOfRunRef'] = retryOfRunRef
     if inputSetRef:
         request['python']['inputSetRef'] = inputSetRef
+    if dimensionFilter is not None:
+        request['python']['dimensionFilter'] = deepcopy(dimensionFilter)
+    if filterInputRef is not None:
+        request['python']['filterInputRef'] = filterInputRef
     request['python']['capabilityDecision'] = capability_decision
     if supersedesRunRefs: request['python']['supersedesRunRefs'] = list(dict.fromkeys(supersedesRunRefs))
     if workPlan is not None:
-        request['python']['workPlan'] = deepcopy(workPlan)
+        from .work_bindings import python_bindings
+        request['python']['workPlan'] = deepcopy(python_bindings(workPlan, answerOutputs))
     key = 'python:' + requestKey
     if base is None:
         reused_run = service.store.find_request(service.owner, 'python', key, digest(request))
@@ -327,9 +389,10 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
         artifact = service.store.get_analysis(service.owner, reused)
         from .query_result_evidence import bind_answer_outputs
         execution = artifact['pythonRuns'][-1]
+        service._record_completed_build(artifact['analysisRef'])
         return {**service._built(artifact), 'pythonRunRef': execution['runRef'],
                 'excludedOperationInputs': execution.get('excludedOperationInputs', []),
-                **bind_answer_outputs(service, execution, answerOutputs)}
+                **bind_answer_outputs(service, execution, answerOutputs, analysis_ref=artifact['analysisRef'])}
     started = perf_counter()
     # 每次实际执行有独立记录；同参数的新请求或失败重试不能覆盖旧执行证据。
     run_ref = 'python_' + uuid4().hex
@@ -340,6 +403,8 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
     saved_files = [{key: value for key, value in item.items() if key != '_path'} for item in files]
     execution = {'runRef': run_ref, 'code': code, 'purpose': purpose, 'inputRefs': inputRefs,
                  'inputSetRef': inputSetRef,
+                 **({'dimensionFilter': deepcopy(dimensionFilter)} if dimensionFilter is not None else {}),
+                 **({'filterInputRef': filterInputRef} if filterInputRef is not None else {}),
                  'supersedesRunRefs': list(dict.fromkeys(supersedesRunRefs or [])),
                  'capabilityDecision': capability_decision,
                  'excludedOperationInputs': excluded_operations,
@@ -424,11 +489,33 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
                 'boundary': ('网格来源及冻结文件已绑定；inputDeliverySummary 记录宿主实际提供范围，不证明算法使用正确。公式和业务聚合仍沿用预算口径。'
                              if grids else '工作区文件已冻结并执行；文件内容不是预算来源核验证据。')}
     require_unchanged(service, input_state)
+    return register_outputs(service, base, execution, workPlan, answerOutputs, request, key)
+
+
+def register_outputs(service, base, saved, workPlan, answerOutputs, request, key):
+    from .input_state import validate_analysis
+    from .query_result_evidence import bind_answer_outputs
+    validate_analysis(service, base)
+    execution = dict(saved)
+    execution.pop('registrationError', None)
+    execution.pop('registrationPlan', None)
+    run_ref = execution['runRef']
+    analysisRef = base['analysisRef']
+    reused = service.store.find_request(service.owner, 'build', key, digest(request))
+    if reused:
+        registered = service.store.get_analysis(service.owner, reused)
+        service._record_completed_build(reused)
+        return {**service._built(registered), 'pythonRunRef': run_ref,
+                **bind_answer_outputs(service, execution, answerOutputs, analysis_ref=reused)}
+    values = execution['outputs']
+    grids = [v for v in execution.get('fileInputs', []) if v.get('kind') == 'GRID_FILE']
     artifact = deepcopy(base)
     artifact['captureRefs'] = list(dict.fromkeys([*artifact['captureRefs'], *[value['captureRef'] for value in grids]]))
     artifact['derivedValues'] += values
     existing_runs = {run['runRef']: run for run in artifact.get('pythonRuns', [])}
-    existing_runs.update({run['runRef']: run for run in superseded_runs})
+    for ref in execution.get('supersedesRunRefs', []):
+        if ref not in existing_runs:
+            existing_runs[ref] = service.store.get_python_run(service.owner, ref)
     artifact['pythonRuns'] = [*existing_runs.values(), execution]
     artifact.update(claims=[], viewPlan=[], findings=[], actions=[], baseAnalysisRef=analysisRef)
     for field in ('freeDocument', 'delivery'):
@@ -439,9 +526,13 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
         # 执行与登记分别留痕：计划引用不合法不能把已执行的脚本伪装成执行失败。
         if workPlan is not None:
             from .completion import continue_plan, completion_summary, validate_target_continuity
-            _, effective_work = continue_plan(base, base['plan']['scope'], workPlan)
-            output_refs = {output['name']: value['derivedId'] for output, value in zip(outputs, values)}
-            output_refs.update({reference.removeprefix('derived_'): reference for reference in operation_ids})
+            output_refs = {value['derivedId'].removeprefix('derived_' + run_ref + '_'): value['derivedId'] for value in values}
+            from .work_bindings import python_bindings
+            assignments = python_bindings(workPlan, answerOutputs) if (
+                isinstance(answerOutputs, list) and all(isinstance(n, str) and n in output_refs for n in answerOutputs)) else workPlan
+            _, effective_work = continue_plan(base, base['plan']['scope'], assignments)
+            known = {v.get('factId', v.get('derivedId')) for v in base['facts'] + base['derivedValues']}
+            output_refs.update({ref.removeprefix('derived_'): ref for ref in known if ref.startswith('derived_')})
             for task in effective_work:
                 if task.get('kind') == 'COMPUTATION':
                     from .scalar_references import normalize_reference
@@ -457,12 +548,16 @@ async def analyze(service, code, purpose, requestKey, analysisRef=None, inputRef
         artifact = service.store.build(service.owner, request, artifact, key, analysisRef)
     except AnalysisError as error:
         execution['registrationError'] = error.as_dict()
+        execution['registrationPlan'] = deepcopy(workPlan or [])
         service.store.save_python_run(service.owner, run_ref, execution)
-        error.details = {**(error.details or {}), 'pythonRunRef': run_ref,
+        error.details = {**(error.details or {}), 'pythonRunRef': run_ref, 'executionStatus': 'COMPLETED',
+                         'registrationStatus': 'FAILED', 'requiresSourceQuery': False,
+                         'recovery': {'tool': 'AnalysisPython', 'registerRunRef': run_ref,
+                                      'hint': '脚本已执行成功。仅修正 workPlan 与输出归属，使用新 requestKey 登记，不再执行脚本。'},
                          'nextRead': {'section': 'python', 'pythonRunRef': run_ref}}
         raise
-    from .query_result_evidence import bind_answer_outputs
+    service._record_completed_build(artifact['analysisRef'])
     return {**service._built(artifact), 'pythonRunRef': run_ref,
-            'excludedOperationInputs': excluded_operations,
-            **bind_answer_outputs(service, execution, answerOutputs),
+            'excludedOperationInputs': execution.get('excludedOperationInputs', []),
+            **bind_answer_outputs(service, execution, answerOutputs, analysis_ref=artifact['analysisRef']),
             'boundary': '代码已执行且输出引用有效；业务含义仍须核对，原始来源事实未改变。'}

@@ -235,8 +235,10 @@ def validate_views(artifact, views):
     known.update({v["derivedId"]: v for v in artifact["derivedValues"]})
     ids = set()
     for view in views:
-        if set(view) - {"viewId", "scopeId", "type", "valueRefs", "title", "field", "relationRef", "showUnit", "description", "includeDetails", "collapsed", "pageSize", "nodeRefs", "numberFormat", "labels", "comparisonRef", "descriptionParts", "maxInputsPerScene", "groupId", "orderRef", "nodeDescriptions", "relationLayout", "showChecks", "emphasisRefs", "orientation"}:
+        if set(view) - {"viewId", "scopeId", "type", "valueRefs", "title", "field", "relationRef", "showUnit", "description", "includeDetails", "collapsed", "pageSize", "nodeRefs", "numberFormat", "labels", "comparisonRef", "descriptionParts", "maxInputsPerScene", "groupId", "orderRef", "nodeDescriptions", "relationLayout", "showChecks", "emphasisRefs", "orientation", "trendRef"}:
             raise AnalysisError("INVALID_VIEW", "展示要求不接受任意代码或替代数值。")
+        if 'trendRef' in view and (view.get('type') == 'ORDER' or not isinstance(view['trendRef'], str) or not view['trendRef']):
+            raise AnalysisError('INVALID_VIEW', '将实际 trendRef 放在一个可见的展示项上。')
         if "title" in view and (not isinstance(view["title"], str) or not view["title"].strip() or len(view["title"]) > 1024):
             raise AnalysisError("INVALID_VIEW", "展示标题必须是有界的业务说明。")
         for option in ('showUnit', 'includeDetails', 'collapsed', 'showChecks'):

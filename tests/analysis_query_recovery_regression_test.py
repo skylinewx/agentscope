@@ -34,7 +34,8 @@ class QueryReferenceRecoveryTests(PresentationCase):
         remember_subject(TurnCompletion(self.service, previous), {'status': 'DIRECT'})
         self.turn = TurnCompletion(self.service, {'turnKey': 'next', 'request': '按板块分析',
             'buildRefs': [], 'inheritedScope': previous['resolvedSubjectScope'],
-            'previousQueryIntent': previous['queryIntent']})
+            'previousQueryIntent': previous['queryIntent'], 'businessContexts': previous['businessContexts'],
+            'selectedContextRefs': [previous['activeBusinessContextRef']]})
         self.service.turn = self.turn
         self.task = self.turn.task(mode='ANALYSIS', goal='按板块分析', intent={'grouping': '板块'})
 

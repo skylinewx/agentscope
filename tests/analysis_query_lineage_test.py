@@ -316,7 +316,7 @@ class QueryLineageTest(PresentationCase):
         self.assertNotIn('科目0', result.get('contextText', ''))
         self.assertNotIn('无关表', result.get('contextText', ''))
         self.assertNotIn('formCodes', result['scope'])
-        self.assertEqual(result['scope']['taskCodes'], ['TASK'])
+        self.assertNotIn('taskCodes', result['scope'])
 
     def test_new_query_does_not_borrow_previous_runtime_name(self):
         _, capture = self.source()

@@ -6,6 +6,51 @@ from .scalar_references import normalize_reference, reference_id, reference_key,
 PROTECTED_OPERATORS = {'FORMULA_CHECK', 'RECONCILE', 'SUM', 'LINEAR', 'CONVERT'}
 
 
+def formula_correction(artifact, previous, change):
+    """An explicit correction can consume only an entire, independently prepared composition goal."""
+    if (previous.get('kind') != 'RELATION' or previous.get('refs') or previous.get('operator')
+            or any(u.get('refs') for u in artifact.get('workRefs', []) if u.get('taskId') == previous['taskId'])
+            or change.get('operator') != 'FORMULA_CHECK' or change.get('kind', 'COMPUTATION') != 'COMPUTATION'):
+        return None
+    checks = {v['derivedId']: v['formulaTrace']['targetFactRef'] for v in artifact.get('derivedValues', [])
+              if v.get('operator') == 'FORMULA_CHECK' and (v.get('formulaTrace') or {}).get('targetFactRef')}
+    facts = {f['factId']: f for f in artifact.get('facts', [])}
+    refs = change.get('refs') or []
+    targets = change.get('targetRefs') or []
+    if not isinstance(refs, list) or not isinstance(targets, list):
+        return None
+    if any(not isinstance(r, str) or r not in checks for r in refs) or any(
+            not isinstance(t, str) or t not in facts for t in targets):
+        return None
+    objective = change.get('objectiveRef', previous.get('objectiveRef'))
+    if previous.get('objectiveRef') and previous['objectiveRef'] != objective:
+        return None
+    matches = []
+    from .identity import same_source_position
+    for row in artifact.get('objectiveCoverage', []):
+        if (row.get('capability') != 'DATA_COMPOSITION' or objective and row['objectiveRef'] != objective
+                or row.get('failedTargets') or row.get('missingTargets')):
+            continue
+        results = row.get('formulaRefs', [])
+        if not results or not all(r in checks and checks[r] in facts for r in results):
+            continue
+        roots = [checks[r] for r in results]
+        if len(set(roots)) != len(roots) or refs and set(refs) != set(results):
+            continue
+        if targets:
+            resolved = [{r for r in roots if same_source_position(facts[t], facts[r]) and
+                         any(m.get('inputRole', 'PRIMARY') == row.get('role', 'PRIMARY')
+                             for m in facts[t].get('inputMemberships') or [facts[t]])} for t in targets]
+            if any(len(m) != 1 for m in resolved) or set.union(*resolved) != set(roots) or len(targets) != len(roots):
+                continue
+        if not (objective or refs or targets):
+            continue
+        matches.append({**previous, 'kind': 'COMPUTATION', 'operator': 'FORMULA_CHECK',
+                        'requiredEvidence': 'FORMULAS', 'objectiveRef': row['objectiveRef'],
+                        'refs': list(results), 'targetRefs': roots})
+    return matches[0] if len(matches) == 1 else None
+
+
 def continue_plan(base, scope, work_plan):
     """Carry declared obligations across explicit revisions, never across unrelated tasks."""
     scope = deepcopy(scope)
@@ -46,10 +91,15 @@ def continue_plan(base, scope, work_plan):
                 if not task.get('targetRefs'):
                     task['targetRefs'] = revision['targetRefs']
             if task.get('kind') != previous_task['kind']:
-                raise AnalysisError('INVALID_WORK_PLAN', '重建不能改变已有工作项类型；可更新结果引用或新增工作项。', {'taskId': key})
+                corrected = formula_correction(base, previous_task, task)
+                if corrected is None:
+                    raise AnalysisError('INVALID_WORK_PLAN', '原工作项类型须保留。纠正未绑定的关系项时请选择同一数据构成目标及其全部真实公式结果。', {'taskId': key})
+                task = corrected
+            if previous_task.get('objectiveRef') and task.get('objectiveRef', previous_task['objectiveRef']) != previous_task['objectiveRef']:
+                raise AnalysisError('INVALID_WORK_PLAN', '重建不能替换工作项的分析对象。', {'taskId': key})
             if previous_task.get('requiredEvidence') == 'FORMULAS' and task.get('requiredEvidence', 'FORMULAS') != 'FORMULAS':
                 raise AnalysisError('INVALID_WORK_PLAN', '重建须保留已有构成分析目标，不能改成仅取金额宣布完成。', {'taskId': key})
-            for field in ('operator', 'targetRefs', 'requiredEvidence'):
+            for field in ('operator', 'targetRefs', 'requiredEvidence', 'objectiveRef'):
                 if field not in task and field in previous_task:
                     task[field] = deepcopy(previous_task[field])
             targets = task.get('targetRefs', [])
@@ -178,10 +228,31 @@ def automatic_value_refs(artifact):
     plan = artifact.get('plan', {}).get('workPlan', [])
     tasks = [task for task in plan if isinstance(task, dict) and task.get('kind') == 'VALUES']
     scope = artifact.get('scope', {})
-    if (len(tasks) != 1 or tasks[0].get('refs') or scope.get('coverage') != 'COMPLETE'
+    if (len(tasks) != 1 or tasks[0].get('refs')
             or scope.get('pendingMembers') or artifact.get('inputPreparation', {}).get('issues')):
         return {}
     facts = [fact for fact in artifact.get('facts', []) if fact.get('inputRole', 'PRIMARY') == 'PRIMARY']
+    groups = [g for g in scope.get('inputGroups', []) if g.get('role', g.get('inputRole', 'PRIMARY')) == 'PRIMARY']
+    if scope.get('coverage') != 'COMPLETE' and not (groups and scope.get('selectedDataComplete') is True):
+        return {}
+    if tasks[0].get('objectiveRef'):
+        obj = next((o for o in artifact.get('computationIntent', {}).get('objectives', [])
+                    if o['objectiveRef'] == tasks[0]['objectiveRef']), {})
+        if obj.get('role') != 'PRIMARY' or obj.get('capability') != 'VALUES':
+            return {}
+        if obj.get('sourceRef'):
+            groups = [g for g in groups if g.get('sourceRef') == obj['sourceRef']]
+            if not groups:
+                return {}
+    if groups:
+        # The same business record may also carry a FORMULA membership. Source rows selected for
+        # VALUES are the input, whereas recursively loaded expense cells only explain those rows.
+        if not all(g.get('complete') and g.get('factRefs') for g in groups):
+            return {}
+        selected = {r for g in groups for r in g['factRefs']}
+        facts = [f for f in facts if f['factId'] in selected]
+        if {f['factId'] for f in facts} != selected:
+            return {}
     signatures = {(fact.get('metricKey') or fact.get('sourceMeasureCode') or fact.get('measureCode'),
                    tuple(fact.get('headers', [])), fact.get('period'), fact.get('unit'), tuple(fact.get('grain', [])))
                   for fact in facts}
@@ -201,6 +272,10 @@ def completion_summary(artifact):
     automatic = automatic_value_refs(artifact)
     if not isinstance(updates, list) or len(updates) > 100:
         raise AnalysisError('INVALID_WORK_PLAN', 'workRefs 最多 100 项。')
+    if updates and not plan:
+        raise AnalysisError('INVALID_WORK_PLAN', '当前成功构建没有登记工作项，发布时请移除 workRefs，沿用已提交的正文。',
+                            {'path': '/workRefs', 'requiresBuild': False, 'requiresSourceQuery': False,
+                             'repairHint': '使用返回的 repairRef 和 requestKey，提交 repairs=[{"op":"remove","path":"/workRefs"}]、finalize:true。无需修改文档路径或重新计算。'})
     for index, update in enumerate(updates):
         if (not isinstance(update, dict) or not {'taskId', 'refs'} <= set(update) or set(update) - {'taskId', 'refs', 'operator', 'revisionReason'}
                 or not isinstance(update['taskId'], str) or update['taskId'] in updated
@@ -211,8 +286,13 @@ def completion_summary(artifact):
         if 'operator' in update:
             from .engine import OPERATORS
             task = next(task for task in plan if task.get('taskId') == update['taskId'])
-            if (task.get('kind') != 'COMPUTATION'
-                    or not isinstance(update['operator'], str) or update['operator'] not in OPERATORS | {'PYTHON'}):
+            if task.get('kind') != 'COMPUTATION':
+                expected = '来源事实 factId' if task.get('kind') == 'VALUES' else '关系 relationRef'
+                raise AnalysisError('INVALID_WORK_PLAN', f'工作项 {task["taskId"]} 是 {task.get("kind")}，refs 需要{expected}。去掉此项的 operator；已成功的计算仍可用于报告。',
+                                    {'path': f'/workRefs/{index}', 'taskId': task['taskId'], 'expectedKind': task.get('kind'),
+                                     'requiresSourceQuery': False,
+                                     'hint': '局部修复该 workRefs 项，保留 taskId。来源事实与派生结果可以分别用于取值工作项和 document.datasets。'})
+            if not isinstance(update['operator'], str) or update['operator'] not in OPERATORS | {'PYTHON'}:
                 raise AnalysisError('INVALID_WORK_PLAN', '只可显式修正普通计算的方法；来源公式/汇总核对要求保持。')
             if update['operator'] != task.get('operator'):
                 if task.get('operator') in PROTECTED_OPERATORS:
@@ -224,12 +304,14 @@ def completion_summary(artifact):
     result, seen = [], set()
     for task in plan:
         if (not isinstance(task, dict) or not {'taskId', 'title', 'kind', 'refs'} <= set(task)
-                or set(task) - {'taskId', 'title', 'kind', 'refs', 'operator', 'targetRefs', 'requiredEvidence', 'revisionReason'}
+                or set(task) - {'taskId', 'title', 'kind', 'refs', 'operator', 'targetRefs', 'requiredEvidence', 'revisionReason', 'objectiveRef'}
                 or any(not isinstance(task.get(k), str) or not task[k].strip() or len(task[k]) > 1024 for k in ('taskId', 'title'))
                 or task['taskId'] in seen or task['kind'] not in ('VALUES', 'COMPUTATION', 'RELATION')
                 or not isinstance(task['refs'], list) or len(task['refs']) > 1000
                 or len({reference_key(ref) for ref in task['refs']}) != len(task['refs'])):
             raise AnalysisError('INVALID_WORK_PLAN', '工作项须有唯一标识、业务标题、类型和真实引用；尚未取得引用时填空列表，不提交完成状态。')
+        if 'objectiveRef' in task and not any(row.get('objectiveRef') == task['objectiveRef'] for row in artifact.get('objectiveCoverage', [])):
+            raise AnalysisError('UNKNOWN_OBJECTIVE', '工作项所指目标不在本轮已确认的分析目标中。')
         if 'revisionReason' in task and (not isinstance(task['revisionReason'], str) or not task['revisionReason'].strip()
                                          or len(task['revisionReason']) > 1024):
             raise AnalysisError('INVALID_WORK_PLAN', 'revisionReason 须为非空的简短方法修正说明。')
@@ -259,12 +341,21 @@ def completion_summary(artifact):
             value = relations.get(ref) if task['kind'] == 'RELATION' else known.get(ref)
             if value is None or (task['kind'] == 'VALUES' and 'factId' not in value) or (task['kind'] == 'COMPUTATION' and 'derivedId' not in value):
                 allowed = list(relations) if task['kind'] == 'RELATION' else [ref for ref, value in known.items() if ('factId' if task['kind'] == 'VALUES' else 'derivedId') in value]
+                hint = ('从当前 analysisRef 的 allowedRefs 选择实际计算结果。若所需结果出自另一份分析，'
+                        '使用持有它的 analysisRef 发布；需要追加 Python 结果时，使用那份成果返回的 inputSetRef。'
+                        if task['kind'] == 'COMPUTATION' else
+                        '先检查已捕获但未纳入本版本的选择器。VALUES 用 factId，RELATION 用 relationRef。')
+                update_index = next((i for i, row in enumerate(updates) if row['taskId'] == task['taskId']), None)
+                path = '/workPlan' if update_index is None else f'/workRefs/{update_index}/refs'
+                if task['kind'] == 'VALUES' and ref in known and 'derivedId' in known[ref]:
+                    hint = ('该引用是已完成的计算结果。保留原 VALUES 工作项，在其 refs 中绑定本题实际选用的来源 factId；'
+                            '已算结果可直接交给 document.datasets。需要单独登记计算时追加 COMPUTATION 工作项。')
                 raise AnalysisError('INVALID_WORK_REF', '工作项引用不存在或与类型不符。', {'taskId': task['taskId'], 'ref': ref,
-                    'path': '/workPlan', 'requiresSourceQuery': False,
+                    'path': path, 'requiresSourceQuery': False,
                     'expectedKind': task['kind'], 'allowedRefs': allowed[:100], 'allowedRefCount': len(allowed),
                     'actualKind': ('RELATION' if ref in relations else 'VALUES' if 'factId' in known.get(ref, {})
                                    else 'COMPUTATION' if ref in known else 'UNKNOWN'),
-                    'hint': '先检查已捕获但未纳入本版本的选择器及已有派生结果，不重新查询来源。VALUES 用 factId，COMPUTATION 用 derivedId，RELATION 用 relationRef；续建保留原工作项需要的输入。',
+                    'hint': hint + '无需重新取数。',
                     'nextSection': {'VALUES': 'facts', 'COMPUTATION': 'derived', 'RELATION': 'relations'}[task['kind']]})
             if task['kind'] == 'RELATION':
                 ready = value['complete']
@@ -360,6 +451,26 @@ def apply_publication_completion(artifact, request):
     for key in ('workRefs', 'unresolvedItems'):
         if request.get(key) is not None:
             proposed[key] = deepcopy(request[key])
+    tasks = {t['taskId']: t for t in proposed.get('plan', {}).get('workPlan', [])}
+    for update in proposed.get('workRefs', []):
+        if not isinstance(update, dict):
+            continue
+        if not isinstance(update.get('taskId'), str):
+            raise AnalysisError('INVALID_WORK_PLAN', '工作项必须使用已声明的 taskId。')
+        task = tasks.get(update['taskId'])
+        if task and task.get('kind') == 'RELATION' and update.get('operator') == 'FORMULA_CHECK':
+            if set(update) - {'taskId', 'refs', 'operator', 'objectiveRef', 'revisionReason'}:
+                raise AnalysisError('INVALID_WORK_PLAN', '工作项修正包含未识别的字段。')
+            corrected = formula_correction(artifact, task, update)
+            if corrected is None:
+                raise AnalysisError('INVALID_WORK_PLAN', '这组公式没有覆盖该工作项的原分析目标，请选择所属的构成目标及其完整公式结果。')
+            task.update(corrected)
+            update['refs'] = list(task['refs'])
+            update.pop('objectiveRef', None)
+            from .models import digest
+            proposed['planDigest'] = digest(proposed['plan'])
+        elif task and update.get('objectiveRef') and update['objectiveRef'] == task.get('objectiveRef') and task.get('operator') == 'FORMULA_CHECK':
+            update.pop('objectiveRef')
     # Revisions also carry saved issues. Omitting this field must not bypass the
     # same provenance check or keep a completed audit marked as unfinished.
     if 'unresolvedItems' in proposed:

@@ -14,6 +14,89 @@ def scope(identifier='departments', hint='部门', text='所有部门'):
 
 
 class DimensionScopeTests(TestCase):
+    def test_replacing_a_metric_with_its_bound_scenario_in_the_label_keeps_the_cohort_and_scenario(self):
+        from analysis_extension.dimension_scopes import condition_history, retained_scopes
+
+        def confirmed(term, *codes, source='source-one'):
+            return {'conditionId': '/'.join(codes), 'appliesToAllTargets': True,
+                    'confirmedSource': {'executionId': source, 'contextId': 'context', 'querySessionId': 'session'},
+                    'draft': {'id': codes[0], 'dimensionHint': term, 'sourceText': term,
+                              'selector': {'type': 'VALUES', 'members': [term]}},
+                    'bindings': [{'dimCode': code} for code in codes]}
+
+        subject = confirmed('两家企业', 'MD_ORG')
+        metric = confirmed('净利润', 'ACCOUNT', 'INDICATOR')
+        metric['metricTargetLabels'] = ['净利润预算', '预算净利润']
+        scenario = confirmed('预算', 'MD_SCENE')
+        product = confirmed('水泥', 'PRODUCT')
+        state = {'followupContext': {'mode': 'CONTINUE', 'changedFields': ['metric']},
+                 'previousQueryIntent': {'metric': '净利润预算', 'scenario': '预算'},
+                 'queryIntent': {'metric': '营业收入预算', 'scenario': '预算'},
+                 'inheritedDimensionScopes': [subject, metric, scenario, product]}
+        for label in ('净利润预算', '预算净利润'):
+            state['previousQueryIntent']['metric'] = label
+            wire = inherit(SimpleNamespace(state=deepcopy(state)), {
+                'basis': {'kind': 'MEMBERS', 'sourceRef': 'two', 'memberDimensions': ['MD_ORG']},
+                'intentDraft': {'targets': [{'id': 'revenue'}]}})
+            self.assertEqual(wire['basis']['sourceRef'], 'two')
+            self.assertEqual([s['sourceText'] for s in wire['intentDraft']['dimensionScopes']], ['预算', '水泥'])
+            self.assertEqual(retained_scopes(state), [subject, scenario, product])
+            self.assertEqual(condition_history(state, []), retained_scopes(state))
+
+        for current, records in [
+                ('净利润', [metric, scenario]), ('营业收入', [metric]),
+                ('营业收入', [metric, confirmed('预算', 'MD_SCENE', source='another')]),
+                ('营业收入', [metric, confirmed('预算', 'VERSION')]),
+                ('营业收入', [metric, scenario, confirmed('净利润', 'OTHER_ROLE')]),
+                ('营业收入', [metric, scenario, confirmed('销售费用', 'ACCOUNT')]),
+                ('营业收入', [{**metric, 'metricTargetLabels': []}, scenario])]:
+            with self.subTest(current=current, conditions=[r['conditionId'] for r in records]):
+                trial = {**state, 'queryIntent': {'metric': current}, 'inheritedDimensionScopes': records}
+                self.assertEqual(retained_scopes(trial), records)
+
+    def test_source_cell_heading_distinguishes_the_queried_metric_from_an_independent_product_filter(self):
+        from analysis_extension.condition_context import _metric_target_labels
+        def result(key, term, label, headings):
+            coord = {'dimensionCode': 'D', 'baseDataCode': 'V', 'objectCode': key}
+            return {'targetId': key, 'resolvedTerms': [{**coord, 'term': term, 'label': label}],
+                    'rows': [{'conditionEvidence': [{**coord, 'runtimeHeaders': headings}]}]}
+        targets = [{'id': k, 'label': term+'预算', 'allOf': [{'term': term}, {'term': '预算'}]}
+                   for k, term in [('A', '经营结余'), ('P', '砂石')]]
+        data = {'targets': targets, 'resultSets': [result('A','经营结余','六、经营结余',['六、经营结余','预算数']),
+                result('P','砂石','砂石',['营业收入','预算数'])]}
+        self.assertEqual(_metric_target_labels(data), {('D','V','A'):{'经营结余预算'}})
+
+    def test_named_all_accepts_only_the_executed_root_and_descendants(self):
+        from analysis_extension.dimension_scopes import _scope_admitted
+        from analysis_extension.scope_changes import _validate_selector
+        _validate_selector({'type': 'ALL', 'rootText': '示例集团'})
+        expected = {'dimCode': 'MD_ORG', 'hierarchy': {'rootCode': 'G', 'includeSelf': True}}
+        physical = {'dimCode': 'MD_ORG', 'values': ['A', 'G']}
+        batch = {'diagnostics': {'organizationSubtree': {'condition': expected, 'executedCondition': physical}}}
+        for code in ('G', 'A'):
+            self.assertTrue(_scope_admitted(expected, physical, batch, {'dimensions': {'MD_ORG': code}}))
+        self.assertFalse(_scope_admitted(expected, physical, batch, {'dimensions': {'MD_ORG': 'sibling'}}))
+        self.assertFalse(_scope_admitted(expected, {**physical, 'values': ['A']}, batch, {'dimensions': {'MD_ORG': 'A'}}))
+        self.assertFalse(_scope_admitted(expected, physical, {}, {'dimensions': {'MD_ORG': 'G'}}))
+        self.assertFalse(_scope_admitted({'dimCode': 'MD_ORG', 'hierarchy': {'rootCode': 'G'}}, physical, batch, {'dimensions': {'MD_ORG': 'G'}}))
+
+    def test_followup_without_an_organization_retains_selected_members_and_current_member_edit_is_applied(self):
+        from analysis_extension.scope_changes import apply_query_scopes, apply_scope_edits, reconcile_selectors
+        hierarchy = {'type': 'HIERARCHY', 'rootText': '测试集团', 'level': 2}
+        record = {'draft': {**scope(hint='MD_ORG', text='旗下二级单位'), 'selector': hierarchy},
+                  'appliesToAllTargets': True}
+        state = {'request': '查另一指标', 'followupContext': {'mode': 'NEW'},
+                 'inheritedDimensionScopes': [record]}
+        turn = SimpleNamespace(state=deepcopy(state))
+        self.assertEqual(inherit(turn, {'intentDraft': {}})['intentDraft']['dimensionScopes'][0]['selector'], hierarchy)
+        turn = SimpleNamespace(state={**deepcopy(state), 'request': '查测试集团的另一指标'})
+        member = {'type': 'VALUES', 'members': ['测试集团']}
+        apply_scope_edits(turn, [{'dimensionHint': '组织机构', 'selector': member}])
+        request = {'intentDraft': {}}
+        apply_query_scopes(turn.state, request)
+        reconcile_selectors(turn, request)
+        self.assertEqual([s['selector'] for s in inherit(turn, request)['intentDraft']['dimensionScopes']], [member])
+
     def test_followup_root_patch_preserves_level_but_explicit_replacement_clears_it(self):
         from analysis_extension.scope_changes import reconcile_selectors
         old = {'id': 'org', 'dimensionHint': '组织机构', 'sourceText': '二级单位',
@@ -234,6 +317,37 @@ class DimensionScopeTests(TestCase):
         turn = SimpleNamespace(state={'inheritedDimensionScopes': records})
         with self.assertRaisesRegex(AnalysisError, '不同范围'):
             inherit(turn, {'intentDraft': {}})
+
+    def test_new_query_checks_only_applicable_per_target_history_without_erasing_evidence(self):
+        def bound(key, term, shared=False, dim='METRIC'):
+            return {'conditionId': key, 'confirmedTurn': 2, 'appliesToAllTargets': shared,
+                    'draft': {'id': key, 'dimensionHint': dim, 'sourceText': term, 'targetIds': [],
+                              'selector': {'type': 'VALUES', 'members': [term]}},
+                    'bindings': [{'dimCode': dim, 'valueDomain': 'shared-dictionary'}],
+                    'confirmedSource': {'executionId': 'execution', 'scopeId': key,
+                                        'contextId': 'context', 'querySessionId': 'session'}}
+        a, b = bound('a', '周转额'), bound('b', '调度费')
+        org = bound('o', '甲机构', True, 'MD_ORG')
+        common = bound('p', '甲产品', True, 'PRODUCT')
+        prior = snapshot({'dimensionScopeCaptures': {'capture': [a, b, org, common]}}, ['capture'])
+        def query(question, scopes=(), mode='NEW', targets=()):
+            turn = SimpleNamespace(state={'inheritedDimensionScopes': deepcopy(prior), 'followupContext': {'mode': mode}})
+            result = inherit(turn, {'question': question, 'intentDraft': {'dimensionScopes': deepcopy(list(scopes)), 'targets': list(targets)}})
+            self.assertEqual(turn.state['inheritedDimensionScopes'], prior)
+            return result['intentDraft']['dimensionScopes']
+        self.assertEqual([s['id'] for s in query('查询安全支出')], ['o', 'p'])
+        targets = [{'id': 'current', 'businessPhrases': [{'text': '安全支出', 'sourceText': '安全支出'}]}]
+        self.assertEqual([s['id'] for s in query('查询安全支出', mode='CONTINUE', targets=targets)], ['o', 'p'])
+        selected = {**a['draft'], 'targetIds': ['current'], 'confirmedSource': {'scopeId': 'a'}}
+        kept = query('继续查指定项', [selected])
+        self.assertEqual(kept[0]['confirmedSource'], a['confirmedSource'])
+        self.assertEqual(kept[0]['targetIds'], ['current'])
+        with self.assertRaises(AnalysisError) as ambiguous:
+            query('继续看', mode='CONTINUE')
+        self.assertEqual(ambiguous.exception.code, 'FOLLOWUP_DIMENSION_SCOPE_AMBIGUOUS')
+        with self.assertRaises(AnalysisError) as no_owner:
+            query('再查周转额')
+        self.assertEqual(no_owner.exception.code, 'FOLLOWUP_DIMENSION_TARGET_REQUIRED')
 
     def test_analysis_uses_verified_discovery_coordinates_even_with_concrete_grouped_values(self):
         condition = {'dimCode': 'DEPT', 'all': True}

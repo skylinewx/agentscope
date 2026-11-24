@@ -47,7 +47,7 @@ const snapshot = parseSnapshot({ ...fixture.default, columns: [], rows: [], scen
   viewParameters: { ...fixture.default.viewParameters, columnKey: null },
   page: { offset: 0, limit: 100, total: 0, nextOffset: null },
   freeDocument: { version: 'free-html-1', title: '合成报告', contentDigest: 'a'.repeat(64), frameKey: 'b'.repeat(64),
-    bindingCount: 1, datasetCount: 0,
+    bindingCount: 0, datasetCount: 0,
     html: '<!doctype html><html lang="zh"><head><meta charset="UTF-8" /></head><body><h1>合成报告</h1><p>金额 -18,660.23 元</p><p>用于验证报告交付后的可用宽度。</p></body></html>' },
 });
 analysisApi.view = async () => snapshot;

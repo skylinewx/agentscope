@@ -147,6 +147,8 @@ export function useMessages(
 		 * the session list to pick the new one up.
 		 */
 		onSessionUpdated?: () => void;
+		/** Load an older result when a completion links directly to it. */
+		focusReplyId?: string | null;
 		/** True when a dedicated realtime transport already plays PCM audio. */
 		isRealtimeAudioActive?: () => boolean;
 		/** Send a tool confirmation over the active realtime transport. */
@@ -181,6 +183,7 @@ export function useMessages(
 	const [subagentHitl, setSubagentHitl] = useState<SubagentHitlEntry[]>([]);
 
 	const msgsRef = useRef<Msg[]>([]);
+	const olderBefore = useRef<string | null>(null);
 	const confirmedUserIds = useRef(new Set<string>());
 	const sendAttempt = useRef<{ key: string; signature: string; message: Msg } | null>(null);
 	const sendingDirect = useRef<string | null>(null);
@@ -373,6 +376,7 @@ export function useMessages(
 	useEffect(() => {
 		setLoadedKey(null);
 		msgsRef.current = [];
+		olderBefore.current = null;
 		confirmedUserIds.current = new Set();
 		currentReplyRef.current = null;
 		setMsgs([]);
@@ -394,11 +398,12 @@ export function useMessages(
 		// subscription. Reusing partial live messages would append replayed
 		// deltas twice, and keeping the old phase would strand crashed replies.
 		const readHistory = async (reconnecting = false) => {
-			const { messages, is_running, event_cursor } = await sessionApi.messages(
+			const { messages, is_running, event_cursor, has_more } = await sessionApi.messages(
 				sessionId, agentId, undefined,
 				{ signal, silent: reconnecting, timeoutMs: 15_000 },
 			);
 			if (signal.aborted) return null;
+			olderBefore.current = has_more ? messages[0]?.id ?? null : null;
 			const tail = messages.at(-1);
 			const pending = hasPendingToolCall(tail);
 			msgsRef.current = messages;
@@ -727,6 +732,35 @@ export function useMessages(
 	const currentKey = agentId !== null && sessionId !== null ? `${agentId}:${sessionId}` : null;
 	const ownsConversation = currentKey !== null && loadedKey === currentKey;
 	const loading = currentKey !== null && !ownsConversation;
+	const focusReplyId = options?.focusReplyId;
+	const hasFocusedReply = !!focusReplyId && msgs.some((message) => message.id === focusReplyId);
+
+	useEffect(() => {
+		if (!focusReplyId || hasFocusedReply || !ownsConversation || historyError || !agentId || !sessionId) return;
+		const controller = new AbortController();
+		const signal = AbortSignal.any([controller.signal, getAuthSignal()]);
+		async function loadFocusedReply() {
+			try {
+				while (!signal.aborted && olderBefore.current) {
+					const before = olderBefore.current;
+					const { messages, has_more } = await sessionApi.messages(sessionId!, agentId!, { before },
+						{ signal, silent: true, timeoutMs: 15_000 });
+					if (signal.aborted) return;
+					if (before !== olderBefore.current) continue; // A reconnect replaced the history snapshot.
+					const existing = new Set(msgsRef.current.map((message) => message.id));
+					msgsRef.current = [...messages.filter((message) => !existing.has(message.id)), ...msgsRef.current];
+					const oldest = messages[0]?.id;
+					olderBefore.current = has_more && oldest && oldest !== before ? oldest : null;
+					scheduleUpdate();
+					if (messages.some((message) => message.id === focusReplyId)) break;
+				}
+			} catch {
+				// The latest history remains usable if an older page is unavailable.
+			}
+		}
+		void loadFocusedReply();
+		return () => controller.abort();
+	}, [agentId, sessionId, focusReplyId, hasFocusedReply, ownsConversation, historyError, scheduleUpdate]);
 
 	return {
 		msgs: ownsConversation ? msgs : [],

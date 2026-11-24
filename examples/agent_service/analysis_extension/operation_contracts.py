@@ -7,7 +7,7 @@ from .scalar_references import normalize_reference, reference_key
 
 
 def validate_operation(operation):
-    allowed = {'id', 'operator', 'select', 'inputRefs', 'ruleRef', 'comparabilityRef', 'relationRef',
+    allowed = {'id', 'operator', 'taskId', 'select', 'inputRefs', 'ruleRef', 'comparabilityRef', 'relationRef',
                'aggregation', 'expression', 'wholePopulation', 'direction', 'decimalPlaces', 'top', 'checkScope'}
     unknown = sorted(set(operation) - allowed)
     operator = operation.get('operator')

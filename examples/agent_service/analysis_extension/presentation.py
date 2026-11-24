@@ -263,6 +263,12 @@ def project(artifact, registry: RuleRegistry, view_parameters=None):
         bridges.extend(comparison_scenes(artifact))
         if len(bridges) > 100: raise AnalysisError("DIAGRAM_LIMIT", "图表超过 100 幅，请缩小展示范围。")
     scenes = comparisons + bridges
+    if any(view.get('trendRef') for view in artifact['viewPlan']):
+        if restricted:
+            unavailable.append('当前筛选改变了所选范围，原范围的时期折线保留在完整视图。')
+        else:
+            from .period_trend_scenes import scenes_for_views
+            scenes.extend(scenes_for_views(artifact, artifact['viewPlan']))
     if len(scenes) > 100: raise AnalysisError("DIAGRAM_LIMIT", "图表超过 100 幅，请缩小展示范围。")
     tables = business_tables(artifact, facts, rows, published_order=params['sort'] == 'published')
     groups = sections(artifact, metrics, scenes, tables)

@@ -4,8 +4,9 @@ from decimal import Decimal
 import json
 import re
 
+from .budget_dimensions import dimension_labels, source_models
 from .business_tables import (
-    BUDGET_TOTAL_MEMBER, BusinessTable, DEFAULT_LABELS, STATES, actual_periods, escape,
+    BUDGET_TOTAL_MEMBER, BusinessTable, STATES, actual_periods, escape,
 )
 from .formula_arithmetic import BUDGET_FORMULA
 
@@ -171,8 +172,7 @@ def render_input_material(service, prepared, artifact, input_ref, max_chars):
     more = f'正文仅展示部分输入。Python 使用完整冻结集合。可用 AnalysisInspect(section="inputFields", inputSetRef="{input_ref}", offset=…, limit=…) 分页读取。'
     for (capture_ref, _, _, task, form, period, roles), entries in groups.items():
         data = receipts[capture_ref].get('data') or {}
-        labels = {**DEFAULT_LABELS, **{d['dimCode']: d['label'] for d in data.get('dimensionCatalog', [])
-                                       if d.get('dimCode') and d.get('label')}}
+        labels = dimension_labels(data.get('dimensionCatalog') or [], models=source_models(entries))
         # Metric field aliases may differ between batches. Use their verified
         # source codes as columns; remove only source-bound header decorations.
         table = BusinessTable('', {'taskName': task, 'formName': form, 'period': period}, '', '', labels, False, entries)

@@ -167,6 +167,68 @@ class ReportReviewDeliveryTests(PresentationCase):
         await self.service.publish(analysisRef=self.ref, requestKey='resume-again', resumeReview=True)
         self.assertEqual(len(calls), 1)
 
+    async def test_view_resume_and_fresh_business_review_have_distinct_costs_and_goals(self):
+        request = await self.prepare()
+        self.service.preview_reviewer = self.partial_review
+        await self.service.publish(**request, previewOnly=True)
+        await self.service.publish_available_report(self.ref, 'REVIEW_LIMIT')
+        calls = []
+        async def reviewer(prompt, payload):
+            calls.append(payload)
+            return with_coverage({'issues': []})
+        self.service.material_reviewer = reviewer
+        self.service.turn = TurnCompletion(self.service, current_turn(AgentState(), UserMsg('user', '继续未完成的审查')))
+        for n, action in enumerate(('VIEW', 'RESUME', 'RESUME')):
+            await self.service.publish(analysisRef=self.ref, requestKey=str(n), reviewAction=action)
+        self.assertEqual(len(calls), 1)
+        for goal in ('复核整篇报告的趋势', '复核全年金额'):
+            self.service.turn = TurnCompletion(self.service, current_turn(AgentState(), UserMsg('user', goal)))
+            before = len(calls)
+            await self.service.publish(analysisRef=self.ref, requestKey='fresh', reviewAction='RECHECK')
+            fresh = calls[before:]
+            self.assertEqual(len(fresh), 2)
+            for payload in fresh:
+                self.assertEqual(review_material(payload)['businessReviewRequest'], goal)
+                self.assertIn(goal, payload.markdown)
+                self.assertEqual(payload.markdown.count('本次复核要求'), 1)
+            await self.service.publish(analysisRef=self.ref, requestKey='retry', reviewAction='RECHECK')
+            self.assertEqual(len(calls), before + 2)
+
+    async def test_view_of_another_stored_revision_cannot_deliver_a_recheck_of_the_first(self):
+        from analysis_extension.review_control import progress
+        request = await self.prepare()
+        self.service.preview_reviewer = self.partial_review
+        await self.service.publish(**request, previewOnly=True)
+        await self.service.publish_available_report(self.ref, 'REVIEW_LIMIT')
+        async def reviewer(prompt, payload):
+            return with_coverage({'issues': []})
+        self.service.material_reviewer = reviewer
+        turn = TurnCompletion(self.service, current_turn(AgentState(), UserMsg('user', '复核已交付报告')))
+        self.service.turn = turn
+        turn.task(mode='REPORT', goal='复核已交付报告', delivery='DOCUMENT')
+        turn.state['adoptedReportRef'] = self.ref
+        sibling = self.ref.partition(':')[0] + ':99'
+        self.assertIsNone(turn.review_target_issue(sibling))
+        for action in ('RECHECK', 'VIEW', 'RESUME'):
+            result = await self.service.publish(analysisRef=self.ref, requestKey=action, reviewAction=action)
+            self.assertEqual(result['reviewAction'], action)
+        saved = progress(turn)['resumedReportRefs'][self.ref]
+        self.assertEqual(saved['action'], 'RECHECK')
+        self.assertIsNone(turn.review_target_issue(self.ref))
+        self.assertIsNone(turn.review_target_issue('another-report:1'))
+        for action in ('VIEW', 'RESUME', 'RECHECK'):
+            progress(turn, lambda state: state['resumedReportRefs'].update({sibling: {'action': action}}))
+            if action == 'RECHECK':
+                self.assertIsNone(turn.review_target_issue(sibling))
+            else:
+                finding, = turn.check(analysis_ref=sibling)['issues']
+                self.assertEqual(finding['code'], 'REPORT_REVIEW_TARGET_MISMATCH')
+                self.assertEqual(finding['reviewedAnalysisRefs'], [self.ref])
+                self.assertEqual(finding['deliveryAnalysisRef'], sibling)
+        progress(turn, lambda state: state['resumedReportRefs'].pop(sibling))
+        progress(turn, lambda state: state.setdefault('presentationRevisionRefs', {}).update({sibling: self.ref}))
+        self.assertIsNone(turn.review_target_issue(sibling))
+
     async def test_semantically_same_material_has_distinct_frozen_bytes(self):
         await self.prepare()
         first = begin_review(self.turn, self.ref, 'first', ['{"documentText":"same text","reviewHistory":[]}'], 'prompt')
@@ -175,6 +237,32 @@ class ReportReviewDeliveryTests(PresentationCase):
         self.assertEqual(a['key'], b['key'])
         self.assertNotEqual(a['materialRef'], b['materialRef'])
         self.assertNotEqual(self.store.get_review_material(OWNER, a['materialRef']), self.store.get_review_material(OWNER, b['materialRef']))
+
+    async def test_reviewed_report_in_report_mode_registers_the_real_export_before_finishing(self):
+        from analysis_extension.middleware import AnalysisMiddleware
+        request = await self.prepare()
+        self.service.preview_reviewer = self.partial_review
+        await self.service.publish(**request, previewOnly=True)
+        await self.service.publish_available_report(self.ref, 'REVIEW_LIMIT')
+        turn = TurnCompletion(self.service, current_turn(AgentState(), UserMsg('user', '复核刚才报告')))
+        self.service.turn = turn
+        turn.task(mode='REPORT', goal='复核已有报告', delivery='DOCUMENT')
+        turn.state['adoptedReportRef'] = self.ref
+        middleware = object.__new__(AnalysisMiddleware)
+        middleware.service = self.service
+        async def reviewer(prompt, payload):
+            return with_coverage({'issues': []})
+        self.service.material_reviewer = reviewer
+        result = await self.service.publish(analysisRef=self.ref, requestKey='fresh-review', reviewAction='RECHECK')
+        recovery_fixtures.CloseoutRecoveryTests.observe(self, turn, 'AnalysisPublish', result)
+        self.assertEqual([i['code'] for i in turn.check()['issues']], ['REPORT_NOT_DELIVERED'])
+        await middleware._register_reviewed_export()
+        report = turn.registered_export(self.ref)
+        self.assertTrue(report and self.delivery.report(self.ref, report['exportRef'])['html'])
+        self.assertEqual(turn.check()['status'], 'READY')
+        self.assertIn(report['markdown'], middleware._approved_delivery())
+        self.assertEqual(turn.state['hostCloseout']['semanticReview'], 'PASS')
+        self.assertEqual(turn.state['buildRefs'], [])
 
     async def test_resumed_review_keeps_full_report_when_new_turn_times_out_and_recovers(self):
         import json

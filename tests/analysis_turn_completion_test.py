@@ -256,17 +256,41 @@ class TurnCompletionTests(PresentationCase):
         self.assertEqual(status['status'], 'WAITING')
         middleware.query_reviewer.assert_not_awaited()
 
-    def test_query_read_registers_existing_capture_but_failed_read_does_not(self):
+    async def test_query_read_registers_existing_capture_but_failed_read_does_not(self):
+        from analysis_extension.tools import QueryResultRead
         turn = self.turn('DIRECT')
         ref, _, _ = source_fixtures.SourceBoundaryTests.json_capture(self)
         call = ToolCallBlock(id='read', name='QueryResultRead', input=json.dumps({'captureRef': ref}))
         turn.observe(call, ToolResponse(state=ToolResultState.ERROR))
         self.assertNotIn('queryCaptureRefs', turn.state)
-        turn.observe(call, ToolResponse())
+        chunk = await QueryResultRead(self.service).call(captureRef=ref)
+        self.assertEqual(chunk.metadata['analysisReadCaptureRefs'], [ref])
+        response = ToolResponse(metadata=chunk.metadata, content=chunk.content)
+        turn.observe(call, response)
         self.assertEqual(turn.state['queryCaptureRefs'], [ref])
-        turn.observe(call, ToolResponse())
+        turn.observe(call, response)
         self.assertEqual(turn.state['queryCaptureRefs'], [ref])
         self.assertNotIn('queryCaptureRefs', current_turn(AgentState(), UserMsg('user', '新查询')))
+
+    async def test_partial_query_read_registers_only_returned_capture_pages(self):
+        from analysis_extension.tools import QueryResultRead
+        turn = self.turn('DIRECT')
+        saved, _, _ = source_fixtures.SourceBoundaryTests.json_capture(self)
+        tool = QueryResultRead(self.service)
+        wrong = 'src_not_a_query_receipt'
+        for args, expected in (({'captureRef': wrong, 'allPages': True}, []),
+                              ({'requests': [{'captureRef': wrong}, {'captureRef': saved}], 'allPages': True}, [saved])):
+            with self.subTest(args=args):
+                chunk = await tool.call(**args)
+                self.assertEqual(chunk.metadata['analysisReadCaptureRefs'], expected)
+                self.assertEqual(chunk.metadata['readPerformance']['failedRequestCount'], 1)
+                self.assertIn('captureRef', chunk.content[0].text)
+                turn.observe(ToolCallBlock(id='read', name=tool.name, input=json.dumps(args)),
+                             ToolResponse(metadata=chunk.metadata, content=chunk.content))
+                self.assertEqual(turn.state.get('queryCaptureRefs', []), expected)
+        with self.assertRaises(AnalysisError):
+            turn._add_query_capture(wrong)
+        self.assertEqual(turn.state['queryCaptureRefs'], [saved])
 
     async def test_direct_review_capacity_fails_without_silent_truncation(self):
         turn = self.turn('DIRECT')
@@ -586,13 +610,17 @@ class TurnCompletionTests(PresentationCase):
         user = UserMsg('user', '分析一下这两个对象')
         saved = current_turn(state, user)
         state.context = []
-        self.assertEqual(current_turn(state, None)['previousMessages'][-1]['text'], 'A 和 B 均已查到。')
+        self.assertNotIn('previousMessages', current_turn(state, None))
         turn = TurnCompletion(self.service, saved)
         turn.task(mode='ANALYSIS', goal='分析上述两个对象')
         artifact = await self.generic_result(turn)
         payload = review_payload(turn, artifact, '候选结论')
+        self.assertNotIn('查询 A、B 两个对象的读数', payload)
+        self.assertNotIn('A 和 B 均已查到。', payload)
+        turn.state.update(historyReferences=[{'contextRef': 'selected', 'use': 'FACTS'}],
+                          businessContexts=[{'contextRef': 'selected', 'request': '查询 A、B 两个对象的读数'}])
+        payload = review_payload(turn, artifact, '候选结论')
         self.assertIn('查询 A、B 两个对象的读数', payload)
-        self.assertIn('A 和 B 均已查到。', payload)
         self.assertNotIn('private reasoning', payload)
         self.assertNotIn('处理中', payload)
 

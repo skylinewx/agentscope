@@ -23,6 +23,77 @@ def request():
 
 
 class ConditionContextTests(TestCase):
+    def test_members_keep_roles_and_explicit_filters_when_changing_measures(self):
+        from analysis_extension.condition_context import previous_target_scopes
+        term = {'term': '旧指标', 'dimensionCode': 'ROLE_A', 'baseDataCode': 'SHARED',
+                'objectCode': '01', 'label': '原表指标行'}
+        def binding(role):
+            return {'id': role, 'draft': {'selector': {'type': 'VALUES', 'members': ['旧指标']}},
+                    'bindings': [{'dimCode': role, 'valueDomain': 'SHARED', 'condition': {'values': ['01']}}]}
+        selected = {'resultSetId': 'selected', 'targetId': 'old', 'resolvedTerms': [term], 'rows': [
+            {'factId': 'fact', 'conditionEvidence': [{**term, 'runtimeHeaders': ['原表指标行']}]}]}
+        receipt = {'data': {'targets': [{'id': 'old', 'label': '旧指标'}], 'resultSets': [selected],
+                            'conditionState': {'entries': [binding('ROLE_A'), binding('ROLE_B')]}}}
+        source = {'resultSetId': 'selected', 'factIds': ['fact']}
+        draft = {'question': '看这些成员的新指标', 'intentDraft': {'targets': [
+            {'businessPhrases': [{'text': '新指标'}]}]}}
+        self.assertEqual(previous_target_scopes(receipt, source, draft), ['ROLE_A'])
+        self.assertEqual(previous_target_scopes(receipt, {**source, 'factIds': ['other']}, draft), [])
+        receipt['data']['scopeResolution'] = [{'status': 'RESOLVED', 'dimCode': 'ROLE_A', 'valueDomain': 'SHARED'}]
+        self.assertEqual(previous_target_scopes(receipt, source, draft), [])
+        receipt['data'].pop('scopeResolution')
+        selected['resolvedTerms'].append({**term, 'dimensionCode': 'ROLE_B'})
+        self.assertEqual(previous_target_scopes(receipt, source, draft), ['ROLE_A'])
+        selected['rows'][0]['conditionEvidence'].append({**term,'dimensionCode':'ROLE_B','runtimeHeaders':['原表指标行']})
+        receipt['data']['targets'][0]['titleTerms'] = ['标题口径']
+        self.assertEqual(previous_target_scopes(receipt, source, draft), ['ROLE_A', 'ROLE_B'])
+        receipt['data']['scopeResolution'] = [{'status': 'RESOLVED', 'dimCode': 'ROLE_B', 'valueDomain': 'SHARED'}]
+        self.assertEqual(previous_target_scopes(receipt, source, draft), ['ROLE_A'])
+        mixed = binding('ROLE_A')
+        mixed.update(id='both', bindings=mixed['bindings'] + binding('ROLE_B')['bindings'])
+        receipt['data']['conditionState']['entries'].append(mixed)
+        self.assertEqual(previous_target_scopes(receipt, source, draft), ['ROLE_A'])
+        # Alternate form, same metric and phrase, different dimension. This is one native history entry.
+        receipt['data'].pop('scopeResolution')
+        second = selected['resolvedTerms'].pop()
+        receipt['data']['resultSets'].append({'resultSetId':'alternate', 'targetId':'old','rows':[], 'resolvedTerms':[second]})
+        self.assertEqual(previous_target_scopes(receipt, source, draft), ['ROLE_A', 'both'])
+        receipt['data']['resultSets'][-1]['targetId'] = 'different'
+        self.assertEqual(previous_target_scopes(receipt, source, draft), ['ROLE_A'])
+
+    def test_members_replace_only_unused_parts_of_a_compound_metric(self):
+        from analysis_extension.condition_context import previous_target_scopes
+        terms = [('D_WORK','检修'),('D_COST','设备费'),('D_REGION','北区')]
+        members = [dict(term=term,label=term,dimensionCode=dim,baseDataCode=dim,objectCode='01') for dim,term in terms]
+        row = {'factId':'fact','dimensions':{dim:'01' for dim,_ in terms},
+               'conditionEvidence':[dict(m,verifiedBy='RUNTIME_DIMENSION',runtimeHeaders=['检修','设备费']) for m in members]}
+        old = {'intentDraft':{'targets':[{'id':'cost','businessPhrases':[{'text':term} for _,term in terms]}]}}
+        receipt = {'data':{'targets':[{'id':'cost:1','label':'检修 设备费 北区','titleTerms':['支出口径']}],
+            'resultSets':[{'resultSetId':'old','targetId':'cost:1','resolvedTerms':members,'rows':[row]}],
+            'conditionState':{'entries':[{'id':dim,'draft':{'selector':{'type':'VALUES','members':[term]}},
+                'bindings':[{'dimCode':dim,'valueDomain':dim,'condition':{'values':['01']}}]} for dim,term in terms]}}}
+        def released(phrases):
+            req = {'question':'这些站点的情况','intentDraft':{'targets':[{'id':'new','businessPhrases':[{'text':p} for p in phrases]}]}}
+            return previous_target_scopes(receipt,{'resultSetId':'old','factIds':['fact']},req,old)
+        self.assertEqual(released(['设备费']), ['D_WORK'])
+        self.assertEqual(released(['年度产出']), ['D_WORK','D_COST'])
+        self.assertEqual(released([term for _,term in terms]), [])
+
+    def test_stage_is_protected_and_account_is_an_ordinary_business_binding(self):
+        from analysis_extension.condition_context import system_scope
+        req = request()
+        for dimension, protected in [('MD_STAGE', True), ('MD_BUDACCOUNT', False)]:
+            with self.subTest(dimension=dimension):
+                self.assertEqual(protected, system_scope({'bindings': [{'dimCode': dimension}]}))
+                item = req['conditionContext']['conditions'][0]
+                item['dimensionCodes'] = [dimension]
+                req['conditionContext']['omitted'] = [item['id']]
+                if protected:
+                    with self.assertRaises(AnalysisError):
+                        apply_omissions(req)
+                else:
+                    self.assertNotIn(item, apply_omissions(req)['conditionContext']['conditions'])
+
     def receipt(self, turn=1):
         rows = []
         for key, dimension, domain, value, caption in [('bound-p','PRODUCT','P','01','产品甲'), ('bound-s','MD_SCENE','S','01','预算')]:
@@ -170,6 +241,88 @@ class ConditionContextTests(TestCase):
         self.assertNotEqual(semantic_review_key(material, 'review'), semantic_review_key(changed, 'review'))
         self.assertEqual(state, original)
 
+    def test_older_group_anchor_does_not_hide_the_last_delivered_member_scope_from_model_or_reviewer(self):
+        from analysis_extension.condition_context import review_system_scope
+        from analysis_extension.review_request import make_review_request
+        from analysis_extension.task_projection import render
+        def record(selector):
+            return {'draft': {'dimensionHint': '组织机构', 'selector': selector}, 'bindings': [{'dimCode': 'MD_ORG'}]}
+        parent = record({'type': 'VALUES', 'members': ['示例集团']})
+        children = record({'type': 'HIERARCHY', 'rootText': '示例集团', 'level': 2})
+        state = {'activeBusinessContextRef': 'latest', 'selectedContextRefs': ['earlier'],
+                 'inheritedDimensionScopes': [parent], 'businessContexts': [
+                     {'contextRef': 'latest', 'request': '列出二级单位', 'dimensionScopes': [children]}]}
+        scope = review_system_scope(state)
+        self.assertEqual(scope['latestSourceScope']['conditions'], [children['draft']])
+        material = {'userRequest': '查示例集团的新指标', 'followupScope': scope}
+        for markdown in [render(material), *(make_review_request(material, query=q).markdown for q in (True, False))]:
+            self.assertIn('列出二级单位', markdown)
+        self.assertIn('第2层', make_review_request(material, query=True).markdown)
+        self.assertNotIn('latestSourceScope', review_system_scope({**state, 'selectedContextRefs': ['latest']}))
+        self.assertNotIn('latestSourceScope', review_system_scope({**state, 'inheritedDimensionScopes': [children]}))
+
+    def test_active_native_organization_is_provided_even_after_clearing_the_model_declaration(self):
+        from unittest.mock import Mock
+        proof = {'scopeId':'org', 'contextId':'c', 'querySessionId':'s', 'executionId':'exec'}
+        record = {'conditionId':'org','confirmedSource':proof,'appliesToAllTargets':True,
+                  'draft':{'dimensionHint':'组织机构','selector':{'type':'HIERARCHY','level':2,'rootText':'示例集团'}},
+                  'bindings':[{'dimCode':'MD_ORG'}]}
+        other = {**record,'conditionId':'other','bindings':[{'dimCode':'MD_PRODUCT'}]}
+        scoped = {**record,'conditionId':'comparison','appliesToAllTargets':False}
+        anchor = {'contextRef':'last','dimensionScopes':[record,other,scoped]}
+        turn = SimpleNamespace(state={'conditionTurn':3,'businessContexts':[anchor],'activeBusinessContextRef':'last',
+                               'selectedContextRefs':['earlier'],'inheritedDimensionScopes':[]},
+                               service=SimpleNamespace(owner=Mock(session_id='chat')))
+        envelope = prepare(turn, {'question':'再看收入','intentDraft':{}})['conditionContext']
+        self.assertEqual(envelope['organizationDefaults'], ['org'])
+        self.assertEqual(envelope['conditions'], [{'id':'org','source':proof}])
+        self.assertNotIn('organizationDefaults', prepare(turn, {'basis':{'kind':'MEMBERS'},'intentDraft':{}})['conditionContext'])
+
+    def test_native_organization_correction_is_bounded_to_the_current_question_and_frozen_proofs(self):
+        proof = {'scopeId':'org','executionId':'verified'}
+        prior = {'id':'saved','dimensionHint':'组织机构','selector':{'type':'HIERARCHY','level':2},
+                 'sourceText':'二级单位','confirmedSource':proof}
+        req = {'purpose':'QUERY','question':'查示例集团的收入','intentDraft':{'dimensionScopes':[prior]},
+               'conditionContext':{'turn':2,'conditions':[{'id':'org','scopeId':'saved','source':proof}],
+                                   'organizationDefaults':['org'],'omitted':[]}}
+        current = deepcopy(req)
+        named = {'id':'saved','dimensionHint':'MD_ORG','selector':{'type':'VALUES','members':['示例集团']},
+                 'sourceText':'示例集团','targetIds':[]}
+        current['intentDraft']['dimensionScopes'] = [named]
+        current['conditionContext']['conditions'][0].pop('scopeId')
+        self.assertEqual(effective_request(req, {'effectiveRequest':current}), current)
+        named['selector']['members'] = ['另一集团']
+        with self.assertRaises(AnalysisError):
+            effective_request(req, {'effectiveRequest':current})
+        named['selector']['members'] = ['示例集团']
+        current['intentDraft']['valueFilter'] = {'gt':500}
+        with self.assertRaises(AnalysisError):
+            effective_request(req, {'effectiveRequest':current})
+
+    def test_comparison_cannot_replace_a_target_owned_organization_or_adopt_a_peer(self):
+        question = '对比甲公司2025年收入和乙公司2026年收入'
+        org = {'id': 'org', 'dimensionHint': 'MD_ORG', 'sourceText': '甲公司', 'targetIds': ['current'],
+               'selector': {'type': 'VALUES', 'members': ['甲公司']}}
+        req = {'purpose': 'QUERY', 'question': question,
+               'intentDraft': {'targets': [{'id': 'current'}], 'dimensionScopes': [org]},
+               'conditionContext': {'turn': 2, 'conditions': [], 'omitted': [], 'comparisonBatch': {
+                   'targetIds': ['current'], 'peers': [{'targetId': 'other', 'terms': ['乙公司'], 'periodText': '2026年'}]}}}
+        self.assertEqual(effective_request(req, {'effectiveRequest': deepcopy(req)}), req)
+        actual = deepcopy(req)
+        actual_org = actual['intentDraft']['dimensionScopes'][0]
+        actual_org.update(targetIds=[], sourceText=question)
+        actual_org['selector']['members'] = ['甲公司', '乙公司']
+        with self.assertRaises(AnalysisError) as error:
+            effective_request(req, {'effectiveRequest': actual})
+        self.assertEqual(error.exception.code, 'EFFECTIVE_SCOPE_MISMATCH')
+
+        req['intentDraft']['dimensionScopes'] = []
+        with self.assertRaises(AnalysisError) as error:
+            effective_request(req, {'effectiveRequest': actual})
+        self.assertEqual(error.exception.code, 'EFFECTIVE_SCOPE_MISMATCH')
+        actual_org['selector']['members'] = ['甲公司']
+        self.assertEqual(effective_request(req, {'effectiveRequest': actual}), actual)
+
     def test_legacy_receipts_preserve_scopes_without_inventing_confirmation_turns(self):
         from analysis_extension.dimension_scopes import remember
         from unittest.mock import Mock
@@ -223,6 +376,18 @@ class ConditionContextTests(TestCase):
         original['conditionContext']['omitted'] = ['product']
         actual = apply_omissions(original)
         self.assertEqual(actual['intentDraft']['targets'][0]['businessPhrases'], [target])
+
+    def test_in_service_selection_is_verified_against_the_frozen_request(self):
+        original = request()
+        branch = deepcopy(original)
+        branch['conditionContext']['omitted'] = ['product']
+        actual = apply_omissions(branch)
+        receipt = {'appliedHistoricalConditions': ['product'], 'effectiveRequest': actual}
+        self.assertEqual(effective_request(original, receipt), actual)
+        for wrong in (['unknown'], ['scenario'], ['region'], ['product', 'product']):
+            with self.assertRaises(AnalysisError):
+                effective_request(original, {**receipt, 'appliedHistoricalConditions': wrong})
+        self.assertEqual(original, request())
 
     def test_omission_preserves_other_complete_evidence_containing_same_word(self):
         original = request()
@@ -329,7 +494,7 @@ class ConditionContextTests(TestCase):
 
 
 class ConditionRecoveryTests(IsolatedAsyncioTestCase):
-    async def exercise(self, results):
+    async def exercise(self, results, *, initial_code='DIMENSION_SCOPE_UNRESOLVED'):
         records, requests = {}, []
         descriptor = {'tier': 1, 'dropAll': [], 'chooseFrom': ['product', 'region'], 'chooseCount': 1}
         initial = request()
@@ -339,7 +504,7 @@ class ConditionRecoveryTests(IsolatedAsyncioTestCase):
             records[ref] = {'captureRef': ref, 'request': deepcopy(req), 'response': receipt,
                             'originalToolName': 'execute_budget_query'}
             return ToolResponse(id=ref, state=ToolResultState.SUCCESS, content=[], metadata={'analysisCaptureRef': ref})
-        first = event(initial, {'status': 'FAILED', 'error': {'code': 'BUDGET_TARGET_UNRESOLVED'},
+        first = event(initial, {'status': 'FAILED', 'error': {'code': initial_code},
                                 'data': {'conditionRecovery': descriptor}})
         async def pages(agent, kwargs, handler, *, frozen_request=None):
             if frozen_request is None:
@@ -361,7 +526,7 @@ class ConditionRecoveryTests(IsolatedAsyncioTestCase):
         next_tier = {'tier': 2, 'dropAll': [], 'chooseFrom': ['product', 'region'], 'chooseCount': 2}
         requests, output = await self.exercise([
             {'status': 'SUCCEEDED', 'data': {'resultSets': [{'rows': []}]}},
-            {'status': 'FAILED', 'error': {'code': 'BUDGET_TARGET_UNRESOLVED'}, 'data': {'conditionRecovery': next_tier}}])
+            {'status': 'FAILED', 'error': {'code': 'DIMENSION_SCOPE_UNRESOLVED'}, 'data': {'conditionRecovery': next_tier}}])
         self.assertEqual([r['conditionContext']['omitted'] for r in requests], [['product'], ['region']])
         self.assertTrue(output[0].metadata['conditionExecution']['frontierComplete'])
 
@@ -371,8 +536,20 @@ class ConditionRecoveryTests(IsolatedAsyncioTestCase):
             {'status': 'FAILED', 'error': {'code': 'BUDGET_TARGET_UNRESOLVED'}, 'data': {}}])
         self.assertEqual(len(requests), 2)
 
-    async def test_all_unlocated_branches_advance_once_to_next_tier(self):
-        failure = {'status': 'FAILED', 'error': {'code': 'BUDGET_TARGET_UNRESOLVED'}, 'data': {'conditionRecovery':
+    async def test_target_miss_returns_to_candidate_search_before_relaxing_history(self):
+        requests, output = await self.exercise([], initial_code='BUDGET_TARGET_UNRESOLVED')
+        self.assertEqual(requests, [])
+        self.assertNotIn('conditionExecution', output[0].metadata)
+
+    async def test_unlocated_peer_cannot_be_hidden_by_another_scope_recovery_plan(self):
+        next_tier = {'tier': 2, 'dropAll': [], 'chooseFrom': ['product', 'region'], 'chooseCount': 2}
+        requests, _ = await self.exercise([
+            {'status': 'FAILED', 'error': {'code': 'BUDGET_TARGET_UNRESOLVED'}, 'data': {}},
+            {'status': 'FAILED', 'error': {'code': 'DIMENSION_SCOPE_UNRESOLVED'}, 'data': {'conditionRecovery': next_tier}}])
+        self.assertEqual(len(requests), 2)
+
+    async def test_all_scope_blocked_branches_advance_once_to_next_tier(self):
+        failure = {'status': 'FAILED', 'error': {'code': 'DIMENSION_SCOPE_UNRESOLVED'}, 'data': {'conditionRecovery':
             {'tier': 2, 'dropAll': [], 'chooseFrom': ['product', 'region'], 'chooseCount': 2}}}
         requests, _ = await self.exercise([failure, failure, {'status': 'SUCCEEDED', 'data': {}}])
         self.assertEqual([r['conditionContext']['omitted'] for r in requests], [['product'], ['region'], ['product', 'region']])

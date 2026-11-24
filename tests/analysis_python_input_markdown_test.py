@@ -93,11 +93,21 @@ class PythonInputMarkdownTests(IsolatedAsyncioTestCase):
 
     async def test_python_handoff_registers_native_result_and_keeps_detailed_scope_readable(self):
         value = {**self.result, 'pythonRunRef': 'run', 'resultRefs': ['output']}
+        self.artifact['facts'] = [
+            {**self.records[0], 'factId': period, 'value': amount,
+             'dimensions': {**self.records[0]['dimensions'], 'DATATIME': period}}
+            for period, amount in [('2026J0001', '250'), ('2026J0002', '370')]]
         before = deepcopy(value)
         self.service.python = AsyncMock(return_value=value)
         response = await AnalysisPython(self.service).call()
         self.assertEqual(response.metadata['analysisNativeResult'],
                          {'analysisRef': 'analysis:1', 'pythonRunRef': 'run', 'resultRefs': ['output']})
         self.assertIn('"section":"summary"', response.content[0].text)
+        body = response.content[0].text
+        self.assertIn('AnalysisPublish 的 analysisRef=analysis:1', body)
+        self.assertIn('本次返回的 inputSetRef=selected', body)
+        self.assertIn('trend_', body)
+        self.assertIn('2026年第2季度', body)
+        self.assertNotIn('"points"', body)
         self.assertNotIn('member-a', response.content[0].text)
         self.assertEqual(value, before)

@@ -37,6 +37,12 @@ def recovery_details(code, details):
         details['nextAction'] = 'BUILD_WITH_REQUIRED_INPUTS'
         details['repairHint'] = '先按缺失对象和引用核对分析范围及已有捕获，补入必要证据或计算后重新 Build，再复用页面内容预览；仅修改报告文字不能解决此错误。'
     else:
+        if code == 'INVALID_WORK_REF' and details.get('path') == '/workPlan':
+            # Publishing can override an existing task's references, but cannot edit its frozen plan.
+            details['path'] = '/workRefs'
+            if 'issues' in details:
+                details['issues'] = [{**item, 'path': '/workRefs'} if item.get('code') == code and item.get('path') == '/workPlan'
+                                     else item for item in details['issues']]
         details.setdefault('nextAction', 'REPAIR_SAVED_PROPOSAL')
         details.setdefault('repairHint', '按 issues/path 局部修复：再次调用 AnalysisPublish，使用 repairRef 和 repairs；保留未修改的图表、数据与说明，无需重新取数。')
     return details
@@ -44,6 +50,10 @@ def recovery_details(code, details):
 
 def repair_fields(request):
     """Describe the saved shape, including explicit nulls; never guess edits."""
+    if 'markdown' in (request.get('document') or {}):
+        return {'正文': {'path': '/document/markdown', 'op': 'replaceText'},
+                '追加段落或图表': {'path': '/document/markdown', 'op': 'appendMarkdown'},
+                '完整草稿': {'path': '/document/path', 'op': 'replace'}}
     return {key: {'path': '/' + key, 'op': 'replace' if key in request else 'add',
                   'exists': key in request}
             for key in sorted(REPAIR_FIELDS)}
@@ -59,17 +69,26 @@ def repair_request(saved, analysis_ref, repairs):
                   if isinstance(edit, dict) and edit.get('op') == 'replaceText']
     if text_edits:
         # 文字补丁与整页替换不能混用，避免顺序改变匹配基准。其他字段仍按原契约处理。
-        if any(isinstance(edit, dict) and edit.get('op') != 'replaceText'
-               and edit.get('path') in ('/document', '/document/html', '/document/path') for edit in repairs):
+        if any(isinstance(edit, dict) and edit.get('op') not in ('replaceText', 'appendMarkdown')
+               and edit.get('path') in ('/document', '/document/html', '/document/markdown', '/document/path') for edit in repairs):
             raise AnalysisError('INVALID_REPAIR', '同批不能同时替换整页和修正文本文字。')
         from .document_repair import apply_text_repairs
         document = request.get('document') or {}
-        source = document.get('html')
-        binding_keys = {binding['key'] for binding in document.get('bindings', [])}
-        repaired = apply_text_repairs(source, text_edits, binding_keys)
-        request['document']['html'] = repaired
+        field = 'markdown' if 'markdown' in document else 'html'
+        source = document.get(field)
+        appended = []
     for index, edit in enumerate(repairs):
         if isinstance(edit, dict) and edit.get('op') == 'replaceText':
+            continue
+        if isinstance(edit, dict) and edit.get('op') == 'appendMarkdown':
+            document = request.get('document') or {}
+            if (set(edit) != {'op', 'path', 'value'} or edit['path'] != '/document/markdown'
+                    or 'markdown' not in document or not isinstance(edit['value'], str) or not edit['value'].strip()):
+                raise AnalysisError('INVALID_REPAIR', 'appendMarkdown 需要已保存的 Markdown 正文、/document/markdown 路径和非空的段落或图表引用。')
+            if text_edits:
+                appended.append(edit['value'].strip())
+            else:
+                document['markdown'] = document['markdown'].rstrip() + '\n\n' + edit['value'].strip()
             continue
         try:
             if (not isinstance(edit, dict) or set(edit) - {'op', 'path', 'value'}
@@ -130,6 +149,12 @@ def repair_request(saved, analysis_ref, repairs):
                                 {'path': f'/repairs/{index}', 'targetPath': edit.get('path') if isinstance(edit, dict) else None,
                                  'reason': reason if reason in REPAIR_REASONS else 'invalid path', 'hint': hint,
                                  **({'suggestedEdit': corrected[0]} if corrected else {})}) from exc
+    if text_edits:
+        bindings = request['document'].get('bindings', [])
+        if not isinstance(bindings, list) or any(not isinstance(b, dict) or not isinstance(b.get('key'), str) for b in bindings):
+            raise AnalysisError('INVALID_REPAIR', '修订后的数据绑定需要可引用的 key。')
+        repaired = apply_text_repairs(source, text_edits, {b['key'] for b in bindings}, field=field)
+        request['document'][field] = '\n\n'.join([repaired, *appended]) if appended else repaired
     if 'analysisRef' not in request or (not request.get('document') and not {'claims','viewPlan'} <= request.keys()):
         raise AnalysisError('INVALID_REPAIR', '不能移除发布身份或全部展示内容。')
     return request
@@ -237,7 +262,7 @@ def schema_issues(request):
         return [{'code': 'INVALID_PUBLICATION', 'path': '/arguments', 'validator': 'additionalProperties',
                  'message': '工具参数直接放在顶层 JSON 对象中，不再包一层 arguments；不能传字符串化的整份参数。',
                  'requiredFields': ['requestKey'],
-                 'hint': '首次提供 analysisRef 和 document 或 claims+viewPlan；局部修复用 repairRef+repairs；续审用 analysisRef+resumeReview=true。仅预览才带 previewOnly=true。'}]
+                 'hint': '首次提供 analysisRef 和 document 或 claims+viewPlan；局部修复用 repairRef+repairs；审核已有报告用 analysisRef、requestKey 和 reviewAction。仅预览才带 previewOnly=true。'}]
     issues = []
     if isinstance(request, dict) and 'repairRef' in request:
         mixed = sorted(set(request) & REPAIR_FIELDS)
@@ -252,7 +277,13 @@ def schema_issues(request):
         path = ''.join('/' + str(k).replace('~', '~0').replace('/', '~1') for k in error.absolute_path)
         message = error.message[:500]
         extra = {}
-        if error.validator == 'oneOf':
+        if path == '/document' and error.validator == 'anyOf':
+            message = 'document.bindings 或 document.datasets 至少一项须为非空数组。'
+            misplaced = [key for key in ('bindings', 'datasets') if key in request]
+            if misplaced:
+                message += '将已有的 ' + '、'.join(misplaced) + ' 从请求顶层移入 document 对象，保留数组内容、analysisRef 和报告文件。'
+            extra.update(requiredAlternatives=['/document/bindings','/document/datasets'], requiresBuild=False)
+        elif error.validator == 'oneOf':
             forms = [branch.get('required', []) for branch in error.validator_value]
             extra['parameterForms'] = forms
             message = '参数形式不完整或存在互斥字段；请选择一种形式并补齐必填项：' + '；'.join(
@@ -263,6 +294,10 @@ def schema_issues(request):
             extra['unknownFields'] = sorted(set(error.instance) - set(error.schema.get('properties', {})))
             extra['availableFields'] = sorted(error.schema.get('properties', {}))
             message = '包含不支持的字段；按 availableFields 选择。'
+            misplaced = [key for key in ('bindings', 'datasets') if key in extra['unknownFields']]
+            if not path and misplaced and isinstance(request.get('document'), dict):
+                message = '将请求顶层的 ' + '、'.join(misplaced) + ' 并入 document 内的同名数组，保留已有条目，移除顶层对应字段。'
+                extra['requiresBuild'] = False
         elif error.validator == 'required':
             missing = [key for key in error.validator_value if key not in error.instance]
             for field in missing:

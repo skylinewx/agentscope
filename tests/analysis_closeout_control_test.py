@@ -101,6 +101,18 @@ class CloseoutControlTests(PresentationCase):
         record_repair(turn, 'formal-review', 'DOCUMENT_SEMANTIC_ERRORS')
         self.assertEqual(closeout_reason(turn), 'REPAIR_LIMIT')
 
+    async def test_advancing_to_render_does_not_spend_prior_parameter_repairs(self):
+        turn = self.turn()
+        for index, code in enumerate(('STALE_INPUT_SET', 'DOCUMENT_FORMULA_DATASET_REQUIRED',
+                                      'DOCUMENT_FORMULA_COVERAGE_MISSING', 'DOCUMENT_RENDER_ERRORS')):
+            record_repair(turn, str(index), code)
+        self.assertEqual(progress(turn)['repairCounts'], {'parameter': 2, 'render': 2})
+        self.assertIsNone(closeout_reason(turn))
+        for index in range(2, self.store.limits.max_analysis_repairs):
+            self.assertIsNone(closeout_reason(turn))
+            record_repair(turn, f'new-preview-{index}', 'DOCUMENT_RENDER_ERRORS')
+        self.assertEqual(closeout_reason(turn), 'REPAIR_LIMIT')
+
     async def test_failed_preview_checks_do_not_count_cached_or_unrun_content_review(self):
         from agentscope.message import TextBlock, ToolCallBlock
         from agentscope.tool import ToolResponse

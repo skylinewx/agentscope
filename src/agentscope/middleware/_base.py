@@ -221,6 +221,10 @@ class MiddlewareBase:  # pylint: disable=unused-argument
             f"{type(self).__name__} does not implement on_check_permission",
         )
 
+    async def on_prepare_model_input(self, agent: "Agent", input_kwargs: dict) -> dict:
+        """Project the non-persisted model view used for both sizing and inference."""
+        return input_kwargs
+
     async def on_model_call(
         self,
         agent: "Agent",

@@ -41,8 +41,8 @@ def target_recovery(receipt, request):
     return {'action': 'SEARCH_CANDIDATES', 'targets': groups,
             'sourceTerms': list(dict.fromkeys(term for group in groups for term in group['searchTerms'])),
             'searchArguments': {key: deepcopy(request[key]) for key in ('contractVersion', 'contextId', 'querySessionId') if key in request},
-            'next': '优先使用随本次回执返回的扩大检索候选。需继续检索时，用目标原词作 entityMention 调用 search_entities，省略未经元数据确认的 modelKinds。结合上下文选择候选，再用 scope.bindings 的 text+candidateRef 绑定。'
-                    '保留原指标、成员、时期、情景和 selection；候选是表样不代表用户要求整表。alternatives 只接受原词的完整分词，不接受同义词替换。',
+            'next': '优先使用随本次回执返回的扩大检索候选。需继续检索时，用目标原词作 entityMention 调用 search_entities，省略未经元数据确认的 modelKinds。结合上下文选择候选，再用 scope.bindings 的 candidateRef 绑定。'
+                    '仅选候选会沿用已有条件和 selection。同一指标需要纠正筛选、时期或共享条件时，随绑定提交改动。alternatives 只接受原词的完整分词。',
             'scenarioRule': '非预算情景先由本体尝试预算格定位后切换到原目标情景取数。若仍未定位，再搜索候选；成功返回空值则接受空值，不改用预算金额。'}
 
 
@@ -81,7 +81,7 @@ async def expand_targets(turn, references, runner):
                     choice['candidateRef'] += f":{ref}:{group['targetIndex']}"
                 sections.append(f"目标 {group['logicalTargetId']} 的“{term}”扩大检索候选（原查询 {ref}）\n" + model_text({
                     'viewType': 'scope_candidates', 'scopeCandidates': choices, 'captureRef': refs[-1],
-                    'note': f'候选属于上述目标。选择后宿主复用原查询条件；已有结果可从原回执读取。'}))
+                    'note': '沿用现有条件只需选候选。同一目标可以同时提交更正的筛选、时期或共享条件。要修改目标拆分，请移除旧候选绑定并提交修正后的 intentDraft。'}))
             else:
                 sections.append(f'“{term}”的扩大检索返回 {len(items)} 个候选，本页没有可绑定的任务或表样。'
                                 f'可用 QueryResultRead 读取 {refs[-1]} 的 /data/candidates，结合业务含义继续定位。')

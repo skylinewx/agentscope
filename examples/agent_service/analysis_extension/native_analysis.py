@@ -4,7 +4,7 @@ from decimal import Decimal, Inexact, Rounded, ROUND_HALF_UP, localcontext
 
 from .models import AnalysisError, decimal_text, decimal_value, digest, precise_sum
 
-CAPABILITY_VERSION = 'native-analysis-20261116-half-up'
+CAPABILITY_VERSION = 'native-analysis-20261123-bound-results'
 STATISTIC_FIELDS = ('sum', 'positiveSum', 'negativeSum', 'minimum', 'maximum', 'mean', 'topSum', 'topShare')
 
 
@@ -144,6 +144,7 @@ def formula_check_summary(trace):
             'allLocalChecksCompleted': bool(nodes) and not blocked,
             'allLocalChecksMatch': bool(nodes) and len(matched) == len(nodes),
             'exceptions': exceptions[:20], 'exceptionCount': len(exceptions),
+            **({'differenceGuidance': '列出来源值、复算值和差额。差额方向只说明相差多少；归因需要另有业务依据。'} if mismatched else {}),
             'differenceMeaning': '来源值减本层复算值；反向展示须同时变更符号与标题',
             'boundary': '每项结论只适用于当前对象和公式节点。本层相符、差异及缺值分别说明；下层缺值不抹去上层本层结果，局部相符不代表所有对象或整条公式相符。'}
 

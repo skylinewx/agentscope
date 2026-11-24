@@ -46,6 +46,79 @@ def exact_fixture():
 
 
 class ExactCellsTests(TestCase):
+    def test_indices_for_one_metric_cannot_silently_drop_another_requested_metric(self):
+        capture, _ = exact_fixture()
+        selector, = budget_batch.selectors(capture)
+        wrong = {**selector, 'rowIndices': [0, 1]}
+        with self.assertRaises(AnalysisError) as failure:
+            budget_batch.catalog(capture, [wrong])
+        self.assertEqual(failure.exception.code, 'INVALID_SELECTOR')
+        self.assertEqual(failure.exception.details['unmatchedColumns'],
+                         {'metric2': {'availableCount': 2, 'exampleRowIndices': [2, 3]}})
+        split = [{**wrong, 'columnNames': ['metric1']}, {**selector, 'columnNames': ['metric2'], 'rowIndices': [2, 3]}]
+        self.assertEqual(budget_batch.catalog(capture, split), budget_batch.catalog(capture, [selector]))
+        facts = budget_batch.catalog(capture, [wrong, split[1]])
+        self.assertEqual(len(facts), 4)
+        self.assertTrue(any(fact['value'] is None for fact in facts))
+
+    def test_matching_row_suggestion_needs_unique_full_coordinates_in_the_same_form(self):
+        _, receipt = exact_fixture()
+        table = receipt['data']['stepResults'][0]['batchResults'][0]
+        rows = table['data']['cellResults']
+        origins = table['cellOrigins']
+        for source, candidate in [(0, 3), (1, 2)]:
+            rows[candidate]['dimensions'] = deepcopy(rows[source]['dimensions'])
+            origins[candidate]['context'] = deepcopy(origins[source]['context'])
+        options = {'metric2': [2, 3]}
+        self.assertEqual(budget_exact.corresponding_rows(table, {0}, options), {'metric2': [3]})
+        rows[2]['dimensions'] = deepcopy(rows[0]['dimensions'])
+        origins[2]['context'] = deepcopy(origins[0]['context'])
+        self.assertEqual(budget_exact.corresponding_rows(table, {0}, options), {})
+        for origin in origins[2:]:
+            origin['context']['target']['formBindingKey'] = 'different-table'
+        self.assertEqual(budget_exact.corresponding_rows(table, {0}, options), {})
+
+    def test_requesting_discovery_rows_from_value_batch_points_to_its_readable_values(self):
+        from analysis_extension.adapters.budget_v2 import BudgetV2Adapter
+        capture, receipt = exact_fixture()
+        step = receipt['data']['stepResults'][0]
+        self.assertEqual(BudgetV2Adapter().rows(capture, 'batch'), step['rows'])
+        del step['rows']
+        update(capture, receipt)
+        with self.assertRaises(AnalysisError) as failure:
+            BudgetV2Adapter().rows(capture, 'batch')
+        self.assertEqual(failure.exception.details['nextRead'], {'section': 'materials', 'captureRef': capture['captureRef']})
+
+    def test_batch_grain_alias_requires_one_code_in_this_tables_metadata(self):
+        from analysis_extension.prepared_inputs import normalize_prepared_grains
+        capture, receipt = exact_fixture()
+        ref = capture['captureRef']
+        item = {'captureRef': ref, 'stepId': 'batch', 'batchId': 'batch-A', 'grain': ['部门']}
+        entries = [{'dimCode': 'MD_ORG', 'label': '部门', 'modelCode': 'MX_FINANCIAL'},
+                   {'dimCode': 'MD_SCENE', 'label': '部门', 'modelCode': 'OTHER'}]
+        receipt['data']['dimensionCatalog'] = entries
+        update(capture, receipt)
+        self.assertEqual(normalize_prepared_grains({ref: capture}, [item], {})[0]['grain'], ['MD_ORG'])
+        self.assertEqual(item['grain'], ['部门'])
+        entries[1]['modelCode'] = 'MX_FINANCIAL'
+        update(capture, receipt)
+        with self.assertRaisesRegex(AnalysisError, '多个实际维度'):
+            normalize_prepared_grains({ref: capture}, [item], {})
+
+    def test_multi_metric_selector_round_trips_and_still_rejects_a_real_filter_widening(self):
+        capture, receipt = exact_fixture()
+        selector, = budget_batch.selectors(capture)
+        self.assertNotIn('rowIndices', selector)
+        self.assertEqual(selector['columnNames'], ['metric1', 'metric2'])
+        self.assertEqual(len(budget_batch.catalog(capture, [selector])), 4)
+        self.assertEqual(len(budget_batch.catalog(capture, [{**selector, 'rowIndices': [0, 2]}])), 2)
+        receipt['data']['resultSets'][0]['rows'].pop()
+        update(capture, receipt)
+        with self.assertRaisesRegex(AnalysisError, '超出'):
+            budget_batch.catalog(capture, [selector])
+        filtered = budget_batch.selectors(capture)
+        self.assertEqual(len(budget_batch.catalog(capture, filtered)), 3)
+
     def test_inventory_accepts_source_measure_and_batch_selector(self):
         from analysis_extension.inventory import inventory
         capture, _ = exact_fixture()
@@ -134,7 +207,10 @@ class ExactCellsTests(TestCase):
         answer = empty_query_answer(evidence)
         self.assertEqual(answer['reason'], 'NO_DATA')
         self.assertIn('合成利润表', answer['answer'])
-        self.assertIn('| R1 | 无数据 |', answer['answer'])
+        self.assertIn('| 项目 | 内容 |', answer['answer'])
+        self.assertIn('| 情景 | 实际数 |', answer['answer'])
+        self.assertIn('| 业务表 | 指标 | 查询值 | 单位 |', answer['answer'])
+        self.assertIn('| 合成利润表 | 净利润 | 无数据 | 元 |', answer['answer'])
         for state in ['PRESENT', 'NULL', 'NO_VALUE', 'ERROR']:
             source['facts'][0]['valueState'] = state
             self.assertIsNone(empty_query_answer(evidence))

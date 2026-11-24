@@ -6,6 +6,7 @@ import type {
 	InterruptSessionResponse,
 	SessionListResponse,
 	SessionRecord,
+	SessionStatus,
 	UpdateSessionRequest,
 	Msg,
 } from './types';
@@ -15,6 +16,65 @@ export interface MessagesResponse {
 	event_cursor: string | null;
 	is_running: boolean;
 	has_more: boolean;
+}
+
+export type SessionAddress = { agent_id: string; session_id: string };
+export type ReplyAddress = SessionAddress & { reply_id: string };
+
+export type SessionActivityEvent =
+	| { type: 'ready' }
+	| (SessionAddress & { type: 'session_status'; status: SessionStatus })
+	| (ReplyAddress & { type: 'reply_completed'; question: string; replayed?: false })
+	| (ReplyAddress & { type: 'reply_completed'; replayed: true });
+
+type SessionUpdate = SessionActivityEvent | { type: 'title_updated'; agent_id: string };
+
+async function* streamSse<T>(
+	path: string,
+	params?: Record<string, string>,
+	signal?: AbortSignal,
+	onOpen?: () => void,
+): AsyncGenerator<T> {
+	// Both streams send a heartbeat every 30s. Only transport silence times out.
+	const controller = new AbortController();
+	const streamSignal = AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]);
+	let watchdog: ReturnType<typeof setTimeout> | undefined;
+	const heartbeat = () => {
+		clearTimeout(watchdog);
+		watchdog = setTimeout(() => controller.abort(
+			new DOMException('Session stream heartbeat timed out.', 'TimeoutError'),
+		), 90_000);
+	};
+	let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+	const decoder = new TextDecoder();
+	let buffer = '';
+
+	try {
+		heartbeat();
+		const res = await client.stream(path, { params, signal: streamSignal, silent: true });
+		if (!res.body) throw new Error('Session stream has no response body.');
+		reader = res.body.getReader();
+		onOpen?.();
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			heartbeat();
+
+			buffer += decoder.decode(value, { stream: true });
+			const lines = buffer.split('\n');
+			buffer = lines.pop() ?? '';
+			for (const line of lines) {
+				if (line.startsWith('data: ')) {
+					const json = line.slice(6).trim();
+					if (json) yield JSON.parse(json) as T;
+				}
+			}
+		}
+	} finally {
+		clearTimeout(watchdog);
+		controller.abort();
+		reader?.releaseLock();
+	}
 }
 
 /**
@@ -67,8 +127,11 @@ export const sessionApi = {
 	) =>
 		client.patch<SessionRecord>(`/sessions/${sessionId}`, body, { agent_id: agentId }, options),
 
-	delete: (sessionId: string, agentId: string) =>
-		client.delete(`/sessions/${sessionId}`, { agent_id: agentId }),
+	delete: (
+		sessionId: string,
+		agentId: string,
+		options?: { silent?: boolean; signal?: AbortSignal; timeoutMs?: number },
+	) => client.delete(`/sessions/${sessionId}`, { agent_id: agentId }, options),
 
 	/**
 	 * Request interruption of an in-progress reply (running or parked).
@@ -115,64 +178,17 @@ export const sessionApi = {
 	 * @param onOpen - Called once the subscription response is open.
 	 * @returns An async generator yielding ``AgentEvent`` objects.
 	 */
-	streamEvents: async function* (
+	streamEvents: (
 		sessionId: string,
 		agentId: string,
 		signal?: AbortSignal,
 		after?: string | null,
 		onOpen?: () => void,
-	): AsyncGenerator<AgentEvent> {
-		// The server sends a heartbeat every 30s, even during long model/tool
-		// calls. Only transport silence times out; a slow reply stays connected.
-		const controller = new AbortController();
-		const streamSignal = AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]);
-		let watchdog: ReturnType<typeof setTimeout> | undefined;
-		const heartbeat = () => {
-			clearTimeout(watchdog);
-			watchdog = setTimeout(() => controller.abort(
-				new DOMException('Session stream heartbeat timed out.', 'TimeoutError'),
-			), 90_000);
-		};
-		let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
-		const decoder = new TextDecoder();
-		let buffer = '';
+	) => streamSse<AgentEvent>(`/sessions/${sessionId}/stream`, {
+		agent_id: agentId,
+		...(after != null && { after }),
+	}, signal, onOpen),
 
-		try {
-			heartbeat();
-			const res = await client.stream(`/sessions/${sessionId}/stream`, {
-				method: 'GET',
-				params: {
-					agent_id: agentId,
-					...(after != null && { after }),
-				},
-				signal: streamSignal,
-				silent: true,
-			});
-			if (!res.body) throw new Error('Session stream has no response body.');
-			reader = res.body.getReader();
-			onOpen?.();
-			while (true) {
-				const { done, value } = await reader.read();
-				if (done) break;
-				heartbeat();
-
-				buffer += decoder.decode(value, { stream: true });
-				const lines = buffer.split('\n');
-				buffer = lines.pop() ?? '';
-
-				for (const line of lines) {
-					if (line.startsWith('data: ')) {
-						const json = line.slice(6).trim();
-						if (json) yield JSON.parse(json) as AgentEvent;
-					}
-					// SSE comment frames (`:...\n`) are silently skipped
-					// (used for heartbeats).
-				}
-			}
-		} finally {
-			clearTimeout(watchdog);
-			controller.abort();
-			reader?.releaseLock();
-		}
-	},
+	streamUpdates: (signal: AbortSignal) =>
+		streamSse<SessionUpdate>('/sessions/updates', undefined, signal),
 };

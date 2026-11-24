@@ -71,7 +71,71 @@
       "minLength": 1,
       "type": "string"
     },
+    "formPreferences": {
+      "items": {
+        "additionalProperties": false,
+        "maxProperties": 256,
+        "properties": {
+          "lastUsedTurn": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "source": {
+            "additionalProperties": false,
+            "maxProperties": 256,
+            "properties": {
+              "contextId": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "executionId": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              },
+              "querySessionId": {
+                "maxLength": 64,
+                "minLength": 1,
+                "type": "string"
+              },
+              "resultSetId": {
+                "maxLength": 4096,
+                "minLength": 1,
+                "type": "string"
+              }
+            },
+            "required": [
+              "contextId",
+              "executionId",
+              "querySessionId",
+              "resultSetId"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "lastUsedTurn",
+          "source"
+        ],
+        "type": "object"
+      },
+      "maxItems": 1000,
+      "minItems": 0,
+      "type": "array"
+    },
     "omitted": {
+      "items": {
+        "maxLength": 16384,
+        "minLength": 1,
+        "type": "string"
+      },
+      "maxItems": 1000,
+      "minItems": 0,
+      "type": "array"
+    },
+    "organizationDefaults": {
+      "description": "宿主提供最近采用的已绑定机构范围引用，本轮明确的机构优先",
       "items": {
         "maxLength": 16384,
         "minLength": 1,

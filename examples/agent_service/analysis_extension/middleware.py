@@ -23,6 +23,24 @@ from .turn_completion import (TurnCompletion, current_turn, candidate_text, revi
     review_query_answer, query_evidence, issue, REVIEW_PROMPT, QUERY_REVIEW_PROMPT, MONEY_UNIT_POLICY)
 
 
+def _format_query_events(events, evidence):
+    """Keep the same text block IDs and other attachments when formatting an approved reply."""
+    from .report_markdown import format_query_markdown
+    deltas = {}
+    for index, event in enumerate(events):
+        if isinstance(event, TextBlockDeltaEvent):
+            deltas.setdefault(event.block_id, []).append(index)
+    skip = set()
+    for first, *rest in deltas.values():
+        text = events[first].delta + ''.join(events[i].delta for i in rest)
+        rendered = format_query_markdown(text, evidence)
+        if rendered != text:
+            events[first] = events[first].model_copy(update={'delta': rendered})
+            skip.update(rest)
+    if skip:
+        events[:] = [event for i, event in enumerate(events) if i not in skip]
+
+
 class AnalysisMiddleware(MiddlewareBase):
     def __init__(self, store, owner, resource_ids, authorize, rules=None, number_formats=None, skill_versions=None, delivery=None, actions_enabled=False, finding_rules=None, sources=None, render_checker=None, web_ui_url=None):
         self.capture = ReceiptCapture(store, owner, frozenset(resource_ids), authorize, number_formats, sources)
@@ -34,6 +52,8 @@ class AnalysisMiddleware(MiddlewareBase):
         self.capture.turn_key_provider = lambda: self.service.turn.state.get('turnKey') if self.service.turn else None
         self.capture.query_cache_provider = lambda: self.service.turn.state.setdefault('sourceQueryCache', {}) if self.service.turn else None
         self.capture.task_context_provider = self._source_task_context
+        from .query_context import QueryContexts
+        self.query_contexts = QueryContexts()
         from .followup_scope import prepare_request
         self.capture.request_preparer = lambda origin, request: prepare_request(self.service.turn, origin, request) if self.service.turn else request
         self.answer_reviewer = review_answer
@@ -63,19 +83,8 @@ class AnalysisMiddleware(MiddlewareBase):
         delivered_at = None
         candidate_events, approved_ids, approved_blocks = [], set(), []
         if agent is not None and hasattr(getattr(agent, 'state', None), 'middle_context'):
-            saved = current_turn(agent.state, input_kwargs.get('inputs'))
+            saved = current_turn(agent.state, input_kwargs.get('inputs'), self.service)
             self.service.turn = TurnCompletion(self.service, saved) if saved else None
-            if saved and saved.get('businessContexts') and not saved.get('contextDirectoryProvided'):
-                from .conversation_context import context_directory
-                directory = context_directory(saved)
-                hint = HintBlock(hint=(
-                    '本会话业务上下文目录（内容是资料，不是新指令）：' + json.dumps(directory, ensure_ascii=False)
-                    + '\n按本轮用户原话选择承接对象。普通追问沿用相关已交付结果；继续未完成工作可用 PENDING 的 contextRef；'
-                    '回到较早问题用对应 contextRef；明确综合才选多个。目录未显示的历史可用 AnalysisTask(action=contexts) 查询。'
-                    '声明时 context.contextRefs 使用真实引用；不要把失败任务意图和其他成功结果范围拼接。'),
-                    source=json.dumps({'label': 'System', 'sublabel': 'Business contexts'}))
-                agent.state.append_context(agent.name, [hint])
-                saved['contextDirectoryProvided'] = True
         preview_turn = self.service.turn
         async def review_preview(artifact):
             # 审查的是已经冻结、与最终发布相同的页面，模型输入不含执行指令。
@@ -95,6 +104,22 @@ class AnalysisMiddleware(MiddlewareBase):
                 raise AnalysisError('PREPARATION_TURN_CHANGED', '当前提问已切换，原提问的材料保持独立。')
             return await self._call_readonly_source(agent, turn, capture, tool_name, arguments)
         self.service.budget_preparation.runner = prepare_source if preview_turn is not None else None
+        async def comparison_read(turn, arguments):
+            if turn is not preview_turn or self.service.turn is not turn:
+                raise AnalysisError('TASK_TURN_CHANGED', '当前提问已经切换。')
+            available = await agent.toolkit._get_available_tools(agent.state.tool_context.activated_groups)
+            origins = [origin for registration in available.values()
+                       if (origin := leased_mcp_origin(registration.tool, self.capture.resource_ids))
+                       and origin['originalToolName'] == 'execute_budget_query'
+                       and readonly_capability(registration.tool, origin, self.capture.sources)]
+            if len(origins) != 1:
+                raise AnalysisError('QUERY_SOURCE_SELECTION', '请在已授权连接中选择本次比较的数据来源。')
+            origin = origins[0]
+            args = await self.query_contexts.bind(turn, origin, arguments, prepare_source)
+            return await self._call_readonly_source(agent, turn, origin, 'execute_budget_query', args, public_query=True)
+        self.service.comparison_reader = comparison_read if preview_turn is not None else None
+        self.capture.bind_query_context = (lambda origin, request: self.query_contexts.bind(
+            preview_turn, origin, request, prepare_source)) if preview_turn is not None else None
         if self.service.actions_enabled:
             await self.service.authorize()
             runtime.store.recover_action_runs(runtime.owner)
@@ -126,16 +151,19 @@ class AnalysisMiddleware(MiddlewareBase):
                     if isinstance(event, (TextBlockStartEvent, TextBlockDeltaEvent, TextBlockEndEvent,
                                           DataBlockStartEvent, DataBlockDeltaEvent, DataBlockEndEvent)):
                         candidate_events.append(event)
+                        if event.block_id == self.service.turn.state.get('streamedQueryBlock'):
+                            yield event
                         continue
                 if isinstance(event, ReplyEndEvent) and self.service.turn is not None:
                     if event.finished_reason == ReplyFinishedReason.COMPLETED:
-                        status = await self._check_end(agent)
+                        status = await self._check_end(agent, candidate_events)
                         if self.service.turn.state.get('hostCloseout') and status['status'] in ('DIRECT', 'READY', 'PARTIAL'):
                             # 完成检查发生在模型正文之后；事实摘要使用宿主文本替换未经确认的候选。
-                            block = TextBlock(text=self.service.turn.state['hostCloseout']['answer'])
-                            candidate_events = [TextBlockStartEvent(reply_id=event.reply_id, block_id=block.id),
-                                TextBlockDeltaEvent(reply_id=event.reply_id, block_id=block.id, delta=block.text),
-                                TextBlockEndEvent(reply_id=event.reply_id, block_id=block.id)]
+                            if not any(item.block_id == self.service.turn.state.get('streamedQueryBlock') for item in candidate_events):
+                                block = TextBlock(text=self.service.turn.state['hostCloseout']['answer'])
+                                candidate_events = [TextBlockStartEvent(reply_id=event.reply_id, block_id=block.id),
+                                    TextBlockDeltaEvent(reply_id=event.reply_id, block_id=block.id, delta=block.text),
+                                    TextBlockEndEvent(reply_id=event.reply_id, block_id=block.id)]
                         self.service.turn.state['lastCheck'] = status
                         event.metadata['analysisCompletion'] = {k: v for k, v in status.items() if k in ('status', 'analysisRef', 'semanticReview', 'reportDelivery', 'deliveryStatus', 'reason', 'pendingToolCallIds')}
                         event.metadata['analysisPerformance'] = self._performance()
@@ -185,7 +213,12 @@ class AnalysisMiddleware(MiddlewareBase):
                     if event.finished_reason == ReplyFinishedReason.COMPLETED and status['status'] not in ('INCOMPLETE', 'WAITING'):
                         from .followup_scope import remember_subject
                         from .turn_completion import candidate_text
-                        self.service.turn.state['deliveredAnswer'] = candidate_text(agent)
+                        closeout = self.service.turn.state.get('hostCloseout') or {}
+                        delivered = Msg(id=event.reply_id, name=agent.name, role='assistant', content=[])
+                        for item in candidate_events:
+                            delivered.append_event(item)
+                        self.service.turn.state['deliveredAnswer'] = (closeout.get('answer') or
+                            '\n'.join(block.text for block in delivered.content if isinstance(block, TextBlock)) or candidate_text(agent))
                         remember_subject(self.service.turn, status)
                         from .condition_context import confirm_reused
                         try:
@@ -198,10 +231,9 @@ class AnalysisMiddleware(MiddlewareBase):
                                         if isinstance(item, (TextBlockStartEvent, DataBlockStartEvent))}
                         # 模型内部 Msg 与 SSE 文本块的 ID 不同；按实际发布事件还原，
                         # 确保历史消息、最终 Msg 和前端流式显示使用同一组内容及 ID。
-                        delivered = Msg(id=event.reply_id, name=agent.name, role='assistant', content=[])
                         for item in candidate_events:
-                            delivered.append_event(item)
-                            yield item
+                            if item.block_id != self.service.turn.state.get('streamedQueryBlock'):
+                                yield item
                         approved_blocks = delivered.content
                     else:
                         approved_ids = set()
@@ -219,7 +251,9 @@ class AnalysisMiddleware(MiddlewareBase):
                     # 候选答案结束后还有独立审查，最终结束时间必须包含审查及发布。
                     delivered_at = datetime.now()
                     event.created_at = delivered_at.isoformat()
-                    event.metadata['deliveryTiming'] = {'completedAt': delivered_at.isoformat()}
+                    closeout = self.service.turn.state.get('hostCloseout') or {}
+                    event.metadata['deliveryTiming'] = {'completedAt': delivered_at.isoformat(),
+                        **{k: closeout[k] for k in ('tablesShownAt', 'summaryFinishedAt') if k in closeout}}
                     event.metadata['presentation'] = {'answer_block_ids': [block.id for block in approved_blocks],
                         'final_only': True, 'terminal_summary': terminal_summary}
                     candidate_events.clear()
@@ -242,7 +276,9 @@ class AnalysisMiddleware(MiddlewareBase):
                     event.metadata['analysisPerformance'] = self._performance()
                     if delivered_at is not None:
                         event.finished_at = delivered_at
-                        event.metadata['deliveryTiming'] = {'completedAt': delivered_at.isoformat()}
+                        closeout = self.service.turn.state.get('hostCloseout') or {}
+                        event.metadata['deliveryTiming'] = {'completedAt': delivered_at.isoformat(),
+                            **{k: closeout[k] for k in ('tablesShownAt', 'summaryFinishedAt') if k in closeout}}
                 reason = str(getattr(event, "finished_reason", ""))
                 if reason == "interrupted":
                     runtime.finish("CANCELLED", "USER_OR_HOST_INTERRUPTED")
@@ -276,7 +312,7 @@ class AnalysisMiddleware(MiddlewareBase):
                 'reviewTotals': turn.state.get('analysisReviewTotals', {}),
                 'reviewAttempts': turn.state.get('analysisReviewAttempts', [])}
 
-    async def _check_end(self, agent):
+    async def _check_end(self, agent, candidate_events=None):
         turn = self.service.turn
         await self.service.authorize()
         pending = agent.state.middle_context.get('background_tools_v1', {})
@@ -288,19 +324,34 @@ class AnalysisMiddleware(MiddlewareBase):
         if turn.state.get('backgroundEvidenceErrors'):
             return {'status': 'INCOMPLETE', 'semanticReview': 'UNAVAILABLE',
                     'issues': list(turn.state['backgroundEvidenceErrors'].values())}
+        if turn.state.get('comparisonPlan') and turn.state.get('mode') == 'DIRECT':
+            from .direct_query_delivery import source_answer
+            comparison = await asyncio.to_thread(source_answer, turn, at_reply_end=True)
+            if comparison and comparison.get('incomplete'):
+                from .review_control import progress
+                saved = {'answer': comparison['answer'], 'status': 'PARTIAL', 'semanticReview': 'NOT_REVIEWED',
+                         'deliveryStatus': 'INCOMPLETE_COMPARISON', 'issues': [], 'deliveredCaptureRefs': comparison['refs']}
+                progress(turn, lambda item: item.update(closeout=saved))
+                turn.state['hostCloseout'] = saved
+                return {k: v for k, v in saved.items() if k != 'answer'}
+        await self._register_reviewed_export()
         status = turn.check()
         if status['status'] not in ('DIRECT', 'READY', 'PARTIAL'):
             return status
+        if status.get('analysisRef') and turn.state.get('adoptedReportRef'):
+            self._approved_delivery(status)
+            if turn.state.get('hostCloseout'):
+                return {key: value for key, value in turn.state['hostCloseout'].items() if key != 'answer'}
         if status.get('analysisRef'):
             saved_artifact = self.service.store.get_analysis(self.service.owner, status['analysisRef'])
             if saved_artifact.get('reportDelivery', {}).get('mode') in ('PENDING_REVIEW', 'REQUIRES_REVISION'):
-                from .report_review import current_delivery, status_text
+                from .report_review import current_delivery, review_summary
                 metadata = current_delivery(self.service.store, self.service.owner, saved_artifact['reportDelivery'])
                 if metadata['semanticReview'] != 'PASS':
                     delivery = self.service.turn.state.get('delivery', {})
                     result = {**status, 'status': 'PARTIAL', 'semanticReview': metadata['semanticReview'],
                               'reportDelivery': metadata, 'issues': [],
-                              'answer': status_text(metadata) + '\n\n' + delivery.get('markdown', '')}
+                              'answer': review_summary(metadata) + '\n\n' + delivery.get('markdown', '')}
                     self.service.turn.state['hostCloseout'] = result
                     return result
             if saved_artifact.get('hostSummary'):
@@ -348,6 +399,8 @@ class AnalysisMiddleware(MiddlewareBase):
                 validate(verdict, REVIEW_SUMMARY_SCHEMA)
                 cached = {'key': key, 'analysisRef': status.get('analysisRef'), 'issues': verdict['issues'],
                           'coverage': verdict.get('coverage', [])}
+                if verdict.get('rankedDelivery') == 'SOURCE_TABLES' and status['status'] == 'DIRECT':
+                    cached['rankedDelivery'] = 'SOURCE_TABLES'
                 turn.state['reviews'] = [*turn.state['reviews'][-7:], cached]
             except asyncio.CancelledError:
                 raise
@@ -367,7 +420,47 @@ class AnalysisMiddleware(MiddlewareBase):
                 return await self._direct_closeout(agent, artifact, 'REVIEW_UNAVAILABLE')
         if cached['issues']:
             return {**status, 'status': 'INCOMPLETE', 'semanticReview': 'REVISE', 'issues': cached['issues']}
-        return {**status, 'semanticReview': 'PASS', 'reviewCoverage': cached.get('coverage', [])}
+        if status['status'] == 'DIRECT' and cached.get('rankedDelivery') == 'SOURCE_TABLES':
+            from .review_materials import ranked_list_source
+            source = ranked_list_source(artifact)
+            if source:
+                from .review_control import progress
+                closeout = {**status, 'semanticReview': 'PASS', 'deliveryStatus': 'SOURCE_TABLES',
+                           'answer': source['source']['businessTableView']['markdown'],
+                           'deliveredCaptureRefs': [source['captureRef']]}
+                progress(turn, lambda saved: saved.update(closeout=closeout))
+                turn.state['hostCloseout'] = closeout
+                return {key: value for key, value in closeout.items() if key != 'answer'}
+        checked = {**status, 'semanticReview': 'PASS', 'reviewCoverage': cached.get('coverage', [])}
+        if status['status'] != 'DIRECT':
+            return checked
+        from .report_markdown import format_query_markdown
+        displayed = answer
+        delivery = {}
+        if (turn.state.get('queryCaptureRefs')
+                and not (turn.state.get('queryTargets') or turn.state.get('objectives'))):
+            from .direct_query_delivery import source_answer
+            from .review_materials import ranked_list_source
+            # A ranked candidate can intentionally contain only the requested places.
+            tables = None if ranked_list_source(artifact) else await asyncio.to_thread(
+                source_answer, turn, at_reply_end=True, reviewed_answer=answer)
+            if tables:
+                displayed = tables['answer']
+                if not tables['emptyStatus'] and answer.strip():
+                    commentary = tables.get('reviewedAnswer', answer).strip()
+                    displayed = commentary if displayed.strip() in commentary else displayed + '\n\n' + commentary
+                delivery = {'deliveredCaptureRefs': tables['refs'],
+                            'deliveryStatus': tables['emptyStatus'] or 'SOURCE_WITH_REVIEWED_ANSWER'}
+        if not delivery:
+            if candidate_events:
+                await asyncio.to_thread(_format_query_events, candidate_events, artifact)
+            return checked
+        displayed = await asyncio.to_thread(format_query_markdown, displayed, artifact)
+        from .review_control import progress
+        closeout = {**checked, **delivery, 'answer': displayed}
+        progress(turn, lambda saved: saved.update(closeout=closeout))
+        turn.state['hostCloseout'] = closeout
+        return {key: value for key, value in closeout.items() if key != 'answer'}
 
     async def _direct_closeout(self, agent, evidence, reason):
         """Keep the exact current answer when only review availability failed.
@@ -377,6 +470,7 @@ class AnalysisMiddleware(MiddlewareBase):
         force another computation or silently replace its completed answer.
         """
         from .model_closeout import model_closeout
+        from .report_markdown import format_query_markdown
         from .review_control import progress
         turn = self.service.turn
         answer = (candidate_text(agent)
@@ -384,10 +478,11 @@ class AnalysisMiddleware(MiddlewareBase):
         findings = [item for review in turn.state.get('reviews', []) for item in review.get('issues', [])]
         if (reason in ('REVIEW_CAPACITY', 'REVIEW_UNAVAILABLE') and answer.strip()
                 and not findings and not turn.state.get('backgroundEvidenceErrors')):
+            displayed = await asyncio.to_thread(format_query_markdown, answer, evidence)
             status = {'status': 'PARTIAL', 'semanticReview': 'UNAVAILABLE',
                       'deliveryStatus': 'CURRENT_UNREVIEWED', 'reason': reason, 'issues': [],
                       'candidateDigest': digest(answer),
-                      'answer': '以下保留本次已完成的答复。独立审核尚未完成，其中的计算与分析结论仍待核对。\n\n' + answer}
+                      'answer': '以下保留本次已完成的答复。独立审核尚未完成，其中的计算与分析结论仍待核对。\n\n' + displayed}
             progress(turn, lambda saved: saved.update(closeout=status))
             turn.state['hostCloseout'] = status
             return {key: value for key, value in status.items() if key != 'answer'}
@@ -397,6 +492,8 @@ class AnalysisMiddleware(MiddlewareBase):
             status = {'status': 'INCOMPLETE', 'semanticReview': 'NOT_REVIEWED',
                       'reason': error.code, 'issues': [error.as_dict()],
                       'answer': str(error)}
+        if status.get('answer'):
+            status['answer'] = await asyncio.to_thread(format_query_markdown, status['answer'], evidence)
         progress(turn, lambda saved: saved.update(closeout=status))
         turn.state['hostCloseout'] = status
         return {key: value for key, value in status.items() if key != 'answer'}
@@ -421,7 +518,46 @@ class AnalysisMiddleware(MiddlewareBase):
         checkpoints = progress(turn).get('publicationWaits', {})
         return all(checkpoints.get(calls.get(call_id), {}).get('workReady') is True for call_id in pending)
 
-    def _approved_delivery(self):
+    async def _register_reviewed_export(self):
+        """Finish the normal REPORT export for an explicitly reviewed, frozen document."""
+        from .report_review import current_delivery
+        from .review_control import progress
+        turn = self.service.turn
+        state = turn.state
+        ref = state.get('analysisRef')
+        if (state.get('mode') != 'REPORT' or not ref or not state.get('adoptedReportRef')
+                or not (state.get('delivery') or {}).get('registered') or state.get('backgroundEvidenceErrors')
+                or turn.registered_export(ref) or state.get('reviewExportFailed') == ref):
+            return
+        saved = progress(turn)
+        adopted = state['adoptedReportRef']
+        base = ref
+        parents = saved.get('presentationRevisionRefs', {})
+        visited = set()
+        while base != adopted and base in parents and base not in visited:
+            visited.add(base)
+            base = parents[base]
+        if base != adopted or not turn.current_review_resume(adopted):
+            return
+        artifact = self.service.store.get_analysis(self.service.owner, ref)
+        document = artifact.get('freeDocument') or {}
+        delivered = artifact.get('reportDelivery') or {}
+        if (not document or artifact.get('publicationState') != 'PUBLISHED'
+                or delivered.get('contentDigest') != document.get('contentDigest')
+                or current_delivery(self.service.store, self.service.owner, delivered).get('semanticReview') != 'PASS'):
+            return
+        issues = turn.check().get('issues', [])
+        if {issue['code'] for issue in issues} != {'REPORT_NOT_DELIVERED'}:
+            return
+        try:
+            report = await self.service.render_report(ref, 'review-export-' + digest([state['turnKey'], ref]))
+        except AnalysisError as error:
+            state['reviewExportFailed'] = ref
+            state['reviewExportIssue'] = error.as_dict()
+        else:
+            state['report'] = report
+
+    def _approved_delivery(self, status=None):
         """直接交付当前已审查页面，避免另写一遍表格和结论再审查。"""
         turn = self.service.turn
         if (turn.state.get('deliveryMode') != 'DOCUMENT'
@@ -432,7 +568,8 @@ class AnalysisMiddleware(MiddlewareBase):
                     or turn.state.get('report' if mode == 'REPORT' else 'delivery') or {})
         if not delivery.get('registered') or not delivery.get('markdown'):
             return None
-        status = turn.check()
+        if status is None:
+            status = turn.check()
         if status['status'] not in ('READY', 'PARTIAL'):
             return None
         artifact = self.service.store.get_analysis(self.service.owner, status['analysisRef'])
@@ -440,23 +577,53 @@ class AnalysisMiddleware(MiddlewareBase):
                 or not (artifact.get('freeDocument') or artifact.get('claims'))):
             return None
         from .review_control import progress
-        receipt = progress(turn).get('resumedReportRefs', {}).get(artifact['analysisRef'])
+        resumed = progress(turn).get('resumedReportRefs', {})
+        receipt = resumed.get(artifact['analysisRef'])
         saved_delivery = artifact.get('reportDelivery', {})
-        if (receipt and receipt.get('reviewRef') == saved_delivery.get('reviewRef')
-                and receipt.get('contentDigest') == saved_delivery.get('contentDigest')):
-            from .report_review import current_delivery, status_text
+        exact_resume = (receipt and receipt.get('reviewRef') == saved_delivery.get('reviewRef')
+                        and receipt.get('contentDigest') == saved_delivery.get('contentDigest'))
+        # A reviewed presentation-only revision carries its own frozen review. Do not force a
+        # second semantic cache entry or turn advisory observations into delivery failures.
+        from .report_review import request_identity, review_policy_identity
+        from .turn_completion import REVIEW_PROMPT
+        review_ref = saved_delivery.get('reviewRef')
+        review = (self.service.store.get_report_review(self.service.owner, review_ref) or {}) if review_ref else {}
+        same_turn_review = (review.get('status') == 'PASS' and review.get('requestIdentity') == request_identity(turn)
+                            and review.get('analysisRef') == artifact['analysisRef']
+                            and review_ref == review.get('reviewRef')
+                            and review_policy_identity(review) == [digest(REVIEW_PROMPT), self.service.review_budget.semantic_identity()]
+                            and saved_delivery.get('contentDigest') == (artifact.get('freeDocument') or {}).get('contentDigest')
+                            and saved_delivery.get('programChecks') == 'PASS')
+        if not exact_resume and not same_turn_review:
+            from .turn_completion import document_review
+            _, reviewed = document_review(turn, artifact)
+            if reviewed is None or any(item.get('severity') != 'ADVISORY' for item in reviewed['issues']):
+                return None
+        parts = [artifact.get('partialReason')]
+        prior_refs = [*resumed, turn.state.get('adoptedReportRef')]
+        if saved_delivery and any(ref and ref.partition(':')[0] == artifact['analysisRef'].partition(':')[0] for ref in prior_refs):
+            from .report_review import current_delivery, review_summary
             metadata = current_delivery(self.service.store, self.service.owner, saved_delivery)
-            answer = status_text(metadata) + '\n\n' + delivery['markdown']
+            if exact_resume and receipt.get('action') == 'RECHECK' and metadata.get('semanticReview') == 'REVISE':
+                return None
+            parts.append(review_summary(metadata))
+            answer = '\n\n'.join(filter(None, [*parts, delivery['markdown']]))
             turn.state['hostCloseout'] = {**status, 'answer': answer, 'issues': [],
-                'status': 'READY' if metadata['semanticReview'] == 'PASS' else 'PARTIAL',
+                'status': status['status'] if metadata['semanticReview'] == 'PASS' else 'PARTIAL',
                 'semanticReview': metadata['semanticReview'], 'reportDelivery': metadata}
             return answer
-        from .turn_completion import document_review
-        _, reviewed = document_review(turn, artifact)
-        if reviewed is None or reviewed['issues']:
-            return None
-        # 部分交付的限制已随页面审查，保留原文，不由宿主编造新的分析结论。
-        return ((artifact['partialReason'] + '\n\n') if artifact.get('partialReason') else '') + delivery['markdown']
+        return '\n\n'.join(filter(None, [*parts, delivery['markdown']]))
+
+    async def on_prepare_model_input(self, agent, input_kwargs):
+        from .model_materials import current_turn_input
+        turn = self.service.turn
+        if turn is None:
+            return input_kwargs
+        names = getattr(self, 'budget_tool_names', None)
+        if names and 'execute_budget_query' in names.values():
+            turn.state['availableCatalogNames'] = [tool.get('function', tool)['name'] for tool in (input_kwargs.get('tools') or [])]
+            turn.state['fullBudgetCatalogOffered'] = bool(turn.state.get('expandedToolCatalog'))
+        return current_turn_input(turn.state, input_kwargs, names)
 
     async def on_model_call(self, agent, input_kwargs, next_handler):
         turn = self.service.turn
@@ -467,13 +634,16 @@ class AnalysisMiddleware(MiddlewareBase):
                                                  input_kwargs.get('tools'), self.service.review_budget)
             input_kwargs = {**input_kwargs, 'messages': messages}
             record_timing(turn, 'modelInput', 0, **estimate)
+            from agentscope._io_log import observe_request_sizes
+            with observe_request_sizes(lambda sizes: record_timing(turn, 'providerInput', 0, **sizes)):
+                return await next_handler(**input_kwargs)
         return await next_handler(**input_kwargs)
 
     async def on_reasoning(self, agent, input_kwargs, next_handler):
         started = perf_counter()
         from .query_contract import configure
         if agent is not None and getattr(agent, 'toolkit', None) is not None:
-            await configure(agent.toolkit, self.capture.resource_ids)
+            self.budget_tool_names = await configure(agent.toolkit, self.capture.resource_ids)
         turn = self.service.turn
         if turn is not None:
             turn.recover_background_evidence()
@@ -483,6 +653,15 @@ class AnalysisMiddleware(MiddlewareBase):
                                    usage=agent._get_reply_usage(), finished_reason=ReplyFinishedReason.COMPLETED)
                 return
             if not agent.state.middle_context.get('background_tools_v1'):
+                from .direct_query_delivery import source_answer, deliver
+                if turn.state.get('queryTargets') or (turn.state.get('mode') == 'DIRECT' and turn.state.get('materialQueryObjectives')):
+                    await self.service.authorize()
+                    result = await asyncio.to_thread(source_answer, turn)
+                    if result is not None:
+                        async for event in deliver(turn, agent, result):
+                            yield event
+                        return
+                await self._register_reviewed_export()
                 answer = self._empty_scenario_analysis() or self._approved_delivery()
                 if answer is not None:
                     block = TextBlock(text=answer)
@@ -507,7 +686,10 @@ class AnalysisMiddleware(MiddlewareBase):
                 return
         if turn is not None and not turn.state.get('mode'):
             if not turn.state.get('declarationHint'):
-                agent.state.append_context(agent.name, [HintBlock(hint='先调用 AnalysisTask 声明当前用户的任务类型与目标。DIRECT 用于普通查询、排序、简单统计、一般答复或必要澄清；ANALYSIS 用于分析、指标公式构成和分布构成查询，首次以 DOCUMENT 丰富展示；REPORT 用于明确报告。构成查询只完成所需构成，不自动追加原因或预测。只依据本轮意图和上下文选择，不因负值、公式、层级或工具可用就升级任务。普通关联追问 context.mode=CONTINUE，继承上轮有效范围；用户换题用 NEW，明确综合多轮用 SYNTHESIZE。部分条件用 intent 或 scopeEdits 修改，null 明确清除，省略保留。原话由宿主记录。承接实际结果先用 sources 查看来源，再以 subjectSources 明确采用；不为背景比较放开主体范围。')])
+                from .task_contract import DIRECT_QUERY_DECLARATION
+                agent.state.append_context(agent.name, [HintBlock(hint=(
+                    f'先调用 AnalysisTask 声明任务。{DIRECT_QUERY_DECLARATION}'
+                    '分析先辨明对象：具体数值的数据构成，或不同口径之间的取值比较。复合问题先取得足以判断的数据，再决定是否追加具体对象。多个用途分别声明 objectives。'))])
                 turn.state['declarationHint'] = True
             # Filtering with auto also works for providers that reject a named
             # forced tool while reasoning is enabled. The end guard still
@@ -685,11 +867,11 @@ class AnalysisMiddleware(MiddlewareBase):
                 raise AnalysisError('DELIVERY_NOT_REGISTERED', '已生成的数据页面尚未完成交付登记。')
             prefix = '已保留本次分析结果。' if status['status'] == 'READY' else '已整理本次查得的数据，进一步的分析解释尚未完成。'
             if artifact.get('reportDelivery'):
-                from .report_review import status_text, current_delivery
+                from .report_review import review_summary, current_delivery
                 metadata = current_delivery(self.service.store, self.service.owner, artifact['reportDelivery'])
                 status['reportDelivery'] = metadata
                 if metadata['semanticReview'] != 'NOT_REVIEWED':
-                    prefix = status_text(metadata)
+                    prefix = review_summary(metadata)
                     status['semanticReview'] = metadata['semanticReview']
                 elif status['semanticReview'] == 'UNAVAILABLE':
                     prefix = '已保留完整结果；本次内容审查未能完成，尚不能确认全部分析结论。'
@@ -721,7 +903,7 @@ class AnalysisMiddleware(MiddlewareBase):
             if error:
                 raise AnalysisError('EVIDENCE_VERIFICATION_FAILED', '来源核验未完成，已完成的核验凭据保留。', error)
 
-    async def _call_readonly_source(self, agent, turn, capture, tool_name, arguments):
+    async def _call_readonly_source(self, agent, turn, capture, tool_name, arguments, *, public_query=False):
         """核验和材料准备共用真实工具、权限及捕获边界，将来源错误与已完成结果一起返回。"""
         from .actions import source_identity
         from agentscope.permission import PermissionBehavior
@@ -732,14 +914,16 @@ class AnalysisMiddleware(MiddlewareBase):
             origin = leased_mcp_origin(tool, self.capture.resource_ids)
             if (origin and origin.get('originalToolName') == tool_name and source_identity(origin) == source_identity(capture)
                     and (readonly_capability(tool, origin, self.capture.sources)
-                         or tool_name == 'get_context' and arguments.get('action') == 'open')):
+                         or tool_name == 'get_context' and arguments.get('action') in ('discover', 'open'))):
                 candidates.append(tool)
         if len(candidates) != 1:
             raise AnalysisError('VERIFICATION_TOOL_UNAVAILABLE' if tool_name == 'validate_evidence' else 'PREPARATION_TOOL_UNAVAILABLE',
                                 '该连接没有唯一可用的已授权只读工具。', {'tool': tool_name})
         tool = candidates[0]
-        arguments = {**arguments, 'requestId': 'host-read-' + digest([turn.state['turnKey'], source_identity(capture), tool_name, arguments])[:48]}
-        call = ToolCallBlock(id=arguments['requestId'], name=tool.name, input=json.dumps(arguments))
+        call_id = 'host-read-' + digest([turn.state['turnKey'], source_identity(capture), tool_name, arguments])[:48]
+        if not public_query and (tool_name != 'get_context' or arguments.get('action') == 'open'):
+            arguments = {**arguments, 'requestId': call_id}
+        call = ToolCallBlock(id=call_id, name=tool.name, input=json.dumps(arguments))
         decision = await agent._check_permission(call, tool, arguments)
         if decision.behavior != PermissionBehavior.ALLOW or decision.updated_input is not None and decision.updated_input != arguments:
             raise AnalysisError('VERIFICATION_PERMISSION_REQUIRED' if tool_name == 'validate_evidence' else 'PREPARATION_PERMISSION_REQUIRED',
@@ -755,14 +939,15 @@ class AnalysisMiddleware(MiddlewareBase):
         capture_runtime = copy(self.capture)
         # This is a host-built, permission-checked native request. It may carry
         # execution proofs deliberately absent from the model-facing schema.
-        capture_runtime.model_submission = False
+        capture_runtime.model_submission = public_query
         capture_runtime.turn_key_provider = lambda: turn.state['turnKey']
         capture_runtime.query_cache_provider = lambda: turn.state.setdefault('sourceQueryCache', {})
         condition_read = tool_name == 'execute_budget_query' and 'selected' in (arguments.get('conditionContext') or {})
         if condition_read:
             capture_runtime.request_preparer = lambda origin, request: request
         else:
-            capture_runtime.request_preparer = lambda origin, request: prepare_request(turn, origin, request, host_prepared=True)
+            capture_runtime.request_preparer = lambda origin, request: prepare_request(
+                turn, origin, request, host_prepared=not public_query, comparison_read=public_query)
         async for event in capture_runtime.run(agent, {'tool_call': call}, execute):
             if isinstance(event, ToolResponse):
                 if not condition_read:
@@ -810,11 +995,14 @@ class AnalysisMiddleware(MiddlewareBase):
     async def on_acting(self, agent, input_kwargs, next_handler):
         from .execution_progress import phase
         call = input_kwargs['tool_call']
+        turn = self.service.turn
+        if turn and turn.state.get('fullBudgetCatalogOffered') and call.name != 'AnalysisTask':
+            from .model_materials import remember_catalog_tool
+            remember_catalog_tool(turn.state, call.name)
         stage = {'AnalysisPython': 'CALCULATING', 'AnalysisBuild': 'CALCULATING',
                  'AnalysisPublish': 'PUBLISHING'}.get(call.name)
         if stage is None and 'execute_budget_query' in call.name:
             stage = 'QUERYING'
-        turn = self.service.turn
         operation = await phase(turn, stage, 'RUNNING', toolName=call.name) if stage else None
         status = 'COMPLETE'
         try:
@@ -869,10 +1057,24 @@ class AnalysisMiddleware(MiddlewareBase):
                                 try:
                                     sources = directory(turn, limit=6)
                                     if sources['sources']:
+                                        guidance = ('要分析新查询结果，先用 AnalysisTask.subjectSources 明确采用完整来源组，再 AnalysisBuild；'
+                                                    '普通查询可直接答复，无需为采用来源增加步骤。')
+                                        if (turn.state.get('mode') in ('ANALYSIS', 'REPORT') and not turn.state.get('adoptedInputs')
+                                                and len(turn.state.get('objectives', [])) == 1
+                                                and turn.state['objectives'][0]['capability'] == 'VALUES'):
+                                            from .adapters.budget_batch import selectors, whole_metric_selection
+                                            entries = selectors(capture)
+                                            if len(entries) == 1 and len(entries[0]['columnNames']) > 1:
+                                                option = whole_metric_selection(entries[0], turn.state['objectives'][0]['role'])
+                                                if option:
+                                                    guidance = ('本表全部返回指标和行可一次用于分析。若符合本题范围，AnalysisBuild 使用 '
+                                                        + json.dumps({'captureRefs': [reference], 'selections': [option],
+                                                                      'scope': {'label': '本次查询结果', 'selectionReason': '采用本表全部已返回指标和行'},
+                                                                      'operations': []}, ensure_ascii=False, separators=(',', ':'))
+                                                        + ' 并填写 requestKey。只分析部分成员或指标时采用相应来源子集。')
                                         additions.append(TextBlock(text='\n\n' + sources['markdown'] +
                                             '\n来源引用由宿主生成。本次查询不会替换已采用的分析输入。'
-                                            '要分析新查询结果，先用 AnalysisTask.subjectSources 明确采用完整来源组，再 AnalysisBuild；'
-                                            '普通查询可直接答复，无需为采用来源增加步骤。'))
+                                            + guidance))
                                 except AnalysisError as error:
                                     event.metadata['sourceDirectoryError'] = error.as_dict()
                         if reference and turn.state.get('mode') in ('ANALYSIS', 'REPORT'):

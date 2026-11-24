@@ -9,11 +9,15 @@ test('resize accepts current frame key and bounded integer height', () => {
         assert.equal(documentHeight(data,'current'),null);
     }
 });
-test('unbounded or incomplete HTML cannot enter the document frame', () => {
-    const valid={version:'free-html-1',title:'标题',html:'<html></html>',contentDigest:'a'.repeat(64),frameKey:'b'.repeat(64),bindingCount:3};
+const valid = {version:'free-html-1', title:'分析', html:'<html><head></head><body><p>已核验的分析正文</p></body></html>',
+    contentDigest:'a'.repeat(64), frameKey:'b'.repeat(64), bindingCount:3};
+
+test('document versions, required fields and limits are validated independently of binding mode', () => {
     assert.deepEqual(parseFreeDocument(valid),valid);
     assert.equal(parseFreeDocument({...valid,bindingCount:0,datasetCount:1}).datasetCount,1);
-    for(const change of [{version:'unknown'},{frameKey:'not-a-key'},{bindingCount:0},{html:'字'.repeat(300000)},{title:''}]) {
+    assert.throws(() => parseFreeDocument({...valid,version:'free-html-2'}), /UNSUPPORTED_VERSION/);
+    for(const change of [{version:undefined},{frameKey:'not-a-key'},{contentDigest:''},{bindingCount:-1},
+        {bindingCount:2001},{datasetCount:'0'},{datasetCount:51},{html:'字'.repeat(300000)},{html:'  '},{title:'  '}]) {
         assert.throws(()=>parseFreeDocument({...valid,...change}),/INVALID_VIEW/);
     }
 });

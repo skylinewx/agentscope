@@ -16,6 +16,18 @@ def runtime_value_types(receipt):
     data = receipt.get('data', {})
     origins = {origin.get('originId'): origin for origin in data.get('origins', [])}
     result = {}
+    for step in data.get('stepResults', []):
+        for form in step.get('formResults', []):
+            oid = ((form.get('runtime') or {}).get('observation') or {}).get('observationId')
+            if not oid:
+                continue
+            labels = result.setdefault((oid, None), {})
+            for field in form.get('dimensions') or []:
+                dim, member, label = field.get('code'), field.get('value'), field.get('valueLabel')
+                if dim and member is not None and label:
+                    name = str(label).removeprefix(str(member) + ' ').strip()
+                    if name and name != str(member):
+                        labels.setdefault((dim, member), set()).add(name)
     for result_set in data.get('resultSets', []):
         for row in result_set.get('rows', []):
             if not row.get('valueType'):
@@ -31,12 +43,14 @@ def runtime_value_types(receipt):
 
 
 def runtime_dimension_names(receipt):
-    """Reuse declared labels through the same observation/cell origin binding."""
+    """Index member labels by the source cell, dimension and actual member code."""
     data = receipt.get('data', {})
     origins = {origin.get('originId'): origin for origin in data.get('origins', [])}
     result = {}
     for result_set in data.get('resultSets', []):
         for row in result_set.get('rows', []):
+            members = {**result_set.get('context', {}).get('effectiveDimensions', {}),
+                       **row.get('dimensions', {})}
             for ref in row.get('originRefs', []):
                 origin = origins.get(ref, {})
                 if origin.get('sourceType') != 'FORM_RUNTIME':
@@ -44,10 +58,26 @@ def runtime_dimension_names(receipt):
                 runtime = origin.get('runtime', {})
                 names = result.setdefault((runtime.get('observationId'), runtime.get('cell')), {})
                 for dimension, label in row.get('dimensionNames', {}).items():
-                    if label:
-                        _require(dimension not in names or names[dimension] == label, '同一运行格返回了相互冲突的维值名称。')
-                        names[dimension] = label
+                    member = members.get(dimension)
+                    if label and member is not None:
+                        names.setdefault((dimension, member), set()).add(label)
+                        result.setdefault((runtime.get('observationId'), None), {}).setdefault((dimension, member), set()).add(label)
     return result
+
+
+def cell_dimension_names(index, observation_id, cell_key, members):
+    names = {}
+    labels = index.get((observation_id, cell_key), {})
+    for dimension, member in members.items():
+        matches = labels.get((dimension, member))
+        if matches:
+            _require(len(matches) == 1, f'运行格 {cell_key} 的维度 {dimension}、成员 {member} 返回了相互冲突的维值名称。')
+            names[dimension] = next(iter(matches))
+        elif observation_id is not None:
+            same_form = index.get((observation_id, None), {}).get((dimension, member), set())
+            if len(same_form) == 1:
+                names[dimension] = next(iter(same_form))
+    return names
 
 
 def present_value_groups(data):
@@ -128,6 +158,20 @@ def _validate(capture, receipt):
             request = {**request, 'sourceSelection': basis['source']}
     _require(data.get('resultType') == 'BUDGET_QUERY_RESULT', '业务查询没有返回对应的数据契约。')
     _require(data.get('purpose') == request.get('purpose'), '查询与分析用途发生变化。')
+    conditions = request.get('conditionContext') or {}
+    if 'selected' in conditions or (data.get('summary') or {}).get('kind') == 'CONDITION_BINDINGS':
+        state = data.get('conditionState') or {}
+        selected = set(conditions.get('selected', []))
+        baseline = {e['id'] for e in conditions.get('conditions', []) if not e.get('sourceOnly')} & selected
+        _require('selected' in conditions and (data.get('summary') or {}).get('kind') == 'CONDITION_BINDINGS'
+                 and data.get('complete') is True and request['purpose'] == 'QUERY'
+                 and 'effectiveRequest' in data and isinstance(request.get('question'), str)
+                 and data.get('question', request['question']) == request['question']
+                 and state.get('conversationId') == conditions['conversationId'] and state.get('turn') == conditions['turn']
+                 and baseline <= set(state.get('active', [])) <= selected
+                 and all(data.get(key) == [] for key in ('resultSets', 'origins', 'stepResults', 'runtimeRequests', 'targets', 'unresolvedGroups')),
+                 '历史条件确认回执与所选范围不一致。')
+        return []
     selection = request.get('selection', 'CELLS')
     _require(data.get('selection', 'CELLS') == selection, '整表与单元格读取范围发生变化。')
     _require(isinstance(request.get('question'), str) and request['question'] == data.get('question'),
@@ -217,7 +261,7 @@ def _validate(capture, receipt):
                 continue  # Native context has codes; names are validated on canonical result sets below.
             _require(not scope.get(key) or values.get(field) in scope[key], '结果超出了指定的任务或表样。')
         _require(not scope.get('periodCode') or opening_matches(scope['periodCode'], context.get('period')),
-                 '执行期与明确指定的时期不一致。')
+                 '数据加载时期与请求指定的时期不一致。')
         if scope.get('periodRequest'):
             resolution = context.get('periodResolution') or {}
             _require(context.get('period') in resolution.get('periodCodes', [])

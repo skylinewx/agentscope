@@ -5,11 +5,12 @@ from itertools import groupby
 import json
 import re
 
-from .business_tables import DEFAULT_LABELS, STATES, escape, measure_label, member_label, period_label
+from .budget_dimensions import dimension_labels
+from .business_tables import STATES, escape, measure_label, member_label, period_label
 from .review_aliases import replace_references
 from .review_periods import period_labels
 from .review_business_evidence import source_facts, source_entities, review_runs, output_business_fields
-from .review_business_projection import direct_input_fields, compact_business_scopes, business_memberships, row_ranges
+from .review_business_projection import direct_input_fields, compact_business_scopes, business_memberships, repeated_input_block, row_ranges
 
 LABELS = {
     'userRequest': '用户要求', 'queryIntent': '已确认查询条件', 'scope': '分析范围',
@@ -37,9 +38,9 @@ LABELS = {
     'record': '完整输入记录', 'sharedContexts': '共同取数背景', 'sharedContext': '取数背景',
     'referenceSelections': '采用的数据范围', 'orderedSelection': '数据范围', 'count': '数量',
     'periodGlossary': '时期中文说明', 'sourceColumnDefinitions': '来源列定义',
-    'taskName': '预算任务', 'formName': '业务表', 'executionPeriod': '开表时期',
+    'taskName': '预算任务', 'formName': '业务表', 'executionPeriod': '数据加载时期',
     'dataPeriod': '数据时期', 'effectiveDimensions': '固定维度', 'dataPeriodSelection': '时期选择',
-    'selectionExecutionPeriod': '选中表的开表时期', 'selectionDataPeriod': '选中单元格的数据时期',
+    'selectionExecutionPeriod': '所选表的数据加载时期', 'selectionDataPeriod': '所选单元格的实际数据时期',
     'title': '指标／科目', 'status': '状态', 'message': '说明', 'data': '完整计算输出',
     'outputKind': '结果类型', 'name': '名称', 'description': '说明', 'fields': '字段及取值',
     'values': '原始取值', 'entityKind': '资料类型', 'key': '业务编码',
@@ -62,7 +63,6 @@ LABELS = {
 
 # Standard budget dimension vocabulary; source metadata always wins. Unknown
 # configured dimensions retain their actual code, never inferred from values.
-DIMENSIONS = {**DEFAULT_LABELS, 'MD_QD': '渠道', 'MD_QY': '区域', 'MD_SCCP': '产品'}
 
 # Fields added by the host for ownership, storage and tool execution. Custom
 # input fields are not discarded merely because their names are unfamiliar.
@@ -91,6 +91,27 @@ def _flat(value, path=''):
     return result
 
 
+def _rendered_column_gaps(text):
+    """Report measured blank runs compactly. A blank source value remains valid."""
+    notes = []
+    for tabular, lines in groupby(text.splitlines(), key=lambda line: '\t' in line):
+        if not tabular:
+            continue
+        header, *body = ([cell.strip() for cell in line.split('\t')] for line in lines)
+        if not all(header):
+            continue
+        rows = [row for row in body if len(row) == len(header) and any(row)]
+        if len(rows) < 2:
+            continue
+        for i, label in enumerate(header):
+            gaps = sum(row[i] in ('', '—', '–') for row in rows)
+            if gaps >= 2 and gaps >= len(rows) - 1:
+                notes.append(f'{escape(label[:60])}（{gaps}/{len(rows)} 行为空或显示横线）')
+                if len(notes) == 6:
+                    return notes
+    return notes
+
+
 def render_business_markdown(material, aliases, readable_view=None, wire_references=None):
     """Review business evidence; the full execution audit stays frozen in host storage."""
     names = {original: alias for alias, original in aliases.items()}
@@ -109,15 +130,20 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
             input_fields = None
             break
         input_fields.update(fields)
-    dimensions = dict(DIMENSIONS)
     def labels(node):
         if isinstance(node, dict):
-            if node.get('dimCode') and node.get('label'):
-                dimensions[node['dimCode']] = node['label']
-            for child in node.values(): labels(child)
+            name = node.get('dimensionLabel') or (node.get('label') if not node.get('field') and not node.get('objectCode') else None)
+            if node.get('dimCode') and name:
+                yield {'dimCode': node['dimCode'], 'label': name}
+            if isinstance(node.get('dimensionLabels'), dict):
+                for code, label in node['dimensionLabels'].items():
+                    yield {'dimCode': code, 'label': label}
+            for child in node.values():
+                yield from labels(child)
         elif isinstance(node, list):
-            for child in node: labels(child)
-    labels(value)
+            for child in node:
+                yield from labels(child)
+    dimensions = dimension_labels(labels(value))
     def field_label(key):
         parts=str(key).split('.')
         if not any(part in LABELS or part in dimensions for part in parts): return str(key)
@@ -125,6 +151,7 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
     # A provenance identifier is not a business title. Long values stay in the
     # frozen owner-scoped map; literals used by the actual code are listed below.
     all_facts = list(value.get('facts') or [])
+    fact_dimensions = {code for fact in all_facts if isinstance(fact.get('dimensions'), dict) for code in fact['dimensions']}
     evidence = value.get('evidence') or {}
     review_targets=set(value.get('reviewTargets') or evidence.get('resultRoots') or [])
     for source in evidence.get('sources', []):
@@ -290,6 +317,15 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                              escape(title), *[scalar(fact[field],True) if field in fact else '（字段不存在）' for field in metric_fields],
                              escape(shown), escape(fact.get('unit') or '')])
                 if has_scale: rows[-1].append(scalar(fact['scale'],True) if 'scale' in fact else '（字段不存在）')
+            # Hoist exact common display fields without changing row numbers, values or source types.
+            if len(rows) > 2:
+                shared = [i for i, title in enumerate(headings) if title in
+                          ('来源缩放因子', '单位', '指标／科目', '结果指标编码', '来源指标编码')
+                          and all(row[i] == rows[0][i] for row in rows)]
+                if shared:
+                    lines.append('本表各行相同：' + '，'.join(headings[i] + '＝' + (rows[0][i] or '（空）') for i in shared) + '。')
+                    headings = [title for i, title in enumerate(headings) if i not in shared]
+                    rows = [[value for i, value in enumerate(row) if i not in shared] for row in rows]
             table(headings, rows)
             memberships=OrderedDict()
             for row_index,fact in enumerate(group,1):
@@ -320,6 +356,8 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                 else: section('数据时期、类型及实际使用范围',extra,depth+1)
             for fact in group:
                 formula = {k:fact[k] for k in ('formula','formulaTrace','expression','formulaArithmetic') if fact.get(k) is not None}
+                if fact.get('formula') and fact.get('cellAddress'):
+                    formula['来源单元格'] = fact['cellAddress']
                 if formula: section('来源公式：' + (measure_label({**fact,'dimensions':mapping(fact,'dimensions'),
                     'dimensionNames':mapping(fact,'dimensionNames')}) or fact.get('label','')), formula, depth+1)
 
@@ -336,8 +374,13 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
             rows = item.get('rows')
             if isinstance(cols, list) and cols and isinstance(rows, list) and all(isinstance(c, dict) and c.get('name') for c in cols):
                 if all(isinstance(row, dict) and isinstance(row.get('values'), dict) for row in rows):
+                    def cell(row, name):
+                        state = row.get('valueStates', {}).get(name)
+                        if state in ('MISSING', 'FAILED', 'NOT_APPLICABLE'):
+                            return {'MISSING': '字段缺失', 'FAILED': '取值失败', 'NOT_APPLICABLE': '不适用'}[state]
+                        return scalar(row['values'][name]) if name in row['values'] else '字段缺失'
                     table([c.get('label', c['name']) for c in cols],
-                          [[scalar(row['values'].get(c['name'])) for c in cols] for row in rows])
+                          [[cell(row, c['name']) for c in cols] for row in rows])
                     item = {k:v for k,v in item.items() if k != 'rows'}
             simple = {k:v for k,v in item.items() if not isinstance(v,(dict,list)) and k != 'markdown' and '\n' not in str(v)}
             if simple: table(['事项', '内容'], [[escape(field_label(k)), scalar(v)] for k,v in simple.items()])
@@ -391,7 +434,7 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                 if key == 'inputRole':
                     return {'PRIMARY':'主体','REFERENCE':'对照','STRUCTURE':'结构资料'}.get(child,child)
                 if child in dimensions: return dimensions[child]
-                if key in dimensions:
+                if key in fact_dimensions:
                     matches={row.get('dimensionNames',{}).get(key) for row in all_facts
                         if isinstance(row.get('dimensions'),dict) and isinstance(row.get('dimensionNames'),dict)
                         and row['dimensions'].get(key)==child and row['dimensionNames'].get(key)}
@@ -423,12 +466,45 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
 
     heading('一、用户要求与目标', 2)
     lines.extend([str(value.get('userRequest') or (value.get('computationIntent') or {}).get('userRequest') or '见本次用户问题'), ''])
+    if value.get('businessReviewRequest'):
+        heading('本次复核要求', 3)
+        lines.extend([str(value['businessReviewRequest']), ''])
+    support = value.get('supportingEvidence') or {}
+    if support.get('groupedSources'):
+        heading('同次分组查询各来源的采用情况', 3)
+        def group_count(value):
+            return '待核实' if value is None else str(value)
+        rows = [row for row in support['groupedSources'] if '材料已选分组数' in row]
+        if rows:
+            table(['业务表', '返回分组数', '材料已选分组数', '各指标的已选组数 / 返回组数'],
+                  [[escape(row['业务表']), group_count(row['返回分组数']), group_count(row['材料已选分组数']),
+                    '、'.join(f"{escape(m['指标'])} {group_count(m['已选'])}/{group_count(m['返回'])}"
+                             for m in row.get('指标采用', []))] for row in rows])
+        legacy = [row for row in support['groupedSources'] if '纳入本报告的分组数' in row]
+        if legacy:
+            table(['业务表', '旧材料返回的数据格数', '旧材料已选的数据格数'],
+                  [[escape(row['业务表']), str(row['返回分组数']), str(row['纳入本报告的分组数'])] for row in legacy])
+        lines.extend(['已选表示进入分析材料。请对照正文和图表，核实实际展示的来源、分组与指标。'
+                      '在现有 coverage 中用一项说明用户本次要哪些来源。承接此前多份结果且未缩小范围时，'
+                      '把所需来源中遗漏的分组列为需要补齐的交付内容，复用本次查询结果即可。'
+                      '用户限定来源或名次时按该范围检查。AI 自己选用的来源不能作为用户缩小范围的依据。', ''])
     # Show the model's actual choice, never infer a requirement or a source
     # failure from VALUES. The original request remains the review authority.
     material_choices = value.get('materials')
     if material_choices is None:
         material_choices = (value.get('analysisRequirement') or {}).get('materials')
-    if material_choices:
+    objectives = value.get('objectiveCoverage') or []
+    if objectives:
+        heading('本次分析对象', 3)
+        table(['编号', '对象与问题', '用途', '业务能力', '可核对的材料'], [
+            [str(o['number']), escape(o.get('question') or '见用户原问'),
+             {'PRIMARY':'主体','REFERENCE':'对照','STRUCTURE':'结构'}.get(o['role'], o['role']),
+             '数据构成' if o['capability'] == 'DATA_COMPOSITION' else '取值',
+             '、'.join(locations[ref] for ref in o.get('formulaRefs', []) if ref in locations)
+             or ('已采用空结果' if o.get('empty') else '来源边界' if o.get('boundaryRefs')
+                 else '仅供探索' if o.get('exploratory') else '')] for o in objectives])
+        lines.extend(['依据用户原问核对各对象。构成引用该对象的来源公式结果，确认的来源边界按实际材料说明。', ''])
+    elif material_choices:
         heading('AI 本次选择的分析材料', 3)
         roles = {'PRIMARY': '主体', 'REFERENCE': '对照', 'STRUCTURE': '结构依据'}
         kinds = {'VALUES': '数值', 'FORMULAS': '公式构成'}
@@ -471,18 +547,24 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                 lines.extend([group['message'],''])
     followup=value.get('followupScope') or {}
     inherited_system=followup.get('inheritedSystemConditions') or []
-    if inherited_system:
-        heading('本轮开始时已确认的系统维度范围',3)
-        lines.extend(['这些范围在用户未修改时继续继承；下方范围调整是模型声明，是否得到用户授权仍需结合原问题核对。',''])
-        for condition in inherited_system:
+    latest=followup.get('latestSourceScope') or {}
+    for title,conditions,original in (('最近交付的范围与本次选择不同', latest.get('conditions'), latest.get('request')),
+            ('本次选取的历史范围' if latest else '本轮开始时已确认的系统维度范围', inherited_system, None)):
+        if not conditions: continue
+        heading(title,3)
+        if original: lines.extend([original,''])
+        for condition in conditions:
             selector=condition.get('selector') or {}
             parts=[]
-            if selector.get('type') == 'ALL': parts.append('全部成员')
+            if selector.get('type') == 'ALL':
+                parts.append(selector['rootText']+'及全部下属单位' if selector.get('rootText') else '全部成员')
             if selector.get('members'): parts.append('、'.join(selector['members']))
-            if selector.get('rootText'): parts.append('根：'+selector['rootText'])
+            if selector.get('rootText') and selector.get('type') != 'ALL': parts.append('根：'+selector['rootText'])
             if selector.get('level') is not None: parts.append('第'+str(selector['level'])+'层')
             if selector.get('where'): parts.append('筛选条件：'+scalar(selector['where']))
             table(['维度','已确认范围'],[[escape(condition['dimensionHint']),escape('；'.join(parts))]])
+    if latest or inherited_system:
+        lines.extend(['系统维度默认沿用。本轮明确指向机构时按本轮机构或层级取数，未指定时沿用前轮范围。',''])
     if followup.get('effectiveScopes'):
         scope_summary(followup['effectiveScopes'])
     for key,title in (('context','本轮承接方式与用户依据'),('intentSummary','本轮已确认条件'),
@@ -497,6 +579,10 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
         if context: section('本轮继承的查询条件与结果范围',context,3)
 
     heading('二、查询结果与实际输入', 2)
+    if value.get('reportSourceTables'):
+        lines.append('下表是本报告来源记录中的名称，可用来核对正文标注的取数口径。')
+        table(['预算任务', '业务表'], [[escape(row.get('taskName') or ''), escape(row.get('formName') or '')]
+                                 for row in value['reportSourceTables']])
     if value.get('facts') is not None: facts(value['facts'],3)
     for source in evidence.get('sources',[]) if isinstance(evidence,dict) else []:
         if source.get('businessTables'): section('查询结果',source['businessTables'],3)
@@ -507,16 +593,23 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                 facts(list(group),3)
         for actual in source.get('executionScopes',[]):
             background=business_scope(actual)
-            if background: section('实际开表范围',background,3)
+            if isinstance(background, dict) and 'period' in background and 'executionPeriod' not in background:
+                background['executionPeriod'] = background.pop('period')
+            if background: section('数据加载条件',background,3)
         entities=source_entities(source,evidence)
         if entities:
             for entity in entities:
                 entity={k:v for k,v in entity.items() if k not in ('resourceRef','rootResourceRef','fieldProjection','omittedFieldCount')}
                 section('查询到的业务定义或成员',entity,3)
         query = (source.get('source') or {}).get('businessQuery',{})
-        if query.get('failureSummary'): section('本次取数未完成的部分',query['failureSummary'],3)
+        if query.get('unresolvedGroups'):
+            failures = [{k:g[k] for k in ('binding','taskCode','formCode','code','message') if g.get(k)}
+                        for g in query['unresolvedGroups']]
+            section('未完成的来源（按实际任务和表样标识）', failures, 3)
+        elif query.get('failureSummary') and query.get('complete') is not True:
+            section('本次取数未完成的部分',query['failureSummary'],3)
         elif query.get('complete') is False:
-            section('本次取数未完成的部分',query.get('unresolvedGroups') or '查询未完整完成，不能按完整范围交付。',3)
+            section('本次取数未完成的部分','查询未完整完成，不能按完整范围交付。',3)
         if source.get('diagnostic'): section('本次来源查询的实际错误',source['diagnostic'],3)
     for key in ('businessTables','businessTableView'):
         if value.get(key): section('查询结果',value[key],3)
@@ -530,7 +623,8 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                 ('metrics','querySessionId','executionId','bindingRef')}
         if background: scopes.append(background)
     scope_summary(scopes)
-    if value.get('supportingEvidence'): section('同次查询取得的补充业务数据',value['supportingEvidence'],3)
+    if support.get('facts') or support.get('diagnostics') or support and not support.get('groupedSources'):
+        section('同次查询取得的补充业务数据',{k: v for k, v in support.items() if k != 'groupedSources'},3)
     if value.get('subjectCandidates'):
         section('答复主体可选范围', value['subjectCandidates'],3)
         lines.extend(['审核最终答复时，用 candidateRef 记录答复实际使用的来源；rowIndices 为原表零基行号，全部行填 null。不要默认最后一次查询。',''])
@@ -543,7 +637,7 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                           'sourceMeasureCode','measureCode','inputRole','inputMemberships','sourceValueState',
                           'data','rows','columns','operator','formula'}
     shown_sources={}
-    shown_inputs={}
+    shown_inputs=[]
     for index, run in enumerate(runs,1):
         for source in run.get('sourceData',[]):
             identity=_json(source)
@@ -560,14 +654,26 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
             facts([{**cell,'factId':cell.get('key',str(i+1))} for i,cell in enumerate(cells)],4)
             lines.extend(['providedToRun 表示程序是否实际发送该行；发送完成不证明代码使用了该行，应结合脚本筛选与计算核对。',''])
         records_in = run.get('inputRecords',[])
-        input_identity=_json(records_in)
-        if records_in and input_identity in shown_inputs:
-            lines.extend([f'第 {index} 段脚本使用与第 {shown_inputs[input_identity]} 段完全相同的实际输入，值、字段类型和顺序均一致；完整数据见该段。',''])
-            continue
-        if records_in: shown_inputs[input_identity]=index
+        positions = list(range(1, len(records_in) + 1))
+        description = f'第 {index} 段脚本'
+        code = run.get('code', '')
+        read_fields = {key for key in HOST_INPUT_FIELDS - business_input_keys - {'ref', 'label'}
+                       if repr(key) in code or '"'+key+'"' in code}
+        if records_in and all(record.get('ref') for record in records_in):
+            signatures = tuple(_json(record) for record in records_in)
+            reused = repeated_input_block(signatures, shown_inputs, read_fields)
+            shown_inputs.append((signatures, read_fields, index))
+            if reused:
+                previous, start, end = reused
+                lines.extend([f'{description}的输入第 {start+1} 至 {end} 行与第 {previous} 段的全部输入逐行相同，字段、值及顺序见该段。', ''])
+                records_in = records_in[:start] + records_in[end:]
+                positions = positions[:start] + positions[end:]
+                if not records_in: continue
+                lines.extend(['下方按原顺序列出其余输入，原输入行号为 '+row_ranges(positions)+'。', ''])
+                description += '的其余输入'
         conditions = [{key:record[key] for key in ('taskName','formName','executionPeriod') if key in record} for record in records_in]
         conditions = list({_json(condition):condition for condition in conditions if condition}.values())
-        if conditions: section('实际取数的业务表与开表时期',conditions,3)
+        if conditions: section('实际取数的业务表与数据加载时期',conditions,3)
         same_rows = bool(records_in) and [r.get('ref') for r in records_in] == list(inputs_by_fact)
         def matches_source(record):
             source=inputs_by_fact.get(record.get('ref'))
@@ -588,16 +694,16 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
         same_values = bool(records_in) and all(matches_source(record) for record in records_in)
         if same_values:
             if same_rows:
-                lines.extend([f'第 {index} 段脚本使用上方全部 {len(records_in)} 条来源数据，按来源原顺序输入。',''])
+                lines.extend([f'{description}使用上方全部 {len(records_in)} 条来源数据，按来源原顺序输入。',''])
             else:
-                lines.extend([f'第 {index} 段脚本复用上方来源值，实际输入次序如下（含重复使用）：',''])
-                table(['输入次序','来源位置'],[[str(i),scalar(record['ref'])] for i,record in enumerate(records_in,1)])
+                lines.extend([f'{description}复用上方来源值，实际输入次序如下（含重复使用）：',''])
+                table(['输入次序','来源位置'],[[str(i),scalar(record['ref'])] for i,record in zip(positions,records_in)])
         elif records_in:
-            heading(f'第 {index} 段脚本实际使用的业务输入',3)
+            heading(f'{description}对应的业务输入',3)
             projected=[]
-            for record in records_in:
+            for original_position, record in zip(positions, records_in):
                 selected={k:v for k,v in record.items() if k in business_input_keys}
-                selected['factId']=record.get('ref','输入行'+str(len(projected)+1))
+                selected['factId']=record.get('ref','输入行'+str(original_position))
                 if 'data' in selected or 'rows' in selected: section('实际输入',selected,4)
                 elif any(key in selected for key in ('value','dimensions','headers')): projected.append(selected)
             if projected: facts(projected,4)
@@ -606,12 +712,18 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
                           'period 为实际数据时期；headers 为来源标题，unit 为来源单位。缺失字段与来源空值按实际输入区分。',''])
         extras=[]
         extra_positions=[]
-        for record_index,record in enumerate(records_in,1):
+        label_separator = None
+        if records_in and all(isinstance(record.get('label'), str) and record.get('headers')
+                              and all(isinstance(part, str) for part in record['headers']) for record in records_in):
+            label_separator = next((sep for sep in ('_', ' / ') if all(
+                record['label'] == sep.join(record['headers']) for record in records_in)), None)
+        if label_separator is not None:
+            lines.extend([f'脚本收到的每行 label 均由该行原始 headers 按顺序用 `{label_separator}` 连接。', ''])
+        for record_index,record in zip(positions,records_in):
             extra={key:child for key,child in record.items() if key not in HOST_INPUT_FIELDS | business_input_keys
-                   or (key in HOST_INPUT_FIELDS and key not in business_input_keys | {'ref','label'}
-                       and (repr(key) in run.get('code','') or '"'+key+'"' in run.get('code','')))}
+                   or key in read_fields}
             # A distinct script label cannot silently be replaced by a source header.
-            if record.get('label') and record.get('label') != ' / '.join(record.get('headers',[])):
+            if label_separator is None and record.get('label') and record.get('label') != ' / '.join(record.get('headers',[])):
                 extra['label']=record['label']
             for field in ('dimensions','dimensionNames'):
                 if field in record and not record[field]: extra[field]=record[field]
@@ -656,9 +768,19 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
         section('本次计算修改的前后依据',comparison,3)
 
     heading('四、执行结果与交付内容',2)
+    shown_output_tables = {}
     for index,item in enumerate(outputs,1):
         if not isinstance(item,dict): section(f'结果 {index}',item,3); continue
         result=output_business_fields(item)
+        rows, columns = result.get('rows'), result.get('columns')
+        if (result.get('outputKind') in ('TABLE', 'CHART_DATA') and columns and rows
+                and all(isinstance(row, dict) and isinstance(row.get('values'), dict) for row in rows)):
+            # Only share the printed cells. Each run, result identity, role and lineage stays independently addressable.
+            body = _json([columns, [{k: v for k, v in row.items() if k != 'rowRef'} for row in rows]])
+            previous = shown_output_tables.setdefault(body, index)
+            if previous != index:
+                del result['rows'], result['columns']
+                result['明细位置'] = f'列定义、逐行取值和状态与结果{previous}相同，按相同顺序读取其明细。'
         if review_targets:
             result={'本次用途':('本次采用' if item.get('derivedId') in review_targets or item.get('pythonRunRef') in review_targets
                              else '前置计算或探索上下文；核对其对本次采用结果的影响'),**result}
@@ -682,11 +804,38 @@ def render_business_markdown(material, aliases, readable_view=None, wire_referen
             summary['发现的问题']=[{key:row[key] for key in ('message','description','severity','location','suggestion') if key in row}
                                   for row in review['issues']]
         section('已有计算审查结论',summary,3)
+    if value.get('documentTrends'):
+        heading('时期折线图', 3)
+        table(['指标', '时期', '期数', '序列数', '核对状态'], [
+            [escape(item['metric'] + ('（'+item['unit']+'）' if item['unit'] else '')),
+             escape(item['from']+'至'+item['to']), str(item['periods']), str(item['series']),
+             '实际图形已核对' if item['measured'] else '已绑定，未实测']
+            for item in value['documentTrends']])
+    if value.get('documentTextBasis') == 'VERIFIED_MARKDOWN':
+        section('宿主交付的图表与数据附录', {'实际绑定图表': value.get('documentFigures', []),
+                    '附录业务行数': value.get('appendixRows'), '来源事实数': value.get('appendixFacts')}, 3)
+    focus = value.get('revisionFocus') or {}
+    if focus.get('scope') == 'MARKDOWN_DELTA':
+        section('上次审查要求修正的内容', focus['previousIssues'], 3)
+    if value.get('documentOrders'):
+        heading('图表实际排列方向', 3)
+        table(['图表数据集', '已核对的数值顺序'],
+              [[escape(key), '从小到大' if direction == 'asc' else '从大到小']
+               for key, direction in value['documentOrders'].items()])
+    if value.get('documentTextBasis') == 'HOST_RENDERED' and value.get('documentText'):
+        gaps = _rendered_column_gaps(value['documentText'])
+        if gaps:
+            heading('实测页面中的空列', 3)
+            lines.append('、'.join(gaps) + '。请按本次来源核对这些列。来源有名称或数值时，检查明细能否逐行对应；来源确实为空时按空值接受。')
     for key in ('documentText','documentSourceText','candidateAnswer'):
         if value.get(key): section(key,value[key],3)
+    if value.get('completeRankedListsAvailable'):
+        section('本次排序答复的交付选择',
+                '按用户原问选择 rankedDelivery。要求各成员完整排序，且上方来源业务表已回答整题时，选 SOURCE_TABLES；宿主将原样交付所有排序表，按这些表给出审核结论。'
+                '要求限定名次、只看某个来源、另外解释或计算，或来源表不能独立回答整题时，选 CANDIDATE，审核本次答复。',3)
     projection=value.get('documentSourceTextProjection') or {}
     extra_text=['\n'.join(change.get('sourceLines',[])) for change in projection.get('changes',[])]
     if any(extra_text): section('报告折叠部分及其他展示文字','\n\n'.join(extra_text),3)
     if value.get('documentText') and value.get('documentTextBasis'):
-        lines.append('正文取自：'+{'HOST_RENDERED':'程序读取的实际展示正文','STATIC_SOURCE':'静态页面文字（尚未验证浏览器实际展示）'}.get(value['documentTextBasis'],value['documentTextBasis']))
+        lines.append('正文取自：'+{'HOST_RENDERED':'程序读取的实际展示正文','VERIFIED_MARKDOWN':'已通过渲染检查的 Markdown 与来源绑定','STATIC_SOURCE':'静态页面文字（尚未验证浏览器实际展示）'}.get(value['documentTextBasis'],value['documentTextBasis']))
     return '\n'.join(lines) + '\n'

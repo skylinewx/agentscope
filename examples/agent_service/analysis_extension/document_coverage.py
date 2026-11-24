@@ -4,6 +4,13 @@ import json
 from .models import AnalysisError
 from .business_dataset import row_values
 
+WATERFALL_BINDING_HELP = (
+    '完整构成可直接在当前段落放 <div data-analysis-waterfalls="公式数据集key"></div>，宿主按本层来源绘制并标明差额。自定义显示时，'
+    '在当前模板中按 node.waterfall.steps 顺序为每步创建轨道及其子条形。DOM 创建后调用 '
+    'window.analysisCharts.bindHorizontalWaterfall(rows.map(({bar, track, labelElement}, stepIndex) => '
+    '({element: bar, track, labelElement, stepIndex})), {setKey, nodeRef: node.factRef})。'
+    '名称元素显示 step.label。图注如需表内地址用 node.cellAddress。setKey 是 document.datasets 中的绑定名。')
+
 
 def reference(document, binding):
     if not isinstance(binding, dict):
@@ -25,6 +32,8 @@ def reference(document, binding):
         if type(index) is not int or not 0 <= index < len(node['waterfall']['steps']):
             raise ValueError('unknown waterfall step')
         identity = [dataset['valueRef'], 'waterfall', binding['nodeRef'], index]
+    elif set(binding) == {'trendRef'} and binding['trendRef'] in document.get('periodTrendRefs', []):
+        identity = ['periodTrend', binding['trendRef']]
     else:
         raise ValueError('unknown binding shape')
     return 'bound:' + json.dumps(identity, ensure_ascii=False, separators=(',', ':'))
@@ -69,14 +78,17 @@ def evaluate(document, observation):
     return result
 
 
-def required_formula_steps(document):
-    """Expected steps are determined by the frozen document, not observations."""
-    required = set()
+def formula_step_groups(document):
+    """Group expected chart marks by their actual dataset and formula node."""
     for key, dataset in document.get('datasets', {}).items():
         if dataset.get('kind') != 'FORMULA': continue
         for node in dataset.get('nodes', []):
             steps = (node.get('waterfall') or {}).get('steps', [])
             if len(steps) < 3: continue  # A single-input transfer does not require a waterfall.
-            required.update(reference(document, {'setKey': key, 'nodeRef': node['factRef'], 'stepIndex': i})
-                            for i in range(len(steps)))
-    return required
+            refs = [reference(document, {'setKey': key, 'nodeRef': node['factRef'], 'stepIndex': i})
+                    for i in range(len(steps))]
+            yield key, node['factRef'], refs
+
+
+def required_formula_steps(document):
+    return {ref for _, _, refs in formula_step_groups(document) for ref in refs}

@@ -175,6 +175,37 @@ class BudgetPreparationTests(PresentationCase):
             self.assertEqual(target['query']['dimensions'], {'MD_ORG': '07'})
         self.assertEqual(before, self.turn.state)
 
+    async def test_retry_corrects_objective_fact_on_the_selected_source_without_retaining_failed_declaration(self):
+        from analysis_extension.source_views import register
+        capture, selection, _, receipt = self.source(False)
+        source = register(self.turn, {**selection, 'columnNames': ['metric1'], 'rowIndices': [0]})
+        source_ref = source['sourceRef']
+        request = {'mode': 'ANALYSIS', 'goal': '解释所选数据的构成', 'subjectSources': [{'sourceRef': source_ref}]}
+        await self.service.task(**request, materials=[{'role': 'PRIMARY', 'kinds': ['VALUES']}])
+        runner = self.register_runner(capture, receipt)
+        before = deepcopy(self.turn.state)
+        objective = {'role': 'PRIMARY', 'capability': 'DATA_COMPOSITION', 'sourceRef': source_ref}
+
+        with self.assertRaises(AnalysisError) as caught:
+            await self.service.task(**request, objectives=[{**objective, 'question': '解释原选择的行',
+                                                            'factRefs': ['fact_not_in_selection']}])
+        self.assertEqual(caught.exception.code, 'PREPARATION_SUBJECT_NOT_UNIQUE')
+        details = caught.exception.details
+        self.assertEqual(details['sourceRef'], source_ref)
+        self.assertEqual(details['invalidRefs'], ['fact_not_in_selection'])
+        self.assertTrue(details['candidatesComplete'])
+        candidate, = details['candidates']
+        self.assertEqual(before, self.turn.state)
+        runner.assert_not_awaited()
+
+        corrected = await self.service.task(**request, objectives=[{**objective, 'question': '解释已核对的行',
+                                                                    'factRefs': [candidate['factRef']]}])
+        self.assertEqual(corrected['preparedFormulaInputs']['ready'], 1)
+        formulas = [item for item in self.turn.state['objectives'] if item['capability'] == 'DATA_COMPOSITION']
+        self.assertEqual([item['factRefs'] for item in formulas], [[candidate['factRef']]])
+        self.assertEqual(self.turn.state['inputSetVersion'], before['inputSetVersion'])
+        runner.assert_awaited_once()
+
     async def test_multiple_formula_sources_return_explicit_choices_without_adopting_on_failure(self):
         from analysis_extension.source_views import register
         _, selection, _, _ = self.source(False)

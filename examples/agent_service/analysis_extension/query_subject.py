@@ -60,6 +60,11 @@ def candidates(turn):
     return result
 
 
+def _selection(candidate):
+    return {key: deepcopy(candidate[key]) for key in ('captureRef', 'stepId', 'batchId', 'resultSetId', 'columnNames', 'rowIndices')
+            if key in candidate}
+
+
 def freeze_subject(turn, available, choices):
     """沿用同次核对的主体选择。错误或冲突只标记待解析，不能偷换成最后一个查询。"""
     known = {item['candidateRef']: item for item in available}
@@ -74,8 +79,7 @@ def freeze_subject(turn, available, choices):
                  or candidate.get('rowIndices') is not None and not set(rows) <= set(candidate['rowIndices']))):
             invalid = True
             break
-        selected = {key: deepcopy(candidate[key]) for key in ('captureRef', 'stepId', 'batchId', 'resultSetId', 'columnNames', 'rowIndices')
-                    if key in candidate}
+        selected = _selection(candidate)
         if rows is not None:
             selected['rowIndices'] = sorted(set(rows))
         prior = selections.get(choice['candidateRef'])
@@ -92,13 +96,20 @@ def freeze_subject(turn, available, choices):
 
 def remembered_subject(turn):
     """单一来源可保留上界；多个来源必须明确选中，不按最后一次工具调用猜主体。"""
+    delivered = set((turn.state.get('hostCloseout') or {}).get('deliveredCaptureRefs', []))
+    available = None
+    if delivered:
+        available = candidates(turn)
+        selected = [_selection(item) for item in available if item['captureRef'] in delivered]
+        if {item['captureRef'] for item in selected} == delivered:
+            return {'selections': selected, 'basis': 'DELIVERED_BUSINESS_TABLES'}
     reviewed = turn.state.get('queryAnswerSubject')
     if reviewed and reviewed.get('selections'):
         return deepcopy(reviewed)
-    available = candidates(turn)
+    if available is None:
+        available = candidates(turn)
     if len(available) == 1 and not (reviewed or {}).get('invalidSelection'):
-        selected = {key: deepcopy(available[0][key]) for key in ('captureRef', 'stepId', 'batchId', 'resultSetId', 'columnNames', 'rowIndices')
-                    if key in available[0]}
+        selected = _selection(available[0])
         return {'selections': [selected], 'basis': 'SOURCE_RANGE_UPPER_BOUND',
                 'boundary': '来源范围上界；具体筛选以本轮已交付结果及意图为准。'}
     return {'selections': [], 'basis': 'UNRESOLVED_QUERY_SUBJECT', 'candidateCount': len(available),

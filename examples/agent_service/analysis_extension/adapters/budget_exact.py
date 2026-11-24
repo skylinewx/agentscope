@@ -2,7 +2,7 @@
 from collections import Counter
 import re
 
-from ..models import AnalysisError, digest, decimal_text, decimal_value
+from ..models import AnalysisError, Limits, digest, decimal_text, decimal_value
 
 
 def exact(table):
@@ -89,13 +89,60 @@ def view(table):
             'data': {**data, 'columns': columns, 'rows': rows, 'rowCount': len(rows)}}
 
 
+def corresponding_rows(table, selected, alternatives):
+    """Suggest other metrics at exactly the same source coordinates if unique."""
+    if not selected or len(selected) * len(alternatives) > Limits().page_size:
+        return {}
+    rows = table['data']['cellResults']
+    if len({rows[i]['metric'] for i in selected}) != 1:
+        return {}
+    origins = {origin['targetRef']: origin for origin in table['cellOrigins']}
+
+    def position(index):
+        row = rows[index]
+        return digest([origins[row['targetRef']]['context'], row['modelCode'], row['dimensions']])
+
+    coordinates = {position(i) for i in selected}
+    if len(coordinates) != len(selected):
+        return {}
+    result = {}
+    for name, available in alternatives.items():
+        matches = [(i, key) for i in available if (key := position(i)) in coordinates]
+        if len(matches) == len(coordinates) and {key for _, key in matches} == coordinates:
+            result[name] = [i for i, _ in matches]
+    return result
+
+
 def catalog(capture, receipt, step_id, table, path, selections, max_facts):
     from .budget_v2 import budget_source_context, data_context
-    from .budget_batch import selection_scope
+    from .budget_batch import result_ranges, selection_scope
     chosen = None if selections is None else [s for s in selections if s.get('stepId') == step_id and s.get('batchId') == table['batchId']]
     if chosen == []:
         return []
-    ranges = None if chosen is None else [selection_scope(s, table) for s in chosen]
+    ranges = None
+    if chosen is not None:
+        grid = view(table)
+        ranges = [selection_scope(s, grid) for s in chosen]
+        requested = {name for selection, (names, _) in zip(chosen, ranges)
+                     if selection.get('rowIndices') for name in names}
+        covered = {grid['exactRowMetrics'][i] for _, indices in ranges for i in indices}
+        missing = requested - covered
+        if missing:
+            allowed = result_ranges(receipt, step_id, table)
+            alternatives = {}
+            for i, name in enumerate(grid['exactRowMetrics']):
+                if name in missing and (allowed is None or i in allowed.get(name, ())):
+                    alternatives.setdefault(name, []).append(i)
+            if alternatives:
+                matches = (corresponding_rows(table, ranges[0][1], alternatives)
+                           if len(chosen) == 1 and set(chosen[0]['rowIndices']) == ranges[0][1] else {})
+                raise AnalysisError('INVALID_SELECTOR', '这些指标在本次回执中有记录，所填 rowIndices 却没有选中它们：'
+                                    + '、'.join(sorted(alternatives)) + '。行号属于整个回执，各指标可能占用不同的行。',
+                                    {'stepId': step_id, 'batchId': table['batchId'],
+                                     'unmatchedColumns': {name: {'availableCount': len(rows), 'exampleRowIndices': rows[:4],
+                                                              **({'matchingRowIndices': matches[name]} if name in matches else {})}
+                                                          for name, rows in alternatives.items()},
+                                     'hint': '若沿用已选对象，每个指标单独提交 matchingRowIndices（同一表、时期和全部维值唯一对应）。没有对应行号时按目标维度选行；exampleRowIndices 仅供定位。需要完整结果时采用回执的 selectors。'})
     source = budget_source_context(capture, receipt)
     origins = {item['targetRef']: item for item in table['cellOrigins']}
     evidence_ids = [e['evidenceId'] for e in receipt.get('evidence', []) if e.get('kind') == 'BUDGET_BATCH'

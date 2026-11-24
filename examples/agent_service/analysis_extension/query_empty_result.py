@@ -8,6 +8,12 @@ def business_answer(sources):
     return '\n\n'.join(view['markdown'] for view in views)
 
 
+def _delivered_captures(sources):
+    # business_answer has verified that the host printed the complete tables for these receipts.
+    return list(dict.fromkeys(source['captureRef'] for source in sources)) if all(
+        source.get('captureRef') for source in sources) else []
+
+
 def empty_scenario_analysis_answer(evidence):
     """A completed scenario override with no data cannot gain a formula by querying the budget again."""
     if not evidence or evidence.get('pythonRuns'):
@@ -25,7 +31,7 @@ def empty_scenario_analysis_answer(evidence):
     if answer is None:
         return None
     return {'status': 'DIRECT', 'semanticReview': 'NOT_REVIEWED', 'deliveryStatus': 'NO_DATA',
-            'reason': 'NO_DATA', 'issues': [], 'answer': answer}
+            'reason': 'NO_DATA', 'issues': [], 'answer': answer, 'deliveredCaptureRefs': _delivered_captures(sources)}
 
 
 def _unmatched_answer(query):
@@ -63,25 +69,102 @@ def _confirmed_empty_filter(query):
             and all(batch.get('status') == 'SUCCEEDED' and batch.get('rowCount') == 0 for batch in batches))
 
 
+def business_outcome(query):
+    outcome = (query.get('failureSummary') or {}).get('outcome')
+    if outcome == 'NO_MATCH' and _confirmed_empty_filter(query):
+        return 'NO_DATA'
+    return outcome
+
+
+def incomplete_result_rows(query):
+    return (any(result.get('rowsComplete') is False or not isinstance(result.get('rows'), list)
+                for result in query.get('resultSets', []))
+            or any(result.get('rowsComplete') is False for result in query.get('resultSetCatalog', [])))
+
+
+def completed_result_set(receipt, result):
+    """Use the returned table's execution boundary when another named binding failed."""
+    data = receipt.get('data') or {}
+    if incomplete_result_rows({'resultSets': [result], 'resultSetCatalog': [
+            entry for entry in data.get('resultSetCatalog', [])
+            if entry.get('resultSetId') == result.get('resultSetId')]}):
+        return False
+    if receipt.get('status') == 'SUCCEEDED' and data.get('complete') is True:
+        return True
+    issues = data.get('unresolvedGroups') or []
+    binding = (result.get('context', {}).get('target') or {}).get('formBindingKey')
+    if (receipt.get('status') != 'PARTIAL' or data.get('resultType') != 'BUDGET_QUERY_RESULT'
+            or not binding or not issues or receipt.get('resumeRef') or receipt.get('error')
+            or any(not g.get('binding') or g['binding'] == binding for g in issues)
+            or data.get('valueFilter') and data['valueFilter'].get('executionStatus') != 'EXECUTED'):
+        return False
+    rows = result['rows']
+    if rows:
+        return all(row.get('valueState') in ('PRESENT', 'NULL', 'NO_DATA') and row.get('originRefs') for row in rows)
+    # An empty placeholder alone cannot establish a successful filter. Its native batch
+    # must have run the specified target on this form and returned exactly zero rows.
+    from .adapters.budget_batch import tables
+    logical = str(result.get('targetId') or '').split(':', 1)[0]
+    for item in (data.get('valueFilter') or {}).get('batches', []):
+        column = (item.get('logicalTargetColumns') or {}).get(logical)
+        if item.get('status') != 'SUCCEEDED' or item.get('rowCount') != 0 or not column:
+            continue
+        for _, table, _ in tables(receipt):
+            if (table.get('batchId') == item.get('batchId') and table.get('disposition') == 'SUCCEEDED'
+                    and table.get('data', {}).get('rowCount') == 0
+                    and any(metric.get('name') == column and metric.get('context', {}).get('target', {}).get('formBindingKey') == binding
+                            and metric['context'].get('period') == result['context'].get('period') for metric in table.get('metrics', []))):
+                return True
+    return False
+
+
+def empty_table_status(query, facts):
+    """Classify completed business tables without changing any source cell or its display."""
+    if (query.get('purpose') != 'QUERY' or query.get('complete') is not True
+            or query.get('unresolvedGroups') or incomplete_result_rows(query)):
+        return None
+    outcome = business_outcome(query)
+    if outcome not in (None, 'ROWS_RETURNED', 'NO_DATA'):
+        return None
+    seen = set()
+    for fact in facts:
+        state = fact.get('valueState')
+        if state not in ('NULL', 'NO_DATA') or fact.get('value') is not None:
+            return None
+        seen.add(state)
+    if 'NULL' in seen:
+        return 'EMPTY_VALUES' if outcome != 'NO_DATA' else None
+    if seen or outcome == 'NO_DATA':
+        return 'NO_DATA'
+    summary = query.get('summary') or {}
+    if (query.get('resultSets') and summary.get('rowCount', 0) == 0
+            or summary.get('resultSetCount') and summary.get('rowCount') == 0):
+        return 'NO_DATA'
+    return None
+
+
 def empty_query_answer(evidence):
-    if not evidence or evidence.get('pythonRuns'):
+    if not evidence or evidence.get('pythonRuns') or evidence.get('referencedCalculations'):
         return None
     empty_sources, unmatched = [], []
+    has_null_values = False
     for source in evidence.get('sources', []):
-        if source.get('diagnostic') or any(fact.get('valueState') != 'NO_DATA' for fact in source.get('facts', [])):
+        if source.get('diagnostic'):
             return None
+        facts = source.get('facts', [])
         info = source.get('source', {})
         query = info.get('businessQuery')
         if not query:
-            if source.get('facts') or info.get('batchQueries') or info.get('gridFiles') or info.get('gridFileErrors'):
+            if facts or info.get('batchQueries') or info.get('gridFiles') or info.get('gridFileErrors'):
                 return None
             continue
         if query.get('purpose') != 'QUERY' or query.get('complete') is not True or info.get('status') not in (None, 'SUCCEEDED'):
             return None
-        outcome = (query.get('failureSummary') or {}).get('outcome')
-        if outcome == 'NO_DATA' or (outcome == 'NO_MATCH' and _confirmed_empty_filter(query)):
+        table_status = empty_table_status(query, facts)
+        if table_status:
             empty_sources.append(source)
-        elif outcome == 'NO_MATCH':
+            has_null_values |= table_status == 'EMPTY_VALUES'
+        elif business_outcome(query) == 'NO_MATCH' and all(f.get('valueState') == 'NO_DATA' for f in facts):
             unmatched.append(_unmatched_answer(query))
         else:
             return None
@@ -90,10 +173,11 @@ def empty_query_answer(evidence):
         tables = business_answer(empty_sources)
         if tables is None:
             return None
-        answer, outcome = '\n\n'.join([tables, *unmatched]), 'NO_DATA'
+        answer = '\n\n'.join([tables, *unmatched])
+        outcome = 'EMPTY_VALUES' if has_null_values else 'NO_DATA'
     elif unmatched:
         answer, outcome = '\n\n'.join(unmatched), 'NO_MATCH'
     else:
         return None
     return {'status': 'DIRECT', 'semanticReview': 'NOT_REVIEWED', 'deliveryStatus': outcome,
-            'reason': outcome, 'issues': [], 'answer': answer}
+            'reason': outcome, 'issues': [], 'answer': answer, 'deliveredCaptureRefs': _delivered_captures(empty_sources)}

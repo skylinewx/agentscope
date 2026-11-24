@@ -244,6 +244,6 @@ class CapturedGroupingLifecycleTests(PresentationCase):
         self.assertEqual(prepared['intentDraft']['dimensionScopes'][0]['confirmedSource'], {**record['confirmedSource'], 'contextId': receipt['context']['contextId'], 'querySessionId': receipt['querySessionId']})
         self.assertEqual(prepared['intentDraft']['dimensionScopes'][0]['sourceText'], record['draft']['sourceText'])
         self.assertEqual(prepared['scope']['periodCode'], '2026N0001')
-        self.assertEqual(prepared['scope']['taskCodes'], ['TASK'])
+        self.assertNotIn('taskCodes', prepared['scope'])
         self.assertNotIn('板块', prepared.get('contextText', ''))
         self.assertNotIn('grouping', review_context(resumed)['selectedContexts'][0]['intent'])

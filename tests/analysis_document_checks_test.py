@@ -19,6 +19,23 @@ def measurements(refs=(), width=900, partial=False, static_keys=None):
 
 
 class DocumentCheckTests(PresentationCase):
+    async def test_descriptive_table_keeps_its_measured_order_and_caption(self):
+        cap, selectors, scope = saved_fixture(self.store, ('-8300', '-10360.23', '100'))
+        built = await self.service.build([cap], selectors, scope,
+            [{'id': 'stats', 'operator': 'DESCRIBE', 'direction': 'asc'}], 'describe-order')
+        artifact = self.store.get_analysis(OWNER, built['analysisRef'])
+        doc = compile_document(artifact, {'title': '统计', 'html': '<html><head></head><body></body></html>',
+            'datasets': [{'key': 'ranking', 'valueRef': 'derived_stats'}]})
+        data = doc['datasets']['ranking']
+        self.assertEqual((data['kind'], data['direction'], data['directionLabel']), ('TABULAR', 'asc', '从小到大'))
+        refs = [row['values']['factRef'] for row in data['rows']]
+        result = evaluate(doc, measurements(refs))
+        self.assertEqual((result['orders'][0]['status'], result['orders'][0]['direction']), ('PASS', 'asc'))
+        self.assertTrue(evaluate(doc, measurements(refs[::-1]))['blocking'])
+        self.assertEqual(evaluate(doc, measurements(refs[:2], partial=True))['orders'][0]['status'], 'PASS')
+        # A statistics-only report does not have to render a ranking.
+        self.assertEqual(evaluate(doc, {**measurements(), 'orders': []})['unmeasuredDatasets'], [])
+
     async def test_invalid_geometry_blocks_even_without_diagnostic_text_or_with_unavailable_reason(self):
         await self.setup_preview()
         for width in (420, 900):

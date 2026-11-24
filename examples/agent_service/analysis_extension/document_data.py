@@ -14,6 +14,9 @@ def compile_datasets(artifact, specifications):
     if not isinstance(specifications, list) or len(specifications) > 50:
         raise AnalysisError('INVALID_DOCUMENT_DATASET', 'datasets 最多 50 个集合。', {'path': '/document/datasets'})
     facts = {f['factId']: f for f in artifact['facts']}
+    from .presentation_options import label_resolver
+    labels = artifact.get('presentation', {}).get('labels') or []
+    measure_names = label_resolver(artifact)(labels, '/presentation/labels')['measure'] if labels else {}
     derived = {v['derivedId']: v for v in artifact['derivedValues']}
     result, refs = {}, set()
     for index, spec in enumerate(specifications):
@@ -50,7 +53,7 @@ def compile_datasets(artifact, specifications):
                             unavailable=named_rows(columns, [fact_record(facts[ref], fmt) for ref in
                                        value.get('unavailableFactIds', [])], prefix=ref + ':unavailable'))
             elif value['operator'] == 'FORMULA_CHECK':
-                data = formula_dataset(value, facts, spec.get('nodeRefs'), fmt)
+                data = formula_dataset(value, facts, spec.get('nodeRefs'), fmt, measure_names)
             elif value['operator'] in ('PYTHON', 'DESCRIBE') and value.get('outputKind') in ('TABLE', 'CHART_DATA'):
                 from .business_dataset import table
                 data = table(value['columns'], value['rows'], ref=ref)
@@ -60,6 +63,8 @@ def compile_datasets(artifact, specifications):
                 if value['operator'] == 'DESCRIBE':
                     data.update(statistics=deepcopy(value['statistics']), counts=deepcopy(value['counts']),
                                 meaning=value['meaning'], denominator=deepcopy(value['denominator']))
+                    if value.get('direction') in ('asc', 'desc'):
+                        data['direction'] = value['direction']
             elif value['operator'] == 'RECONCILE':
                 data = {'kind': 'RECONCILIATION', 'parent': fact_record(facts[value['inputRefs'][0]], fmt),
                         'children': [fact_record(facts[ref], fmt) for ref in value['inputRefs'][1:]],
@@ -69,6 +74,11 @@ def compile_datasets(artifact, specifications):
                                    for key, source in (('sourceValue', 'parentValue'), ('childSum', 'childSum'), ('difference', 'difference'))}}
             else:
                 raise AnalysisError('INVALID_DOCUMENT_DATASET', '集合只接受排序、公式追溯或汇总核对结果；标量使用 bindings。')
+            if value['operator'] in ('SORT', 'RANK', 'DESCRIBE'):
+                from .display_tables import comparison_labels
+                comparison_labels(data, facts)
+            if data.get('direction') in ('asc', 'desc'):
+                data['directionLabel'] = '从小到大' if data['direction'] == 'asc' else '从大到小'
             data['valueRef'] = value['derivedId']
             result[key] = data
             refs.add(value['derivedId'])
@@ -96,7 +106,7 @@ def fact_record(fact, fmt):
             'valueState': fact['valueState'], **amount(fact['value'] if fact['valueState'] == 'PRESENT' else None, fmt)}
 
 
-def formula_dataset(value, facts, node_refs, fmt):
+def formula_dataset(value, facts, node_refs, fmt, aliases=None):
     trace = value['formulaTrace']
     known = {node['factRef']: node for node in trace['nodes']}
     if node_refs is None:
@@ -110,7 +120,11 @@ def formula_dataset(value, facts, node_refs, fmt):
         node = known[ref]
         if not node.get('expression') or node.get('boundary'):
             raise AnalysisError('INVALID_DOCUMENT_DATASET', 'nodeRefs 须选择可展开的公式节点，叶子/外部边界不会生成计算层。')
-        operands = [{**fact_record(facts[dep['factRef']], fmt)} for dep in node['dependencies']]
+        from .formula_labels import component_labels
+        from .formatting import formula_text
+        references = dict.fromkeys([ref] + [dep['factRef'] for dep in node['dependencies']])
+        labels = component_labels([facts[key] for key in references], aliases or {})
+        operands = [{**fact_record(facts[dep['factRef']], fmt), 'shortLabel': labels[dep['factRef']]} for dep in node['dependencies']]
         for operand in operands:
             if node.get('arithmeticPolicy'):
                 operand['calculationValue'] = amount(local_input_value(node, facts[operand['factRef']]), fmt)
@@ -119,7 +133,10 @@ def formula_dataset(value, facts, node_refs, fmt):
         tree = Expression(node['expression']).tree
         local_checked = node.get('localCheck', {}).get('status') in ('MATCH', 'MISMATCH')
         recursive_checked = node.get('status') in ('MATCH', 'MISMATCH')
-        item = {**fact_record(facts[ref], fmt), 'operands': operands,
+        item = {**fact_record(facts[ref], fmt), 'operands': operands, 'shortLabel': labels[ref],
+                'sourceExpression': node['expression'],
+                'displayExpression': formula_text(tree, {addr: labels[key] for addr, key in address_refs.items()}),
+                'cellAddress': facts[ref].get('cellAddress'),
                 'localStatus': node.get('localCheck', {}).get('status'), 'recursiveStatus': node.get('status'),
                 'expressionTree': reference_tree(tree, address_refs),
                 'values': {key: amount(raw, fmt) for key, raw in {
@@ -169,22 +186,24 @@ def formula_waterfall(node, fmt):
     contributions = node['contributions']
     if local_value is None or any(item['value'] is None for item in contributions):
         return None
+    names = {item['factRef']: item.get('shortLabel') or ' / '.join(str(part) for part in item.get('headers') or [] if part) or '来源未提供名称'
+             for item in [node, *node['operands']]}
     steps, current = [], Decimal(0)
     for contribution in contributions:
         end = current + decimal_value(contribution['value'])
-        steps.append({**contribution, 'kind': 'CONTRIBUTION',
+        steps.append({**contribution, 'kind': 'CONTRIBUTION', 'label': names[contribution['factRef']],
                       'start': decimal_text(current), 'end': decimal_text(end)})
         current = end
     constant = decimal_value(node['constant']['value'])
     if constant:
         end = current + constant
-        steps.append({'kind': 'CONSTANT', **node['constant'],
+        steps.append({'kind': 'CONSTANT', 'label': '公式常数', **node['constant'],
                       'start': decimal_text(current), 'end': decimal_text(end)})
         current = end
     # 终点只能是完整公式的本层计算值，不能用来源值或差额补齐。
     if current != decimal_value(local_value):
         return None
-    steps.append({'kind': 'TOTAL', 'factRef': node['factRef'], 'headers': deepcopy(node.get('headers', [])),
+    steps.append({'kind': 'TOTAL', 'factRef': node['factRef'], 'label': names[node['factRef']], 'headers': deepcopy(node.get('headers', [])),
                   **amount(local_value, fmt), 'start': '0', 'end': decimal_text(current)})
     endpoints = [decimal_value(step[key]) for step in steps for key in ('start', 'end')]
     minimum, maximum = min(endpoints), max(endpoints)

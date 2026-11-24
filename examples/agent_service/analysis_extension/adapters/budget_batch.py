@@ -1,5 +1,6 @@
 """预算批量 TABLE 回执：保留矩阵、查询项身份和真实分组粒度，不构造网格单元格。"""
 from ..models import AnalysisError, Limits, decimal_text, decimal_value, digest
+from ..budget_dimensions import catalog_model_codes
 from ..sources import combined_context
 
 
@@ -127,6 +128,13 @@ def validate(capture, receipt, step_id, table):
     return data
 
 
+def metric_rows(table, names):
+    """The exact-cell protocol assigns each physical row to one metric."""
+    if 'exactRowMetrics' in table:
+        return {i for i, name in enumerate(table['exactRowMetrics']) if name in names}
+    return set(range(table['data']['rowCount']))
+
+
 def selection_scope(selection, table):
     """先校验选择器，再构造集合；避免逐行线性扫描大批行下标。"""
     from .budget_exact import view
@@ -149,7 +157,7 @@ def selection_scope(selection, table):
         raise AnalysisError('INVALID_SELECTOR', 'rowIndices 必须使用真实、无重复的表行下标。')
     chosen = None if indices is None else set(indices)
     if 'exactRowMetrics' in table:
-        eligible = {index for index, name in enumerate(table['exactRowMetrics']) if name in names}
+        eligible = metric_rows(table, names)
         chosen = eligible if chosen is None else chosen & eligible
     return set(names), chosen
 
@@ -170,15 +178,21 @@ def catalog(capture, selections=None, max_facts=Limits().max_facts):
             requested = (None if selections is None else [item for item in selections
                          if item.get('stepId') == step_id and item.get('batchId') == table['batchId']])
             if requested:
+                from .budget_exact import view
+                selected_table = view(table)
                 for selection in requested:
                     names, indices = selection_scope(selection, table)
                     # Omitted rowIndices means all actual rows, including for a
                     # native result already reduced to the matching population.
                     # Never silently intersect a wider selection with the filter.
-                    indices = set(range(data['rowCount'])) if indices is None else indices
                     for name in names:
-                        if not indices <= allowed.get(name, set()):
-                            raise AnalysisError('VALUE_FILTER_SCOPE_MISMATCH', '分析选择超出应用服务确认的数值筛选结果，请使用返回的行选择器。')
+                        actual = metric_rows(selected_table, {name})
+                        selected = actual if indices is None else actual & indices
+                        if not selected <= allowed.get(name, set()):
+                            raise AnalysisError('VALUE_FILTER_SCOPE_MISMATCH', '所选指标与行的组合超出该查询确认的结果范围。请按该指标返回的完整选择器采用行和列。',
+                                                {'stepId': step_id, 'batchId': table['batchId'], 'columnName': name,
+                                                 'availableRowCount': len(allowed.get(name, ())), 'nextRead': 'selectors',
+                                                 'hint': '读取本回执的 selectors，原样采用相应指标的 columnNames 和 rowIndices。'})
             retained = [{'stepId': step_id, 'batchId': table['batchId'], 'columnNames': [name], 'rowIndices': sorted(rows)}
                         for name, rows in allowed.items()]
             if not retained or requested == []:
@@ -281,10 +295,19 @@ def selectors(capture):
                        'rowIndicesOptional': True, 'rowsPointer': path + ('/data/cellResults' if native_exact else '/data/rows'),
                        'inputGuidance': '所选指标和行确定范围；selection 加 role=PRIMARY 后由宿主生成组合粒度成员，scope 仅需 label/selectionReason，不抄机构到 members。空数值保留 null，显示占位符不作为数字。',
                        'columnsPointer': path + ('/request/metrics' if native_exact else '/data/columns')}
+        models = {row.get('modelCode') for row in data.get('cellResults', []) if row.get('modelCode')}
+        models.update(metric['cellExp'].split('[', 1)[0] for metric in table.get('metrics', []) if metric.get('cellExp'))
+        source_codes = catalog_model_codes(models)
+        labels = {}
+        for entry in receipt.get('data', {}).get('dimensionCatalog', []):
+            code, model, label = entry.get('dimCode'), entry.get('modelCode'), entry.get('label')
+            if code in item['memberDimensions'] and label and model in source_codes:
+                labels.setdefault(code, set()).add(label)
+        item['dimensionLabels'] = {code: next(iter(names)) for code, names in labels.items() if len(names) == 1}
         narrowed = (receipt.get('data', {}).get('valueFilter')
                     or receipt.get('data', {}).get('sourceBasis', {}).get('operation') == 'IMMUTABLE_FACT_VIEW')
         full_table = (allowed is not None and set(allowed) == set(item['columnNames'])
-                      and all(rows == set(range(data.get('rowCount', 0))) for rows in allowed.values()))
+                      and all(rows == metric_rows(table, {name}) for name, rows in allowed.items()))
         if allowed is None or full_table and not narrowed:
             result.append(item)
         else:
@@ -292,6 +315,13 @@ def selectors(capture):
                 result.append({**item, 'columnNames': [name], 'rowIndices': sorted(rows), 'rowIndicesOptional': False,
                                'selectionReason': '应用服务已根据原生数值完成筛选' if narrowed else '仅采用最终业务结果实际引用的行列'})
     return result
+
+
+def whole_metric_selection(entry, role):
+    """An explicit option over one returned table whose source permits every row."""
+    if entry.get('disposition') != 'SUCCEEDED' or not entry.get('rowIndicesOptional'):
+        return None
+    return {key: entry[key] for key in ('captureRef', 'stepId', 'batchId', 'columnNames')} | {'role': role}
 
 
 def adapt(captures, selections, scope, max_facts):
@@ -316,6 +346,7 @@ def adapt(captures, selections, scope, max_facts):
                 for ref in data_refs}
     facts = {}
     complete = True
+    selected_sources_complete = True
     populations = []
     for selection in selections:
         ref = selection['captureRef']
@@ -345,7 +376,15 @@ def adapt(captures, selections, scope, max_facts):
             populations.append({row[member_index] if member_index is not None else data['fixedDimValMap'][dimension]
                                 for index, row in enumerate(data['rows'])
                                 if 'exactRowMetrics' not in table or table['exactRowMetrics'][index] in column_names})
-        complete &= receipts[ref].get('completeness', {}).get('enumerationExhausted') is True
+        exhausted = receipts[ref].get('completeness', {}).get('enumerationExhausted') is True
+        complete &= exhausted
+        if receipts[ref].get('status') == 'PARTIAL' and receipts[ref].get('data', {}).get('resultType') == 'BUDGET_QUERY_RESULT':
+            from ..query_empty_result import completed_result_set
+            from ..query_lineage import selected_result_sets
+            results = selected_result_sets(receipts[ref], selection, successful_only=True)
+            selected_sources_complete &= bool(results) and all(completed_result_set(receipts[ref], rs) for rs in results)
+        else:
+            selected_sources_complete &= exhausted
         for item in own:
             if row_set is not None and item['rowIndex'] not in row_set or item['columnName'] not in column_names:
                 continue
@@ -395,7 +434,7 @@ def adapt(captures, selections, scope, max_facts):
                              'value': None, 'valueState': 'NOT_QUERIED', 'captureRefs': [], 'unit': None, 'scale': None})
     if len(result_facts) > max_facts:
         raise AnalysisError('FACT_LIMIT', '包含待查询对象后的事实数量超过上限。')
-    selected_complete = complete and observed == selected_members
+    selected_complete = selected_sources_complete and observed == selected_members
     from ..batch_scope import selection_audit
     source_scopes = selection_audit(captures, selections, scope)
     selected_complete &= not any(item['missingSelectedCellCount'] for item in source_scopes)

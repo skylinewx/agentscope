@@ -405,6 +405,7 @@ interface MessageBubbleProps {
 	message: Msg;
 	/** Current background wait after reconciling subsequent completion notices. */
 	backgroundWaiting: boolean;
+	resultAnchor?: React.ReactNode;
 	/** The live transport is unavailable; execution status is unknown. */
 	connectionLost?: boolean;
 	onUserConfirm: (
@@ -432,7 +433,7 @@ interface MessageBubbleProps {
  * When `content` is empty and the message is still running, the bubble
  * body is omitted entirely so only the bottom status row renders.
  */
-function ASMessageBubbleComponent({ message, agentId, sessionId, backgroundWaiting, connectionLost = false }: MessageBubbleProps) {
+function ASMessageBubbleComponent({ message, agentId, sessionId, backgroundWaiting, resultAnchor, connectionLost = false }: MessageBubbleProps) {
 	const isUser = message.role === 'user';
 	const { t, i18n } = useTranslation();
 
@@ -524,6 +525,7 @@ function ASMessageBubbleComponent({ message, agentId, sessionId, backgroundWaiti
                                 : t(`replyProcess.${presentation.pending}Notice`)}
 						</div>
 					)}
+					{resultAnchor}
 					{blocks
 						.filter((block) => block.type !== 'data')
 						.map((block, index) => (

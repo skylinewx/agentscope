@@ -1,8 +1,38 @@
 """从已有捕获补充正文涉及的同次表观察，不改变分析主体或计算输入。"""
 from copy import deepcopy
+from collections import Counter
 import json
 
 from .models import AnalysisError, digest
+
+
+def _grouping_identity(fact):
+    return digest([fact.get('period'), fact.get('taskName'), fact.get('dataContext'), fact['aggregation'].get('groupBy')])
+
+
+def _group_coordinate(fact):
+    dimensions = fact.get('dimensions') or {}
+    values = []
+    for axis in fact['aggregation'].get('groupBy', []):
+        column = axis['dimCode'] + ('__' + axis['field'] if axis.get('field') else '')
+        if column not in dimensions:
+            return None
+        values.append(dimensions[column])
+    return digest(values) if values else None  # A returned null is a real grouping value.
+
+
+def _group_summary(batch):
+    def count(keys):
+        return None if None in keys else len(keys)
+
+    metrics = batch['metrics']
+    summary = {'业务表': batch['source'], '返回分组数': count(set().union(*(m['groups'] for m in metrics.values()))),
+               '材料已选分组数': count(set().union(*(m['adopted'] for m in metrics.values())))}
+    if len(metrics) > 1:
+        labels = Counter(m['label'] for m in metrics.values())
+        summary['指标采用'] = [{'指标': m['label'] if labels[m['label']] == 1 else f"{m['label']}（{key}）",
+                                  '返回': count(m['groups']), '已选': count(m['adopted'])} for key, m in metrics.items()]
+    return summary
 
 
 def supplement(turn, artifact, document_text):
@@ -15,14 +45,15 @@ def supplement(turn, artifact, document_text):
     cache = getattr(turn.service, '_review_evidence_cache', None)
     if cache is None:
         cache = turn.service._review_evidence_cache = {}
-    cache_key = digest([anchors, batch_anchors, document_text])
-    if cache_key in cache:
-        return deepcopy(cache[cache_key])
     dimension = artifact['scope'].get('memberDimension')
     selected = {fact['factId'] for fact in artifact['facts']}
+    cache_key = digest([anchors, batch_anchors, sorted(selected), dimension, document_text])
+    if cache_key in cache:
+        return deepcopy(cache[cache_key])
     result = {'facts': [], 'complete': True,
               'meaning': '同次表观察或同一捕获中正文明确提及的原生分组证据；不扩大主体、分母或已执行计算'}
     seen, size = set(), 0
+    batches = []
     capture_refs = sorted({ref for fact in [*anchors, *batch_anchors]
                            for ref in fact.get('captureRefs', [fact.get('captureRef')]) if ref})
     for capture_ref in capture_refs:
@@ -33,7 +64,21 @@ def supplement(turn, artifact, document_text):
             result['complete'] = False
             result.setdefault('diagnostics', []).append({'captureRef': capture_ref, 'code': error.code})
             continue
+        grouped_batches = {}
+        local_groups = {_grouping_identity(fact) for fact in batch_anchors
+                        if capture_ref in fact.get('captureRefs', [fact.get('captureRef')])}
         for item in catalog:
+            grouped = local_groups and item.get('batchId') and item.get('aggregation') and _grouping_identity(item) in local_groups
+            if grouped and item.get('factId'):
+                batch = grouped_batches.setdefault((item.get('stepId'), item['batchId']),
+                    {'source': item.get('formName') or item['batchId'], 'metrics': {}})
+                key = item.get('queryMetricName') or item.get('measureCode') or item.get('metricKey') or item.get('label')
+                metric = batch['metrics'].setdefault(key, {'label': item.get('label') or key or '指标',
+                                                           'groups': set(), 'adopted': set()})
+                coordinate = _group_coordinate(item)
+                metric['groups'].add(coordinate)
+                if item['factId'] in selected:
+                    metric['adopted'].add(coordinate)
             if item.get('factId') in selected or item.get('valueState') != 'PRESENT':
                 continue
             labels = [str(label).strip() for label in item.get('headers', []) if isinstance(label, str)]
@@ -46,14 +91,8 @@ def supplement(turn, artifact, document_text):
                        and {**item.get('effectiveDimensions', {}), **item.get('dimensions', {})}.get(dimension)
                        == fact.get('sourceObjectId', fact.get('dimensions', {}).get(dimension))]
             identities = {(fact['objectId'], fact.get('objectModelCode')) for fact in matches}
-            grouped = [fact for fact in batch_anchors
-                       if capture_ref in fact.get('captureRefs', [fact.get('captureRef')])
-                       and item.get('batchId') and item.get('aggregation')
-                       and 2 <= len(str(item.get('formName') or '')) <= 120
-                       and item['formName'] in document_text
-                       and all(item.get(key) == fact.get(key) for key in ('period', 'taskName', 'dataContext'))
-                       and item['aggregation'].get('groupBy') == fact['aggregation'].get('groupBy')]
-            if len(identities) != 1 and not grouped:
+            named_group = grouped and 2 <= len(str(item.get('formName') or '')) <= 120 and item['formName'] in document_text
+            if len(identities) != 1 and not named_group:
                 continue
             candidate = {key: item[key] for key in ('factId', 'captureRef', 'sourceContextId', 'bindingRef',
                 'observationId', 'cellKey', 'headers', 'period', 'dimensions', 'dimensionNames', 'value', 'unit', 'valueState',
@@ -72,6 +111,12 @@ def supplement(turn, artifact, document_text):
             seen.add(identity)
             size += encoded_size
             result['facts'].append(candidate)
+        batches.extend(grouped_batches.values())
+    for batch in batches:
+        metrics = batch['metrics']
+        incomplete = any(None in m['groups'] or m['groups'] != m['adopted'] for m in metrics.values())
+        if len(batches) > 1 or len(metrics) > 1 or incomplete:
+            result.setdefault('groupedSources', []).append(_group_summary(batch))
     cache[cache_key] = deepcopy(result)
     while len(cache) > 8:
         cache.pop(next(iter(cache)))

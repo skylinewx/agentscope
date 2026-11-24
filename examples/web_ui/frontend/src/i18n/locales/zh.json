@@ -300,7 +300,37 @@
 			"emptyNoAgent": "请先选择一个智能体。",
 			"emptyHasAgent": "创建会话开始对话。",
 			"today": "今天",
-			"earlier": "更早"
+			"earlier": "更早",
+			"actions": "会话操作",
+			"bulkDelete": {
+				"enter": "批量删除",
+				"exit": "退出批量删除",
+				"selectAll": "全选",
+				"selectAllLabel": "全选当前智能体的会话",
+				"selected": "已选 {{count}} 个",
+				"deleteSelected": "删除所选",
+				"title": "删除 {{count}} 个会话？",
+				"description": "所选会话和消息记录将永久删除。系统会尝试清理这些会话的专属临时文件。",
+				"preview": "将删除的会话",
+				"current": "当前会话",
+				"more": "另有 {{count}} 个会话",
+				"running": "其中 {{count}} 个会话正在执行，确认删除后会请求取消这些任务。",
+				"team": "删除团队主会话也会解散对应团队，并删除关联的成员会话。",
+				"confirm": "确认删除",
+				"deleting": "删除中…",
+				"success": "已删除 {{count}} 个会话",
+				"partial": "已删除 {{removed}} 个会话，{{failed}} 个删除失败。失败的会话仍处于选中状态。",
+				"failed": "未能删除 {{count}} 个所选会话，可以重试。"
+			},
+			"status": {
+				"running": "执行中",
+				"awaiting_permission": "等待确认",
+				"awaiting_external_result": "等待外部结果"
+			},
+			"unreadResult": "有未读结果",
+			"untitledQuestion": "本轮请求",
+			"replyCompleted": "已完成",
+			"openReply": "查看结果"
 		}
 	},
 	"dialog-agent-create": {
@@ -1047,7 +1077,8 @@
 		"memberPageInfo": "成员 {{start}}–{{end}} / {{total}}；同一成员的相关明细保持完整",
 		"title": "已发布分析",
 		"loading": "正在读取已登记结果…",
-		"unsupported": "该结果的数据协议不受支持，需要重新生成分析。已保存的消息不会被删除。",
+		"unsupported": "当前页面不支持这份报告的格式版本。",
+		"invalidView": "报告的展示数据未通过校验，暂时无法打开。",
 		"activationRequired": "当前分析能力未就绪，请检查 data-analysis Skill 的加载状态及全局分析开关。",
 		"changed": "展示文件缺失或已被修改，可恢复已登记的原版本。",
 		"noAccess": "当前会话无法读取此分析，请确认所属会话和访问权限。",

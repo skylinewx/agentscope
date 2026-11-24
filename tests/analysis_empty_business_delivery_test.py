@@ -8,6 +8,23 @@ from analysis_business_query_test import business_fixture
 
 
 class EmptyBusinessDeliveryTests(TestCase):
+    def test_all_source_nulls_are_delivered_as_cells_and_never_hide_a_value_or_an_error(self):
+        capture, receipt = business_fixture()
+        data = receipt['data']
+        for result in data['resultSets']:
+            for row in result['rows']:
+                row.update(value=None, valueState='NULL')
+        query = {'purpose':'QUERY', 'complete':True, 'failureSummary':{'outcome':'ROWS_RETURNED'}}
+        _, facts, source = business_query_projection(capture, receipt, {'status':'SUCCEEDED', 'businessQuery':query})
+        evidence = {'sources':[{'source':source, 'facts':facts}]}
+        result = empty_query_answer(evidence)
+        self.assertEqual(result['deliveryStatus'], 'EMPTY_VALUES')
+        self.assertEqual(result['answer'], source['businessTableView']['markdown'])
+        self.assertIn('空值', result['answer'])
+        for state, value in [('PRESENT','0'), ('PRESENT',''), ('ERROR',None), ('NOT_LOADED',None)]:
+            facts[-1].update(valueState=state, value=value)
+            self.assertIsNone(empty_query_answer(evidence))
+
     def test_missing_or_incomplete_presentation_never_closes_with_generic_sentence(self):
         evidence = {'sources': [{'source': {'businessQuery': {'purpose': 'QUERY', 'complete': True,
                     'failureSummary': {'outcome': 'NO_DATA'}}}, 'facts': [{'valueState': 'NO_DATA'}]}]}
@@ -45,8 +62,9 @@ class EmptyBusinessDeliveryTests(TestCase):
         closed = empty_query_answer({'sources': [{'source': source, 'facts': facts}]})
         self.assertEqual(closed['deliveryStatus'], 'NO_DATA')
         self.assertEqual(closed['answer'], source['businessTableView']['markdown'])
-        for expected in ('利润表', '2026年', '数值筛选：科目0 &lt; 0', '本次展示：0行', '| 行号 |'):
+        for expected in ('利润表', '2026年', '数值筛选：科目0 &lt; 0', '**查询条件**', '**查询结果**', '本次查询没有数据'):
             self.assertIn(expected, closed['answer'])
+        self.assertNotIn('数据加载时期', closed['answer'])
 
     def test_empty_table_and_unmatched_target_are_delivered_in_either_source_order(self):
         empty = {'source': {'businessQuery': {'purpose': 'QUERY', 'complete': True,
@@ -59,7 +77,8 @@ class EmptyBusinessDeliveryTests(TestCase):
         first = empty_query_answer({'sources': [empty, unmatched]})
         self.assertEqual(empty_query_answer({'sources': [unmatched, empty]}), first)
         self.assertEqual(first['deliveryStatus'], 'NO_DATA')
-        for text in ('合成利润表', '本次展示：0行', '运输收入', '3 个任务表样候选', '数据时期不在所问范围内'):
+        for text in ('| 业务表 | 指标 | 查询值 | 单位 |', '| 合成利润表 | 净利润 | 无数据 |  |',
+                     '运输收入', '3 个任务表样候选', '数据时期不在所问范围内'):
             self.assertIn(text, first['answer'])
 
         empty['source']['businessTableView']['allFactsIncluded'] = False

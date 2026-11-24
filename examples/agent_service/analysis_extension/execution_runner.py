@@ -99,7 +99,10 @@ async def execute(code, inputs, timeout_seconds, context=None):
             details = result.get('error', {})
             if not isinstance(details, dict):
                 raise ValueError('执行错误必须是对象')
-            raise AnalysisError('PYTHON_EXECUTION_FAILED', 'Python 分析未执行完成。',
+            message = 'Python 分析未执行完成。'
+            if details.get('type') == 'TypeError' and 'keys must be str, int, float, bool or None, not tuple' in str(details.get('message', '')):
+                message += '计算中可以按多个字段分组。交付结果时，请将每个组合键展开为一行，每个维度和数值各用一个有名称的字段，再使用原输入重试。'
+            raise AnalysisError('PYTHON_EXECUTION_FAILED', message,
                 {**details, 'exitCode': process.returncode, 'requiresSourceQuery': False})
         if not broker.complete:
             raise AnalysisError('PYTHON_INPUT_INCOMPLETE', '输入提供记录未完整提交，不能登记成功计算。')

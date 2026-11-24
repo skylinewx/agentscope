@@ -46,7 +46,7 @@ class PublicContextTests(TestCase):
     def test_candidate_names_and_scope_remain_candidates(self):
         result = public_observations({'data': {'candidates': [{
             'taskName': '预算二上', 'formName': '利润表', 'bindingRef': 'binding',
-            'matches': [{'label': '净利润', 'targetDimensions': {'MD_BUDACCOUNT': 'np'}},
+            'matches': [{'label': '净利润', 'resourceRef': 'cell-np', 'targetDimensions': {'MD_BUDACCOUNT': 'np'}},
                         {'label': '归母净利润', 'targetDimensions': {'MD_BUDACCOUNT': 'parent'}}],
         }]}}, 'capture', 'discover_query_targets', {'keyword': '净利润'})
         summary = ''.join(f['text'] for f in result['facts'])
@@ -56,20 +56,35 @@ class PublicContextTests(TestCase):
         self.assertIn('候选', summary)
         self.assertIn('尚未读取', summary)
         self.assertNotIn('已核验', summary)
-        self.assertEqual(result['labels']['MD_BUDACCOUNT:np'], '净利润')
+        self.assertEqual(result['labels']['cell-np'], '净利润')
+        self.assertNotIn('member:MD_BUDACCOUNT:np', result['labels'])
 
     def test_query_plan_resolves_observed_labels_and_keeps_requested_scope(self):
-        labels = {'MD_BUDACCOUNT:np': '净利润', 'MD_ORG:sector': '业务板块'}
+        labels = public_observations({'data': {'candidates': [{'modelCode': 'MD_BUDACCOUNT', 'key': 'np',
+            'label': '净利润'}]}}, 'capture', 'search_entities')['labels']
+        labels['MD_ORG:sector'] = '业务板块'
         plan = operation('execute_semantic_plan', {'plan': {'steps': [{
             'operation': 'BATCH_DATA_QUERY', 'batchQuery': {
                 'batchDimensions': [{'dimCode': 'MD_ORG', 'all': True},
                                     {'dimCode': 'DATATIME', 'periodRequest': {'start': {'year': 2026}}}],
-                'metrics': [{'selection': {'targetDimensions': {'MD_BUDACCOUNT': 'np'}}}],
+                'metrics': [{'selection': {'headerText': '预算金额', 'targetDimensions': {'MD_BUDACCOUNT': 'np'}}}],
                 'aggregation': {'groupBy': [{'dimCode': 'MD_ORG', 'field': 'sector'}]},
             }}]}}, labels)['nextAction']
-        for value in ('2026年', '净利润', '业务板块', '全部单位'):
+        for value in ('2026年', '“预算金额”数据', '取数条件包括“净利润”', '业务板块', '全部单位'):
             self.assertIn(value, plan)
         self.assertNotIn('已取得', plan)
+
+    def test_business_dimension_and_metric_column_keep_their_source_names(self):
+        code = 'MD_BUDACCOUNT'
+        labels = public_observations({'data': {'definitions': [
+            {'kind': 'MODEL', 'modelCode': code, 'label': '报表行分类'},
+            {'kind': 'FIELD', 'modelCode': code, 'label': '编码'}]}}, 'cap', 'search_schema')['labels']
+        self.assertIn('报表行分类', operation('list_capabilities', {'modelCodes': [code]}, labels)['nextAction'])
+        self.assertIn('当前对象', operation('list_capabilities', {'modelCodes': [code]})['nextAction'])
+        facts = result_facts({'data': {'rows': [['7.00']], 'columns': [
+            {'name': 'v', 'label': '期末金额', 'unit': '元'}], 'fixedDimNameMap': {code: '管理费用'}}}, 'cap')
+        self.assertIn('“期末金额”为 7.00 元', facts[-1]['text'])
+        self.assertNotIn('管理费用', facts[-1]['text'])
 
     def test_supported_grouping_does_not_claim_actual_groups_or_amounts(self):
         result = public_observations({'data': {'resolutionKind': 'GROUPING', 'status': 'SUPPORTED',

@@ -104,6 +104,15 @@ def bind_single_grid(outputs, inputs, manifest):
 def products(outputs, known, input_refs, scope_id, run_ref):
     """输出按实际类型校验，统一保留依赖，可用于下一次处理或报告数据绑定。"""
     names, values = set(), []
+    missing_kinds = [i for i, out in enumerate(outputs) if isinstance(out, dict) and 'kind' not in out
+                     and ('columns' in out or 'rows' in out)]
+    if missing_kinds:
+        missing_refs = [i for i, out in enumerate(outputs) if isinstance(out, dict) and not out.get('inputRefs')]
+        raise AnalysisError('PYTHON_RESULT_INVALID',
+                            '输出含表格列或行。请标明表格用途（kind=TABLE 或 CHART_DATA），并为每项输出填写实际输入引用。',
+                            {'path': f'/result/{missing_kinds[0]}/kind', 'tableOutputsMissingKind': missing_kinds,
+                             'outputsMissingInputRefs': missing_refs, 'requiresSourceQuery': False,
+                             'hint': '在原脚本的表对象中补 kind，每项 inputRefs 使用该项实际参与计算的 inputs[*].ref。'})
     for output_index, output in enumerate(outputs):
         if not isinstance(output, dict):
             raise AnalysisError('PYTHON_RESULT_INVALID', '输出必须是带 name、label、inputRefs 的对象。')
@@ -116,7 +125,7 @@ def products(outputs, known, input_refs, scope_id, run_ref):
             raise AnalysisError('PYTHON_RESULT_INVALID', '输出须有简短名称及来自本次输入的真实依赖。',
                                 {'path': f'/result/{output_index}', 'requiresSourceQuery': False,
                                  'requiredFields': ['label', 'inputRefs'],
-                                 'hint': '每项输出的 inputRefs 从该项实际使用的 inputs[*].ref 收集；不是 captureRef、列名或自造标识。',
+                                 'hint': '遍历 inputs 时随行保留 item["ref"]，分组统计时同时收集实际使用行的 ref，最后将去重的引用填入该输出的 inputRefs。表格也需要填写。沿用本次输入集修正输出即可。',
                                  'availableInputRefs': input_refs[:20], 'availableInputCount': len(input_refs)})
         common = {'name', 'label', 'inputRefs', 'kind'}
         payload, value, unit, state = {}, None, None, 'NOT_APPLICABLE'

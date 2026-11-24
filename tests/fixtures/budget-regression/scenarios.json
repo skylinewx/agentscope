@@ -9,6 +9,7 @@
         "id": "USER-01",
         "question": "查询一下久其集团26年的净利润预算",
         "rules": [
+          "FORM-AGING",
           "TARGET-DISCOVERY",
           "AMOUNT-UNIT"
         ]
@@ -17,6 +18,7 @@
         "id": "USER-02",
         "question": "从利润表看下二级单位的净利润，按从大到小排",
         "rules": [
+          "FORM-AGING",
           "CONTEXT-MERGE",
           "QUERY-FULL-SORT"
         ]
@@ -61,6 +63,7 @@
         "id": "USER-07",
         "question": "看下久其集团26年EVA预算",
         "rules": [
+          "CONDITION-AGING",
           "TARGET-DISCOVERY",
           "FORMULA-ARITHMETIC"
         ]
@@ -77,7 +80,7 @@
         "question": "对比一下党建经费的管理费预算和销售费预算",
         "rules": [
           "TARGET-DISCOVERY",
-          "GRID-PYTHON"
+          "QUERY-COMPARISON"
         ]
       },
       {
@@ -316,6 +319,50 @@
       ]
     },
     {
+      "id": "ADDED-COMPARISON-PERIOD-SCENE",
+      "origin": "user-approved-additional-20261123",
+      "execution": "one-session-in-order",
+      "purpose": "验证无历史时比较两个费用口径，并逐项复用既有原值、切换时期和情景。",
+      "turns": [
+        {
+          "id": "COMPARE-FEES",
+          "question": "对比一下久其集团26年党建经费的管理费预算和销售费预算",
+          "rules": ["QUERY-COMPARISON", "TARGET-DISCOVERY"]
+        },
+        {
+          "id": "COMPARE-PREVIOUS-ACTUAL",
+          "question": "把刚才两项分别和去年同期的实际数比一下。",
+          "rules": ["QUERY-COMPARISON", "SOURCE-SELECTION", "SCENARIO-FALLBACK", "VALUE-NULL"]
+        }
+      ]
+    },
+    {
+      "id": "ADDED-COMPARISON-FOUR-VALUES",
+      "origin": "user-approved-additional-20261123",
+      "execution": "one-session-in-order",
+      "purpose": "验证无历史时在同一问中取两个指标的本年预算和上年同期实际数，每批保留各自的时期和情景。",
+      "turns": [
+        {
+          "id": "COMPARE-FOUR-VALUES",
+          "question": "对比一下久其集团2026年党建经费的管理费预算和销售费预算，分别和去年同期实际数对比",
+          "rules": ["QUERY-COMPARISON", "TARGET-DISCOVERY", "SCENARIO-FALLBACK", "VALUE-NULL"]
+        }
+      ]
+    },
+    {
+      "id": "ADDED-COMPARISON-THREE-METRICS",
+      "origin": "user-approved-additional-20261123",
+      "execution": "one-session-in-order",
+      "purpose": "验证用户指定表样时，同表三个独立指标都有对应的来源与查询结果。",
+      "turns": [
+        {
+          "id": "COMPARE-THREE-METRICS",
+          "question": "对比一下久其集团2026年利润表的营业收入、营业利润和净利润预算。",
+          "rules": ["QUERY-COMPARISON", "TARGET-DISCOVERY"]
+        }
+      ]
+    },
+    {
       "id": "CODEX-CONDITION-AGING",
       "origin": "codex-added-regression-20261118",
       "execution": "one-session-in-order",
@@ -333,7 +380,8 @@
           "id": "AGE-FEES",
           "question": "对比一下党建经费的管理费预算和销售费预算",
           "rules": [
-            "CONDITION-AGING"
+            "CONDITION-AGING",
+            "QUERY-COMPARISON"
           ]
         },
         {

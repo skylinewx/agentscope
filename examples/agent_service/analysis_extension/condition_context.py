@@ -2,9 +2,7 @@
 from copy import deepcopy
 
 from .models import AnalysisError, digest
-
-
-SYSTEM_DIMENSIONS = frozenset(('DATATIME', 'MD_ORG', 'MD_SCENE', 'MD_CURRENCY', 'MD_MGRVER'))
+from .budget_dimensions import SYSTEM_DIMENSIONS
 
 
 def system_scope(record):
@@ -20,14 +18,26 @@ def review_system_scope(state):
     user request, so neither its old range nor its edit can be projected away.
     """
     from .dimension_scopes import _scope_aliases, concept
+    def project(records):
+        return {digest([concept(record['draft']['dimensionHint']), record['draft']['selector']]): {
+            'dimensionHint': record['draft']['dimensionHint'], 'selector': deepcopy(record['draft']['selector'])}
+            for record in records if system_scope(record)}
+
     records = [record for record in state.get('inheritedDimensionScopes', []) if system_scope(record)]
-    conditions = {digest([record['draft']['dimensionHint'], record['draft']['selector']]): {
-        'dimensionHint': record['draft']['dimensionHint'], 'selector': deepcopy(record['draft']['selector'])}
-        for record in records}
+    conditions = project(records)
+    recent = {}
+    active = state.get('activeBusinessContextRef')
+    if active and active not in state.get('selectedContextRefs', []):
+        from .conversation_context import _source_scopes
+        anchor = next((c for c in reversed(state.get('businessContexts', [])) if c.get('contextRef') == active), None)
+        if anchor:
+            changed = [item for key, item in project(_source_scopes(anchor)).items() if key not in conditions]
+            if changed:
+                recent = {'latestSourceScope': {'contextRef': active, 'request': anchor.get('request', ''), 'conditions': changed}}
     aliases = set().union(*(_scope_aliases(record) for record in records)) if records else set()
     edits = [deepcopy(edit) for edit in state.get('scopeEdits', [])
              if concept(edit['dimensionHint']) in aliases]
-    return {**({'inheritedSystemConditions': list(conditions.values())} if conditions else {}),
+    return {**recent, **({'inheritedSystemConditions': list(conditions.values())} if conditions else {}),
             **({'scopeEdits': edits} if edits else {})}
 
 
@@ -70,7 +80,7 @@ def source_references(state, selected):
     return history, refs
 
 
-def prepare(turn, request):
+def prepare(turn, request, origin=None):
     """Only references to native bindings cross the boundary. The host owns user-turn identity."""
     request.pop('conditionContext', None)
     number = turn.state.get('conditionTurn')
@@ -80,6 +90,20 @@ def prepare(turn, request):
     from .dimension_scopes import retained_scopes
     entries = []
     history, refs = source_references(turn.state, retained_scopes(turn.state))
+    default_orgs = []
+    if (request.get('basis') or {}).get('kind', 'INTENT') == 'INTENT' and request.get('intentDraft') is not None:
+        from .conversation_context import _source_scopes
+        active = turn.state.get('activeBusinessContextRef')
+        anchor = next((c for c in reversed(turn.state.get('businessContexts', [])) if c.get('contextRef') == active), None)
+        baseline = _source_scopes(anchor) if anchor else turn.state.get('inheritedDimensionScopes', [])
+        for record in baseline:
+            key = record.get('conditionId')
+            codes = {b.get('dimCode') or b.get('dimensionCode') for b in record.get('bindings', [])}
+            if key and codes == {'MD_ORG'} and record.get('appliesToAllTargets') and not record.get('ambiguousScope'):
+                history.setdefault(key, record)
+                refs.setdefault(key, {'id': key, 'source': deepcopy(record['confirmedSource'])})
+                if key not in default_orgs:
+                    default_orgs.append(key)
     for key, record in history.items():
         source = record['confirmedSource']
         item = refs[key]
@@ -95,18 +119,128 @@ def prepare(turn, request):
     if conversation:
         request['conditionContext'] = {'conversationId': conversation, 'turn': number,
                                        'conditions': entries, 'omitted': []}
+        if turn.state.get('comparisonPlan'):
+            from .query_comparison import batch_coverage
+            batch = batch_coverage(turn.state, request)
+            if batch:
+                request['conditionContext']['comparisonBatch'] = batch
+        if default_orgs:
+            request['conditionContext']['organizationDefaults'] = default_orgs
+        if origin and (request.get('basis') or {}).get('kind') != 'FACTS':
+            from .form_history import preferences
+            preferred = preferences(turn.state, origin)
+            if preferred:
+                request['conditionContext']['formPreferences'] = preferred
     return request
+
+
+def _metric_target_labels(data):
+    """Identify lookup members that actually name a row or column of the returned metric."""
+    targets = {t['id']: t['label'] for t in data.get('targets', [])
+               if t.get('id') and t.get('label') and not t.get('titleTerms') and len(t.get('allOf', [])) == 2}
+    labels = {}
+    for result in data.get('resultSets', []):
+        target = targets.get(result.get('targetId'))
+        if not target:
+            continue
+        members = {(m.get('dimensionCode'), m.get('baseDataCode'), m.get('objectCode')): m['label']
+                   for m in result.get('resolvedTerms', []) if m.get('label') and m.get('dimensionCode')
+                   and m['dimensionCode'] not in SYSTEM_DIMENSIONS}
+        for row in result.get('rows', []):
+            if not members:
+                break
+            for proof in row.get('conditionEvidence', []):
+                key = (proof.get('dimensionCode'), proof.get('baseDataCode'), proof.get('objectCode'))
+                if key in members and members[key] in proof.get('runtimeHeaders', []):
+                    labels.setdefault(key, set()).add(target)
+                    del members[key]
+    return labels
+
+
+def previous_target_scopes(receipt, source, request, source_request=None):
+    """Release only complete historical conditions proven to locate the selected, replaced metric."""
+    data = receipt.get('data') or {}
+    selected = next((item for item in data.get('resultSets', [])
+                     if item.get('resultSetId') == source.get('resultSetId')), {})
+    target = next((item for item in data.get('targets', []) if item.get('id') == selected.get('targetId')), {})
+    current = (request.get('intentDraft') or {}).get('targets', [])
+    # A declared new target may use retrieval wording. Its identity does not
+    # depend on quoting the user's entire sentence again.
+    current_terms = [{p['text'] for p in t.get('businessPhrases', []) if p.get('text')}
+                     | {ref.partition(':')[2] for ref in t.get('inheritFrom', [])} for t in current]
+    if not current_terms or not all(current_terms):
+        return []
+    old_draft = (data.get('effectiveRequest') or source_request or {}).get('intentDraft') or {}
+    shared = [p['text'] for p in old_draft.get('sharedConditions', []) if p.get('text')]
+    logical_id = target.get('logicalTargetId') or str(selected.get('targetId', '')).split(':', 1)[0]
+    old_target = next((t for t in old_draft.get('targets', []) if t['id'] == logical_id), None)
+    owned = [p['text'] for p in (old_target or {}).get('businessPhrases', [])]
+    owned.extend(ref.partition(':')[2] for ref in (old_target or {}).get('inheritFrom', []))
+    if owned and all(words == set(owned) for words in current_terms):
+        return []
+    explicit_roles = {(scope.get('dimCode'), scope.get('valueDomain')) for scope in data.get('scopeResolution', [])
+                      if scope.get('status') == 'RESOLVED'
+                      and scope.get('targetId') in (None, '', logical_id, selected.get('targetId'))}
+    facts = set(source.get('factIds', []))
+    rows = [row for row in selected.get('rows', []) if row.get('factId') in facts]
+    if not facts or {row['factId'] for row in rows} != facts:
+        return []
+    def coordinate(member):
+        return member.get('dimensionCode'), member.get('baseDataCode'), member.get('objectCode')
+
+    def metric_member(member):
+        key, term = coordinate(member), member.get('term')
+        return (term and all(key) and key[0] not in SYSTEM_DIMENSIONS and key[:2] not in explicit_roles
+                and not member.get('titleFallback') and not any(term in phrase for phrase in shared)
+                and any(term in phrase for phrase in (owned if old_target is not None else [target.get('label', '')]))
+                and not all(words & {term, target.get('label')} for words in current_terms))
+
+    members = {coordinate(m): (m['term'], m.get('label')) for m in selected.get('resolvedTerms', []) if metric_member(m)}
+    # A runtime dimension alone may be an ordinary filter (for example the
+    # product of a sales query). A source row/column label ties it to the metric.
+    confirmed = set(members)
+    for row in rows:
+        row_keys = {coordinate(p) for p in row.get('conditionEvidence', []) if coordinate(p) in members
+                    and members[coordinate(p)][1] in p.get('runtimeHeaders', [])}
+        confirmed.intersection_update(row_keys)
+    # The native ledger can store one VALUES condition spanning alternate forms of
+    # the same target, even when a sibling form returned no matching rows.
+    alternatives = {}
+    for sibling in data.get('resultSets', []):
+        if sibling.get('resultSetId') == selected.get('resultSetId') or sibling.get('targetId') != selected.get('targetId'):
+            continue
+        for m in sibling.get('resolvedTerms', []):
+            key = coordinate(m)
+            if key not in members and metric_member(m):
+                alternatives[key] = m['term']
+    terms = {**alternatives, **{key: members[key][0] for key in confirmed}}
+    result = []
+    for entry in data.get('conditionState', {}).get('entries', []):
+        selector = entry.get('draft', {}).get('selector', {})
+        bindings = entry.get('bindings', [])
+        if not bindings or any(not b.get('condition', {}).get('values') for b in bindings):
+            continue
+        keys = {(b.get('dimCode'), b.get('valueDomain'), value) for b in bindings for value in b['condition']['values']}
+        if (keys & confirmed and keys <= terms.keys() and selector.get('type') == 'VALUES' and not selector.get('where')
+                and set(selector.get('members', [])) == {terms[key] for key in keys}):
+            result.append(entry['id'])
+    return result
 
 
 def native_records(receipt, capture_ref):
     """Expose the native scope to existing follow-up callers; a committed receipt owns its confirmation."""
-    state = (receipt.get('data') or {}).get('conditionState', {})
+    data = receipt.get('data') or {}
+    state = data.get('conditionState', {})
+    metric_labels = _metric_target_labels(data)
     records = []
     for entry in state.get('entries', []):
         key = entry['id']
         source = {'scopeId': key, 'executionId': receipt['executionId'], 'querySessionId': receipt['querySessionId'],
                   'contextId': receipt['context']['contextId']}
+        labels = {label for binding in entry['bindings'] for member in binding.get('condition', {}).get('values', [])
+                  for label in metric_labels.get((binding.get('dimCode'), binding.get('valueDomain'), member), ())}
         records.append({'conditionId': key, 'confirmedTurn': entry['lastConfirmedTurn'], 'receiptTurn': state['turn'],
+                        'metricTargetLabels': sorted(labels),
                         'captureRef': capture_ref, 'confirmedSource': source,
                         **{k: deepcopy(entry[k]) for k in ('scopeField', 'systemRequest') if k in entry},
                         **{field: deepcopy(entry[field]) for field in
@@ -163,6 +297,10 @@ async def confirm_reused(turn, runner):
         if new_state.get('turn') != ordinal or new_state.get('conversationId') != old['conversationId'] or not baseline <= actual <= active:
             raise AnalysisError('CONDITION_SELECTION_MISMATCH', '采用结果的维度回执与本轮选择不一致。')
         renewed = native_records(updated, ref)
+        original_labels = {r['conditionId']: r['metricTargetLabels'] for r in records}
+        for row in renewed:
+            # This receipt only confirms condition ownership. Its facts still belong to the selected query.
+            row['metricTargetLabels'] = original_labels.get(row['conditionId'], [])
         refreshed.append((ref, renewed, [row for row in renewed if row['conditionId'] in actual]))
     for ref, history, actual in refreshed:
         native[ref] = history
@@ -174,6 +312,13 @@ async def confirm_reused(turn, runner):
 def effective_request(request, data):
     """Read the executed scope and verify that only authorized omissions occurred."""
     actual = data.get('effectiveRequest')
+    selected = data.get('appliedHistoricalConditions')
+    if selected is not None:
+        context = request.get('conditionContext') or {}
+        if (not actual or not context or context.get('omitted') or not isinstance(selected, list)
+                or not selected or any(not isinstance(key, str) for key in selected) or len(set(selected)) != len(selected)):
+            raise AnalysisError('INVALID_CONDITION_OMISSION', '本体返回的历史条件选择与本次请求不一致。')
+        request = {**request, 'conditionContext': {**context, 'omitted': selected}}
     if actual is None:
         if (request.get('conditionContext') or {}).get('omitted'):
             raise AnalysisError('EFFECTIVE_SCOPE_MISSING', '已放宽的查询缺少实际执行条件，不能恢复原请求代替。')
@@ -181,9 +326,96 @@ def effective_request(request, data):
     expected = apply_omissions(request)
     # Transport IDs belong to the envelope; native projection contains business input.
     fields = ('purpose', 'selection', 'question', 'scope', 'groupBy', 'contextText', 'intentDraft', 'basis', 'conditionContext')
+    if actual.get('intentDraft') != expected.get('intentDraft') or actual.get('conditionContext') != expected.get('conditionContext'):
+        _adopt_native_organization(expected, actual)
     if any(actual.get(key) != expected.get(key) for key in fields):
         raise AnalysisError('EFFECTIVE_SCOPE_MISMATCH', '实际执行条件与已冻结的条件处理结果不一致。')
     return {**deepcopy(request), **deepcopy(actual)}
+
+
+def _adopt_native_organization(expected, actual):
+    """Accept only the native organization projection. All other fields still compare with the frozen request."""
+    from unicodedata import normalize
+    from .dimension_scopes import concept, selector_evidence
+    context = expected.get('conditionContext') or {}
+    defaults = set(context.get('organizationDefaults', []))
+    if not context or not expected.get('intentDraft') or (expected.get('basis') or {}).get('kind', 'INTENT') != 'INTENT':
+        return
+    original = expected['intentDraft'].get('dimensionScopes', [])
+    resolved = (actual.get('intentDraft') or {}).get('dimensionScopes', [])
+    def is_org(scope):
+        return concept(scope.get('dimensionHint', '')) == '组织机构'
+    if [s for s in original if not is_org(s)] != [s for s in resolved if not is_org(s)]:
+        return
+    scopes = [s for s in resolved if is_org(s)]
+    if not scopes or any(s.get('targetIds') for s in scopes):
+        return
+    peers = (context.get('comparisonBatch') or {}).get('peers', [])
+    if peers and any(is_org(scope) and scope.get('targetIds') for scope in original):
+        return  # A comparison can own an organization even when this batch executes only one target.
+    peer_terms = {normalize('NFKC', term).strip() for peer in peers for term in peer.get('terms', [])}
+    current = expected.get('question', '')
+    entries = {r['id']: r for r in context['conditions']}
+    actual_ids = {s['id'] for s in scopes}
+    inherited = {}
+    if len(actual_ids) != len(scopes):
+        return
+    for scope in scopes:
+        if scope.get('confirmedSource'):
+            key = scope['confirmedSource'].get('scopeId')
+            if key not in defaults or key in inherited or scope['confirmedSource'] != entries.get(key, {}).get('source'):
+                return
+            inherited[key] = scope['id']
+        else:
+            selector = scope.get('selector') or {}
+            source = scope.get('sourceText')
+            if not isinstance(source, str) or not source or source not in current:
+                return
+            if selector.get('type') == 'VALUES':
+                members = selector.get('members') or []
+                if (set(selector) != {'type', 'members'} or not members
+                        or not all(isinstance(member, str) and member and member in current for member in members)):
+                    return
+            elif selector.get('type') == 'HIERARCHY':
+                if (set(selector) - {'type', 'rootText', 'level'} or not (selector.get('rootText') or selector.get('level'))
+                        or selector.get('rootText', '') not in current):
+                    return
+            elif selector.get('type') == 'ALL':
+                if (set(selector) - {'type', 'rootText'} or 'rootText' in selector and (
+                        not isinstance(selector['rootText'], str) or not selector['rootText'] or selector['rootText'] not in current)):
+                    return
+            else:
+                return
+            if peer_terms and any(normalize('NFKC', term).strip() in peer_terms for term in selector_evidence(selector)):
+                return
+    if inherited and (set(inherited) != defaults or len(inherited) != len(scopes)):
+        return
+    original_ids = {s['id'] for s in original if is_org(s)}
+    actual_entries = (actual.get('conditionContext') or {}).get('conditions', [])
+    if [r['id'] for r in actual_entries] != list(entries):
+        return
+    for r in actual_entries:
+        old = entries[r['id']]
+        if old.get('scopeId') == r.get('scopeId'):
+            continue
+        if r.get('scopeId') is None and (r['id'] in defaults or old.get('scopeId') in original_ids):
+            old.pop('scopeId', None)
+        elif r['id'] in inherited and r.get('scopeId') == inherited[r['id']]:
+            old['scopeId'] = r['scopeId']
+        else:
+            return
+    previous_relations = expected['intentDraft'].get('relations', [])
+    actual_relations = actual['intentDraft'].get('relations', [])
+    if previous_relations != actual_relations:
+        targets = {target['id'] for target in expected['intentDraft'].get('targets', [])}
+        hierarchies = [r for r in previous_relations if r.get('type') == 'HIERARCHY']
+        if (not hierarchies or len(scopes) != 1 or scopes[0].get('confirmedSource')
+                or (scopes[0].get('selector') or {}).get('type') != 'ALL'
+                or any(not targets <= set(r.get('targetIds', [])) for r in hierarchies)
+                or [r for r in previous_relations if r.get('type') != 'HIERARCHY'] != actual_relations):
+            return
+        expected['intentDraft']['relations'] = deepcopy(actual_relations)
+    expected['intentDraft']['dimensionScopes'] = deepcopy(resolved)
 
 
 def apply_omissions(request):

@@ -40,6 +40,7 @@ BATCH_SELECTOR = obj({"captureRef": TEXT, "stepId": TEXT, "batchId": TEXT,
                       "rowIndices": array({"type": "integer", "minimum": 0}, 50000)},
                      ["captureRef", "stepId", "batchId"])
 BATCH_SELECTOR['properties']['columnNames']['description'] = '单指标回执可省略，由宿主使用唯一指标列；多指标须选择实际指标列名，维度列自动保留。'
+BATCH_SELECTOR['properties']['rowIndices']['description'] = '原生选择器中的物理行下标。业务表会合并多个指标为一行。全部返回行省略此字段，已筛选的来源沿用它返回的范围。'
 EMPTY_SELECTOR = obj({'captureRef': TEXT, 'resultSetId': TEXT}, ['captureRef', 'resultSetId'])
 SELECTOR = {"oneOf": [FORM_SELECTOR, BATCH_SELECTOR, EMPTY_SELECTOR]}
 FORM_SELECTOR['properties']['preparedTargets'] = {'const': True,
@@ -73,6 +74,7 @@ OPERATION = obj({"id": TEXT, "operator": {"enum": ["SORT", "RANK", "COUNT", "SUM
 OPERATION['properties']['top'] = {'type': 'integer', 'minimum': 1, 'maximum': 1000,
     'description': 'DESCRIBE 可选：统计按 direction 排序后的前 N 项合计及占比；仍保留全部来源行，不截断主体。'}
 OPERATION['properties']['inputRefs']['items'] = SCALAR_REFERENCE
+OPERATION['properties']['taskId'] = {**TEXT, 'description': '多个同算子工作项时，指定这项运算归属。只有一个匹配工作项时宿主自动登记已执行结果。'}
 OPERATION['properties']['expression']['description'] = f'ARITHMETIC：最多 {MAX_ARITHMETIC_INPUTS} 个 inputRefs，按顺序绑定 v0、v1 等；每个输入必须参与，不传 variables，不抄原金额。' + ARITHMETIC_SYNTAX
 OPERATION['allOf'] = [{'if': {'properties': {'operator': {'const': 'ARITHMETIC'}}},
                        'then': {'required': ['inputRefs', 'expression'],
@@ -103,6 +105,7 @@ VIEW = obj({"relationLayout": {"enum": ["compact", "flow"], "description": "FORM
             "pageSize": {"type": "integer", "minimum": 1, "maximum": 100}, "nodeRefs": array(TEXT, 1000, 1),
             "viewId": TEXT, "scopeId": TEXT, "title": TEXT, "relationRef": TEXT, "comparisonRef": TEXT,
             "numberFormat": NUMBER_FORMAT, "labels": array(obj({"valueRef": TEXT, "label": {"type": "string", "minLength": 1, "maxLength": 120}}, ["valueRef", "label"]), 1000),
+            "trendRef": {**TEXT, "description": "显式组件附加时期折线，选用构建返回的 trendRef。"},
             "field": {"enum": ["value", "positive", "negative", "zero", "observed", "unavailable"]},
             "type": {"enum": ["METRIC", "TABLE", "BAR_VALUES", "BAR_RANK", "BRIDGE", "ORDER", "FORMULA", "HIERARCHY", "WATERFALL", "RECONCILIATION"]},
             "valueRefs": array(TEXT, 1000, 1)}, ["viewId", "scopeId", "type", "valueRefs"])
@@ -164,9 +167,17 @@ class _AnalysisTool(ToolBase):
                     'requestCount': len(value['results']),
                     'failedRequestCount': sum(item.get('status') == 'ERROR' for item in value['results']),
                     'partialRequestCount': sum(item.get('status') == 'PARTIAL' for item in value['results'])}
+            if self.method == 'read_query_result':
+                pages = (page for item in value['results'] if item.get('status') != 'ERROR'
+                         for page in item['pages']) if 'results' in value else (value,)
+                metadata['analysisReadCaptureRefs'] = list(dict.fromkeys(
+                    page['captureRef'] for page in pages if isinstance(page.get('captureRef'), str)))
             if isinstance(delivery, dict) and delivery.get("registered") is True and isinstance(delivery.get("processSummary"), dict):
                 metadata["process_summary"] = delivery["processSummary"]
             from .business_tables import model_text
+            if self.method == 'read_query_result' and value.get('view') == 'EXECUTION':
+                from .history_references import trace_markdown
+                return ToolChunk(content=[TextBlock(text=trace_markdown(value))], metadata=metadata)
             if self.method == 'build' and 'derivedValues' in value:
                 from .build_projection import render
                 from .python_input_markdown import frozen_input_markdown
@@ -181,13 +192,22 @@ class _AnalysisTool(ToolBase):
                     info = {**value, 'pythonInputCatalog': catalog_read(value['pythonInputCatalog'])}
                     return ToolChunk(content=[TextBlock(text=material + '\n\n' + model_text(info))], metadata=metadata)
             if self.method == 'python' and value.get('pythonRunRef'):
-                from .build_projection import compact_scope
                 metadata['analysisNativeResult'] = {key: value[key] for key in ('analysisRef', 'pythonRunRef', 'resultRefs') if key in value}
+                if value.get('analysisRef') and value.get('inputSetRef'):
+                    from .build_projection import render
+                    artifact = self.service.store.get_analysis(self.service.owner, value['analysisRef'])
+                    return ToolChunk(content=[TextBlock(text=render(value, artifact))], metadata=metadata)
                 if 'scope' in value and value.get('analysisRef'):
+                    from .build_projection import compact_scope
                     value = {**value, 'scope': compact_scope(value['scope'], value['analysisRef'])}
             if self.method == 'task' and kwargs.get('action', 'declare') == 'declare':
                 from .task_projection import render
                 return ToolChunk(content=[TextBlock(text=render(value))], metadata=metadata)
+            if self.method == 'task' and kwargs.get('action') == 'sources':
+                directory = value['markdown']
+                if value['diagnostics']:
+                    directory += '\n\n' + model_text({'diagnostics': value['diagnostics']})
+                return ToolChunk(content=[TextBlock(text=directory)], metadata=metadata)
             if self.method == 'publish':
                 from .publication_projection import project
                 return ToolChunk(content=[TextBlock(text=model_text(project(value)))], metadata=metadata)
@@ -217,13 +237,18 @@ class AnalysisTask(_AnalysisTool):
     from .task_contract import DESCRIPTION as description, schema as _task_schema
     input_schema = _task_schema(obj, array, TEXT, STRING_MAP, INTENT_FIELDS)
 
+    @property
+    def model_input_schema(self):
+        turn = getattr(self.service, 'turn', None)
+        return _TASK_EXECUTION if turn is None or turn.state.get('mode') else _TASK_DECLARATION
+
 
 class QueryResultRead(_AnalysisTool):
     name = 'QueryResultRead'
     method = 'read_query_result'
     is_read_only = True
     description = '读取当前会话已保存结果，不重新查询。预算查询默认返回业务 Markdown 表格；按返回的 tableRef、C列标识选择 columns，用 filters 对变化维度做 EQ/IN 过滤，严格复制 nextRead 游标续页。行号在同一 captureRef 内稳定。完整数据已返回时不要重复读取。执行覆盖 complete 与本次展示 readComplete 分开。显式排错才使用 pointer/fields 读取原始 JSON 片段；不读取整个 resultSet 对象。其他来源沿其实际 readOptions 读取。'
-    input_schema = obj({'captureRef': TEXT, 'pointer': {'type': 'string', 'maxLength': 2048},
+    input_schema = obj({'captureRef': {**TEXT, 'description': '从已保存查询回执复制 captureRef。sourceRef 用于选择分析来源。'}, 'pointer': {'type': 'string', 'maxLength': 2048},
                         'offset': {'type': 'integer', 'minimum': 0}, 'limit': {'type': 'integer', 'minimum': 1, 'maximum': 100},
                         'search': {'type': 'string', 'minLength': 1, 'maxLength': 200}, 'fields': array(TEXT, 30, 1),
                         'tableRef': TEXT, 'columns': array(TEXT, 100, 1), 'cursor': {'type': 'string', 'maxLength': 2048},
@@ -240,6 +265,11 @@ class QueryResultRead(_AnalysisTool):
     input_schema['allOf'] = [{'if': {'required': ['requests'], 'not': {'required': ['captureRef']}},
                              'then': {'properties': {'requests': array(single_read_schema, 12, 1)}}}]
     description += ' 同一回执的批量读取可以在顶层给 captureRef；项内显式引用优先。单次读取也可 allPages=true，统一返回逐项 pages/readComplete/nextRead，不触发来源查询。'
+    input_schema['properties'].update(view={'const': 'EXECUTION'}, contextRef=TEXT)
+    input_schema['oneOf'].append({'required': ['view', 'contextRef'], 'maxProperties': 2})
+    input_schema['dependentRequired'] = {'view': ['contextRef'], 'contextRef': ['view']}
+    input_schema['allOf'].append({'if': {'required': ['view']}, 'then': {'maxProperties': 2}})
+    description += ' 解释旧查询使用 view=EXECUTION 和 contextRef，仅读取原执行记录。'
 
 
 WORK_ITEM = obj({'taskId': TEXT, 'title': TEXT, 'kind': {'enum': ['VALUES', 'COMPUTATION', 'RELATION']},
@@ -253,24 +283,26 @@ WORK_ITEM['properties']['refs']['description'] = 'VALUES 使用 factId；COMPUTA
 WORK_ITEM['properties']['refs']['description'] += ' COMPUTATION 可用 {valueRef,field,nodeRef?} 引用已有标量。统计任务引用 DESCRIBE 及其字段，不为每个统计值另建 ARITHMETIC。'
 WORK_ITEM['properties']['refs']['description'] += ' 只有一个 VALUES 工作项且主体数据为完整、同口径单指标时，空 refs 由宿主关联本版本主体事实；多指标、多取值任务或待补范围须明确引用，参考数据不自动加入。'
 WORK_ITEM['properties']['title'] = {**TEXT, 'description': '回答用户问题所需的业务结果；先取得必要数据再选择方法，不把可选分析或取数前猜测的实现步骤登记为必交目标。'}
+WORK_ITEM['properties']['kind']['description'] = '按交付依据选：VALUES 列示来源单元格，COMPUTATION 使用计算结果（含 Python 汇总或比较），RELATION 核对实际成员关系。'
 OPERATION['properties']['inputRefs']['description'] += ' ARITHMETIC 可用 {valueRef,field,nodeRef?} 直接计算已返回字段，如 negativeSum/sum；其他算子使用完整 ID。'
 OPERATION['properties']['ruleRef'] = {**TEXT, 'description': '适用的已登记规则；同一原生聚合批次、同一指标、互斥组且来源 CalcType=SUM 时，SUM 可省略，由宿主使用来源规则；其他情况不推定可加。'}
 WORK_ITEM['properties']['operator']['enum'] = [*OPERATION['properties']['operator']['enum'], 'PYTHON']
 for contract in (WORK_ITEM, WORK_REFS['items']):
+    contract['properties']['objectiveRef'] = {**TEXT, 'description': '归属不明确或纠正误填的关系项时，选择本轮已返回的数据构成目标。配合 FORMULA_CHECK 使用同一目标的全部公式结果。'}
     contract['properties']['revisionReason'] = {**TEXT, 'description': '修正已失败且未绑定业务规则的 SUM/LINEAR 方法时填写：误选原因及新方法如何回答原目标。须关联真实失败和同范围的成功结果；不能替换来源公式、勾稽或换算，不缩小业务目标。'}
 WORK_REFS['items']['properties']['operator']['description'] = '关联实际结果的方法。普通方法可显式修正；误选 SUM/LINEAR 且实际执行失败、未绑定规则时可用 revisionReason 纠正。来源公式/勾稽/换算及已绑定业务规则不能降级。'
-VIEW['properties']['nodeRefs']['description'] = '选择 FORMULA_CHECK 已追溯的 factRef；各 valueRefs 依次展示，每条追溯内按此列表顺序展示节点。只选择能说明当前问题的关键层，不必把整条链重复画出；省略才展示全部。运算符和计算依赖顺序不改变。'
+VIEW['properties']['nodeRefs']['description'] = '数据构成主图省略此字段，展示本次返回的全部计算层。另画重点比较图时可选 formulaTrace.nodes[].factRef，按指定顺序展示，每层保留全部直接操作数。'
 VIEW['properties']['includeDetails']['description'] = '仅 FORMULA/HIERARCHY；按阅读需要附带明细。关键图不必附全表；完整核对数据可独立用 TABLE 引用同一派生结果并 collapsed=true。'
 
-REPAIRS = array(obj({'op': {'enum': ['replace', 'remove', 'add', 'replaceText']},
+REPAIRS = array(obj({'op': {'enum': ['replace', 'remove', 'add', 'replaceText', 'appendMarkdown']},
                     'path': {**TEXT, 'description': '错误返回的 JSON Pointer，如 /viewPlan/2/nodeRefs。add 可用 /presentation/labels/- 追加数组项，也可用 0 至当前长度的数字下标插入；replace/remove 须指向已有项。父路径须存在，数组下标不带前导零。仅修改指定路径，其他内容完整保留。'},
-                    'value': {'description': 'replace/add 时按原字段契约提供；remove 不传。replaceText 仅 path=/document/html，value={oldText:textTargets原文片段,newText:修正文字,textRef:可选真实引用}；原文须在单个静态文本节点中唯一匹配，优先用 textTargets 的 oldText/textRef；跨标签原句由宿主定位为现有片段，修改必要片段。保留原数值占位符，可补充引用页面已有 bindings 中的值；不新增绑定定义。多处修改一次提交。'}}, ['op', 'path']), 100, 1)
+                    'value': {'description': 'replace/add 按字段契约提供值，remove 省略。replaceText 用反馈的 repairPath，value={oldText:原稿唯一片段,newText:修正文字,textRef:可选真实引用}，优先使用 textTargets。保留原数值占位符。新引用可在同批用 add 向 /document/bindings/- 登记实际结果，再在 newText 中使用 {{key}}。多处修改一次提交。'}}, ['op', 'path']), 100, 1)
 
 # Put the rules at their input fields so callers do not need to infer variants
 # from a long tool description or load a reference document to fix one field.
 for key, description in {
     'valueRefs': 'FORMULA/WATERFALL 填 FORMULA_CHECK 的 derivedId；RECONCILIATION 填 RECONCILE 的 derivedId；TABLE/BAR_VALUES 填来源 factId；BAR_RANK 填 RANK 的 derivedId；METRIC 填标量引用；HIERARCHY 首项父 factId，其后全部直属子项同指标 factId。',
-    'nodeRefs': '仅 FORMULA/WATERFALL；选择要画出的计算层，填 formulaTrace.nodes[].factRef，按列表顺序展示。选中一个公式节点会展示其全部直接操作数；叶子节点不会生成独立公式图。不是用来删减单条公式的运算项。省略才展示全部计算层。',
+    'nodeRefs': '仅 FORMULA/WATERFALL。数据构成主图省略，展示全部已返回计算层。附加重点图可选 formulaTrace.nodes[].factRef；各层保留全部直接操作数，叶子不另画。',
     'includeDetails': '仅 FORMULA/HIERARCHY 支持，true 为图下附表。TABLE/RECONCILIATION 等必须省略此字段（false 也不传）。',
     'groupId': '引用 presentation.groups 的 groupId。包括 TABLE 在内，同组视图必须连续；不同单位或主题可自行分组。',
     'pageSize': '当前视图所附每张表独立的每页行数 1～100；不裁掉其他表的行。',
@@ -301,9 +333,9 @@ class AnalysisBuild(_AnalysisTool):
     name = "AnalysisBuild"
     method = "build"
     description = (
-        '从已捕获来源构建分析或报告。已用 AnalysisTask.subjectSources 采用来源时，只需 operations/requestKey，宿主沿用这些输入组；多个主体分别用 select.inputRef 计算，跨组计算显式列 inputRefs。也可首次传 captureRefs/scope/operations/requestKey，目标和用途已确定时由宿主生成 selections。'
+        '从已捕获来源构建分析或报告。已采用来源时直接传 operations 和 requestKey，宿主已绑定选区。多个主体分别用 select.inputRef 计算，跨组计算显式列 inputRefs。仅在还未采用来源时，首次传 captureRefs/scope/operations/requestKey，目标和用途确定后由宿主生成 selections。'
         '已有分析追加计算或工作项传 baseAnalysisRef/operations/requestKey，省略三个输入字段以沿用冻结事实、范围、粒度和有效 Python 结果；换数据才完整提交。'
-        '已知 analysisMaterials/selections 直接使用，缺字段才定向 Inspect。批量 TABLE 选择 batchId/columnNames/可选 rowIndices，省略行号取全部实际行；'
+        '仅当前 Schema 提供 selections 时才填写。批量 TABLE 选择 batchId/columnNames/可选 rowIndices，省略行号取全部实际行；'
         'scope.members 可省略，由选择器生成。显式成员用真实 memberRef 或唯一 objectId，名称不能替代 ID；expectedDimensions 仅共同口径。'
         'selections 的 PRIMARY/REFERENCE/STRUCTURE 区分主体、对照、结构，grain 为实际维度列；批量默认全部分组维度，不再按机构树去重。'
         '网格 cellKeys 是真实目标，includeFormulaDependencies=true 自动补齐同观察已捕获依赖并执行 LOCAL FORMULA_CHECK，已有检查不重复提交。'
@@ -349,7 +381,7 @@ class AnalysisPython(_AnalysisTool):
     method = 'python'
     is_concurrency_safe = False
     description = (
-        '用冻结的完整相关输入进行自由 Python 分析。使用 AnalysisBuild 返回的 inputSetRef；纯文件或网格、追加文件使用 '
+        '用冻结输入进行自由 Python 分析。首次使用 Build 返回的 inputSetRef；追加并保留已算结果用该次 Python 返回的新 inputSetRef。纯文件或网格、追加文件使用 '
         'AnalysisTask(action=prepare_inputs) 一次准备。多个来源先明确用途，不能默认最近一次。失败或取消运行用 retryOfRunRef，'
         '不重新取数或重复拼来源列表。程序注入 inputs，代码可自行筛选、连接、分组、统计和输出多个结果。'
         '仅文件执行返回 pythonRunRef，不创建 analysisRef；继续使用原 inputSetRef。'
@@ -361,7 +393,7 @@ class AnalysisPython(_AnalysisTool):
         '预算输入 Markdown 给出本次维度、成员和来源指标的对应关系。dimensions 按成员编码筛选，dimensionNames 取成员显示名称；'
         '预算合计按该维度的字符串 00000000 比较。字段目录由宿主生成，不假设 label 存在。PRIMARY/REFERENCE 分别统计，同一事实可属多组；VALUES 是原数据，FORMULA 是构成材料。'
         '表产物使用 columns[{name,label,type,unit?,decimalPlaces?}] 与 rows[{rowRef,values,valueStates}]，'
-        '按 row.values[column.name] 读取，不依赖列位置；自建输出 rows 可以直接使用具名字典，由宿主统一包裹。'
+        '按 row.values[column.name] 读取；输出 rows 用具名字段。多维分组可用元组作内部键，返回时将组合键拆成各维度列。'
         'GRID_FILE 通过 grid_rows(input["ref"],where) 流式迭代，完整文件不在 data 中；where 支持 '
         'cellKeys、dimensions、measureCode、headerText、mapTypes、startRow/endRowExclusive/startColumn/endColumnExclusive。'
         '网格记录 sourceRef 指输入，保留 key/headers/formula/rawValueJson，dimensions 合并表外条件；按真实指标定位数值格后再计算。'
@@ -375,21 +407,32 @@ class AnalysisPython(_AnalysisTool):
         '表产物可续算或绑定 document.datasets；小结果 payloadComplete=true 时无需重复 Inspect。字段未知才探索，不限制代码创建新的业务列。')
     input_schema = obj({
         'inputSetRef': {**TEXT, 'description': '宿主返回的完整冻结输入集合；不手填 factRef 列表或猜引用。'},
+        'dimensionFilter': {'type': 'object', 'additionalProperties': {'type': 'string'},
+                            'description': '可选，在已冻结的结构化事实中按维度和成员筛选后执行。来源中唯一的中文名与编码等效。'},
+        'filterInputRef': {**TEXT, 'description': '按维度筛选且集合中有不同用途时，选主体或对照的已采用输入组。'},
         'retryOfRunRef': {**TEXT, 'description': '失败或取消运行返回的 pythonRunRef，沿用原冻结输入；与 inputSetRef、operations 二选一。'},
+        'registerRunRef': {**TEXT, 'description': '脚本执行成功、登记失败时只纠正工作项，不重新执行。'},
         'code': {'type': 'string', 'minLength': 1, 'maxLength': 64000},
         'purpose': TEXT,
         'fallbackReason': {'type': 'string', 'minLength': 1, 'maxLength': 2000},
         'requestKey': TEXT,
         'timeoutSeconds': {'type': 'integer', 'minimum': 1, 'maximum': PYTHON_MAX_TIMEOUT_SECONDS,
                            'default': PYTHON_DEFAULT_TIMEOUT_SECONDS},
-        'answerOutputs': array(TEXT, 1000, 1),
+        'answerOutputs': {**array(TEXT, 1000, 1), 'description': '用于答复的脚本输出名。本次明确声明唯一的 PYTHON 工作项、未单独选 refs 时，同时归入该项。多工作项分别在 refs 指定输出名。'},
         'operations': array(OPERATION, 100),
         'workPlan': array(WORK_ITEM, 100),
         'supersedesRunRefs': {**array(TEXT, 20), 'description': '明确被本次纠正替代的同分析旧执行引用；purpose 说明纠正理由。允许调整实际输入，宿主记录差异并重新审查，不证明语义等价；新执行失败不替代，仍被交付或计算依赖的旧产物保留。'},
-    }, ['code', 'purpose', 'fallbackReason', 'requestKey'])
+    }, ['requestKey'])
+    input_schema['if'] = {'required': ['registerRunRef']}
+    input_schema['else'] = {'required': ['code', 'purpose', 'fallbackReason']}
+    input_schema['dependentRequired'] = {'filterInputRef': ['dimensionFilter'], 'dimensionFilter': ['inputSetRef']}
     input_schema['oneOf'] = [
-        {'required': ['inputSetRef'], 'not': {'required': ['retryOfRunRef']}},
-        {'required': ['retryOfRunRef'], 'not': {'anyOf': [{'required': ['inputSetRef']}, {'required': ['operations']}]}}
+        {'title': '新计算，使用已准备的输入', 'required': ['inputSetRef'],
+         'not': {'anyOf': [{'required': ['retryOfRunRef']}, {'required': ['registerRunRef']}]}},
+        {'title': '重试失败或取消的运行', 'required': ['retryOfRunRef'],
+         'not': {'anyOf': [{'required': [k]} for k in ('inputSetRef', 'operations', 'registerRunRef', 'dimensionFilter')]}},
+        {'title': '仅登记成功执行的产物', 'required': ['registerRunRef', 'workPlan'],
+         'not': {'anyOf': [{'required': [k]} for k in ('code', 'purpose', 'fallbackReason', 'inputSetRef', 'retryOfRunRef', 'operations', 'dimensionFilter', 'supersedesRunRefs', 'timeoutSeconds')]}}
     ]
 
 
@@ -406,15 +449,28 @@ AnalysisTask.input_schema['properties']['action']['enum'].append('prepare_inputs
 AnalysisTask.input_schema['properties'].update(_PREPARE_INPUTS)
 AnalysisTask.input_schema['allOf'].append({
     'if': {'properties': {'action': {'const': 'prepare_inputs'}}, 'required': ['action']},
-    'then': obj({'action': {'const': 'prepare_inputs'}, **_PREPARE_INPUTS}, ['action']),
+    'then': obj({'action': {'const': 'prepare_inputs'}, **dict.fromkeys(_PREPARE_INPUTS, {})}, ['action']),
     'else': {'not': {'anyOf': [{'required': [key]} for key in _PREPARE_INPUTS if key != 'analysisRef']}}})
 AnalysisTask.input_schema['allOf'].append({'if': {'required': ['analysisRef']},
-    'then': {'properties': {'action': {'enum': ['declare', 'prepare_inputs']}}}})
-AnalysisTask.input_schema['properties']['analysisRef'] = {**TEXT, 'description': 'declare 时明确复用某份报告的完整输入，不重新取数或计算；不能同时给 subjectSources 或范围修改。prepare_inputs 时冻结该分析用于代码计算。'}
-AnalysisTask.description += ' 仅审核或修订已有报告时，declare 使用 analysisRef 复用原报告全部输入，不从 sources 目录重新选单列。只续审用 AnalysisPublish(analysisRef,requestKey,resumeReview=true)。'
+    'then': {'properties': {'action': {'enum': ['declare', 'prepare_inputs', 'tools']}}}})
+AnalysisTask.input_schema['allOf'].append({'if': {'properties': {'action': {'const': 'tools'}}, 'required': ['action']},
+    'then': obj({'action': {'const': 'tools'}, 'analysisRef': TEXT}, ['action'])})
+AnalysisTask.input_schema['properties']['analysisRef'] = {**TEXT, 'description': 'declare 时复用所选报告的完整输入；prepare_inputs 时冻结分析供计算；tools 可附已知引用核验其归属。'}
+AnalysisTask.description += ' 审核已有报告时，declare 用 analysisRef 沿用全部冻结输入。查看原意见、接续待审、独立复核已审正文分别使用 AnalysisPublish 的 VIEW、RESUME、RECHECK。'
 AnalysisTask.description += (' prepare_inputs 将已确认 analysisRef 或 captureRefs/selections/scope，以及显式 fileInputs/gridInputs '
     '冻结为 inputSetRef。来源不明确先选择，不默认最新结果。AnalysisBuild 已直接返回 inputSetRef，无需重复准备。'
     '新增前置运算可放 operations；换来源或条件重新准备，纯文件也可独立分析。')
+
+# Each view is constructed once. A tool instance selects its own turn's view.
+_TASK_EXECUTION = deepcopy(AnalysisTask.input_schema)
+for _field in ('materials', 'formulaSubjects'):
+    _TASK_EXECUTION['properties'].pop(_field)
+_TASK_DECLARATION = deepcopy(_TASK_EXECUTION)
+_TASK_DECLARATION['properties']['action']['enum'] = ['declare', 'contexts', 'sources']
+for _field in (_PREPARE_INPUTS.keys() - {'analysisRef'}) | {'failedToolCallIds', 'evidenceCaptureRefs', 'resultRefs', 'reason', 'groupingCaptureRefs'}:
+    _TASK_DECLARATION['properties'].pop(_field, None)
+_TASK_DECLARATION['allOf'] = [rule for rule in _TASK_DECLARATION['allOf']
+                              if rule['if'].get('properties', {}).get('action', {}).get('const') != 'prepare_inputs']
 
 
 class AnalysisInspect(_AnalysisTool):
@@ -424,7 +480,7 @@ class AnalysisInspect(_AnalysisTool):
     description = "分页读取本会话分析输入、精确值引用和校验诊断，不触发新来源查询。已知适用 captureRef 时 inventory 仅加载该捕获，不扫描无关历史；需要另一次捕获的名称时定向读 entities 并纳入引用。nextRead 是保留本次筛选条件的续读参数，可直接使用。section=entities 读取对象 key/label/modelCode/resourceRef 及名称 captureRef（可按 objectId 或 captureRef 筛选；搜索候选只补名称，不证明成员完整）；section=results 发现本会话已有结果及主题范围；selectors 按 captureRef 返回实际 stepId/memberPointers/populationSelector；inventoryIssues 分页读被隔离的无效输入。facts/inventory 返回受字符预算限制，严格沿 nextOffset 继续，不自行加 limit；facts 支持 factRef 定位及 fields 精确选择，detail=full 恢复全字段；来源捕获字段为 captureRefs 数组，inventory 的 captureRef 是另一种结构。INVALID_FIELDS 返回 availableFields，不猜字段名。inventory 默认 detail=compact，以 contextRef 引用顶层 contexts，detail=full 读全元数据；支持 captureRef/stepId/cellKey 精确选择，对象筛选须同时给出 memberDimension；inventory/capture 的 memberRef 是成员来源引用，sourceObjectId 是原始 ID。跨来源同名 ID 用 memberRef 填 members/referenceMembers，Build 后的选择使用实际返回的 objectId；memberRef 不能作为 MCP 业务 ID。名称按 dimensionModels/objectModelCode 匹配实体模型。section=inventory 汇集当前会话各次查询的单元格、对象名称、任务时期、值及引用，支持 memberDimension/objectId/bindingRef/period/measureCode/search 分页筛选，不合并不同观察；section=captures 列输入；capture 定位单元格；receipt 核对原请求；protocol 查算子及已登记规则；facts/derived/summary 读分析；formulas 加 factRef 分页读表内依赖及具体断点；order 按 derivedId 分页读排序结果；relations 读取来源证明的一级关系，用于 HIERARCHY 图；省略 analysisRef 时发现全会话已捕获关系，带 analysisRef 时仅读该版本。"
     description += ' summary 同时返回模型声明的 presentation（含共享 labels）和 viewPlan（含局部 labels），用于综合或重建时恢复展示约定；由模型筛选、补充并重新提交，不自动套用旧布局。'
     description += ' queryContexts 按最新优先读取本会话已捕获的查询条件、绑定、指标定位和任务机构类型，每页最多 10 个回执；追问只增加分组等条件时先复用仍适用的上下文，不重新发现任务和指标。未命中当前页时沿 nextOffset 继续；失败回执保留失败原因。'
-    input_schema = obj({"section": {"enum": ["materials", "gridFiles", "inventory", "inventoryIssues", "entities", "results", "selectors", "captures", "queryContexts", "capture", "receipt", "rows", "protocol", "facts", "derived", "formulas", "summary", "claims", "verificationRecords", "relations", "order", "delivery", "findings", "actions", "preview", "python", "products", "inputFields"]},
+    input_schema = obj({"section": {"enum": ["materials", "gridFiles", "inventory", "inventoryIssues", "entities", "results", "selectors", "captures", "queryContexts", "capture", "receipt", "rows", "protocol", "facts", "derived", "formulas", "summary", "claims", "verificationRecords", "relations", "order", "delivery", "findings", "actions", "preview", "python", "products", "inputFields", "periodTrends"]},
                         'pythonRunRef': {**TEXT, 'description': 'section=python 读取成功、失败、取消或超时的执行记录；或用 analysisRef 列出该分析已登记的 Python 计算。'},
                         'pythonPath': {**TEXT, 'description': 'section=python 的完整记录 JSON Pointer，沿返回的 readOptions/read/nextRead 读取代码、输入和输出；支持 offset/limit/fields 分页，默认仅摘要。'},
                         "previewRef": {**TEXT, 'description': '仅 section=preview，传成功预览返回的 repairRef；读取当前文档的页面检查记录，不会代替浏览器运行检查。'},
@@ -447,7 +503,7 @@ class AnalysisInspect(_AnalysisTool):
         {'properties': {'section': {'const': 'python'}}, 'anyOf': [{'required': ['pythonRunRef']}, {'required': ['analysisRef']}]},
     ]
     single_fields = list(input_schema['properties'])
-    input_schema['properties'].update(requests=array(single_read_schema, 12, 1), allPages={'type': 'boolean'})
+    input_schema['properties']['allPages'] = {'type': 'boolean'}
     input_schema['oneOf'] = [{'not': {'anyOf': [{'required': ['requests']}, {'required': ['allPages']}]}},
                             {'required': ['requests'], 'not': {'anyOf': [{'required': [key]} for key in single_fields]}}]
     shared_read_schema = deepcopy(single_read_schema)
@@ -455,46 +511,72 @@ class AnalysisInspect(_AnalysisTool):
     input_schema['properties']['requests'] = array(shared_read_schema, 12, 1)
     input_schema['oneOf'][1]['not']['anyOf'] = [{'required': [key]} for key in single_fields if key != 'analysisRef']
     input_schema['allOf'] = [{'if': {'required': ['requests'], 'not': {'required': ['analysisRef']}},
-                             'then': {'properties': {'requests': array(single_read_schema, 12, 1)}}}]
+                             'then': {'properties': {'requests': {'items': {'oneOf': single_read_schema['oneOf']}}}}}]
     description += ' 同一分析的批量读取可在顶层给 analysisRef，requests 每项只写 section 和具体目标；项内显式引用优先，不自动跨分析或会话。'
 
 
 DOCUMENT_BINDING = obj({'key': {'type': 'string', 'pattern': '^[A-Za-z][A-Za-z0-9_-]{0,63}$'},
                         'valueRef': _VALUE_PART['valueRef'], 'field': _VALUE_PART['field'],
-                        'nodeRef': _VALUE_PART['nodeRef'], 'format': NUMBER_FORMAT}, ['key', 'valueRef'])
+                        'nodeRef': _VALUE_PART['nodeRef'], 'format': NUMBER_FORMAT,
+                        'rowRef': TEXT, 'column': TEXT}, ['key', 'valueRef'])
+DOCUMENT_BINDING['description'] = '引用已有计算表中的数值时，valueRef 指向该表，rowRef 和 column 使用实际返回的行引用和数值列名。'
+DOCUMENT_BINDING['dependentRequired'] = {'rowRef': ['column'], 'column': ['rowRef']}
 DOCUMENT_DATASET = obj({'key': DOCUMENT_BINDING['properties']['key'], 'valueRef': TEXT,
                         'nodeRefs': array(TEXT, 200, 1), 'format': NUMBER_FORMAT}, ['key', 'valueRef'])
 DOCUMENT_DATASET['description'] = '绑定 SORT/RANK、FORMULA_CHECK 或 RECONCILE 的真实 derivedId。window.analysisSets[key] 提供后端排好序的 rows、公式 nodes/operands/values/contributions 或 parent/children/values。nodeRefs 仅为公式选择关键计算层，每层仍保留全部操作数。数字为精确字符串，display 已格式化。'
 DOCUMENT_DATASET['description'] += ' 也接受 AnalysisPython 的 TABLE/CHART_DATA 产物，生成 kind=TABULAR 的 columns/rows/rowCount；复用已有页面组件绘图，不改模板。'
 DOCUMENT_DATASET['description'] += ' DESCRIBE 同样直接提供 TABULAR columns/rows 与 statistics/counts；不需要为组装展示表另写 Python。公式集合从 window.analysisSets[key].nodes 读取：节点金额用 node.values.sourceValue/localValue/localDifference 的 value/display；节点状态是 localStatus/recursiveStatus。直接操作数在 node.operands，金额为 operand.value/display。不能把公式节点的金额对象当成普通 fact。预算来源原始 null 保留，operand.calculationValue 是实际运算输入，contributions/waterfall 已应用空值按0规则。本表公式展示参考 report-generation 的 references/formula-visualization-examples.md；完整多项加减遍历 waterfall.steps 绘制横向瀑布图，后台已返回的相关下层可折叠但不漏项，重点比较图仅作补充；展开深度由后台决定，未见底不影响展示，不为出图继续展开；非线性用关系图或步骤，单输入用衔接说明。不自行重算、把未读数据补零或为画图追查表外。'
 DOCUMENT = obj({'title': {'type':'string','minLength':1,'maxLength':300},
-                'path': {**TEXT, 'description':'当前工作区内 UTF-8 .html 的相对路径；成功读取后冻结内容。'},
+                'path': {**TEXT, 'description':'当前工作区内 UTF-8 .md 或 .html 的相对路径。'},
+                'markdown': {'type':'string','minLength':1,'maxLength':524288},
                 'html': {'type':'string','minLength':1,'maxLength':524288},
                 'bindings': array(DOCUMENT_BINDING, 2000), 'datasets': array(DOCUMENT_DATASET, 50)}, ['title'])
 DOCUMENT['anyOf'] = [{'required': ['bindings'], 'properties': {'bindings': {'minItems': 1}}},
-                     {'required': ['datasets'], 'properties': {'datasets': {'minItems': 1}}}]
-DOCUMENT['oneOf'] = [{'required':['path'], 'not':{'required':['html']}}, {'required':['html'], 'not':{'required':['path']}}]
-DOCUMENT['description'] = '自由 HTML 页面，无固定布局或图型。path/html 二选一。bindings 绑定真实 factId/derivedId，可用 field/nodeRef/format。正文 {{key}} 自动填展示值；内联图表脚本从 window.analysisData[key].value/display 读取可信值。完整 HTML 使用内联 CSS/JS/SVG；无外部依赖或 http-equiv。预览冻结源文件与绑定，最终复用同一 repairRef 发布。'
-DOCUMENT['description'] += ' bindings/datasets 至少一个非空。表格与图共用同一排序集合 rows，不手抄重排；容器标 data-analysis-set="集合key"，行/图形项标 data-analysis-ref="factRef" 以检查顺序；筛选或分页容器加 data-analysis-partial="true"。公式树使用 factRef 与运算符，由模型为全部操作数编写简称，按问题选图，不能把差额当作来源值的一部分。'
-DOCUMENT['description'] += ' 声明了已完成排序工作项时必须绑定其排序集合。部分交付在模型选择的可见正文位置放 {{analysisPartialReason}}，宿主只填声明内容，不插入固定版式。'
-DOCUMENT['description'] += ' 同一零基线线性条形须调用 analysisCharts.bindLinearBars(items,{extent:真实轨道元素})，items 每项为 {element:实际条形元素,valueKey:绑定key} 或 {element,setKey:集合key,factRef:行引用}。函数绑定数值、标记和长度；模型仍决定布局、颜色、文字与分析重点。每次调用默认独立刻度，全量与局部放大分别调用。点图、区间、堆叠终点等不适用图型不套用。diagnostics.renderChecks.viewports[].numericChecks 说明受检范围，NOT_DECLARED 不表示图形正确。'
-DOCUMENT['description'] += ' 极小值可用精确标签或明细表代替条形，无须维持首稿条形数量。analysisCharts.bindValueLabel(element,{valueKey}) 或 {setKey,factRef} 绑定标签；明细行保留 data-analysis-ref 及所属 data-analysis-set。实际图形保留数值及比例尺绑定，不能只删除检查标记。'
+                     {'required': ['markdown']},
+                     {'required': ['datasets'], 'properties': {'datasets': {'minItems': 1}}},
+                     {'required': ['html'], 'properties': {'html': {'pattern': 'data-analysis-trend'}}},
+                     {'required': ['path']}]
+DOCUMENT['description'] = '多时期分析可直接绑定宿主折线图。对于 path，读取冻结页面后统一验证其数值、集合或趋势引用。'
+DOCUMENT['oneOf'] = [{'required':[key]} for key in ('markdown', 'path', 'html')]
+DOCUMENT_DATASET['description'] += (' 图注需要排序方向时，在现有文案中放 <span data-analysis-order-label="集合key"></span>，'
+    '宿主按实际 SORT/RANK/DESCRIBE 输出“从小到大”或“从大到小”。描述统计若只展示汇总数，不要求绘制排序图。'
+    '表和图共用 row.values。公式步骤名用 step.label，原表地址仅用 node.cellAddress。解释主体时直接展开关键计算层，衔接和明细可折叠。')
+DOCUMENT['description'] = ('Markdown 业务正文写在 markdown 或 .md 草稿 path 中。图表直接复制本次 markdownFigures 中的图片引用，单独成段。'
+    '正文 {{key}} 绑定数值。宿主保留报告模板并生成来源明细。HTML 草稿接受相同的绑定和发布检查。')
+
 
 
 class AnalysisPublish(_AnalysisTool):
+    @property
+    def model_input_schema(self):
+        turn = getattr(self.service, 'turn', None)
+        if (turn and turn.state.get('adoptedReportRef') and not turn.state.get('expandedToolCatalog')
+                and not turn.state.get('reportReviewRead')):
+            return obj({key: self.input_schema['properties'][key] for key in ('analysisRef', 'requestKey', 'reviewAction')},
+                       ['analysisRef', 'requestKey', 'reviewAction'])
+        if turn and turn.state.get('deliveryMode') == 'DOCUMENT' and not turn.state.get('expandedToolCatalog'):
+            props = self.input_schema['properties']
+            document = obj({k: DOCUMENT['properties'][k] for k in ('title', 'markdown', 'path', 'bindings')}, ['title'])
+            document['oneOf'] = [{'required': [k]} for k in ('markdown', 'path')]
+            document['description'] = '业务正文用 Markdown。图形从 markdownFigures 或时期候选的 Markdown 列复制，独立成段。'
+            fields = {key: props[key] for key in ('analysisRef', 'requestKey', 'finalize', 'repairRef', 'repairs',
+                                                    'previewOnly', 'workRefs', 'unresolvedItems', 'reviewAction')}
+            return obj({**fields, 'document': document}, ['requestKey'])
+        return None
     validates_input_in_call = True
     name = "AnalysisPublish"
     method = "publish"
     # 工具描述直接给出完整最短路径，不要求为机械确认再读多份文档。
-    description = ('发布分析版本，默认由模型编写自由 HTML 页面，决定布局、图表和解释，复用用户已确认模板。原生优先仅指计算；用户明确选择显式组件时才用 claims+viewPlan。首次提交 analysisRef/requestKey/document{title,path 或 html,bindings,datasets}，通常带 finalize=true：宿主检查冻结页面、核对内容，通过后同次发布；不通过返回具体诊断和 repairAndFinalize。'
-        '文字实质错误 textRepairable=true 时优先沿用 repairAndFinalize，一次传齐 repairs:[{op:"replaceText",path:"/document/html",value:{oldText:textTargets原文片段,newText:修正文字,textRef:textTargets引用}}]，直接修改冻结页面，无需 Read/Edit/Build。结合 issues 的原句与 repairEvidence 一并修正正文、摘要、图注。textRepairable=false 不猜定位；标签、脚本或绑定确需改变时编辑当前 HTML（已有 documentEditSource 则用其 path），用 {op:"replace",path:"/document/path",value:实际文件路径} 刷新；不重抄原 bindings/datasets。'
-        'previewOnly=true 仅预览，与 finalize=true 二选一；成功预览也可原样使用 confirmPublish。语义 REVISE 只修实质错误，合理解释不反复润色；NOT_REVIEWED/UNAVAILABLE 不是通过。宿主完成两种宽度测量则复用记录，不重复调用浏览器 MCP；确实不可用时保留未检查状态，不放过已测错误。'
-        '线性条形使用 analysisCharts.bindLinearBars(items,{extent:trackElement})；第二参数必填，trackElement 是已挂入页面的真实轨道元素，每项用 {element,valueKey} 或 {element,setKey,factRef}。原生 DESCRIBE 的 TABULAR 与 ORDERED 集均可直接绑定。'
-        '仅 delivery.registered=true 才交付链接。workRefs 补已声明工作项；真实缺失用 unresolvedItems，已补齐时传 [] 清除。来源正常返回空值、空属性及已完成核对的复算差异写在分析正文，不算未完成。显式组件用 claims+viewPlan，与 document 二选一。参数不套 arguments，title/path/html/bindings/datasets 均在 document 内。已发布版本修改时宿主自动续版，无需版本参数。')
+    description = ('用 Markdown 发布图文分析。提交 analysisRef、requestKey、document:{title,markdown}、finalize:true。'
+        'title 是报告总标题，正文从概述或 ## 章节开始。数值用千分位，保留原精度。正文写结论、依据与解释。每幅图从 markdownFigures 或时期候选的 Markdown 列复制图片引用并独立成段，宿主绘图并附查询数据。'
+        '内容较长可用 documentDraft.path 写 .md。正文要引用精确结果可用 bindings；宿主自动绑定所选图。'
+        '已确认的合理解释保留；实质问题按 repairAndFinalize 用 replaceText 和返回的 repairPath、textTargets 修原稿。'
+        '整稿修改用 /document/path。仅 delivery.registered=true 后交付。续审复用 reviewAction 与原 analysisRef。'
+        '已发布的 HTML 仍可用原稿修订、续审或导出。')
     input_schema = obj({"document": DOCUMENT, "finalize": {"type": "boolean", "description": "true 在一次调用内完成预览、页面检查、内容核对和通过后的发布；有问题返回保存草稿及局部修复入口，不自动改写业务内容。"}, "previewOnly": {"type": "boolean", "description": "true 只检查预览，不发布；与 finalize=true 互斥。"}, "presentation": PRESENTATION, "analysisRef": TEXT, "claims": array(CLAIM, 50), "viewPlan": array(VIEW, 20), "requestKey": TEXT,
                         'repairRef': {**TEXT, 'description': '失败或预览返回的保存草案。通常复用 repairAndFinalize，以 requestKey/repairRef/repairs 和 finalize=true 完成修复检查及通过后的发布；仅预览才用 previewOnly=true，不重写完整计划。'},
                         'repairs': {**REPAIRS, 'minItems': 0},
-                        'workRefs': {**WORK_REFS, 'description': '为已有 taskId 关联真实结果或字段；可显式修正普通计算的 operator。保留目标范围及来源核对、业务汇总要求，不删除或重命名工作项。'},
+                        'workRefs': {**WORK_REFS, 'description': '有工作项时按其 taskId 补真实结果；可修正普通计算的 operator。工作项为空时省略。目标 objectiveRef 不填在此处。'},
                         'unresolvedItems': {**array(ISSUE_SCHEMA, 100),
                                             'description': '真实缺口须含 requirement/reason/basis。WORK_ITEM 引用待完成 taskId；AUDIT_RESULT 引用 FORMULA_CHECK/RECONCILE 的 resultRefs，核对已完成时宿主转为审核发现，不保留未完成标记；INVESTIGATION 仅用 AnalysisTask/Build 返回的 investigations.requirementRef；确实遗漏且尚无工作项的用户要求用 USER_REQUIREMENT/userQuote，由内容核对确认。未明差额成因不自动成为调查要求。[] 清除旧缺口，正文复用 {{analysisPartialReason}}。'},
                         'renderCheckUnavailableReason': {'type': 'string', 'minLength': 1, 'maxLength': 1000, 'description': '仅浏览器检查确实不可用时填写具体原因；记录未检查状态，不证明布局合格，也不能跳过已测到的错误。修复草案时通过 repairs 修改此字段。'},
@@ -505,16 +587,32 @@ class AnalysisPublish(_AnalysisTool):
     input_schema['oneOf'] = [{'required': ['analysisRef', 'document'], 'not': {'anyOf': [{'required':['repairRef']}, {'required':['viewPlan']}, {'required':['presentation']}]}},
                              {'required': ['analysisRef', 'claims', 'viewPlan'], 'not': {'anyOf': [{'required':['repairRef']}, {'required':['document']}]}},
                              {'required': ['repairRef', 'repairs'], 'not': {'anyOf': [{'required': [key]} for key in
-                              ('analysisRef', 'claims', 'viewPlan', 'document', 'presentation', 'workRefs', 'unresolvedItems', 'renderCheckUnavailableReason', 'technicalDetails', 'findingPlan', 'actionPlan', 'thresholds', 'hypotheses')]}}]
+                              ('claims', 'viewPlan', 'document', 'presentation', 'workRefs', 'unresolvedItems', 'renderCheckUnavailableReason', 'technicalDetails', 'findingPlan', 'actionPlan', 'thresholds', 'hypotheses')]}}]
     input_schema['allOf'] = [{'not': {'required': ['finalize', 'previewOnly'],
                                     'properties': {'finalize': {'const': True}, 'previewOnly': {'const': True}}}}]
     input_schema['properties']['resumeReview'] = {'const': True, 'description': '对已交付待审报告续审。只传 analysisRef/requestKey/resumeReview=true，沿冻结材料重试未完成段，不重查、不重算、不重写报告。'}
+    input_schema['properties']['reviewAction'] = {'enum': ['VIEW', 'RESUME', 'RECHECK'],
+        'description': '查看原结论用 VIEW，补未完成的审核用 RESUME，要求再次审核已完成报告用 RECHECK。冻结数据和已审核计算由宿主复用。'}
     for branch in input_schema['oneOf']:
         prior_exclusion = branch.pop('not', None)
-        branch['not'] = {'anyOf': ([prior_exclusion] if prior_exclusion else []) + [{'required': ['resumeReview']}]}
+        branch['not'] = {'anyOf': ([prior_exclusion] if prior_exclusion else []) + [{'required': [field]} for field in ('resumeReview', 'reviewAction')]}
     input_schema['oneOf'].append({'required': ['analysisRef', 'resumeReview'], 'not': {'anyOf': [
         {'required': [key]} for key in input_schema['properties'] if key not in ('analysisRef', 'requestKey', 'resumeReview')]}})
-    description += ' 宿主可在审查不可用时交付 PENDING_REVIEW 完整报告，或带 REQUIRES_REVISION 及具体问题交付当前成果；不自动选择旧报告；依据 reportDelivery 的实际状态说明，不把可查看当作全部审查通过。需要继续审查时用 resumeReview。'
+    input_schema['oneOf'].append({'required': ['analysisRef', 'reviewAction'], 'not': {'anyOf': [
+        {'required': [key]} for key in input_schema['properties'] if key not in ('analysisRef', 'requestKey', 'reviewAction')]}})
+    description += ' PENDING_REVIEW 为已保存待审，REQUIRES_REVISION 携带实质问题。依据 reportDelivery 说明状态。复核已交付报告时用 reviewAction，提交修订只处理实质问题。'
+
+    async def call(self, **kwargs):
+        document = kwargs.get('document')
+        if isinstance(document, dict) and 'analysisRef' in kwargs and not {'repairRef', 'resumeReview'} & kwargs.keys():
+            # Placement is unambiguous for a fresh document. References and conflicts continue through normal validation.
+            for field in ('bindings', 'datasets'):
+                misplaced = kwargs.get(field)
+                existing = document.get(field, [])
+                if isinstance(misplaced, list) and isinstance(existing, list):
+                    document = {**document, field: [*existing, *kwargs.pop(field)]}
+            kwargs['document'] = document
+        return await super().call(**kwargs)
 
 
 class AnalysisFollowUp(_AnalysisTool):

@@ -38,7 +38,7 @@ def _field(value, field):
     return value
 
 
-def _select(facts, operation, known):
+def _select(facts, operation, known, source_scopes=()):
     if operation.get("inputRefs"):
         try:
             return [known[ref] for ref in operation["inputRefs"]]
@@ -73,11 +73,9 @@ def _select(facts, operation, known):
                 grouped.append({**fact, **{key: value for key, value in matches[0].items() if key != 'inputRef'}})
         selected = grouped
     for key, expected in selector.items():
-        if key in ('inputRef', 'inputRefs'):
+        if key in ('inputRef', 'inputRefs', 'dimensions'):
             continue
-        if key == "dimensions":
-            selected = [f for f in selected if all(f.get("dimensions", {}).get(k) == v for k, v in expected.items())]
-        elif key == 'inputRole' and group_refs is None:
+        if key == 'inputRole' and group_refs is None:
             role_selected = []
             for fact in selected:
                 memberships = [item for item in fact.get('inputMemberships', []) if item['inputRole'] == expected
@@ -91,6 +89,9 @@ def _select(facts, operation, known):
             selected = role_selected
         else:
             selected = [f for f in selected if f.get(key) == expected]
+    if 'dimensions' in selector:
+        from .member_filters import select_facts
+        return select_facts(selected, selector['dimensions'], source_scopes)
     return selected
 
 
@@ -173,7 +174,7 @@ def calculate(facts: list[dict], scope: dict, operations: list[dict], registry: 
             aliases.update({ref: ref for ref in known})
             bindings = [normalize_reference(ref, aliases) for ref in operation.get('inputRefs', [])]
             resolved = {**operation, 'inputRefs': [reference_id(ref) for ref in bindings]}
-            items = _select(pool, resolved, known)
+            items = _select(pool, resolved, known, scope.get('sourceScopes', []))
             if not bindings and not selector.get('inputRef') and not selector.get('inputRefs'):
                 groups = {membership['inputRef'] for item in items for membership in item.get('inputMemberships', [])
                           if membership['inputRole'] == selector.get('inputRole', 'PRIMARY')}

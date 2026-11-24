@@ -17,8 +17,48 @@ from analysis_extension.review_evidence import supplement
 
 
 class GenericDisplayTests(unittest.TestCase):
+    def test_group_coverage_includes_separately_captured_sources_and_unknown_coordinates(self):
+        def source(name, coordinate):
+            return {'factId': name, 'captureRef': name, 'batchId': name, 'formName': name,
+                    'measureCode': '数量', 'dimensions': coordinate, 'aggregation': {'groupBy': [{'dimCode': 'D'}]}}
+
+        catalog = {name: [source(name, coordinate)] for name, coordinate in [('一表', {'D': 'a'}), ('二表', {})]}
+        service = SimpleNamespace(owner=None, store=SimpleNamespace(get_capture=lambda owner, ref: ref),
+                                  sources=SimpleNamespace(catalog=lambda ref, dim: catalog[ref]))
+        turn = SimpleNamespace(service=service)
+        artifact = {'facts': [items[0] for items in catalog.values()], 'scope': {'memberDimension': 'D'}}
+        result = supplement(turn, artifact, '比较两个表样。')
+        self.assertEqual(result['groupedSources'], [
+            {'业务表': '一表', '返回分组数': 1, '材料已选分组数': 1},
+            {'业务表': '二表', '返回分组数': None, '材料已选分组数': None}])
+        unknown = supplement(turn, {**artifact, 'facts': catalog['二表']}, '分析二表。')
+        self.assertIsNone(unknown['groupedSources'][0]['返回分组数'])
+
+    def test_multi_axis_groups_keep_tuples_typed_nulls_and_missing_evidence(self):
+        def fact(ref, site, kind, measure):
+            return {'factId':ref, 'batchId':'b', 'formName':'产出', 'captureRef':'cap', 'measureCode':measure,
+                    'dimensions':{'SITE':site, 'D__K':kind}, 'aggregation':{'groupBy':[{'dimCode':'SITE'}, {'dimCode':'D','field':'K'}]}}
+        base = [fact('f1','A',None,'数量'),fact('f2','A',None,'成本'),fact('f3','A','None','数量'),fact('f4','B',None,'数量')]
+        service = SimpleNamespace(owner=None, store=SimpleNamespace(get_capture=lambda *_:{}),
+                                  sources=SimpleNamespace(catalog=lambda *_:base))
+        turn = SimpleNamespace(service=service)
+        def summary(selection):
+            packet = supplement(turn,{'scope':{'memberDimension':'SITE'},'facts':selection},'本次分析')
+            return packet['groupedSources'][0]
+        overview = summary([base[0],base[2]])
+        self.assertEqual((overview['返回分组数'],overview['材料已选分组数']), (3,2))
+        self.assertEqual(overview['指标采用'], [{'指标':'数量','返回':3,'已选':2},{'指标':'成本','返回':1,'已选':0}])
+        extra = fact('f5','A',None,'成本')
+        del extra['dimensions']['D__K']
+        base.append(extra)
+        overview = summary([*base[:2],extra])
+        self.assertIsNone(overview['返回分组数'])
+        self.assertIsNone(overview['材料已选分组数'])
+        self.assertEqual(overview['指标采用'][0]['返回'],3)
+
     def test_same_capture_grouping_supports_named_other_form_without_expanding_analysis(self):
         primary = {'factId': 'p', 'batchId': 'b1', 'captureRefs': ['cap'], 'formName': '主表',
+                   'dimensions': {'ORG__TYPE': 'A'}, 'measureCode': 'quantity', 'label': '数量',
                    'period': '2026N0001', 'taskName': '任务', 'dataContext': {'snapshotId': 's'},
                    'aggregation': {'groupBy': [{'dimCode': 'ORG', 'field': 'TYPE'}]}}
         other = {**primary, 'factId': 'o', 'batchId': 'b2', 'formName': '对照表',
@@ -33,7 +73,25 @@ class GenericDisplayTests(unittest.TestCase):
         self.assertEqual([f['factId'] for f in supported['facts']], ['o'])
         self.assertEqual(supported['facts'][0]['inputRole'], 'REVIEW_SUPPORT')
         self.assertEqual(artifact, before)
-        self.assertEqual(supplement(turn, artifact, '只分析主表。')['facts'], [])
+        unnamed = supplement(turn, artifact, '只分析主表。')
+        self.assertEqual(unnamed['facts'], [])
+        self.assertEqual(unnamed['groupedSources'], [
+            {'业务表': '主表', '返回分组数': 1, '材料已选分组数': 1},
+            {'业务表': '对照表', '返回分组数': 1, '材料已选分组数': 0}])
+        from analysis_extension.review_business_markdown import render_business_markdown
+        packet = render_business_markdown({'userRequest': '延续前面的分组', 'supportingEvidence': unnamed}, {})
+        self.assertLess(packet.index('延续前面的分组'), packet.index('同次分组查询各来源的采用情况'))
+        self.assertLess(packet.index('| 对照表 | 1 | 0 |'), packet.index('二、查询结果'))
+        self.assertNotIn('同次查询取得的补充业务数据', packet)
+        extra = {**other, 'factId': 'o2', 'measureCode': 'cost', 'label': '成本'}
+        service.sources.catalog = lambda *_: [primary, other, extra]
+        all_sources = {**artifact, 'facts': [primary, other]}
+        partial = supplement(turn, all_sources, '比较所选范围。')
+        summary = partial['groupedSources'][1]
+        self.assertEqual((summary['返回分组数'], summary['材料已选分组数']), (1,1))
+        self.assertEqual(summary['指标采用'], [{'指标':'数量','返回':1,'已选':1},{'指标':'成本','返回':1,'已选':0}])
+        complete = supplement(turn, {**all_sources, 'facts': [primary, other, extra]}, '比较所选范围。')
+        self.assertEqual([row['材料已选分组数'] for row in complete['groupedSources']], [1,1])
         for key in ('period', 'taskName', 'dataContext'):
             with self.subTest(field=key):
                 changed = {**other, key: 'different'}
@@ -83,7 +141,9 @@ class GenericRepairTests(PresentationCase):
         self.assertIsNone(closeout_reason(turn))
         record_repair(turn, 'review-1', 'PUBLICATION_REVISE')
         self.assertEqual(progress(turn)['repairCounts'], {'parameter': 3, 'semantic': 1})
-        record_repair(turn, 'last-param', 'INVALID_SELECTOR')
+        for index in range(3, self.store.limits.max_analysis_repairs):
+            self.assertIsNone(closeout_reason(turn))
+            record_repair(turn, f'param-{index}', 'INVALID_SELECTOR')
         self.assertEqual(closeout_reason(turn), 'REPAIR_LIMIT')
 
     def test_repair_time_budget_survives_a_new_turn_instance(self):

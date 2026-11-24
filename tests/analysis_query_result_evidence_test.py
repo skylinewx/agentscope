@@ -147,6 +147,43 @@ class ResultEvidenceTests(PresentationCase):
         self.assertEqual(runs[first['pythonRunRef']]['inputs'][0]['value'], '2')
         self.assertEqual(runs[second['pythonRunRef']]['outputs'][0]['value'], '5')
 
+    async def test_completed_calculation_with_wrong_output_name_recovers_without_execution(self):
+        turn = self.turn()
+        capture, selectors, scope = saved_fixture(self.store, ('2',))
+        built = await self.service.build([capture], selectors, scope, [], 'base')
+        code = "result=[{'name':'total','label':'合计','value':D(inputs[0]['value']),'unit':'元','inputRefs':[inputs[0]['ref']]}]"
+        request = dict(analysisRef=built['analysisRef'], code=code, purpose='合计', requestKey='total')
+        with self.assertRaises(AnalysisError) as failed:
+            await self.service.python(**request, answerOutputs=['合计'])
+        detail = failed.exception.details
+        self.assertEqual(detail['executionStatus'], 'COMPLETED')
+        self.assertEqual(detail['availableNames'], ['total'])
+        self.assertFalse(turn.state.get('queryResultRefs'))
+        from analysis_extension.review_control import progress
+        self.assertIn(detail['analysisRef'], progress(turn)['completedBuildRefs'])
+        ref = detail['availableOutputRefs'][0]
+        selected = turn.task(action='select_results', resultRefs=[{'pythonRunRef':detail['pythonRunRef'], 'outputRefs':[ref]}])
+        self.assertEqual(selected['status'], 'SELECTED')
+        self.assertIn(ref, json.dumps(await self.service.inspect(**detail['nextRead'])))
+        artifact = self.store.get_analysis(OWNER, detail['analysisRef'])
+        self.assertEqual(artifact['derivedValues'][0]['derivedId'], ref)
+        reused = await self.service.python(**request, answerOutputs=['total'])
+        self.assertEqual((reused['pythonRunRef'],reused['analysisRef']), (detail['pythonRunRef'],detail['analysisRef']))
+
+    async def test_file_output_selection_reports_saved_run_without_report_reference(self):
+        self.turn()
+        capture, file, _, _, _ = await self.make_grid()
+        code = "result=[{'name':'one','label':'一项','value':'1','unit':None,'inputRefs':[inputs[0]['ref']]}]"
+        with self.assertRaises(AnalysisError) as failed:
+            await self.compute(capture, file, 'one', code, answerOutputs=['missing'])
+        detail = failed.exception.details
+        self.assertNotIn('analysisRef', detail)
+        self.assertIn(detail['availableOutputRefs'][0], json.dumps(await self.service.inspect(**detail['nextRead'])))
+        with self.assertRaises(AnalysisError) as retry:
+            await self.service.python(retryOfRunRef=detail['pythonRunRef'], purpose='采用成果', requestKey='retry', code=code)
+        self.assertEqual(retry.exception.code, 'PYTHON_RETRY_INPUT')
+        self.assertEqual(retry.exception.details['nextRead'], detail['nextRead'])
+
     async def test_result_selection_rejects_fabrication_and_other_session(self):
         turn = self.turn()
         capture, file, _, _, _ = await self.make_grid()
@@ -186,6 +223,28 @@ class ResultEvidenceTests(PresentationCase):
         self.assertEqual(saved['errorCode'], 'REVIEW_CAPACITY')
         self.assertEqual(saved['completedPartCount'], 0)
         self.assertGreaterEqual(saved['prepareMs'], 0)
+
+    async def test_ranked_delivery_uses_exact_reviewed_source_or_respects_custom_answer(self):
+        turn = self.turn()
+        capture, _, _ = saved_fixture(self.store, ('8', '3'))
+        turn._add_query_capture(capture)
+        middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize)
+        middleware.service = self.service
+        state = AgentState(reply_id='answer')
+        agent = SimpleNamespace(name='agent', state=state)
+        sources = [{'captureRef': capture, 'source': {'businessTableView': {
+            'markdown': '完整来源甲\n\n完整来源乙', 'allFactsIncluded': True, 'completeRankedLists': True}}}]
+        with patch('analysis_extension.middleware.query_evidence', return_value={'sources': sources}):
+            for choice, draft in [('CANDIDATE', '用户只要第一名'), ('SOURCE_TABLES', '完整排序')]:
+                state.context = [Msg(id='answer', name='agent', role='assistant', content=[TextBlock(text=draft)])]
+                middleware.query_reviewer = AsyncMock(return_value={'issues': [], 'rankedDelivery': choice})
+                status = await middleware._check_end(agent)
+                self.assertEqual(status['semanticReview'], 'PASS')
+                if choice == 'CANDIDATE':
+                    self.assertNotIn('hostCloseout', turn.state)
+                else:
+                    self.assertEqual(turn.state['hostCloseout']['answer'], '完整来源甲\n\n完整来源乙')
+                    self.assertEqual(turn.state['hostCloseout']['deliveredCaptureRefs'], [capture])
 
     async def test_direct_capacity_keeps_current_answer_and_known_data_error_still_blocks(self):
         turn = self.turn()

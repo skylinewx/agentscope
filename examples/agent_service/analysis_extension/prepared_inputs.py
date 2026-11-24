@@ -1,8 +1,14 @@
 """消费本体定位的目标；不推断业务范围，不复制公式计算引擎。"""
 from copy import deepcopy
 
+from .budget_dimensions import catalog_model_codes
 from .models import AnalysisError
 from .material_plan import needs_formulas
+
+
+def clear_formula_inputs(state):
+    for key in ('budgetFormulaTargets', 'budgetFormulaPreparation', 'budgetFormObjectiveFacts', 'materialBoundaries'):
+        state.pop(key, None)
 
 
 def task_basis(service):
@@ -14,7 +20,8 @@ def task_basis(service):
     intent = {key: value for key, value in state.get('queryIntent', {}).items()
               if key not in ('grouping', 'order')}
     return digest({**{key: state.get(key) for key in ('turnKey', 'request',
-                   'inputSetVersion', 'adoptedInputs', 'scopeEdits')}, 'queryIntent': intent})
+                   'inputSetVersion', 'adoptedInputs', 'scopeEdits')}, 'queryIntent': intent,
+                   **({'objectives': state['objectives']} if state.get('objectives') else {})})
 
 
 def freeze_input_set(service, artifact=None, *, files=(), examples=2):
@@ -133,11 +140,11 @@ def _confirmed_grain(capture, form, context, requested=None):
         return requested
     coordinates = [{**context.get('effectiveDimensions', {}), **cell.get('dimensions', {})} for cell in roots]
     available = set.intersection(*(set(row) for row in coordinates))
-    models = {cell['modelCode'] for cell in roots if isinstance(cell.get('modelCode'), str)}
+    source_codes = catalog_model_codes({cell['modelCode'] for cell in roots if isinstance(cell.get('modelCode'), str)})
     aliases = {code: {code} for code in available}
     for entry in data.get('dimensionCatalog', []):
         code, model = entry.get('dimCode'), entry.get('modelCode')
-        if code not in available or not model or not any(value == model or value.rsplit('_', 1)[0] == model for value in models):
+        if code not in available or not model or model not in source_codes:
             continue
         for name in [entry.get('label'), *entry.get('names', [])]:
             if isinstance(name, str) and name:
@@ -168,9 +175,29 @@ def _confirmed_grain(capture, form, context, requested=None):
 
 def normalize_prepared_grains(captures, selections, scope):
     result = deepcopy(selections)
+    batch_fields = {}
     for item in result:
         capture = captures.get(item.get('captureRef'), {})
-        if capture.get('originalToolName') != 'execute_budget_query' or not item.get('preparedTargets'):
+        if capture.get('originalToolName') != 'execute_budget_query':
+            continue
+        if item.get('batchId') and isinstance(item.get('grain'), list) and all(isinstance(k, str) for k in item['grain']):
+            from .adapters import budget_batch
+            ref = item['captureRef']
+            if ref not in batch_fields:
+                batch_fields[ref] = {(s['stepId'], s['batchId']): s for s in budget_batch.selectors(capture)}
+            fields = batch_fields[ref].get((item.get('stepId'), item['batchId']), {})
+            names = fields.get('dimensionLabels', {})
+            for index, name in enumerate(item['grain']):
+                if name in fields.get('memberDimensions', []):
+                    continue
+                codes = [code for code, label in names.items() if label == name]
+                if len(codes) > 1:
+                    raise AnalysisError('ANALYSIS_GRAIN_UNRESOLVED', '同一名称对应多个实际维度，请按本题选用维度标识。',
+                                        {'dimension': name, 'candidates': codes, 'path': '/selections/grain'})
+                if codes:
+                    item['grain'][index] = codes[0]
+            continue
+        if not item.get('preparedTargets'):
             continue
         matches = [(form, context) for step, form, context, observation in prepared_forms(capture)
                    if step == item['stepId'] and (not item.get('observationId')
@@ -288,7 +315,12 @@ def infer_selections(service, captures, scope, declared=()):
                 batches.append({key: item[key] for key in ('captureRef', 'stepId', 'batchId', 'columnNames', 'rowIndices', 'selectionReason')
                                 if key in item} | {'role': 'PRIMARY'})
             else:
-                raise AnalysisError('PREPARATION_NEEDS_SELECTION', '请在候选指标或已有子集之间明确选择。', {'selectionRead': {'section': 'selectors', 'captureRef': ref}})
+                details = {'selectionRead': {'section': 'selectors', 'captureRef': ref}}
+                option = budget_batch.whole_metric_selection(item, 'PRIMARY')
+                if not prior and option:
+                    details['ifUsingAllReturnedMetricsInThisTable'] = option
+                raise AnalysisError('PREPARATION_NEEDS_SELECTION',
+                    '请选择本表要分析的指标或已有子集。若要本表全部返回指标和行，可直接采用返回的选区。', details)
         # 一个计划有多个对象时逐分支核对到达情况；不同计划允许使用相同的 stepId。
         from .models import digest
         plan = capture['request'].get('plan') or {}

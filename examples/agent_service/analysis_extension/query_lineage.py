@@ -12,28 +12,43 @@ def scope_phrase_terms(selector):
     return selector_evidence(selector) + values(selector.get('where') or {})
 
 
-def selected_result_sets(receipt, selection=None, result_set=None):
+def batch_origin_ids(receipt, selection):
+    """Match a saved row/column selection to native origins, including exact-cell target references."""
+    from .adapters.budget_batch import tables
+    exact_indices = {(step, table['batchId'], row.get('targetRef')): index
+                     for step, table, _ in tables(receipt)
+                     if step == selection.get('stepId', step) and table['batchId'] == selection.get('batchId', table['batchId'])
+                     for index, row in enumerate(table.get('data', {}).get('cellResults', []))}
+    rows = None if selection.get('rowIndices') is None else set(selection['rowIndices'])
+    columns = selection.get('columnNames')
+    origins = set()
+    for item in receipt.get('data', {}).get('origins', []):
+        if any(selection.get(key) is not None and item.get(key) != selection[key] for key in ('stepId', 'batchId')):
+            continue
+        index = item.get('rowIndex', exact_indices.get((item.get('stepId'), item.get('batchId'), item.get('targetRef'))))
+        if (columns is None or item.get('sourceColumn') in columns) and (rows is None or index in rows):
+            origins.add(item['originId'])
+    return origins
+
+
+def selected_result_sets(receipt, selection=None, result_set=None, *, successful_only=False):
     """Resolve selected native identities once for targets and scope provenance."""
     sets = receipt.get('data', {}).get('resultSets', [])
+    def matches(row, origins):
+        return (not successful_only or row.get('valueState') in ('PRESENT', 'NULL', 'NO_DATA')) and origins.intersection(row.get('originRefs', []))
     result_set = result_set or (selection or {}).get('resultSetId')
     if result_set:
         sets = [item for item in sets if item.get('resultSetId') == result_set]
-    elif selection and sets:
-        # Native exact-cell results live in cellResults, not the empty legacy
-        # rows array. Their origin carries targetRef instead of rowIndex.
-        from .adapters.budget_batch import tables
-        exact_indices = {(step, table['batchId'], row.get('targetRef')): index
-                         for step, table, _ in tables(receipt)
-                         for index, row in enumerate(table.get('data', {}).get('cellResults', []))}
-        def row_index(origin):
-            return origin.get('rowIndex') if 'rowIndex' in origin else exact_indices.get(
-                (origin.get('stepId'), origin.get('batchId'), origin.get('targetRef')))
+    elif selection and selection.get('observationId') and not selection.get('batchId'):
+        cells = set(selection.get('cellKeys', []))
         origins = {item['originId'] for item in receipt.get('data', {}).get('origins', [])
-                   if all(selection.get(key) is None or item.get(key) == selection[key]
-                          for key in ('stepId', 'batchId'))
-                   and (selection.get('columnNames') is None or item.get('sourceColumn') in selection['columnNames'])
-                   and (selection.get('rowIndices') is None or row_index(item) in selection['rowIndices'])}
-        sets = [item for item in sets if any(origins.intersection(row.get('originRefs', []))
+                   if item.get('runtime', {}).get('observationId') == selection['observationId']
+                   and (not cells or item['runtime'].get('cell') in cells)}
+        sets = [item for item in sets if any(matches(row, origins)
+                                             for row in item.get('rows', []))]
+    elif selection and sets:
+        origins = batch_origin_ids(receipt, selection)
+        sets = [item for item in sets if any(matches(row, origins)
                                            for row in item.get('rows', []))]
     return sets
 
@@ -77,7 +92,9 @@ def scope_terms(turn, origin, request, source_ref=None):
             from .models import AnalysisError
             raise AnalysisError('SOURCE_CONNECTION_MISMATCH', '来源引用不属于本次预算工具连接。')
         contexts = source.get('contexts', [])
-    elif turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE':
+    elif (turn.state.get('followupContext', {}).get('mode', 'CONTINUE') == 'CONTINUE'
+          and (turn.state.get('selectedContextRefs') or turn.state.get('adoptedInputs')
+               or any(item['use'] == 'REQUERY' for item in turn.state.get('historyReferences', [])))):
         selections = _selectors(turn)
         for selection in selections:
             if 'resultSetId' not in selection:

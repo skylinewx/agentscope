@@ -14,6 +14,10 @@ from both ends here:
   excerpt of the opening message when the model call fails, and settles
   the name so it runs at most once per session.
 """
+import asyncio
+from collections.abc import Callable
+from contextlib import aclosing
+import json
 import tempfile
 from typing import Any
 from unittest import IsolatedAsyncioTestCase
@@ -25,6 +29,7 @@ from utils import AnyString
 
 from agentscope.agent import ContextConfig, ReActConfig
 from agentscope.app import create_app
+from agentscope.app._router._session import stream_session_title_updates
 from agentscope.app._service import ChatService
 from agentscope.app.message_bus import (
     InMemoryMessageBus,
@@ -100,13 +105,15 @@ class SessionNameOwnershipTest(IsolatedAsyncioTestCase):
         return response.json()["session_id"]
 
     async def _config(self, session_id: str) -> dict:
-        """Return the stored config of *session_id* as plain JSON."""
+        """Return the stored fields relevant to name ownership."""
         record = await self.storage.get_session(
             "alice",
             self.agent_id,
             session_id,
         )
-        return record.config.model_dump(mode="json")
+        return record.config.model_dump(
+            mode="json", include={"name", "naming", "cwd"},
+        )
 
     async def test_unnamed_session_is_the_servers_to_name(self) -> None:
         """No name at creation leaves the placeholder up for grabs."""
@@ -115,16 +122,10 @@ class SessionNameOwnershipTest(IsolatedAsyncioTestCase):
         self.assertDictEqual(
             await self._config(session_id),
             {
-                "workspace_id": AnyString(),
                 # The creation timestamp — a placeholder, hence `auto`.
                 "name": AnyString(),
                 "naming": {"auto": True},
                 "cwd": None,
-                "chat_model_config": None,
-                "fallback_chat_model_config": None,
-                "tts_model_config": None,
-                "realtime_model_config": None,
-                "knowledge_config": None,
             },
         )
 
@@ -137,15 +138,9 @@ class SessionNameOwnershipTest(IsolatedAsyncioTestCase):
         self.assertDictEqual(
             await self._config(session_id),
             {
-                "workspace_id": AnyString(),
                 "name": "release notes",
                 "naming": {"auto": False},
                 "cwd": None,
-                "chat_model_config": None,
-                "fallback_chat_model_config": None,
-                "tts_model_config": None,
-                "realtime_model_config": None,
-                "knowledge_config": None,
             },
         )
 
@@ -164,15 +159,9 @@ class SessionNameOwnershipTest(IsolatedAsyncioTestCase):
         self.assertDictEqual(
             await self._config(session_id),
             {
-                "workspace_id": AnyString(),
                 "name": "my own name",
                 "naming": {"auto": False},
                 "cwd": None,
-                "chat_model_config": None,
-                "fallback_chat_model_config": None,
-                "tts_model_config": None,
-                "realtime_model_config": None,
-                "knowledge_config": None,
             },
         )
 
@@ -191,15 +180,9 @@ class SessionNameOwnershipTest(IsolatedAsyncioTestCase):
         self.assertDictEqual(
             await self._config(session_id),
             {
-                "workspace_id": AnyString(),
                 "name": AnyString(),
                 "naming": {"auto": True},
                 "cwd": "sub/dir",
-                "chat_model_config": None,
-                "fallback_chat_model_config": None,
-                "tts_model_config": None,
-                "realtime_model_config": None,
-                "knowledge_config": None,
             },
         )
 
@@ -214,20 +197,8 @@ class SessionNameOwnershipTest(IsolatedAsyncioTestCase):
             {"workspace_id": "workspace-1", "name": "named last month"},
         )
 
-        self.assertDictEqual(
-            config.model_dump(mode="json"),
-            {
-                "workspace_id": "workspace-1",
-                "name": "named last month",
-                "naming": {"auto": False},
-                "cwd": None,
-                "chat_model_config": None,
-                "fallback_chat_model_config": None,
-                "tts_model_config": None,
-                "realtime_model_config": None,
-                "knowledge_config": None,
-            },
-        )
+        self.assertEqual(config.name, "named last month")
+        self.assertFalse(config.naming.auto)
 
 
 class _Storage:
@@ -237,20 +208,19 @@ class _Storage:
         self.session = session
         self.written_configs: list[SessionConfig] = []
 
-    async def upsert_session(
+    async def mutate_session(
         self,
         user_id: str,
         agent_id: str,
-        config: SessionConfig,
-        session_id: str | None = None,
-        **_: Any,
+        session_id: str,
+        mutate: Callable[[SessionRecord], None],
     ) -> SessionRecord:
         """Apply the config write and remember it."""
         assert user_id == self.session.user_id
         assert agent_id == self.session.agent_id
         assert session_id == self.session.id
-        self.written_configs.append(config.model_copy(deep=True))
-        self.session.config = config
+        mutate(self.session)
+        self.written_configs.append(self.session.config.model_copy(deep=True))
         return self.session
 
 
@@ -328,30 +298,27 @@ class AutoNameSessionTest(IsolatedAsyncioTestCase):
         return [payload for _, payload in entries]
 
     async def test_generated_title_replaces_the_placeholder(self) -> None:
-        """A working model names the session and settles the name."""
-        await self._name(_Model("Release notes for v2"), "draft the v2 notes")
-
-        self.assertListEqual(
-            [c.model_dump(mode="json") for c in self.storage.written_configs],
-            [
-                {
-                    "workspace_id": "workspace-1",
-                    "name": "Release notes for v2",
-                    "naming": {"auto": False},
-                    "cwd": None,
-                    "chat_model_config": {
-                        "type": "test",
-                        "credential_id": "credential-1",
-                        "model": "test-model",
-                        "parameters": {},
-                    },
-                    "fallback_chat_model_config": None,
-                    "tts_model_config": None,
-                    "realtime_model_config": None,
-                    "knowledge_config": None,
-                },
-            ],
+        """Publish the stored title change even without a session subscriber."""
+        expected_config = self.session.config.model_copy(deep=True)
+        expected_config.name = "Release notes for v2"
+        expected_config.naming = SessionNaming(auto=False)
+        response = await stream_session_title_updates(
+            user_id="user-1", message_bus=self.bus,
         )
+        async with aclosing(response.body_iterator) as events:
+            self.assertEqual(await anext(events), 'data: {"type":"ready"}\n\n')
+            await self.bus.publish(
+                MessageBusKeys.session_title_updates("other-user"),
+                {"type": "title_updated", "agent_id": "other-agent"},
+            )
+            await self._name(_Model("Release notes for v2"), "draft the v2 notes")
+            published = await asyncio.wait_for(anext(events), timeout=1)
+            self.assertDictEqual(
+                json.loads(published.removeprefix("data: ")),
+                {"type": "title_updated", "agent_id": "agent-1"},
+            )
+
+        self.assertListEqual(self.storage.written_configs, [expected_config])
         self.assertListEqual(
             await self._published(),
             [

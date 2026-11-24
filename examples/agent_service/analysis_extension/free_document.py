@@ -30,16 +30,18 @@ def fail(code, message, path='/document', **details):
 def freeze_source(document, workspace):
     """Resolve a workspace file once. Repairs and final publication use this copy."""
     result = deepcopy(document)
+    if len({'path', 'markdown', 'html'}.intersection(result)) != 1:
+        fail('INVALID_DOCUMENT', '正文从 markdown、html 和工作区 path 中选择一项。')
     if 'path' not in result:
         return result
     if workspace is None:
         fail('DOCUMENT_WORKSPACE_REQUIRED', '当前宿主未提供可读取的展示工作区。', '/document/path')
     raw = result['path']
     if not isinstance(raw, str) or len(raw) > 1024 or '\\' in raw or ':' in raw or raw.startswith('/'):
-        fail('INVALID_DOCUMENT_PATH', 'path 使用当前工作区内的相对 .html 路径。', '/document/path')
+        fail('INVALID_DOCUMENT_PATH', 'path 使用当前工作区内的相对 .md 或 .html 路径。', '/document/path')
     parts = raw.removeprefix('./').split('/')
-    if any(p in ('', '.', '..') or p.endswith((' ', '.')) for p in parts) or not raw.lower().endswith('.html'):
-        fail('INVALID_DOCUMENT_PATH', 'path 使用当前工作区内的相对 .html 路径，不允许父目录。', '/document/path')
+    if any(p in ('', '.', '..') or p.endswith((' ', '.')) for p in parts) or not raw.lower().endswith(('.md', '.html')):
+        fail('INVALID_DOCUMENT_PATH', 'path 使用当前工作区内的相对 .md 或 .html 路径，不允许父目录。', '/document/path')
     root = Path(workspace).resolve()
     candidate = root
     for part in parts:
@@ -53,9 +55,9 @@ def freeze_source(document, workspace):
             content = stream.read(MAX_SOURCE_BYTES + 1)
         if len(content) > MAX_SOURCE_BYTES:
             fail('DOCUMENT_TOO_LARGE', '页面源文件超过 512 KiB，请精简页面。', '/document/path')
-        result['html'] = content.decode('utf-8-sig')
+        result['markdown' if raw.lower().endswith('.md') else 'html'] = content.decode('utf-8-sig')
     except (OSError, UnicodeError) as exc:
-        fail('DOCUMENT_READ_FAILED', '无法读取 UTF-8 HTML 文件；核对当前工作区路径。', '/document/path')
+        fail('DOCUMENT_READ_FAILED', '无法读取 UTF-8 报告草稿，请核对当前工作区路径。', '/document/path')
     result.pop('path')
     return result
 
@@ -72,6 +74,7 @@ class DocumentCheck(HTMLParser):
         self.scripts = 0
         self.raw_text = None
         self.text_slots = set()
+        self.trend_refs = []
 
     def handle_data(self, data):
         keys = set(SLOT.findall(data))
@@ -96,6 +99,10 @@ class DocumentCheck(HTMLParser):
         if tag in ('script', 'style'):
             self.raw_text = tag
         pairs = dict(attrs)
+        if 'data-analysis-trend' in pairs:
+            if tag != 'div' or self.counts['body'] != 1 or self.raw_text:
+                fail('INVALID_DOCUMENT_BINDING', '时期折线图放在正文的 div 容器内。', '/document/html')
+            self.trend_refs.append(pairs['data-analysis-trend'] or '')
         if len(pairs) != len(attrs):
             fail('INVALID_DOCUMENT_HTML', '同一元素不能包含重复属性。', '/document/html')
         if tag in self.counts:
@@ -128,12 +135,20 @@ class DocumentCheck(HTMLParser):
 
 
 def compile_document(artifact, document):
-    if not isinstance(document, dict) or set(document) - {'title', 'html', 'bindings', 'datasets'}:
-        fail('INVALID_DOCUMENT', 'document 需要 title、html/path 和 bindings/datasets。')
+    if not isinstance(document, dict) or set(document) - {'title', 'markdown', 'html', 'bindings', 'datasets'} or ('markdown' in document) == ('html' in document):
+        fail('INVALID_DOCUMENT', 'document 需要 title 和一份冻结的 Markdown 或 HTML 正文。')
     title, source = (document.get(k) for k in ('title', 'html'))
     bindings = document.get('bindings', [])
     if not isinstance(title, str) or not title.strip() or len(title) > 300:
         fail('INVALID_DOCUMENT', '页面需要简短的业务标题。', '/document/title')
+    from .display_tables import display_facts
+    artifact = {**artifact, 'facts': display_facts(artifact['facts'])}
+    figures = []
+    appendix_counts = {}
+    if 'markdown' in document:
+        from .report_markdown import compile_source
+        source, specifications, figures = compile_source(artifact, document, appendix_counts)
+        document = {**document, 'datasets': specifications}
     if not isinstance(source, str) or not source.strip():
         fail('INVALID_DOCUMENT', '页面 HTML 不能为空。', '/document/html')
     if len(source.encode('utf-8')) > MAX_SOURCE_BYTES:
@@ -144,21 +159,48 @@ def compile_document(artifact, document):
     datasets, dataset_refs = compile_datasets(artifact, document.get('datasets', []))
     from .document_formula_requirements import require_formula_datasets
     require_formula_datasets(artifact, datasets)
-    if not bindings and not datasets:
-        fail('INVALID_DOCUMENT', 'bindings 与 datasets 至少提供一个真实引用。')
     known = {f['factId']: f for f in artifact['facts']}
     known.update({v['derivedId']: v for v in artifact['derivedValues']})
     payload, refs = {}, set()
+    cell_indexes = {}
     for i, binding in enumerate(bindings):
         path = f'/document/bindings/{i}'
-        if not isinstance(binding, dict) or set(binding) - {'key', 'valueRef', 'field', 'nodeRef', 'format'}:
-            fail('INVALID_DOCUMENT_BINDING', '绑定仅接受 key/valueRef/field/nodeRef/format。', path)
+        if not isinstance(binding, dict) or set(binding) - {'key', 'valueRef', 'field', 'nodeRef', 'rowRef', 'column', 'format'}:
+            fail('INVALID_DOCUMENT_BINDING', '使用数值绑定，或用 rowRef 和 column 定位已有计算表的数值。', path)
         key, ref = binding.get('key'), binding.get('valueRef')
         if not isinstance(key, str) or not KEY.fullmatch(key) or key in payload or key == PARTIAL_SLOT:
             fail('INVALID_DOCUMENT_BINDING', 'key 需要唯一的字母开头标识，最长 64 字符。', path+'/key')
         if not isinstance(ref, str) or ref not in known:
             fail('INVALID_VALUE_REF', '绑定必须引用当前版本的事实或计算结果。', path+'/valueRef')
         item = known[ref]
+        if 'rowRef' in binding or 'column' in binding:
+            if (not isinstance(binding.get('rowRef'), str) or not isinstance(binding.get('column'), str)
+                    or 'field' in binding or 'nodeRef' in binding or item.get('calculationValidation') != 'PASS'
+                    or item.get('outputKind') not in ('TABLE', 'CHART_DATA')):
+                fail('INVALID_DOCUMENT_BINDING', '表格数值使用已成功计算的 valueRef、实际 rowRef 和 column。', path)
+            if ref not in cell_indexes:
+                from .business_dataset import table
+                data = table(item['columns'], item['rows'], ref=ref)
+                cell_indexes[ref] = ({row['rowRef']: row for row in data['rows']},
+                                     {c['name']: c for c in data['columns'] if c.get('type') == 'DECIMAL_STRING'})
+            rows, columns = cell_indexes[ref]
+            row, column = rows.get(binding['rowRef']), columns.get(binding['column'])
+            if row is None or column is None:
+                fail('INVALID_DOCUMENT_BINDING', '在所选结果中按实际行引用和数值列名定位。', path,
+                     numericColumns=list(columns), valueRef=ref)
+            name = column['name']
+            state = row['valueStates'][name]
+            if state not in ('PRESENT', 'NO_VALUE'):
+                fail('UNSUPPORTED_CLAIM', '所选表格位置缺少可交付的计算结果。', path, valueState=state)
+            if 'format' in binding:
+                validate_number_format(binding['format'])
+            raw = row['values'][name]
+            payload[key] = {'value': raw, 'display': '' if raw is None else number_text(raw, binding.get('format'), grouping=True),
+                            'unit': column.get('unit') or '', 'valueState': state, 'valueRef': ref,
+                            'rowRef': row['rowRef'], 'field': name, 'measure': column['label'], 'objectLabel': '',
+                            'basis': {'kind': 'CALCULATED', 'operator': item['operator'], 'rowRef': row['rowRef'], 'column': name}}
+            refs.add(ref)
+            continue
         if not executable_field(item, binding.get('field'), binding.get('nodeRef')):
             fail('UNSUPPORTED_CLAIM', '所选字段尚无可用数值；请核对本层与逐层计算口径。', path,
                  **value_reference_details(item, binding.get('field'), binding.get('nodeRef')))
@@ -201,6 +243,17 @@ def compile_document(artifact, document):
         fail('INVALID_DOCUMENT_HTML', '提交完整 HTML 文档，包含唯一的 html、head、body。', '/document/html')
     if partial and PARTIAL_SLOT not in checked.text_slots:
         fail('PARTIAL_RESULT_UNDISCLOSED', '部分交付须在可见正文放置 {{analysisPartialReason}}，位置与样式由模型决定。', '/document/html')
+    from .period_trends import selected_trends, trend_catalog
+    trends = selected_trends(trend_catalog(artifact), checked.trend_refs)
+    if 'markdown' in document:
+        refs.update(fact['factId'] for fact in artifact['facts'])
+    if not bindings and not datasets and not trends and not refs:
+        fail('INVALID_DOCUMENT', '请绑定真实数值、结果集合或时期折线图。')
+    for chart in trends.values():
+        if chart.get('derivedRef'):
+            refs.add(chart['derivedRef'])
+        else:
+            refs.update(point['ref'] for line in chart['series'] for point in line['points'] if point)
     updates = {item['taskId']: item['refs'] for item in artifact.get('workRefs', [])}
     for task in artifact.get('plan', {}).get('workPlan', []):
         if task['kind'] != 'COMPUTATION': continue
@@ -212,10 +265,21 @@ def compile_document(artifact, document):
                     and ref not in dataset_refs):
                 fail('ORDER_DATASET_REQUIRED', '已声明的排序须绑定 document.datasets 并遍历 rows，不能仅绑定金额后手排。',
                      '/document/datasets', valueRef=ref, taskId=task['taskId'])
-    data_json = json.dumps({'values': payload, 'sets': datasets, 'staticKeys': sorted(checked.text_slots & set(payload))}, ensure_ascii=False, separators=(',', ':')).replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
-    frame_key = digest({'rendererVersion': 'static-bindings-2', 'source': source,
-                        'data': payload, 'sets': datasets, 'partialReason': partial})
+    frame_data = {'values': payload, 'sets': datasets, 'staticKeys': sorted(checked.text_slots & set(payload))}
+    if trends:
+        frame_data['trends'] = trends
+    data_json = json.dumps(frame_data, ensure_ascii=False, separators=(',', ':')).replace('<', '\\u003c').replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
+    frame_key = digest({'rendererVersion': 'static-bindings-3', 'source': source,
+                        'data': payload, 'sets': datasets, 'trends': trends, 'partialReason': partial})
     runtime = Path(__file__).with_name('document_runtime.js').read_text('utf-8').replace('FRAME_KEY', json.dumps(frame_key))
+    trend_runtime = Path(__file__).with_name('document_trend.js').read_text('utf-8') if trends else ''
+    runtime = runtime.replace('/* TREND_COMPONENT */', trend_runtime)
+    if 'data-analysis-waterfalls' in source:
+        component = Path(__file__).with_name('document_waterfalls.js').read_text('utf-8')
+        runtime = runtime.replace('/* TREND_COMPONENT_END */', component)
+    if 'markdown' in document and 'data-markdown-comparison=' in source:
+        component = Path(__file__).with_name('document_comparison.js').read_text('utf-8')
+        runtime += '\n' + component
     injection = (f'<meta http-equiv="Content-Security-Policy" content="{escape(CSP, quote=True)}">'
                  f'<script id="analysis-host-data" type="application/json">{data_json}</script>'
                  f'<script id="analysis-host-runtime">{runtime}</script>')
@@ -233,9 +297,11 @@ def compile_document(artifact, document):
     if len(compiled.encode('utf-8')) > MAX_DOCUMENT_BYTES:
         fail('DOCUMENT_TOO_LARGE', '绑定后的页面超过展示容量，请缩小展示范围。')
     return {'version': DOCUMENT_VERSION, 'title': title.strip(), 'html': compiled,
+            **({'markdown': document['markdown'], 'figureSources': figures, 'sourceTableCounts': appendix_counts} if 'markdown' in document else {}),
             'contentDigest': digest(compiled), 'frameKey': frame_key,
             'bindings': deepcopy(bindings), 'valueRefs': sorted(refs | dataset_refs),
             'datasets': datasets, 'datasetBindings': deepcopy(document.get('datasets', [])),
+            **({'periodTrendRefs': list(trends)} if trends else {}),
             'staticBindingKeys': sorted(checked.text_slots), 'hasScripts': bool(checked.scripts),
             'numericBindingKeys': sorted(key for key, value in payload.items() if value['value'] is not None and value['field'] != 'unit'),
             'bindingCount': len(bindings), 'datasetCount': len(datasets)}

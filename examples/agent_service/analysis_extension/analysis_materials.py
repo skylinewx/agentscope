@@ -81,10 +81,13 @@ def materials(capture, sources, *, offset=0, limit=100, max_chars=MATERIAL_CHARS
     if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
         raise AnalysisError('INVALID_QUERY_PAGE', '资料 offset 须非负，limit 须为 1—100。')
     source_state = {key: info[key] for key in ('status', 'context', 'querySessionId', 'error', 'branches', 'completeness', 'resumeRef') if key in info}
-    selections = []
+    selections, batch_fields = [], {}
     # 批量表由适配器给出指标列和分组维度，不能把属性组还原为机构明细。
     for item in selection_candidates(capture, sources, catalog):
         if item.get('batchId') and item.get('columnNames'):
+            batch_fields[(item['stepId'], item['batchId'])] = {
+                'stepId': item['stepId'], 'batchId': item['batchId'],
+                'grain': {code: item.get('dimensionLabels', {}).get(code, code) for code in item.get('memberDimensions', [])}}
             # A filtered selector is executable only with its original row boundary.
             # Projection must preserve that boundary and the host's selection basis.
             selections.append({key: deepcopy(item[key]) for key in
@@ -111,6 +114,8 @@ def materials(capture, sources, *, offset=0, limit=100, max_chars=MATERIAL_CHARS
                                     'stepId', 'observationId', 'batchId', 'rowIndex', 'columnName', 'cellKey'],
               'note': '已展示的值和公式可直接分析；构建时使用真实 selections 与本题 scope。多个对象/部分用 requests 批量读取；相关计算一次提交，缺字段才补读。'}
     if adapter.adapter_id == 'budget-v2':
+        if batch_fields:
+            result['batchFields'] = list(batch_fields.values())
         from .prepared_inputs import summaries
         prepared = summaries(capture)
         if prepared:
@@ -125,7 +130,10 @@ def materials(capture, sources, *, offset=0, limit=100, max_chars=MATERIAL_CHARS
             '本回执只代表已捕获资料，失败分支不能当作已取得；追问原主体不因局部输入失败而缩小。')
     if adapter.adapter_id == 'budget-v2' and selections and not info.get('gridFiles'):
         result['buildInput'] = {'captureRefs': [reference]}
-        result['buildInputMeaning'] = '使用所选回执与本题 scope、operations、requestKey 构建。多个来源分别承担主体或对照、需选子集时显式传 selections。'
+        if any(len(item.get('columnNames', [])) > 1 for item in selections):
+            result['buildInputMeaning'] = '本回执含多个指标。选用上面的 selections 传入 AnalysisBuild，columnNames 选本题指标；选择器省略 rowIndices 即采用各指标的全部实际行。grain 用 batchFields 中的字段标识。'
+        else:
+            result['buildInputMeaning'] = '使用所选回执与本题 scope、operations、requestKey 构建。多个来源分别承担主体或对照、需选子集时显式传 selections。'
     # 大网格不展开目录，直接给出可执行输入引用及运行时字段。
     if info.get('gridFiles') or info.get('gridFileErrors'):
         result['gridFiles'] = info.get('gridFiles', [])

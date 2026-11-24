@@ -7,6 +7,14 @@ from .business_tables import encode
 
 def project(value):
     result = deepcopy(value)
+    delivery = result.get('reportDelivery', {})
+    record = delivery.get('review')
+    if isinstance(record, dict):
+        delivery['review'] = {key: record[key] for key in (
+            'reviewRef', 'status', 'issues', 'coverage', 'completedPartCount') if key in record}
+        delivery['review']['totalParts'] = len(record.get('parts', []))
+        if record.get('previousBusinessReviews'):
+            delivery['review']['priorAssessmentCount'] = len(record['previousBusinessReviews'])
     if not result.get('repairRef') or not isinstance(result.get('diagnostics'), dict):
         return result
     analysis_ref = result['analysisRef']

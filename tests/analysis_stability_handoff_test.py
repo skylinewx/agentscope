@@ -76,7 +76,11 @@ class StabilityHandoffTests(unittest.TestCase):
         self.assertTrue(view['readComplete'])
         self.assertEqual(view['references'][0]['sourceExpression'], 'B1-C1+2')
         self.assertEqual({d['factRef'] for d in view['references'][0]['dependencies']}, {'subtotal', 'expense'})
-        self.assertIn('差额=-4', render(value, artifact))
+        handoff = render(value, artifact)
+        self.assertIn('差额=-4', handoff)
+        self.assertIn('省略 workRefs', handoff)
+        with_tasks = {**artifact, 'plan': {**artifact.get('plan', {}), 'workPlan': [{'taskId': 'review-value'}]}}
+        self.assertNotIn('省略 workRefs', render(value, with_tasks))
         self.assertEqual(projected['documentInputs'], value['documentInputs'])
 
     def test_target_recovery_retains_original_conditions_without_reinterpreting_null(self):

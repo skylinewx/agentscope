@@ -13,6 +13,7 @@ from .review_encoding import pack_review_records
 
 def artifact_closeout_records(artifact):
     """Keep all business facts and local checks; omit repeated transport/provenance details."""
+    from .display_tables import display_facts
     from .review_revision import formula_review_trace
     from .formula_check_summary import summarize
     fields = ('factId', 'sourceContextId', 'objectId', 'objectLabel', 'objectLabelState', 'sourceObjectId',
@@ -20,7 +21,8 @@ def artifact_closeout_records(artifact):
               'dimensions', 'effectiveDimensions', 'dimensionNames', 'value', 'valueType', 'valueState',
               'unit', 'unitBasis', 'scale', 'scaleBasis', 'precision', 'formula', 'formulaStatus', 'expression',
               'taskName', 'formName', 'cellAddress')
-    facts = [{key: deepcopy(fact[key]) for key in fields if key in fact} for fact in artifact.get('facts', [])]
+    facts = [{key: deepcopy(fact[key]) for key in fields if key in fact}
+             for fact in display_facts(artifact.get('facts', []))]
     computed = deepcopy(artifact.get('derivedValues', []))
     for value in computed:
         if value.get('operator') == 'FORMULA_CHECK' and value.get('formulaTrace'):

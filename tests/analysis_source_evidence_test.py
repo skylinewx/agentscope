@@ -12,6 +12,28 @@ from analysis_extension.query_attempts import prepare, logical_request
 
 
 class SourceEvidenceTest(TestCase):
+    def test_runtime_labels_follow_the_selected_member_of_each_dimension(self):
+        from analysis_extension.adapters.budget_query import runtime_dimension_names, cell_dimension_names
+        rows = [{'dimensions': {'D': code}, 'dimensionNames': {'D': name}, 'originRefs': ['origin']}
+                for code, name in [('A', '情景甲'), ('B', '情景乙')]]
+        receipt = {'data': {'origins': [{'originId': 'origin', 'sourceType': 'FORM_RUNTIME',
+                                        'runtime': {'observationId': 'view', 'cell': '11:5'}}],
+                            'resultSets': [{'rows': rows}]}}
+        def read(member):
+            return cell_dimension_names(runtime_dimension_names(receipt), 'view', '11:5', {'D': member})
+        self.assertEqual(read('A'), {'D': '情景甲'})
+        self.assertEqual(read('B'), {'D': '情景乙'})
+        self.assertEqual(read('anchor'), {})
+        rows.append({**rows[0], 'dimensionNames': {'D': '冲突名称'}})
+        self.assertEqual(read('B'), {'D': '情景乙'})
+        with self.assertRaisesRegex(AnalysisError, '成员 A'):
+            read('A')
+
+    def test_bound_single_member_keeps_its_exact_quote(self):
+        scope = {'dimensionHint': 'MD_ORG', 'sourceText': '示例集团', 'selector': {'type': 'VALUES', 'members': ['示例集团']}}
+        request = {'question': '查示例集团今年的收入', 'intentDraft': {'dimensionScopes': [scope]}}
+        self.assertEqual(bind(None, request)['intentDraft']['dimensionScopes'][0]['sourceText'], '示例集团')
+
     def fixture(self):
         quote = '从利润表查询久其集团二级单位的26年净利润预算，并按从大到小排'
         scope = {'id': 'org', 'dimensionHint': '组织机构', 'sourceText': quote,
@@ -41,15 +63,15 @@ class SourceEvidenceTest(TestCase):
                 'analysis_extension.followup_scope._inherited_tables', return_value=[(None, capture, None, None)]):
             return prepare_request(turn, {'originalToolName': 'execute_budget_query'}, request)
 
-    def test_grouping_inherits_form_and_scope_without_repeating_historical_sentence(self):
+    def test_grouping_retains_scope_without_copying_the_historical_form_into_hard_constraints(self):
         turn, capture, request = self.fixture()
         result = self.prepare(turn, capture, request)
         inherited = result['intentDraft']['dimensionScopes'][0]
         self.assertEqual(inherited['sourceText'], capture['request']['question'])
         self.assertEqual(inherited['confirmedSource'], {'executionId': 'execution', 'scopeId': 'org',
                                                       'contextId': 'original-context', 'querySessionId': 'original-session'})
-        self.assertEqual(result['scope']['formNames'], ['利润表'])
-        for word in ['利润表', '久其集团', '净利润', '预算', '26年']:
+        self.assertNotIn('formNames', result.get('scope', {}))
+        for word in ['久其集团', '净利润', '预算', '26年']:
             self.assertIn(word, result['contextText'])
         self.assertNotIn(capture['request']['question'], result['contextText'])
         self.assertEqual(result['question'], turn.state['request'])
@@ -134,10 +156,12 @@ class SourceEvidenceTest(TestCase):
         turn, capture, request = self.fixture()
         capture['request']['scope'] = {'formCodes': ['LRB'], 'taskNames': ['年度二上']}
         capture['request']['question'] += '，年度二上'
+        request.setdefault('scope', {})['formCodes'] = ['LRB']
         result = self.prepare(turn, capture, request)
         self.assertEqual(result['scope']['formCodes'], ['LRB'])
-        self.assertIn('LRB', result['contextText'])
-        self.assertIn('年度二上', result['contextText'])
+        self.assertNotIn('LRB', result['contextText'])
+        self.assertNotIn('年度二上', result['contextText'])
+        self.assertNotIn('taskNames', result['scope'])
 
     def test_inherited_reference_and_quote_cannot_be_fabricated_by_model(self):
         turn, _, _ = self.fixture()

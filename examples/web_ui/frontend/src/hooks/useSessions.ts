@@ -1,15 +1,87 @@
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { useCallback } from 'react';
+import { type QueryFilters, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useCallback, useEffect, useEffectEvent, useState } from 'react';
 
 import { sessionApi } from '../api';
 import type { SessionView, CreateSessionRequest, UpdateSessionRequest } from '../api';
 import { getAuthSignal } from '../api/auth-state';
+import { ApiError } from '../api/client';
+import type { SessionActivityEvent } from '../api/session';
 
 /** Stable empty list, so `sessions` keeps its identity between renders. */
 const NO_SESSIONS: SessionView[] = [];
 
 /** Every agent's session list, so one mutation refreshes all of them. */
 const SESSIONS_KEY = ['sessions'];
+const CONCURRENT_SESSION_DELETES = 4;
+
+/** One subscription for this account, independent of the selected session. */
+export function useSessionUpdates(onActivity?: (event: SessionActivityEvent) => void) {
+	const queryClient = useQueryClient();
+	const authSignal = getAuthSignal();
+	const [connectedAuth, setConnectedAuth] = useState<AbortSignal | null>(null);
+	const receiveActivity = useEffectEvent((event: SessionActivityEvent) => onActivity?.(event));
+
+	useEffect(() => {
+		const controller = new AbortController();
+		const signal = AbortSignal.any([authSignal, controller.signal]);
+		let retryTimer: ReturnType<typeof setTimeout> | undefined;
+		let attempts = 0;
+
+		async function refreshLists(filters: QueryFilters) {
+			const wasFetching = queryClient.isFetching(filters) > 0;
+			await queryClient.invalidateQueries(filters, { cancelRefetch: false });
+			// A read already in flight may have captured the old title. Let
+			// its callers receive the result, then reconcile after the update.
+			if (wasFetching && !signal.aborted) {
+				await queryClient.invalidateQueries(filters, { cancelRefetch: false });
+			}
+		}
+
+		async function connect() {
+			if (signal.aborted) return;
+			try {
+				for await (const event of sessionApi.streamUpdates(signal)) {
+					if (signal.aborted) return;
+					if (event.type === 'ready') {
+						attempts = 0;
+						setConnectedAuth(authSignal);
+						// Recover status and title changes missed while offline.
+						void refreshLists({ queryKey: SESSIONS_KEY, type: 'active' });
+						receiveActivity(event);
+					} else if (event.type === 'title_updated') {
+						void refreshLists({
+							queryKey: [...SESSIONS_KEY, event.agent_id], exact: true, type: 'active',
+						});
+					} else {
+						receiveActivity(event);
+						if (event.type === 'reply_completed' && !event.replayed) {
+							const key = [...SESSIONS_KEY, event.agent_id];
+							const views = queryClient.getQueryData<SessionView[]>(key);
+							if (views && !views.some(({ session }) => session.id === event.session_id)) {
+								void refreshLists({ queryKey: key, exact: true, type: 'active' });
+							}
+						}
+					}
+				}
+			} catch (error) {
+				if (signal.aborted) return;
+				if (error instanceof ApiError && [401, 403, 404, 405].includes(error.status)) {
+					setConnectedAuth(null);
+					return;
+				}
+			}
+			if (signal.aborted) return;
+			setConnectedAuth(null);
+			retryTimer = setTimeout(connect, Math.min(1000 * 2 ** Math.min(attempts++, 4), 10_000));
+		}
+
+		signal.addEventListener('abort', () => clearTimeout(retryTimer), { once: true });
+		void connect();
+		return () => controller.abort();
+	}, [authSignal, queryClient]);
+
+	return connectedAuth === authSignal;
+}
 
 /**
  * Manages session views for a given agent.
@@ -36,6 +108,7 @@ export function useSessions(agentId: string | null) {
 	const {
 		data,
 		isPending,
+		isFetching,
 		error,
 		refetch: runRefetch,
 	} = useQuery({
@@ -119,13 +192,57 @@ export function useSessions(agentId: string | null) {
 		[agentId, invalidate],
 	);
 
+	/** Returns the selected ids that are now gone, including already-deleted sessions. */
+	const removeMany = useCallback(
+		async (sessionIds: string[]) => {
+			if (!agentId) throw new Error('No agent selected');
+			const authSignal = getAuthSignal();
+			const removed = new Set<string>();
+			for (let start = 0; start < sessionIds.length; start += CONCURRENT_SESSION_DELETES) {
+				authSignal.throwIfAborted();
+				const batch = sessionIds.slice(start, start + CONCURRENT_SESSION_DELETES);
+				const results = await Promise.allSettled(
+					batch.map((id) =>
+						sessionApi.delete(id, agentId, { silent: true, signal: authSignal, timeoutMs: 30_000 }),
+					),
+				);
+				results.forEach((result, index) => {
+					if (
+						result.status === 'fulfilled' ||
+						(result.reason instanceof ApiError && result.reason.status === 404)
+					) {
+						removed.add(batch[index]);
+					}
+				});
+			}
+
+			authSignal.throwIfAborted();
+			const key = [...SESSIONS_KEY, agentId];
+			// Discard list reads that may have started before the deletions committed.
+			await queryClient.cancelQueries({ queryKey: key, exact: true });
+			authSignal.throwIfAborted();
+			if (removed.size > 0) {
+				queryClient.setQueryData<SessionView[]>(key, (views) =>
+					views?.filter(({ session }) => !removed.has(session.id)),
+				);
+			}
+			// Team leaders can also remove member sessions from other agents' lists.
+			void invalidate();
+			return removed;
+		},
+		[agentId, invalidate, queryClient],
+	);
+
 	return {
 		sessions: data ?? NO_SESSIONS,
+		loaded: data !== undefined,
 		loading: agentId !== null && isPending,
+		fetching: isFetching,
 		error: error as Error | null,
 		refetch,
 		create,
 		update,
 		remove,
+		removeMany,
 	};
 }

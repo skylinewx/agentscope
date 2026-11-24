@@ -74,6 +74,9 @@ class FormulaDeliveryTests(TestCase):
         with self.assertRaises(AnalysisError) as caught:
             require_publication_checks(document, [record], unavailable_reason='只检测一个宽度')
         self.assertEqual(caught.exception.code, 'DOCUMENT_FORMULA_COVERAGE_MISSING')
+        self.assertEqual(caught.exception.details['missingFormulaNodes'],
+                         [{'setKey':'profit', 'nodeRef':'node', 'expectedSteps':3, 'missingSteps':3}])
+        self.assertIn('bindHorizontalWaterfall', caught.exception.details['hint'])
         record['valueCoverage'] = evaluate(document, {'charted':bindings, 'presented':bindings, 'complete':True})
         require_publication_checks(document, [record], unavailable_reason='只检测一个宽度')
         changed = deepcopy(document)

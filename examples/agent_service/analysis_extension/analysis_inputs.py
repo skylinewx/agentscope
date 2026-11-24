@@ -73,11 +73,12 @@ def _adapt_inputs(registry, captures, selections, scope, max_facts):
         table = None
         empty = 'resultSetId' in selection
         if 'batchId' in selection:
-            _, table, _, _, rows = next(selected_tables(captures, [selection]))
+            from .adapters.budget_batch import metric_rows
+            _, table, _, columns, rows = next(selected_tables(captures, [selection]))
             if grain is None:
                 grain = [name for name, value in table['columnRoles'].items()
                          if value['kind'] in ('DIMENSION', 'PROPERTY')]
-            if rows is not None and len(rows) != table['data']['rowCount'] and role == 'PRIMARY' and not selection.get('selectionReason'):
+            if rows is not None and role == 'PRIMARY' and not selection.get('selectionReason') and rows != metric_rows(table, columns):
                 raise AnalysisError('SELECTION_REASON_REQUIRED', '主体筛选须说明与用户要求对应的选择理由；审查保留被排除行。')
         elif empty:
             from .empty_sources import result
@@ -93,7 +94,13 @@ def _adapt_inputs(registry, captures, selections, scope, max_facts):
             from .empty_sources import adapt
             data = adapt(captures[selection['captureRef']], selection, local_scope)
         elif table is not None:
-            local_scope = resolve_members(registry, captures, [selection], local_scope, max_facts)
+            try:
+                local_scope = resolve_members(registry, captures, [selection], local_scope, max_facts)
+            except AnalysisError as error:
+                if error.code == 'BATCH_GRAIN_MISMATCH' and 'grain' in selection:
+                    error.details.update(path='/selections/grain', selectionRead={'section': 'selectors', 'captureRef': selection['captureRef']},
+                                         hint='grain 按所选回执的维度标识填写，显示名称见 dimensionLabels。可复用这次取数结果。')
+                raise
         else:
             candidates = registry.catalog(captures[selection['captureRef']], grain[0], grid_selection=selection)
             wanted = set(selection.get('cellKeys', []))
@@ -128,7 +135,10 @@ def _adapt_inputs(registry, captures, selections, scope, max_facts):
                 raise AnalysisError('INPUT_DATA_INCOMPLETE', '所选输入仍有未查询的成员。')
             dimensions = {**fact.get('effectiveDimensions', {}), **fact.get('dimensions', {})}
             if any(dim not in dimensions for dim in grain):
-                raise AnalysisError('GRAIN_NOT_CAPTURED', '粒度字段必须来自当前事实，不能凭名称补齐。', {'grain': grain, 'factId': fact['factId']})
+                raise AnalysisError('GRAIN_NOT_CAPTURED', '请将 grain 中缺少的字段换成所选来源的维度标识，可复用此次查询。',
+                                    {'grain': grain, 'missing': [dim for dim in grain if dim not in dimensions],
+                                     'availableDimensions': sorted(dimensions), 'factId': fact['factId'],
+                                     'selectionRead': {'section': 'selectors', 'captureRef': selection['captureRef']}})
             identity = {dim: dimensions[dim] for dim in grain}
             member = member_ref(namespace, identity if len(grain) > 1 else identity[grain[0]])
             names = fact.get('dimensionNames', {})

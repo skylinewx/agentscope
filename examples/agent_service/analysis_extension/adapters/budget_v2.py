@@ -314,7 +314,7 @@ def cell_value(cell, number_format=None, value_type=None):
 
 def catalog(capture, *, grid_selection=None):
     receipt = receipt_from_capture(capture)
-    from .budget_query import runtime_value_types, runtime_dimension_names
+    from .budget_query import runtime_value_types, runtime_dimension_names, cell_dimension_names
     value_types = runtime_value_types(receipt)
     dimension_names = runtime_dimension_names(receipt)
     from ..identity import dimension_models
@@ -366,7 +366,8 @@ def catalog(capture, *, grid_selection=None):
                           "cellKey": cell.get("key"), "row": cell.get("row"), "column": cell.get("column"),
                           "headers": actual_headers(cell, context.get("period")), "modelCode": cell.get("modelCode"), "measureCode": cell.get("measureCode"),
                           "dimensions": cell.get("dimensions", {}), "displayValue": cell.get("displayValue"),
-                          "dimensionNames": dimension_names.get((oid, cell.get('key')), {}),
+                          "dimensionNames": cell_dimension_names(dimension_names, oid, cell.get('key'),
+                              {**context.get('effectiveDimensions', {}), **cell.get('dimensions', {})}),
                           "unit": cell.get("unit") if value_type in (None, 'DECIMAL_STRING') else None,
                           "value": value, "valueState": state, "precision": precision, "valueType": value_type,
                           "formula": cell.get("formula"), "cellAddress": source_address(cell, cells),
@@ -498,7 +499,7 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
     if not selections:
         raise AnalysisError("EMPTY_SELECTION", "需要选择实际捕获的对象和单元格。")
     receipts = {ref: receipt_from_capture(value) for ref, value in captures.items()}
-    from .budget_query import runtime_value_types, runtime_dimension_names
+    from .budget_query import runtime_value_types, runtime_dimension_names, cell_dimension_names
     value_types = {ref: runtime_value_types(receipt) for ref, receipt in receipts.items()}
     dimension_names = {ref: runtime_dimension_names(receipt) for ref, receipt in receipts.items()}
     captures = resolve_form_requests(captures, receipts)
@@ -649,8 +650,8 @@ def adapt_forms(captures: dict[str, dict], selections: list[dict], scope_request
                     "cellKey": key, "row": cell.get("row"), "column": cell.get("column"),
                     "cellAddress": source_address(cell, cells),
                     "measureCode": cell.get("measureCode"), "headers": actual_headers(cell, context.get("period")) or [c["displayValue"] for c in cells if c.get("row") == cell.get("row") and c.get("displayValue") and cell_value(c, capture.get("numberFormat"))[1] == "NOT_APPLICABLE"],
-                    "dimensions": effective, "dimensionModels": dimension_models(form),
-                    "dimensionNames": dimension_names[ref].get((oid, key), {}),
+                    "dimensions": effective, "dimensionModels": dimension_models(form), "modelCode": cell.get("modelCode"),
+                    "dimensionNames": cell_dimension_names(dimension_names[ref], oid, key, effective),
                     "formContext": json_values(context),
                     "period": effective.get("DATATIME", context.get("period")),
                     "executionPeriod": context.get('period'), "periodResolution": context.get('periodResolution'),
@@ -876,8 +877,15 @@ class BudgetV2Adapter(SourceAdapter):
         return selectors(capture) + batch_selectors(capture)
 
     def rows(self, capture, step_id):
-        from .budget_discovery import selected_rows
-        return selected_rows(receipt_from_capture(capture), step_id)['rows']
+        from .budget_discovery import selected_rows, row_sets
+        from .budget_batch import tables
+        receipt = receipt_from_capture(capture)
+        ordinary = {sid for sid, _ in row_sets(receipt)}
+        if step_id not in ordinary and any(table.get('disposition') == 'SUCCEEDED'
+                and (not ordinary or sid == step_id) for sid, table, _ in tables(receipt)):
+            raise AnalysisError('UNKNOWN_STEP', '这是批量预算取数。查看指标、维度和数值请读取 materials，沿用当前回执即可。',
+                                {'nextSection': 'materials', 'nextRead': {'section': 'materials', 'captureRef': capture['captureRef']}})
+        return selected_rows(receipt, step_id)['rows']
 
     def population(self, capture, selector, members):
         from .budget_discovery import selected_rows, rows_complete

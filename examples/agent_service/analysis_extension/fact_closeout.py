@@ -1,13 +1,19 @@
 """Deterministic source-only delivery after review/repair exhaustion."""
-from .business_tables import escape, text, STATES, DEFAULT_LABELS
+import re
+
+from .budget_dimensions import dimension_labels
+from .business_tables import escape, text, STATES
+from .business_tables import period_label, source_data_period
+from .display_tables import display_facts, field_name, member_name
+from .formatting import NUMERIC_TYPES, grouped_value
 
 
 def summarize(material, reason):
-    facts = material.get('facts', [])
+    facts = display_facts(material.get('facts', []))
     from .analysis_inputs import fact_roles
     has_comparison = any('REFERENCE' in fact_roles(fact) for fact in facts)
     lines = ['已取得以下来源数据。本次分析或答复核对尚未完成，先列示已确认的来源值。',
-             '', ('| 用途 ' if has_comparison else '') + '| 对象 | 指标或标题 | 任务／表样 | 实际时期 | 其他维度 | 来源值 | 单位 |',
+             '', ('| 用途 ' if has_comparison else '') + '| 对象 | 指标或标题 | 任务／表样 | 数据时期 | 其他维度 | 来源值 | 单位 |',
              ('| --- ' if has_comparison else '') + '| --- | --- | --- | --- | --- | ---: | --- |']
     refs = []
     contexts = {}
@@ -16,17 +22,25 @@ def summarize(material, reason):
             contexts.update(item)
     for fact in facts[:80]:
         context = contexts.get(fact.get('contextRef', fact.get('sourceContextId')), {})
+        labels = dimension_labels(material.get('dimensionCatalog') or [], context=context)
         dims = {**context.get('effectiveDimensions', {}), **(fact.get('effectiveDimensions') or {}),
                 **(fact.get('dimensions') or {})}
         names = fact.get('dimensionNames') or {}
         headers = fact.get('headers', [])
         title = ' / '.join(map(str, headers)) if isinstance(headers, list) else str(headers)
+        source_value = fact.get('value')
+        if source_value is None:
+            source_value = STATES.get(fact.get('valueState'), '状态未确认')
+        elif fact.get('valueType', 'DECIMAL_STRING') in NUMERIC_TYPES:
+            source_value = grouped_value(source_value)
+        period = source_data_period(fact)
         values = [fact.get('objectLabel') or names.get('MD_ORG') or fact.get('objectId') or dims.get('MD_ORG', ''),
                   title or fact.get('title') or fact.get('measureCode', ''),
                   ' / '.join(str(fact.get(k) or context[k]) for k in ('taskName', 'formName') if fact.get(k) or context.get(k)),
-                  fact.get('dataPeriod') or fact.get('period') or dims.get('DATATIME', ''),
-                  '；'.join(f'{DEFAULT_LABELS.get(key, key)}={names.get(key) or value}' for key, value in dims.items() if key not in ('DATATIME', 'MD_ORG')),
-                  text(fact.get('value')) if fact.get('value') is not None else STATES.get(fact.get('valueState'), '状态未确认'), fact.get('unit') or '']
+                  period_label(period, names.get('DATATIME')) if period else '未返回',
+                  '；'.join(f'{field_name(labels, key)}={member_name({**fact, "dimensions": dims}, key)}'
+                           for key in dims if key not in ('DATATIME', 'MD_ORG')),
+                  source_value, fact.get('unit') or '']
         if has_comparison:
             labels = {'PRIMARY': '主体', 'REFERENCE': '对照', 'STRUCTURE': '结构证据'}
             values.insert(0, '、'.join(labels[role] for role in labels if role in fact_roles(fact)))
@@ -49,7 +63,10 @@ def summarize(material, reason):
                 continue
             fact = by_ref.get(item['factRef'], {})
             label = ' / '.join(str(v) for v in [fact.get('objectLabel'), *(fact.get('headers') or [])] if v)
-            checks.append((label or '已捕获公式', item['statement']))
+            statement = item['statement']
+            if item['status'] == 'MISMATCH':
+                statement = re.sub(r'(?<![\d.,])[+−-]?\d+(?:\.\d+)?(?![\d.,])', lambda m: grouped_value(m[0]), statement)
+            checks.append((label or '已捕获公式', statement))
         if checks and derived.get('derivedId'):
             refs.append(derived['derivedId'])
     if checks:

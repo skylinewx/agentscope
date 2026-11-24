@@ -65,6 +65,7 @@ class ReceiptCapture:
         self.query_cache_provider = lambda: None
         self.task_context_provider = lambda: {}
         self.request_preparer = lambda origin, request: request
+        self.bind_query_context = None
         self.model_submission = True
 
     def _model_projection(self, adapter, receipt, capture, source_chars):
@@ -93,6 +94,8 @@ class ReceiptCapture:
             # A failed execution remains readable as diagnostics, never valid facts.
             if receipt.get('status') in ('SUCCEEDED', 'PARTIAL'):
                 receipt = adapter.receipt(capture)
+                if (receipt['data'].get('summary') or {}).get('kind') == 'CONDITION_BINDINGS':
+                    return {'captureRef': reference, 'markdown': '已确认本轮沿用的预算条件。'}
             from .business_tables import business_view
             navigation = {}
             if receipt['data'].get('purpose') == 'PREPARE_MATERIALS' and receipt.get('status') in ('SUCCEEDED', 'PARTIAL'):
@@ -287,6 +290,8 @@ class ReceiptCapture:
                 schema = (tool.model_input_schema if self.model_submission and tool.model_input_schema is not None
                           else tool.input_schema)
                 request = canonical_arguments(encode(request), schema)
+                if self.model_submission and self.bind_query_context and origin['originalToolName'] == 'execute_budget_query':
+                    request = await self.bind_query_context(origin, request)
             # Only the host continuation loop supplies this private argument.
             # A model parameter/requestId never skips preparation or authorization.
             normalized = (deepcopy(frozen_request) if frozen_request is not None else

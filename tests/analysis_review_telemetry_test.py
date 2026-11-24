@@ -62,7 +62,7 @@ class ReviewTelemetryTests(PresentationCase):
         invalid = {'issues': [], 'coverage': [
             {'requirement': '核对金额', 'status': 'COVERED', 'location': '原文金额', 'evidenceRefs': ['表1']},
             {'requirement': '核对范围', 'status': 'SOURCE_LIMITED', 'location': '范围说明', 'evidenceRefs': ['表1第1行', '查询范围与选择条件']}]}
-        patch_refs = {'repairs': [{'index': 1, 'sources': {}}, {'index': 0, 'sources': {'表1': [1]}}]}
+        patch_refs = {'repairs': {'1': [], '0': [1]}}
         agent = self.model(None)
         agent.model.generate_structured_output.side_effect = [
             SimpleNamespace(content=data, usage=None) for data in (invalid, patch_refs)]
@@ -73,8 +73,10 @@ class ReviewTelemetryTests(PresentationCase):
         expected['coverage'][0]['evidenceRefs'] = ['source_fact']
         expected['coverage'][1]['evidenceRefs'] = ['source_fact']
         self.assertEqual(result, expected)
-        item = agent.model.generate_structured_output.call_args.kwargs['structured_model']['properties']['repairs']['items']
-        self.assertEqual(item['properties']['sources']['properties']['表1']['items'], {'type': 'integer', 'minimum': 1, 'maximum': 1})
+        patch_schema = agent.model.generate_structured_output.call_args.kwargs['structured_model']['properties']['repairs']
+        self.assertEqual(patch_schema['properties']['0']['maxItems'], 12)
+        self.assertEqual(patch_schema['properties']['1']['maxItems'], 11)
+        self.assertCountEqual(patch_schema['required'], ['0', '1'])
         self.assertEqual(progress(turn)['review']['attempts'], 5)
         self.assertEqual(progress(turn)['reviewOutputRepairs'], {'frozen': 1})
         with self.assertRaisesRegex(AnalysisError, '限额'):
@@ -92,3 +94,45 @@ class ReviewTelemetryTests(PresentationCase):
         self.assertEqual(call['failureKind'], 'HOST_WAIT_TIMEOUT')
         self.assertIsNone(call['tokenUsage'])
         self.assertFalse(call['retry'])
+
+    async def test_sdk_accepts_parsed_overflow_then_host_repairs_only_citations(self):
+        from jsonschema import validate
+        source = {'facts': [{'factId': f'fact_{i}', 'recordTable': '费用表', 'value': str(i)}
+                            for i in range(1, 15)]}
+        refs = [f'表1第{i}行' for i in range(1, 14)]
+        verdict = {'issues': [], 'coverage': [{'requirement': '核对金额', 'status': 'COVERED',
+                                               'location': '金额明细', 'evidenceRefs': refs}]}
+        replies = iter([verdict, {'repairs': {'0': [2, 10]}}])
+        async def sdk(messages, *, structured_model, max_tokens):
+            response = next(replies)
+            validate(response, structured_model)
+            return SimpleNamespace(content=response, usage=None)
+        agent = self.model(None)
+        agent.model.generate_structured_output.side_effect = sdk
+        result = await call_review_model(self.turn(), lambda: _model_review(agent, REVIEW_PROMPT, source),
+            phase='DOCUMENT', input_chars=0, round_started=time.perf_counter(), material_key='overflow')
+        self.assertEqual(result['coverage'][0], {**verdict['coverage'][0], 'evidenceRefs': ['fact_2', 'fact_10']})
+        self.assertEqual(agent.model.generate_structured_output.await_count, 2)
+
+    async def test_merged_limit_counts_retained_refs_across_all_source_types(self):
+        from jsonschema import ValidationError, validate
+        from analysis_extension.review_output import output_correction, correction_request
+        from analysis_extension.review_request import make_review_request
+        from analysis_extension.turn_completion import ANALYSIS_REVIEW_SCHEMA
+        refs = [f'表1第{i}行' for i in range(1, 12)] + ['不存在的位置']
+        row = {'requirement': '金额', 'status': 'COVERED', 'location': '明细', 'evidenceRefs': refs}
+        req = make_review_request({'facts': [{'factId': f'f{i}', 'value': str(i)} for i in range(1, 15)],
+                                   'candidateAnswer': '原报告正文的唯一标记'})
+        token = output_correction.set({'message': '核对位置', 'indexes': [0], 'invalidPositions': {0: [11]},
+                                       'verdict': {'coverage': [row], 'issues': []}})
+        try:
+            material, schema = correction_request(req, ANALYSIS_REVIEW_SCHEMA)
+            self.assertNotIn('原报告正文的唯一标记', material)
+            self.assertIn('14', material)
+            with self.assertRaises(ValidationError):
+                validate({'repairs': {'0': [12, 13]}}, schema)
+            with self.assertRaises(ValidationError):
+                validate({'repairs': {'0': [15]}}, schema)
+            validate({'repairs': {'0': []}}, schema)
+        finally:
+            output_correction.reset(token)

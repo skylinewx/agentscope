@@ -1,11 +1,55 @@
 /* Generic measurements of the rendered document; never chooses its layout. */
 (()=>{
 const data=JSON.parse(document.getElementById('analysis-host-data').textContent);
+// A report template may pass either the wrapped row or its business fields to a
+// chart. Both views read the same frozen cell; never copy values or shadow row metadata.
+for(const set of Object.values(data.sets)){
+    if(set.rowContract!=='BUSINESS_DATASET_V1'||!Array.isArray(set.rows))continue;
+    const fields=Object.create(Object.prototype);
+    const reserved=new Set(['rowRef','values','valueStates','metadata','then','toJSON']);
+    for(const {name} of set.columns){
+        if(typeof name!=='string'||reserved.has(name)||name in fields)continue;
+        Object.defineProperty(fields,name,{get(){return Object.hasOwn(this.values,name)?this.values[name]:undefined;}});
+    }
+    Object.freeze(fields);
+    for(const row of set.rows)Object.setPrototypeOf(row,fields);
+}
 const freeze=x=>{if(x&&typeof x==='object'){Object.values(x).forEach(freeze);Object.freeze(x);}};freeze(data);
 Object.defineProperty(window,'analysisData',{value:data.values,writable:false,configurable:false});
 Object.defineProperty(window,'analysisSets',{value:data.sets,writable:false,configurable:false});
 const errors=[];
 const error=text=>{if(errors.length<20)errors.push(String(text).slice(0,300));};
+let measurePeriodTrends=()=>[];
+// The numeric binding already establishes that this text is a value, not an ID.
+const groupedNumber = value => {
+    const raw = String(value);
+    const match = /^([+−-]?)(\d+)(?:\.(\d+))?(?:e([+-]?\d+))?$/i.exec(raw);
+    if (!match) return raw;
+    let [, sign, whole, fraction = '', exponent] = match;
+    if (exponent) {
+        const shift = Number(exponent);
+        if (Math.abs(shift) > 128) return raw;
+        const digits = whole + fraction, decimalAt = whole.length + shift;
+        whole = decimalAt <= 0 ? '0' : digits.padEnd(decimalAt, '0').slice(0, decimalAt).replace(/^0+(?=\d)/, '');
+        fraction = '0'.repeat(Math.max(0, -decimalAt)) + digits.slice(Math.max(0, decimalAt));
+    }
+    return sign + whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',') + (fraction ? '.' + fraction : '');
+};
+/* TREND_COMPONENT */
+/* TREND_COMPONENT_END */
+addEventListener('DOMContentLoaded',()=>{
+    for(const label of document.querySelectorAll('[data-analysis-order-label]')){
+        const key=label.getAttribute('data-analysis-order-label'), direction=data.sets[key]?.directionLabel;
+        if(direction)label.textContent=direction;
+        else error('排序说明需要已绑定的原生排序或统计集合，请检查集合名：'+key);
+    }
+    for(const label of document.querySelectorAll('[data-analysis-formula-address]')){
+        const set=data.sets[label.dataset.analysisFormulaAddress];
+        const node=set?.nodes?.find(item=>item.factRef===label.dataset.analysisNodeRef);
+        label.textContent=node?.cellAddress||'';
+        if(!node)error('公式地址须绑定当前公式集合及实际节点引用。');
+    }
+});
 addEventListener('error',e=>error(e.message||'resource error'));
 addEventListener('unhandledrejection',e=>error(e.reason?.message||'unhandled rejection'));
 addEventListener('securitypolicyviolation',e=>error('resource policy: '+e.violatedDirective));
@@ -17,13 +61,29 @@ const linearBindings=new WeakMap();
 const registeredCharts=new Set(), valueLabels=new Map();
 // 排序、原生统计和脚本表格都按实际字段名读取，不依赖列下标。
 // 仅接受明确的 factRef/value 列，不猜金额列，也不把空值当成零。
+const setRows=new WeakMap();
 const setDatum=(setKey,factRef)=>{
     const set=data.sets[setKey];
-    if(!set||!Array.isArray(set.rows))return undefined;
-    const names=(set.columns||[]).map(column=>column.name);
-    if(!names.includes('factRef')||!names.includes('value'))return undefined;
-    const rows=set.rows.filter(row=>row.values?.factRef===factRef);
-    return rows.length===1?rows[0].values:undefined;
+    if(!set||!Array.isArray(set.rows)||typeof factRef!=='string'||!factRef)return undefined;
+    if(!setRows.has(set)){
+        const names=(set.columns||[]).map(column=>column.name);
+        const facts=new Map(),rows=new Map();
+        const add=(map,id,value)=>{
+            if(typeof id==='string'&&id)map.set(id,map.has(id)?null:value);
+        };
+        if(names.includes('factRef')&&names.includes('value')){
+            for(const row of set.rows){
+                add(facts,row.values?.factRef,row.values);
+                add(rows,row.rowRef,row.values);
+            }
+        }
+        setRows.set(set,{facts,rows});
+    }
+    const {facts,rows}=setRows.get(set);
+    if(facts.has(factRef))return facts.get(factRef)??undefined;
+    // Both the supplied row and its target fact must be unique in this set.
+    const row=rows.get(factRef);
+    return row&&facts.get(row.factRef)===row?row:undefined;
 };
 const bindingDatum=binding=>{
     if(binding.valueKey)return data.values[binding.valueKey];
@@ -33,8 +93,12 @@ const bindingDatum=binding=>{
 const bindValueLabel=(element,binding)=>{
     const datum=bindingDatum(binding);
     if(!(element instanceof Element)||datum?.value==null)throw new Error('数值标签需要实际元素和当前文档的非空数值绑定');
-    element.textContent=datum.display??String(datum.value);
+    element.textContent=datum.display??groupedNumber(datum.value);
     valueLabels.set(element,{...binding});
+};
+const allowZeroLength=(element,axis)=>{
+    // Decorative minimums would enlarge zero and subpixel amounts on the value axis.
+    if(element instanceof HTMLElement)element.style[axis==='x'?'minWidth':'minHeight']='0px';
 };
 const bindLinearBars=(items,options={})=>{
     // 每次调用默认独立刻度，避免局部放大图误用全量图的分组名称。
@@ -44,14 +108,19 @@ const bindLinearBars=(items,options={})=>{
     const rows=items.map(item=>{
         const element=item.element;
         const datum=item.valueKey?data.values[item.valueKey]:setDatum(item.setKey,item.factRef);
-        if(!(element instanceof Element)||datum?.value==null||!Number.isFinite(Number(datum.value)))throw new Error('线性条形必须绑定实际非空数值');
+        if(!(element instanceof Element)||datum?.value==null||!Number.isFinite(Number(datum.value)))throw new Error(
+            '线性条形必须绑定实际非空数值。请使用已挂入页面的条形元素，并从同一行的 row.values 读取 factRef 和 value；空值只显示为空。');
+        allowZeroLength(element,axis);
         waterfallBindings.delete(element);
         delete element.dataset.analysisWaterfallSet;delete element.dataset.analysisWaterfallNode;delete element.dataset.analysisWaterfallStep;
         element.dataset.analysisScale=scale;element.dataset.analysisBarAxis=axis;
         if(item.valueKey){element.dataset.analysisBarValue=item.valueKey;delete element.dataset.analysisBarSet;delete element.dataset.analysisBarRef;}
-        else{delete element.dataset.analysisBarValue;element.dataset.analysisBarSet=item.setKey;element.dataset.analysisBarRef=item.factRef;}
+        else{delete element.dataset.analysisBarValue;element.dataset.analysisBarSet=item.setKey;element.dataset.analysisBarRef=datum.factRef;}
         registeredCharts.add(element);
-        return {element,value:Math.abs(Number(datum.value)),binding:item.valueKey?{valueKey:item.valueKey}:{setKey:item.setKey,factRef:item.factRef}};
+        const binding=item.valueKey?{valueKey:item.valueKey}:{setKey:item.setKey,factRef:datum.factRef};
+        const registration={axis,length:0,binding};
+        linearBindings.set(element,registration);
+        return {element,value:Math.abs(Number(datum.value)),registration};
     });
     const maximum=options.maximum??Math.max(...rows.map(row=>row.value));
     if(!Number.isFinite(maximum)||maximum<Math.max(...rows.map(row=>row.value)))throw new Error('线性条形的刻度上限不得小于实际最大值');
@@ -59,8 +128,9 @@ const bindLinearBars=(items,options={})=>{
         const pixels=options.extent?.getBoundingClientRect()[axis==='x'?'width':'height']??options.pixels;
         if(!Number.isFinite(pixels)||pixels<0)throw new Error('线性条形需要真实容器或非负像素长度');
         for(const row of rows){
+            if(linearBindings.get(row.element)!==row.registration)continue;
             const length=maximum?row.value/maximum*pixels:0;
-            linearBindings.set(row.element,{axis,length,binding:row.binding});
+            row.registration.length=length;
             if(row.element instanceof SVGElement)row.element.setAttribute(axis==='x'?'width':'height',String(length));
             else row.element.style[axis==='x'?'width':'height']=length+'px';
         }
@@ -92,26 +162,35 @@ const bindHorizontalWaterfall=(items,options={})=>{
             throw new Error('横向瀑布图每一步需要实际条形、其直接父轨道及有效 stepIndex');
         if(item.zero!=null&&(!(item.zero instanceof HTMLElement)||item.zero.parentElement!==track))
             throw new Error('瀑布零线需要属于对应轨道的实际元素');
-        return {element,track,step,index:item.stepIndex,zero:item.zero};
+        if(item.labelElement!=null&&!(item.labelElement instanceof Element))
+            throw new Error('瀑布图的 labelElement 须引用该步骤显示业务名称的元素。');
+        return {element,track,step,index:item.stepIndex,zero:item.zero,labelElement:item.labelElement};
     });
     if(new Set(bindings.map(item=>item.element)).size!==bindings.length)
         throw new Error('横向瀑布图每一步需要独立条形，不能用同一元素覆盖多个贡献');
-    for(const {element,track,step,index} of bindings){
+    const rowContainers=new Set(bindings.map(item=>item.track.parentElement));
+    for(const item of bindings){
+        const {element,track,step,index}=item;
         // 专用轨道只负责定位；厚度、标签、颜色和报告布局仍由页面决定。
         if(getComputedStyle(track).position==='static')track.style.position='relative';
         element.style.position='absolute';element.style.display='block';element.style.boxSizing='border-box';
+        allowZeroLength(element,'x');
         element.dataset.analysisScale=scale;element.dataset.analysisBarAxis='x';
         element.dataset.analysisWaterfallSet=options.setKey;element.dataset.analysisWaterfallNode=options.nodeRef;
         element.dataset.analysisWaterfallStep=String(index);
         delete element.dataset.analysisBarValue;delete element.dataset.analysisBarSet;delete element.dataset.analysisBarRef;
         linearBindings.delete(element);
-        waterfallBindings.set(element,{track,step,binding:{setKey:options.setKey,nodeRef:options.nodeRef,stepIndex:index}});
+        item.registration={track,step,labelElement:item.labelElement,unit:node.unit,
+            separateRows:rowContainers.size===bindings.length,binding:{setKey:options.setKey,nodeRef:options.nodeRef,stepIndex:index}};
+        waterfallBindings.set(element,item.registration);
         registeredCharts.add(element);
     }
     // All rows share a real drawing interval, even when a decorated total row
     // has padding. Keep the report layout; never apply a different scale per row.
     const draw=()=>{
-        const tracks=bindings.map(({track})=>{
+        const active=bindings.filter(item=>waterfallBindings.get(item.element)===item.registration);
+        if(!active.length)return;
+        const tracks=active.map(({track})=>{
             const box=track.getBoundingClientRect(),zoom=track.offsetWidth?box.width/track.offsetWidth:0;
             return {left:box.left+track.clientLeft*zoom,width:track.clientWidth*zoom,zoom};
         });
@@ -119,12 +198,12 @@ const bindHorizontalWaterfall=(items,options={})=>{
         const left=Math.max(...tracks.map(t=>t.left));
         const width=Math.min(...tracks.map(t=>t.left+t.width))-left;
         if(width<=0)throw new Error('同一瀑布图的轨道没有共同绘图区；请保持各步骤纵向对齐，保留全部公式项');
-        bindings.forEach(({element,step,zero},i)=>{
-            const track=tracks[i],binding=waterfallBindings.get(element);
+        active.forEach(({element,step,zero,registration},i)=>{
+            const track=tracks[i];
             const cssLeft=(left-track.left+step.geometry.left*width)/track.zoom;
             const cssWidth=step.geometry.width*width/track.zoom;
             element.style.left=cssLeft+'px';element.style.width=cssWidth+'px';
-            Object.assign(binding,{cssLeft,cssWidth});
+            Object.assign(registration,{cssLeft,cssWidth});
             if(zero)zero.style.left=((left-track.left+waterfall.zero*width)/track.zoom)+'px';
         });
     };
@@ -137,7 +216,28 @@ const bindHorizontalWaterfall=(items,options={})=>{
     for(const {track} of bindings)observer?.observe(track);
     return ()=>{observer?.disconnect();if(pendingFrame!==null)cancelAnimationFrame(pendingFrame);};
 };
-Object.defineProperty(window,'analysisCharts',{value:Object.freeze({bindLinearBars,bindHorizontalWaterfall,bindValueLabel}),writable:false,configurable:false});
+// Author scripts sometimes catch binding errors. Keep failed, still-mounted
+// bindings visible to publication checks, clearing them if the page repairs them.
+const failedCharts=new Map(),failedLabels=new Map();
+const checked=(bind,failures)=>(...args)=>{
+    const first=args[0];
+    const elements=Array.isArray(first)?first.map(item=>item?.element).filter(el=>el instanceof Element)
+        :first instanceof Element?[first]:[];
+    try{
+        const result=bind(...args);
+        for(const el of elements)failures.delete(el);
+        return result;
+    }catch(cause){
+        const message=String(cause.message||cause);
+        if(elements.length){for(const el of elements)failures.set(el,message);}
+        else error(message);
+        throw cause;
+    }
+};
+Object.defineProperty(window,'analysisCharts',{value:Object.freeze({
+    bindLinearBars:checked(bindLinearBars,failedCharts),bindHorizontalWaterfall:checked(bindHorizontalWaterfall,failedCharts),
+    bindValueLabel:checked(bindValueLabel,failedLabels)
+}),writable:false,configurable:false});
 const send=()=>{
     if(!document.body)return;
     const rect=document.body.getBoundingClientRect(),style=getComputedStyle(document.body);
@@ -162,6 +262,21 @@ const rendered=el=>{
 const visible=el=>{
     const r=el.getBoundingClientRect();
     return r.width>0&&r.height>0&&rendered(el);
+};
+const waterfallHasName=({track,step,unit,labelElement,separateRows})=>{
+    if(!step.label)return true; // The source supplied no business name to display.
+    const readable=el=>{
+        if(!visible(el))return false;
+        const text=(el.innerText??el.textContent??'').trim();
+        return text===step.label||/\p{L}/u.test(unit?text.split(unit).join(''):text);
+    };
+    if(labelElement)return readable(labelElement);
+    // Custom templates can bind an external label explicitly. For a traditional
+    // label/track/amount row, verify its own text, never a nearby table or heading.
+    if(!separateRows||!track.parentElement)return true;
+    const siblings=[...track.parentElement.children].filter(el=>el!==track);
+    if(siblings.length<2)return true;
+    return siblings.some(readable);
 };
 const label=el=>(el.getAttribute('aria-label')||el.textContent||el.id||el.tagName).trim().slice(0,100);
 const elementPath=el=>{
@@ -203,10 +318,34 @@ const measure=()=>{
     // visible rows and frozen values. They never choose or rewrite a chart.
     const consistencyErrors=[];
     const mismatch=text=>{if(consistencyErrors.length<20)consistencyErrors.push(text.slice(0,300));};
+    const failedMessages=new Set();
+    for(const failures of [failedCharts,failedLabels])for(const [el,message] of failures)if(el.isConnected)failedMessages.add(message);
+    for(const message of failedMessages)mismatch(message);
+    // Only a single, explicitly declared source address on the caption of a
+    // bound formula can be checked. Other references may be operands or prose.
+    for(const figure of document.querySelectorAll('[data-analysis-set][data-analysis-ref]')){
+        const set=data.sets[figure.dataset.analysisSet];
+        if(set?.kind!=='FORMULA')continue;
+        const address=set.nodes.find(node=>node.factRef===figure.dataset.analysisRef)?.cellAddress;
+        if(!address||!/^\$?[A-Z]{1,3}\$?[1-9]\d*$/i.test(address))continue;
+        const caption=figure.querySelector(':scope > figcaption')||figure.previousElementSibling;
+        if(!caption?.matches('h1,h2,h3,h4,h5,h6,figcaption')||!visible(caption))continue;
+        const claim=/[（(]\s*(?:表内公式|原表单元格|来源单元格)\s*[：:]?\s*(\$?[A-Z]{1,3}\$?[1-9]\d*)\s*[）)]\s*$/i.exec(caption.innerText);
+        const normalized=ref=>ref.replaceAll('$','').toUpperCase();
+        if(claim&&normalized(claim[1])!==normalized(address))
+            mismatch('公式图标题标注 '+claim[1]+'，该节点的来源单元格是 '+address+'。请用 node.cellAddress 填写原表坐标，或省略该标注。');
+    }
     const counters=[...document.querySelectorAll('[data-analysis-count-for]')];
     const declaredBars=[...new Set([...document.querySelectorAll('[data-analysis-scale]'),...registeredCharts].filter(el=>el.isConnected))];
     const charted=new Map(), presented=new Map();
-    const keep=(map,binding)=>{if(binding)map.set(JSON.stringify(binding),binding);};
+    const keep=(map,binding)=>{
+        if(!binding)return;
+        if(binding.factRef){
+            const datum=setDatum(binding.setKey,binding.factRef);
+            if(datum)binding={...binding,factRef:datum.factRef};
+        }
+        map.set(JSON.stringify(binding),binding);
+    };
     const chartBinding=bar=>linearBindings.get(bar)?.binding||waterfallBindings.get(bar)?.binding||
         (bar.dataset.analysisWaterfallSet?{setKey:bar.dataset.analysisWaterfallSet,nodeRef:bar.dataset.analysisWaterfallNode,stepIndex:Number(bar.dataset.analysisWaterfallStep)}:
         bar.dataset.analysisBarValue?{valueKey:bar.dataset.analysisBarValue}:
@@ -225,6 +364,7 @@ const measure=()=>{
         const count=rows.filter(row=>!rows.some(parent=>parent!==row&&parent.contains(row))).length;
         if(Number(text)!==count){numericChecks.counts.failed++;mismatch('集合计数不一致：'+text+'，实际可见 '+count+' 项（'+counter.dataset.analysisCountFor+'）');}
     }
+    const geometryTolerancePx=1;
     const scales=new Map();
     for(const bar of declaredBars.slice(0,1000)){
         const axis=bar.dataset.analysisBarAxis||'x';
@@ -258,16 +398,28 @@ const measure=()=>{
             &&Math.abs(length-linear.length)<0.5;
         if(waterfall){
             const {track,step}=waterfall,trackBox=track.getBoundingClientRect();
+            if(!waterfallHasName(waterfall)){
+                numericChecks.linearBars.invalid++;
+                mismatch('瀑布图第'+(waterfall.binding.stepIndex+1)+'步缺少可见名称“'+step.label+'”。用 step.label 填入名称元素；独立图例用 labelElement 绑定。保留现有数据与图形。');
+                continue;
+            }
             const zoom=track.offsetWidth?trackBox.width/track.offsetWidth:0;
+            if(!zoom||!Number.isFinite(waterfall.cssLeft)||!Number.isFinite(waterfall.cssWidth)){
+                numericChecks.linearBars.invalid++;
+                mismatch('横向瀑布图 '+waterfall.binding.nodeRef+' 第'+waterfall.binding.stepIndex+'步：'+elementPath(track)+
+                    '；当前视口 '+document.documentElement.clientWidth+'px，本轨道实际宽 '+trackBox.width.toFixed(2)+
+                    'px。同一图的轨道尚未全部取得可绘宽度。请检查窄屏下标签和金额列是否挤占绘图区，允许换行或调整列宽；保留全部公式项。');
+                continue;
+            }
             const expectedLeft=trackBox.left+(track.clientLeft+waterfall.cssLeft)*zoom;
             const expectedWidth=waterfall.cssWidth*zoom;
             // 极小贡献可能小于浏览器可绘像素；保留精确标签，不用最小宽度放大。
             subpixel=expectedWidth>0&&expectedWidth<0.5;
-            if(bar.parentElement!==track||bar.offsetParent!==track||!zoom||!Number.isFinite(expectedWidth)
-               ||Math.abs(box.left-expectedLeft)>0.5||Math.abs(box.width-expectedWidth)>0.5){
+            if(bar.parentElement!==track||bar.offsetParent!==track
+               ||Math.abs(box.left-expectedLeft)>geometryTolerancePx||Math.abs(box.width-expectedWidth)>geometryTolerancePx){
                 numericChecks.linearBars.invalid++;
                 mismatch('横向瀑布图 '+waterfall.binding.nodeRef+' 第'+waterfall.binding.stepIndex+'步：'+elementPath(bar)+
-                    '；实际 left/width='+box.left.toFixed(2)+'/'+box.width.toFixed(2)+
+                    '；累计位置或长度不符。实际 left/width='+box.left.toFixed(2)+'/'+box.width.toFixed(2)+
                     '，期望='+expectedLeft.toFixed(2)+'/'+expectedWidth.toFixed(2)+
                     '。保留瀑布及全部公式项，仅修正轨道或覆盖绑定的 margin、transform、最小宽度；不要删图改表。');
                 continue;
@@ -289,12 +441,12 @@ const measure=()=>{
         const pivot=bars.reduce((a,b)=>b.value>a.value?b:a,{value:0,length:0});
         // A lone nonzero bar does not establish a comparative scale. Zero bars
         // still have a checkable zero length, and positive values cannot vanish.
-        const inconsistent=bars.some(bar=>(bar.value>0&&bar.length===0&&!bar.subpixel)||Math.abs(bar.length-(pivot.value?bar.value/pivot.value*pivot.length:0))>0.5);
-        if(inconsistent||bars.length>1||pivot.value===0)numericChecks.linearBars.checkedGroups++;
-        if(inconsistent){
+        const different=bars.find(bar=>bar.value===0 ? bar.length!==0 :
+            (bar.length===0&&!bar.subpixel)||Math.abs(bar.length-bar.value/pivot.value*pivot.length)>geometryTolerancePx);
+        if(different||bars.length>1||pivot.value===0)numericChecks.linearBars.checkedGroups++;
+        if(different){
             numericChecks.linearBars.failedGroups++;
-            const different=bars.find(bar=>Math.abs(bar.length-(pivot.value?bar.value/pivot.value*pivot.length:0))>0.5);
-            mismatch('线性条形比例不一致：'+key+'；'+(different?.path||'')+'。同名 scale 共享刻度；全量图与局部放大图须使用不同组名，或分别调用 analysisCharts.bindLinearBars 并省略 scale；同图检查最小长度与绑定值。');
+            mismatch('线性条形比例不一致：'+key+'；'+different.path+'。同名 scale 共享刻度；全量图与局部放大图须使用不同组名，或分别调用 analysisCharts.bindLinearBars 并省略 scale；同图检查最小长度与绑定值。');
         }
     }
     let diagnosticsTruncated=false;
@@ -390,21 +542,58 @@ const measure=()=>{
                 observe(overlaps,{first:label(a),second:label(b)});
         }
     }
-    const containers=[...document.querySelectorAll('[data-analysis-set]')];
+    const containers=[],rowSections=new Map(),rowOwners=new WeakMap();
+    for(const marked of document.querySelectorAll('[data-analysis-set]')){
+        const section=marked.parentElement;
+        // A table row can carry both identifiers. Read sibling rows of the same
+        // dataset in this section, keeping independent tables and datasets apart.
+        if(marked.matches('tr[data-analysis-ref]')&&section?.matches('tbody,thead,tfoot')
+            &&!marked.querySelector('[data-analysis-ref],[data-analysis-set]')&&!marked.hasAttribute('data-analysis-partial')&&!marked.hasAttribute('data-analysis-order-axis')){
+            const outer=section.closest('[data-analysis-set]'),key=marked.dataset.analysisSet;
+            if(outer&&outer.dataset.analysisSet===key){rowOwners.set(marked,outer);continue;}
+            if(!rowSections.has(section))rowSections.set(section,new Map());
+            const byKey=rowSections.get(section);
+            if(!byKey.has(key)){
+                const view={container:section,key,rows:[]};byKey.set(key,view);containers.push(view);
+            }
+            byKey.get(key).rows.push(marked);
+        }else containers.push({container:marked,key:marked.dataset.analysisSet});
+    }
+    const completeTables=new Map(),unmarkedOrders=[];
     let refBytes=0;
-    for(const container of containers.slice(0,50)){
+    for(const {container,key,rows:markedRows} of containers.slice(0,50)){
         if(!visible(container))continue;
         const axis=container.dataset.analysisOrderAxis==='x'?'left':'top';
-        const items=[...container.querySelectorAll('[data-analysis-ref]')].filter(el=>el.closest('[data-analysis-set]')===container&&visible(el));
+        const items=markedRows?markedRows.filter(visible):[...container.querySelectorAll('[data-analysis-ref]')]
+            .filter(el=>(rowOwners.get(el)??el.closest('[data-analysis-set]'))===container&&visible(el));
         items.sort((a,b)=>a.getBoundingClientRect()[axis]-b.getBoundingClientRect()[axis]);
         const refs=[];
         for(const el of items){
-            const ref=el.getAttribute('data-analysis-ref');
+            const supplied=el.getAttribute('data-analysis-ref');
+            const ref=setDatum(key,supplied)?.factRef??supplied;
             refBytes+=encoder.encode(JSON.stringify(ref)).length;
             if(refBytes>18000||refs.length>=2000)break;
             refs.push(ref);
         }
-        orders.push({key:container.dataset.analysisSet,partial:container.dataset.analysisPartial==='true',refs,truncated:refs.length<items.length});
+        const order={key,partial:container.dataset.analysisPartial==='true',refs,truncated:refs.length<items.length};
+        orders.push(order);
+        if(order.truncated||!refs.length)continue;
+        if(!container.hasAttribute('data-analysis-partial'))unmarkedOrders.push(order);
+        const table=items[0].closest('table');
+        if(!table||order.partial||!items.every(el=>el.closest('table')===table))continue;
+        const rows=data.sets[order.key]?.rows;
+        const tableRows=new Set(items.map(el=>el.closest('tr')));
+        if(!Array.isArray(rows)||rows.length!==refs.length||tableRows.has(null)||tableRows.size!==refs.length||new Set(refs).size!==refs.length)continue;
+        if(rows.every((row,i)=>typeof row.values?.factRef==='string'&&row.values.factRef===refs[i]))completeTables.set(order.key,rows.length);
+    }
+    // Only a complete, visible table of the same source proves that another view can be partial.
+    // The host still verifies each companion's identities and relative order.
+    for(const order of unmarkedOrders){
+        const fullSize=completeTables.get(order.key);
+        if(fullSize!==undefined&&order.refs.length<fullSize)order.partial=true;
+    }
+    for(const trendRef of measurePeriodTrends()){
+        keep(charted,{trendRef});keep(presented,{trendRef});
     }
     const result={version:4,viewport:{width,height:Math.round(innerHeight)},numericChecks,
         valueCoverage:{charted:[...charted.values()].slice(0,1200),presented:[...presented.values()].slice(0,1200),
@@ -437,3 +626,17 @@ addEventListener('message',e=>{
     }
 });
 })();
+// A printed copy includes adopted source data. Restore the reader's previous disclosure state afterwards.
+{
+    let printOpened = [];
+    addEventListener('beforeprint', () => {
+        for (const el of document.querySelectorAll('details.source-data:not([open])')) {
+            printOpened.push(el);
+            el.open = true;
+        }
+    });
+    addEventListener('afterprint', () => {
+        for (const el of printOpened) el.open = false;
+        printOpened = [];
+    });
+}

@@ -153,7 +153,8 @@ class ScenarioFallbackTests(TestCase):
         attach_empty_business_view(evidence)
         answer = empty_query_answer(evidence)['answer']
         self.assertIn('合成利润表', answer)
-        self.assertIn('实际数（元）', answer)
+        self.assertIn('| 情景 | 实际数 |', answer)
+        self.assertIn('| 合成利润表 | 净利润 | 无数据 | 元 |', answer)
         self.assertNotIn('预算值', answer)
         self.assertNotIn('运行匹配记录', answer)
 

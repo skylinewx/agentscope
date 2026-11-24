@@ -22,6 +22,7 @@ from ._logging import logger
 
 _context = ContextVar("agentscope_io_context", default={})
 _model_call = ContextVar("agentscope_model_io", default=None)
+_request_size_observer = ContextVar("agentscope_request_size_observer", default=None)
 _logger = logger.getChild("io")
 _secret = re.compile(
     r"(?:api[_-]?key|password|passwd|secret|(?:access|refresh|auth|csrf|bearer)[_-]?token|"
@@ -271,8 +272,26 @@ class CallIO:
             _model_call.reset(token)
 
 
+@contextmanager
+def observe_request_sizes(observer):
+    token = _request_size_observer.set(observer)
+    try:
+        yield
+    finally:
+        _request_size_observer.reset(token)
+
+
 def model_request(payload):
     """Record the final SDK arguments after provider-specific formatting."""
+    observer = _request_size_observer.get()
+    if observer is not None and isinstance(payload, dict):
+        try:
+            def size(value):
+                return len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str))
+            observer({"formattedMessageChars": size(payload.get("messages", payload.get("input", []))),
+                      "formattedToolSchemaChars": size(payload.get("tools", []))})
+        except Exception:
+            logger.debug("Could not record formatted model request size", exc_info=True)
     call = _model_call.get()
     if call is not None:
         call.input(payload, format="provider")

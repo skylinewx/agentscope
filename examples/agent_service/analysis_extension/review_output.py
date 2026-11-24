@@ -2,7 +2,6 @@
 from contextvars import ContextVar
 from copy import deepcopy
 import json
-import re
 
 from agentscope.exception import StructuredOutputError
 from jsonschema import ValidationError
@@ -29,84 +28,106 @@ def correction_for(error, diagnostic, previous):
     elif diagnostic.get('failureKind') == 'structured_output' or isinstance(error, StructuredOutputError):
         details = {}
         feedback = '模型回复未生成符合约定的结构化审查意见。'
+        cause = error.__cause__
+        if isinstance(cause, ValidationError):
+            feedback = f'字段 {cause.json_path} 未满足 {cause.validator} 约束。请按该条可用位置和剩余额度填写。'
     else:
         return None
     correction = dict(previous or {})
-    correction['message'] = feedback
     if details.get('coverageIndexes') and hasattr(error, 'wire_verdict'):
-        correction.update(verdict=error.wire_verdict, indexes=details['coverageIndexes'])
-        correction['invalidPositions'] = error.invalid_positions
+        correction.update(verdict=error.wire_verdict, indexes=details['coverageIndexes'],
+                          invalidPositions=error.invalid_positions)
+    elif getattr(error, 'requires_full_review', False):
+        correction = {}
+    correction['message'] = feedback
     return correction
 
 
+def retained_refs(correction, index):
+    invalid = set(correction['invalidPositions'][index])
+    refs = correction['verdict']['coverage'][index]['evidenceRefs']
+    return list(dict.fromkeys(ref for pos, ref in enumerate(refs) if pos not in invalid))
+
+
+def coverage_overflow(verdict, schema):
+    """Only isolate a length error when the rest of the complete verdict is valid."""
+    from jsonschema import validate
+    if ('coverage' not in schema.get('properties', {}) or not isinstance(verdict, dict)
+            or not isinstance(verdict.get('coverage'), list)):
+        return None
+    limit = schema['properties']['coverage']['items']['properties']['evidenceRefs']['maxItems']
+    check = deepcopy(verdict)
+    positions = {}
+    for index, row in enumerate(check.get('coverage') or []):
+        refs = row.get('evidenceRefs') if isinstance(row, dict) else None
+        if isinstance(refs, list) and len(refs) > limit and all(isinstance(ref, str) for ref in refs):
+            positions[index] = list(range(len(refs)))
+            row['evidenceRefs'] = []
+    if not positions:
+        return None
+    try:
+        validate(check, schema)
+    except ValidationError:
+        return None
+    error = AnalysisError('REVIEW_COVERAGE_INVALID', f'每项最多引用 {limit} 个位置；请选择足以支持原判断的代表位置。',
+                          {'coverageIndexes': list(positions)})
+    error.wire_verdict, error.invalid_positions = verdict, positions
+    return error
+
+
+def initial_review_schema(schema):
+    """Keep a parsed verdict available when only its citation count needs correction.
+
+    The SDK otherwise discards the parsed object on maxItems and repeats the
+    entire model request. The host immediately validates the canonical contract.
+    """
+    transport = deepcopy(schema)
+    refs = transport['properties']['coverage']['items']['properties']['evidenceRefs']
+    limit = refs.pop('maxItems')
+    refs['description'] = f'每项最多 {limit} 个实际位置，通常一两个即可；仅依据正文时填空数组。'
+    return transport
+
+
 def correction_request(request, schema):
-    markdown = request.markdown
     correction = output_correction.get()
     if not correction:
-        return markdown, schema
+        return request.markdown, schema
     note = '\n\n## 纠正本次审查的输出\n' + correction['message']
     if 'indexes' not in correction:
-        return markdown + note + ' 请依据同一份材料，按原约定返回完整审查意见。', schema
-    indexes = correction['indexes']
+        return request.markdown + note + ' 请依据同一份材料，按原约定返回完整审查意见。', schema
+    from .review_reference_index import reference_index, numbered_locations
+    locations = numbered_locations(request)
+    limit = schema['properties']['coverage']['items']['properties']['evidenceRefs']['maxItems']
+    props = {}
     rows = []
-    for index in indexes:
-        row = correction['verdict']['coverage'][index]
-        rows.append({'index': index, 'requirement': row['requirement'], 'location': row['location'],
-                     '待纠正的引用': [row['evidenceRefs'][i] for i in correction['invalidPositions'][index]]})
-    note += (' 仅为下列条目选择能支持原判断的数据位置。原有业务判断和有效引用由宿主保留。\n'
+    for index in correction['indexes']:
+        item = correction['verdict']['coverage'][index]
+        kept = retained_refs(correction, index)
+        remaining = max(0, limit - len(kept))
+        position = {'type': 'integer', 'minimum': 1, 'maximum': len(locations)} if locations else {'type': 'string'}
+        props[str(index)] = {'type': 'array', 'items': position, 'uniqueItems': True, 'maxItems': remaining}
+        rows.append({'条目': index, '要求': item['requirement'], '判断': item['status'], '位置': item['location'],
+                     '已保留': kept, '待纠正': [item['evidenceRefs'][i] for i in correction['invalidPositions'][index]],
+                     '最多可补': remaining})
+    coordinate = '在数组中只填“引用号”对应的整数。' if locations else '按本份历史材料里的实际引用填写。'
+    note += ('\n仅核对列出的条目，原判断和有效引用已保留。' + coordinate
+             + '每条通常只需一两个直接依据，仅依据正文或已有引用足够时填 []。\n'
              + json.dumps(rows, ensure_ascii=False, separators=(',', ':')))
-    groups = {}
-    for label in request.wire_references:
-        match = re.fullmatch(r'(表\d+)第(\d+)行|(结果|Python脚本)(\d+)', label)
-        if match:
-            group, number = (match[1], match[2]) if match[1] else (match[3], match[4])
-            groups.setdefault(group, {})[int(number)] = label
-    properties = {'index': {'type': 'integer', 'enum': indexes}}
-    if groups:
-        # Coordinates come from rendered tables. Range bounds stay small even for a large grid.
-        sources, descriptions = {}, []
-        for group, locations in groups.items():
-            numbers = sorted(locations)
-            if len(numbers) == numbers[-1] - numbers[0] + 1:
-                allowed = {'minimum': numbers[0], 'maximum': numbers[-1]}
-                description = f'{numbers[0]} 至 {numbers[-1]}'
-            else:
-                allowed = {'enum': numbers}
-                description = '、'.join(map(str, numbers))
-            sources[group] = {'type': 'array', 'items': {'type': 'integer', **allowed}, 'uniqueItems': True}
-            descriptions.append(f'{group}的编号 {description}')
-        properties['sources'] = {'type': 'object', 'properties': sources, 'additionalProperties': False}
-        note += ('\n可选位置为' + '，'.join(descriptions) + '。在 sources 中以实际表名、结果或脚本为键，只填写整数编号。'
-                 '章节标题已由 location 表达。如该条仅依据正文或没有额外数据位置，填空对象 {}。')
-    else:
-        properties['evidenceRefs'] = schema['properties']['coverage']['items']['properties']['evidenceRefs']
-        note += '\n按原文选择可以核对的 evidenceRefs。仅依据正文时填空数组。'
-    item = {'type': 'object', 'properties': properties, 'required': list(properties), 'additionalProperties': False}
-    return markdown + note, {'type': 'object', 'properties': {'repairs': {'type': 'array',
-            'minItems': len(indexes), 'maxItems': len(indexes), 'items': item}},
-            'required': ['repairs'], 'additionalProperties': False}
+    patch_schema = {'type': 'object', 'properties': props, 'required': list(props), 'additionalProperties': False}
+    return reference_index(request, locations) + note, {'type': 'object', 'properties': {'repairs': patch_schema},
+                                             'required': ['repairs'], 'additionalProperties': False}
 
 
 def corrected_verdict(response, request):
     correction = output_correction.get()
     if not correction or 'indexes' not in correction:
         return response
-    rows = response['repairs']
-    if sorted(row['index'] for row in rows) != correction['indexes']:
-        raise AnalysisError('REVIEW_COVERAGE_INVALID', '请为每个指定的 index 各返回一次引用修正。')
     verdict = deepcopy(correction['verdict'])
-    for row in rows:
-        index = row['index']
-        item = verdict['coverage'][index]
-        refs = [ref for pos, ref in enumerate(item['evidenceRefs']) if pos not in correction['invalidPositions'][index]]
-        if 'sources' in row:
-            for group, numbers in row['sources'].items():
-                for number in numbers:
-                    location = f'{group}第{number}行' if group.startswith('表') else f'{group}{number}'
-                    if location not in request.wire_references:
-                        raise AnalysisError('REVIEW_COVERAGE_INVALID', '请选择本次材料实际列出的数据编号。')
-                    refs.append(location)
-        else:
-            refs.extend(row['evidenceRefs'])
-        item['evidenceRefs'] = list(dict.fromkeys(refs))
+    from .review_reference_index import numbered_locations
+    locations = numbered_locations(request)
+    for index in correction['indexes']:
+        refs = response['repairs'][str(index)]
+        if locations:
+            refs = [locations[number - 1] for number in refs]
+        verdict['coverage'][index]['evidenceRefs'] = list(dict.fromkeys(retained_refs(correction, index) + refs))
     return verdict

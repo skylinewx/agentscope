@@ -129,6 +129,19 @@ class FinalizeTests(PresentationCase):
         self.assertEqual(artifact['publicationState'], 'PUBLISHED')
         self.assertTrue(self.service.preview_reviewer.await_count)
 
+    async def test_markdown_edit_without_finalize_reruns_preview_before_registration(self):
+        request = await self.request()
+        request['document'] = {'title': '比较', 'markdown': '## 结果\n\n原值 {{amount}}。',
+                               'bindings': request['document']['bindings']}
+        self.service.preview_reviewer = AsyncMock(return_value=with_coverage({'issues': []}))
+        preview = await self.service.publish(**request, previewOnly=True)
+        count = self.service.preview_reviewer.await_count
+        result = await self.service.publish(repairRef=preview['repairRef'], requestKey='edit-markdown',
+            repairs=[{'op':'appendMarkdown', 'path':'/document/markdown', 'value':'补充一句解释。'}])
+        self.assertEqual(result['automaticFinalization']['status'], 'PUBLISHED')
+        self.assertTrue(result['delivery']['registered'])
+        self.assertGreater(self.service.preview_reviewer.await_count, count)
+
     async def test_revise_and_unreviewed_preserve_draft_instead_of_publishing(self):
         request = await self.request()
         for review in (None, AsyncMock(return_value=with_coverage({'issues': [{'code': 'VALUE_MISMATCH', 'message': '数值不符'}]}))):
@@ -183,6 +196,15 @@ class FinalizeTests(PresentationCase):
             middleware = AnalysisMiddleware(self.store, OWNER, [], self.service.authorize)
             middleware.service = self.service
             self.assertEqual(middleware._approved_delivery(), result['delivery']['markdown'])
+            turn.state['adoptedReportRef'] = 'another-analysis:1'
+            self.assertEqual(middleware._approved_delivery(), result['delivery']['markdown'])
+            turn.state['adoptedReportRef'] = artifact['analysisRef']
+            reply = middleware._approved_delivery()
+            self.assertIn('已完成必要审查', reply)
+            self.assertTrue(reply.endswith(result['delivery']['markdown']))
+            self.assertEqual(turn.state['hostCloseout']['reportDelivery']['analysisRef'], result['analysisRef'])
+            turn.state.pop('hostCloseout')
+            turn.state.pop('adoptedReportRef')
             await review_answer(None, turn, self.store.get_analysis(OWNER, result['analysisRef']), result['delivery']['markdown'])
         self.assertEqual(reviewer.await_count, 1)
         frozen = self.store.get_analysis(OWNER, result['analysisRef'])
@@ -203,7 +225,12 @@ class TabularChartTests(PresentationCase):
         request['document']['datasets'] = [{'key': 'statistics', 'valueRef': 'derived_stats'}]
         refs = [fact['factId'] for fact in artifact['facts']]
         request['document']['html'] += '''<div id="track" style="width:100%"><div id="one" style="height:14px;background:teal"></div><div id="two" style="height:14px;background:orange"></div></div><script>
-analysisCharts.bindLinearBars(REFS.map((ref,i)=>({element:document.getElementById(i?'two':'one'),setKey:'statistics',factRef:ref})),{extent:document.getElementById('track')});</script>'''.replace('REFS', json.dumps(refs))
+const bars=REFS.map((ref,i)=>{
+    const row=analysisSets.statistics.rows.find(item=>item.values.factRef===ref);
+    if(row.value!==row.values.value||row.object!==row.values.object||Object.keys(row).includes('value'))throw new Error('具名列须读取相同的只读业务值');
+    return {element:document.getElementById(i?'two':'one'),setKey:'statistics',factRef:i?row.rowRef:row.factRef};
+});
+analysisCharts.bindLinearBars(bars,{extent:document.getElementById('track')});</script>'''.replace('REFS', json.dumps(refs))
         result = await self.service.publish(**request, previewOnly=True)
         self.assertEqual(result['nextAction'], 'REVIEW_AND_CONFIRM', result['diagnostics'])
         for sample in result['diagnostics']['renderChecks']['viewports']:
@@ -242,7 +269,7 @@ class RevisionTests(PresentationCase):
         focused = focus_revision(turn, changed)
         self.assertEqual(focused['facts'], material['facts'])
         self.assertEqual(focused['derived'], material['derived'])
-        self.assertNotIn('sourceScopes', focused)
+        self.assertEqual(focused['sourceScopes'], material['sourceScopes'])
         for key, value in (('facts', [{'value': '1'}]), ('sourceScopes', ['新范围']), ('toolFailures', ['新错误'])):
             self.assertNotIn('revisionFocus', focus_revision(turn, {**changed, key: value}))
         hidden = focus_revision(turn, {**material, 'documentSourceText': '隐藏说明乙'})

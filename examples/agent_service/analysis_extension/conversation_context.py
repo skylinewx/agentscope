@@ -17,6 +17,7 @@ def _snapshot(state, status):
     captures = state.get('queryCaptureRefs', []) + scope.get('captureRefs', [])
     captures += [selection['captureRef'] for selection in scope.get('selections', [])]
     from .dimension_scopes import snapshot, retained_scopes, condition_history
+    from .review_materials import failure_summary
     selected = [item['captureRef'] for item in scope.get('selections', [])] or scope.get('captureRefs', []) or captures
     dimension_scopes = snapshot(state, selected) if completed else retained_scopes(state)
     # Sources stay immutable. A separately committed selection receipt can update
@@ -55,6 +56,9 @@ def _snapshot(state, status):
         'analysisRef': state.get('analysisRef') or scope.get('analysisRef'),
         'resultRefs': deepcopy(state.get('queryResultRefs', [])),
         'captureRefs': list(dict.fromkeys(captures)),
+        'executionCaptureRefs': list(dict.fromkeys(state.get('queryCaptureRefs', []))),
+        'toolFailures': [dict(failure_summary(failure), callId=call_id)
+                         for call_id, failure in state.get('failures', {}).items() if isinstance(failure, dict)],
         # Frozen calculation proofs stay server-side; the visible context catalog
         # continues to expose only the answer summary and source references.
         'referencedCalculations': deepcopy(state.get('referencedCalculations', {})),
@@ -68,7 +72,9 @@ def _snapshot(state, status):
 
 def save_context(state, status):
     """成功上下文成为默认锚点；未完成任务另存，供用户继续时显式选用。"""
-    if not (state.get('queryIntent') or state.get('queryCaptureRefs') or state.get('analysisRef')
+    if state.get('executionTracesRead') and not state.get('queryCaptureRefs') and not state.get('analysisRef'):
+        return
+    if not (state.get('queryIntent') or state.get('queryCaptureRefs') or state.get('analysisRef') or state.get('failures')
             or state.get('resolvedSubjectScope', {}).get('selections') or state.get('resolvedSubjectScope', {}).get('captureRefs')):
         return
     record = _snapshot(state, status)
@@ -97,14 +103,14 @@ def next_context_state(saved):
         active = next((item for item in reversed(records) if item['kind'] == 'DELIVERED'), None)
     chronological = next((item for item in reversed(records) if item['kind'] == 'DELIVERED'), {})
     result = {'conversationConditions': deepcopy([row for row in chronological.get('conditionHistory', []) if row.get('conditionId')]),
+              'priorFormHistory': deepcopy(previous.get('formHistory', {})),
+              'formHistory': deepcopy(previous.get('formHistory', {})),
               'businessContexts': records, 'activeBusinessContextRef': active['contextRef'] if active else None,
-              'selectedContextRefs': [active['contextRef']] if active else [],
+              'selectedContextRefs': [],
               'previousQueryIntent': deepcopy(active['intent']) if active else {},
               'inheritedScope': deepcopy(active['subjectScope']) if active else {},
               'inheritedSystemRequest': deepcopy(active.get('systemRequest', {})) if active else {},
               'inheritedDimensionScopes': _source_scopes(active) if active else []}
-    if active and active.get('adoptedInputs'):
-        result.update(adoptedInputs=deepcopy(active['adoptedInputs']), inputSetVersion=active.get('inputSetVersion'))
     if not records:
         # 仅旧状态有可核对的上一轮意图时恢复，不能把失败轮当前意图当成交付意图。
         result['previousQueryIntent'] = deepcopy(saved.get('previousQueryIntent', {}))
@@ -181,7 +187,9 @@ def select_context(turn, context):
             turn.state['scopeEdits'] = deepcopy(selected[0].get('scopeEdits', []))
             turn.state['intentDecisions'] = deepcopy(selected[0].get('intentDecisions', {}))
             turn.state['queryIntent'] = deepcopy(selected[0]['intent'])
-        inputs = [deepcopy(value) for item in selected for value in item.get('adoptedInputs', [])]
+        source_uses = {item['use'] for item in turn.state.get('historyReferences', [])}
+        inputs = [deepcopy(value) for item in selected for value in item.get('adoptedInputs', [])
+                  if not source_uses or source_uses.intersection({'FACTS', 'REPORT'})]
         if inputs:
             from .source_views import install
             install(turn, list({value['inputRef']: value for value in inputs}.values()))
@@ -209,6 +217,7 @@ def _confirmed_context_scopes(record, known, visited=()):
     from .dimension_scopes import retained_scopes
     return retained_scopes({'inheritedDimensionScopes': scopes,
         'previousQueryIntent': (base or {}).get('intent', {}),
+        'queryIntent': record.get('intent', {}),
         'basePendingChanges': record.get('pendingChanges', []),
         'basePendingDimensions': record.get('pendingDimensions', [])})
 

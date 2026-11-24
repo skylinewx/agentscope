@@ -83,7 +83,8 @@ def current_delivery(store, owner, delivery):
                                 else 'PASS' if final_parts and all(part['status'] == 'PASS' for part in final_parts)
                                 else 'PENDING')
         if record['status'] == 'REVISE': result['mode'] = 'REQUIRES_REVISION'
-        elif record['status'] == 'PASS' and result['mode'] == 'PENDING_REVIEW': result['mode'] = 'REVIEWED_AFTER_RESUME'
+        elif record['status'] == 'PASS' and result['mode'] in ('PENDING_REVIEW', 'REQUIRES_REVISION'): result['mode'] = 'REVIEWED_AFTER_RESUME'
+        elif record['status'] in ('PENDING', 'PARTIAL'): result['mode'] = 'PENDING_REVIEW'
     newer = result.get('newerCandidate')
     if newer:
         newer_record = store.get_report_review(owner, newer.get('reviewRef', ''))
@@ -91,6 +92,25 @@ def current_delivery(store, owner, delivery):
             newer['review'] = newer_record
     result['notice'] = status_text(result)
     return result
+
+
+def review_summary(delivery):
+    """Expose the registered verdict and its business findings alongside the report link."""
+    review = delivery.get('review') or {}
+    lines = [status_text(delivery)]
+    for key, label in (('calculationReview', '计算专项'), ('finalReview', '报告内容')):
+        state = delivery.get(key)
+        if isinstance(state, dict):
+            state = state.get('status')
+        wording = {'PASS': '已通过', 'REVISE': '需修正', 'PENDING': '待审', 'UNAVAILABLE': '尚未完成'}.get(state)
+        if wording:
+            lines.append(label + wording + '。')
+    issues = sorted(review.get('issues', []), key=lambda item: item.get('severity') == 'ADVISORY')
+    findings = list(dict.fromkeys(str(item.get('message') or item.get('statement') or '').strip() for item in issues))
+    findings = [item for item in findings if item]
+    if len(findings) > 3:
+        lines.append(f'共有 {len(findings)} 条意见，完整记录见报告。')
+    return ''.join(lines) + (('\n\n' + '\n'.join('- ' + item for item in findings[:3])) if findings else '')
 
 
 def review_notice_html(delivery):
@@ -173,8 +193,16 @@ def candidate_proof(turn, proof, diagnostics):
     return proof
 
 
-async def resume_review(service, analysis_ref):
-    """Only unfinished immutable parts are submitted; no re-query or re-render."""
+async def resume_review(service, analysis_ref, action='RESUME'):
+    """A view reads the stored verdict; a new business assessment gets its own identity."""
+    import asyncio
+    if not hasattr(service, '_report_review_lock'):
+        service._report_review_lock = asyncio.Lock()
+    async with service._report_review_lock:
+        return await _review_frozen_report(service, analysis_ref, action)
+
+
+async def _review_frozen_report(service, analysis_ref, action):
     import time
     from jsonschema import validate
     from .models import AnalysisError
@@ -187,8 +215,12 @@ async def resume_review(service, analysis_ref):
     if not delivery or artifact['publicationState'] != 'PUBLISHED':
         raise AnalysisError('REPORT_REVIEW_REQUIRED', '续审需要已交付且绑定审查记录的报告版本。')
     record = service.store.get_report_review(service.owner, delivery.get('reviewRef', ''))
-    if not record or service.turn is None or not service.material_reviewer:
+    if not record or service.turn is None or (action != 'VIEW' and not service.material_reviewer):
         raise AnalysisError('REVIEW_UNAVAILABLE', '当前未配置可用的审查恢复入口。')
+    if action == 'VIEW':
+        return _review_result(service, artifact, record, action)
+    from .review_business_projection import report_source_tables
+    source_tables = report_source_tables(artifact.get('facts', []))
     from .review_budget import ReviewBudgetConfig
     previous_semantics = record.get('reviewSemanticConfig') or ReviewBudgetConfig(**record.get('reviewConfig', {})).semantic_identity()
     config_changed = (previous_semantics != service.review_budget.semantic_identity()
@@ -226,6 +258,36 @@ async def resume_review(service, analysis_ref):
         record['reviewPolicy'] = digest(REVIEW_PROMPT)
         record['priorPolicyReviews'] = history[-4:]
         save_review(service.turn, record)
+    if action == 'RECHECK':
+        refresh = digest([service.turn.state['turnKey'], analysis_ref, delivery['contentDigest'], review_policy_identity(record)])
+        if refresh != record.get('businessRecheck'):
+            for part in record['parts']:
+                if part['kind'] != 'CALCULATION' and not part.get('materialRef'):
+                    raise AnalysisError('REVIEW_MATERIAL_UNAVAILABLE', '未找到该正文的冻结审查材料，无法生成新的复核结论。')
+            record.setdefault('previousBusinessReviews', []).append({
+                'reviewedAt': record.get('updatedAt'), 'status': record['status'],
+                'issues': deepcopy(record.get('issues', [])), 'coverage': deepcopy(record.get('coverage', []))})
+            record['businessRecheck'] = refresh
+            for part in record['parts']:
+                if part['kind'] != 'CALCULATION':
+                    original_ref = part.setdefault('originalBusinessMaterialRef', part['materialRef'])
+                    original = service.store.get_review_material(service.owner, original_ref)
+                    material = review_material(original['payload'])
+                    material.pop('revisionFocus', None)
+                    material['businessReviewRequest'] = service.turn.state['request']
+                    payload = make_review_request(material)
+                    prompt = REVIEW_PROMPT if config_changed else original['prompt']
+                    ref = 'review_input_' + digest([prompt, payload.stored()])
+                    service.store.save_review_material(service.owner, ref, prompt, payload)
+                    part.update(materialRef=ref, inputChars=len(payload))
+                    part.update(status='PENDING', issues=[], coverage=[])
+                    part.pop('failure', None)
+            save_review(service.turn, record)
+    def part_key(part, payload, prompt):
+        key = semantic_review_key(payload, prompt, service.review_budget)
+        if record.get('businessRecheck') and part['kind'] != 'CALCULATION':
+            return digest([key, record['businessRecheck']])
+        return key
     def refresh_completed_calculation():
         computation_parts = [item for item in record['parts'] if item['kind'] == 'CALCULATION']
         keys = {item.get('computationKey') for item in computation_parts}
@@ -249,7 +311,7 @@ async def resume_review(service, analysis_ref):
             material = service.store.get_review_material(service.owner, part['materialRef'])
             payload = refresh_business_proof(service.turn, material['payload'])
             prompt = REVIEW_PROMPT if config_changed else material['prompt']
-            if semantic_review_key(payload, prompt, service.review_budget) != part['key']:
+            if part_key(part, payload, prompt) != part['key']:
                 part.update(status='PENDING', issues=[], coverage=[])
                 part.pop('failure', None)
 
@@ -265,6 +327,10 @@ async def resume_review(service, analysis_ref):
                 material = service.store.get_review_material(service.owner, part.get('materialRef', part['key']))
                 from .computation_review import refresh_business_proof
                 payload = refresh_business_proof(service.turn, material['payload'])
+                if source_tables and part['kind'] != 'CALCULATION' and part['status'] not in ('PASS', 'REVISE'):
+                    source_material = review_material(payload)
+                    if source_material.get('reportSourceTables') != source_tables:
+                        payload = make_review_request({**source_material, 'reportSourceTables': source_tables})
                 if config_changed:
                     # Old revision focus assumes the earlier policy completed
                     # review. A new policy/profile must examine the whole body.
@@ -272,7 +338,7 @@ async def resume_review(service, analysis_ref):
                     value.pop('revisionFocus', None)
                     payload = make_review_request(value)
                 prompt = REVIEW_PROMPT if config_changed else material['prompt']
-                key = semantic_review_key(payload, prompt, service.review_budget)
+                key = part_key(part, payload, prompt)
                 if key != part['key']:
                     part.update(key=key, status='PENDING', issues=[], coverage=[])
                     payload = make_review_request(payload)
@@ -319,14 +385,32 @@ async def resume_review(service, analysis_ref):
                           {'issues': record['issues']} if record['status'] in ('PASS', 'REVISE') else None,
                           unavailable=record['status'] not in ('PASS', 'REVISE'),
                           release_output_only=output_exhausted and record['status'] not in ('PASS', 'REVISE'))
+    return _review_result(service, artifact, record, action)
+
+
+def review_policy_identity(record):
+    return [record.get('reviewPolicy'), record.get('reviewSemanticConfig')]
+
+
+def _review_result(service, artifact, record, action):
+    analysis_ref, delivery = artifact['analysisRef'], artifact['reportDelivery']
     metadata = current_delivery(service.store, service.owner, delivery)
+    service.turn.state['reportReviewRead'] = True
     registered = service.delivery.ensure(analysis_ref) if service.delivery else {}
     if registered.get('registered'):
         from .review_control import progress
-        progress(service.turn, lambda saved: saved.setdefault('resumedReportRefs', {}).update({analysis_ref: {
-            'reviewRef': record['reviewRef'], 'contentDigest': delivery['contentDigest']}}))
+        def remember(saved):
+            receipts = saved.setdefault('resumedReportRefs', {})
+            identity = {'reviewRef': record['reviewRef'], 'contentDigest': delivery['contentDigest']}
+            previous = receipts.get(analysis_ref, {})
+            performed = action
+            if all(previous.get(key) == value for key, value in identity.items()):
+                if action == 'VIEW' or previous.get('action') == 'RECHECK':
+                    performed = previous.get('action') or action
+            receipts[analysis_ref] = {**identity, 'action': performed}
+        progress(service.turn, remember)
     return {'analysisRef': analysis_ref, 'publicationState': 'PUBLISHED', 'reportDelivery': metadata,
-            'reviewNotice': status_text(metadata), 'delivery': registered}
+            'reviewAction': action, 'reviewNotice': status_text(metadata), 'delivery': registered}
 
 
 def choose_candidate(service, artifact):

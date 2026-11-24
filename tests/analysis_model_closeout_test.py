@@ -150,7 +150,8 @@ class ModelCloseoutTests(PresentationCase):
             events = [event async for event in middleware.on_reasoning(agent, {}, next_handler)]
         self.assertTrue(events)
         self.assertIn('合成利润表', turn.state['hostCloseout']['answer'])
-        self.assertIn('实际数（元）', turn.state['hostCloseout']['answer'])
+        self.assertIn('| 情景 | 实际数 |', turn.state['hostCloseout']['answer'])
+        self.assertIn('| 合成利润表 | 净利润 | 无数据 | 元 |', turn.state['hostCloseout']['answer'])
         self.assertEqual(turn.state['queryCaptureRefs'], [])
         next_handler.assert_not_called()
         agent.model.generate_structured_output.assert_not_awaited()
@@ -221,7 +222,7 @@ class ModelCloseoutTests(PresentationCase):
         self.assertTrue(validator.is_valid({'action': 'status'}))
         self.assertTrue(validator.is_valid({'action': 'declare', 'mode': 'ANALYSIS', 'goal': '分析构成'}))
         self.assertFalse(validator.is_valid({'action': 'declare', 'context': {'mode': 'CONTINUE'}, 'goal': '分析构成'}))
-        self.assertFalse(validator.is_valid({'action': 'declare', 'mode': 'ANALYSIS'}))
+        self.assertTrue(validator.is_valid({'action': 'declare', 'mode': 'ANALYSIS'}))
 
     def test_lossless_compaction_preserves_missing_and_null(self):
         from analysis_extension.review_revision import compact_query_facts

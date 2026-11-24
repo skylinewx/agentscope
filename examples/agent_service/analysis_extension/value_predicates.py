@@ -3,7 +3,7 @@ import re
 from .models import AnalysisError
 
 
-def validate(condition, target_ids=None, depth=0):
+def validate(condition, target_ids=None, depth=0, *, aliases=None):
     if not isinstance(condition, dict) or set(condition) - {'operator', 'value', 'targetId', 'children'} or depth > 4:
         raise AnalysisError('INVALID_VALUE_FILTER', '数值条件使用业务目标引用、比较或 AND/OR/NOT，不填写物理列编码。')
     op = condition.get('operator')
@@ -12,16 +12,18 @@ def validate(condition, target_ids=None, depth=0):
         if (not isinstance(children, list) or not 1 <= len(children) <= 32
                 or (op == 'NOT' and len(children) != 1) or condition.get('value') is not None or condition.get('targetId') is not None):
             raise AnalysisError('INVALID_VALUE_FILTER', '逻辑条件只包含 operator/children。')
-        return {'operator': op, 'children': [validate(child, target_ids, depth + 1) for child in children]}
+        return {'operator': op, 'children': [validate(child, target_ids, depth + 1, aliases=aliases) for child in children]}
     if children or op not in ('LT', 'LE', 'GT', 'GE', 'EQ', 'NE', 'IS_NULL', 'IS_NOT_NULL'):
         raise AnalysisError('INVALID_VALUE_FILTER', '不支持的数值条件。')
     target = condition.get('targetId')
-    if target_ids is not None and (target not in target_ids if target is not None else len(target_ids) != 1):
-        raise AnalysisError('INVALID_VALUE_FILTER', '多个业务目标需要明确 targetId，不能按物理指标名称推测。')
-    result = {'operator': op}
     if target is not None:
         if not isinstance(target, str) or not target.strip():
             raise AnalysisError('INVALID_VALUE_FILTER', 'targetId 必须是业务目标标识。')
+        target = (aliases or {}).get(target, target)
+    if target_ids is not None and (target not in target_ids if target is not None else len(target_ids) != 1):
+        raise AnalysisError('INVALID_VALUE_FILTER', '请在筛选条件的 targetId 中填写要筛选的业务目标。', {'targetIds': sorted(target_ids)})
+    result = {'operator': op}
+    if target is not None:
         result['targetId'] = target
     value = condition.get('value')
     if op in ('IS_NULL', 'IS_NOT_NULL'):

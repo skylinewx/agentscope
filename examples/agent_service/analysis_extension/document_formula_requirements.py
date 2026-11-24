@@ -1,6 +1,7 @@
 """Enforce already declared formula work; never infer intent from user words."""
 from .models import AnalysisError
 from .scalar_references import reference_id
+from .document_coverage import WATERFALL_BINDING_HELP
 
 
 def require_formula_datasets(artifact, datasets):
@@ -38,5 +39,5 @@ def require_formula_datasets(artifact, datasets):
         raise AnalysisError('DOCUMENT_FORMULA_DATASET_REQUIRED',
             '本题已确认的公式构成尚未完整关联到页面；只绑定结果金额不能代替已取得的构成。',
             {'path':'/document/datasets','missingFormulas':missing,'requiresBuild':False,
-             'hint':'为所列 valueRef 绑定 FORMULA dataset；省略 nodeRefs 可保留后台已返回的全部计算层。'
-                    '复用现有模板并逐项展示，零贡献保留名称和 0；不重新取数、不追加跨表递归。'})
+             'hint':'为所列 valueRef 绑定 FORMULA dataset。省略 nodeRefs 可保留已返回的全部计算层。'
+                    '多项加减节点同时绘制横向瀑布图。' + WATERFALL_BINDING_HELP})

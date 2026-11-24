@@ -32,7 +32,7 @@ class EvidenceCoverageTest(TestCase):
                 {'targetId': 'a', 'operator': 'GT', 'value': '1000'}, {'targetId': 'b', 'operator': 'GT', 'value': '1000'}]},
                 'batches': [{'rangeSummary': {'targetCombinationCount': 11, 'alignedRowCount': 11, 'matchedTargetCount': 2, 'filteredOutRowCount': 9}}]}}}
         markdown = state_markdown(receipt)
-        self.assertIn('应收票据 &gt; 1000 且 短期借款 &gt; 1000', markdown)
+        self.assertIn('应收票据 &gt; 1,000 且 短期借款 &gt; 1,000', markdown)
         self.assertIn('命中目标组合：2', markdown)
         self.assertNotIn('0 项来源值', markdown)
         turn = SimpleNamespace(state={'mode': 'ANALYSIS', 'materials': [{'role': 'PRIMARY', 'kinds': ['VALUES']}], 'request': '对比预算金额'})

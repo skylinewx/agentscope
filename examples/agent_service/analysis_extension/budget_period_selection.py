@@ -2,6 +2,14 @@
 import re
 
 
+def annual_caption_year(text):
+    match = re.fullmatch(r'\s*((?:20)?[0-9]{2})\s*年\s*', text or '')
+    if not match:
+        return None
+    year = match[1]
+    return int(year) + (2000 if len(year) == 2 else 0)
+
+
 def type_code(value):
     # Public intent names and immutable source codes are different representations.
     return {'YEAR': 'N', 'HALF_YEAR': 'H', 'QUARTER': 'J', 'MONTH': 'Y',

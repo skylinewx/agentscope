@@ -145,6 +145,33 @@ document.getElementById('b').style.minWidth='20px';delete document.getElementByI
         _, records = await self.prepare('''document.getElementById('track').remove();analysisCharts.bindValueLabel(document.getElementById('label'),{valueKey:'b'});document.getElementById('label').textContent='0';''')
         self.assertTrue(all(record['blocking'] for record in records))
 
+    async def test_focus_rows_need_a_complete_ordered_table_in_the_same_dataset(self):
+        await self.prepare('')
+        built = await self.service.build(baseAnalysisRef=self.ref, operations=[{'id':'order','operator':'SORT'}], requestKey='sort')
+        artifact = self.store.get_analysis(OWNER, built['analysisRef'])
+        source = deepcopy(self.source)
+        source['datasets'] = [{'key':'rows','valueRef':'derived_order'}]
+        html = '''<table data-analysis-set="rows" id="all"></table><div data-analysis-set="rows" id="focus"></div>
+<script>
+const rows=analysisSets.rows.rows, table=document.getElementById('all'), focus=document.getElementById('focus');
+for(const row of rows){
+    const tr=table.insertRow(); tr.dataset.analysisRef=row.values.factRef; tr.insertCell().textContent=row.values.value;
+}
+const item=document.createElement('p');item.dataset.analysisRef=rows[1].values.factRef;
+item.textContent=rows[1].values.value;focus.appendChild(item);
+</script>'''
+        original = source['html']
+        mark_rows = "for(const row of table.rows)row.dataset.analysisSet='rows';"
+        for extra, should_block in [('', False), (mark_rows, False), (mark_rows+"delete table.dataset.analysisSet;", False),
+                                    ('table.deleteRow(0);', True),
+                                    ("focus.dataset.analysisPartial='false';", True),
+                                    ("focus.appendChild(item.cloneNode(true));", True)]:
+            with self.subTest(extra=extra):
+                source['html'] = original.replace('<script></script>', html.replace('</script>', extra+'</script>'))
+                document = compile_document(artifact, source)
+                records = [evaluate(document, sample) for sample in await self.checker.check(document)]
+                self.assertEqual([r['blocking'] for r in records], [should_block, should_block])
+
     async def test_table_row_can_replace_bar_but_hidden_number_cannot(self):
         script = '''document.getElementById('track').remove();const table=document.createElement('div');table.dataset.analysisSet='rows';
 for(const item of analysisSets.rows.rows){const row=item.values;const el=document.createElement('div');el.dataset.analysisRef=row.factRef;el.textContent=row.value;table.appendChild(el);}document.body.appendChild(table);'''

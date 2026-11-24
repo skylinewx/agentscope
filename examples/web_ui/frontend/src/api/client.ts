@@ -16,12 +16,14 @@ export const apiUrl = (path: string) => new URL(path.replace(/^\/+/, ''), getBas
 export class ApiError extends Error {
 	readonly status: number;
 	readonly detail: string;
+	readonly code?: string;
 
-	constructor(status: number, detail: string) {
+	constructor(status: number, detail: string, code?: string) {
 		super(detail);
 		this.name = 'ApiError';
 		this.status = status;
 		this.detail = detail;
+		this.code = code;
 	}
 }
 
@@ -66,19 +68,24 @@ export function buildHeaders(hasBody = false): Record<string, string> {
 	return headers;
 }
 
-/** Parse the response body and extract the `detail` field if the backend returned JSON. */
-async function extractErrorDetail(res: Response): Promise<string> {
+/** Preserve the backend's error code as well as its human-readable detail. */
+async function responseError(res: Response): Promise<ApiError> {
 	const text = await res.text();
 	try {
 		const json = JSON.parse(text) as { detail?: unknown };
-		if (typeof json.detail === 'string') return json.detail;
-		if (json.detail && typeof json.detail === 'object' && 'message' in json.detail
-			&& typeof json.detail.message === 'string') return json.detail.message;
-		if (json.detail !== undefined) return JSON.stringify(json.detail);
+		const detail = json.detail;
+		if (typeof detail === 'string') return new ApiError(res.status, detail);
+		if (detail !== undefined) {
+			const code = detail && typeof detail === 'object' && 'code' in detail && typeof detail.code === 'string'
+				? detail.code : undefined;
+			const message = detail && typeof detail === 'object' && 'message' in detail && typeof detail.message === 'string'
+				? detail.message : JSON.stringify(detail);
+			return new ApiError(res.status, message, code);
+		}
 	} catch {
 		// not JSON – fall through
 	}
-	return text || res.statusText;
+	return new ApiError(res.status, text || res.statusText);
 }
 
 async function streamRequest(path: string, options: RequestOptions = {}): Promise<Response> {
@@ -131,11 +138,10 @@ async function streamRequest(path: string, options: RequestOptions = {}): Promis
 	}
 
 	if (!res.ok) {
-		const detail = await extractErrorDetail(res);
+		const error = await responseError(res);
 		// A response from a previous login must not invalidate the current one.
 		if (path !== '/auth/login' && !authSignal.aborted) handleUnauthorized(res.status);
-		const error = new ApiError(res.status, detail);
-		if (!silent) toast.error(detail);
+		if (!silent) toast.error(error.detail);
 		throw error;
 	}
 
@@ -168,8 +174,11 @@ export const client = {
 		params?: Record<string, string>,
 		options?: { silent?: boolean },
 	) => request<T>(path, { method: 'PATCH', body, params, silent: options?.silent }),
-	delete: <T = void>(path: string, params?: Record<string, string>) =>
-		request<T>(path, { method: 'DELETE', params }),
+	delete: <T = void>(
+		path: string,
+		params?: Record<string, string>,
+		options?: { silent?: boolean; signal?: AbortSignal; timeoutMs?: number },
+	) => request<T>(path, { method: 'DELETE', params, ...options }),
 	stream: (path: string, options?: RequestOptions) => streamRequest(path, options),
 };
 
@@ -181,7 +190,7 @@ export function resourceClient(owner?: string): typeof client {
     get: (path, values, options) => client.get(path, params(values), options),
     post: (path, body, values, options) => client.post(path, body, params(values), options),
     patch: (path, body, values, options) => client.patch(path, body, params(values), options),
-    delete: (path, values) => client.delete(path, params(values)),
+    delete: (path, values, options) => client.delete(path, params(values), options),
     upload: (path, body, values) => client.upload(path, body, params(values)),
     stream: (path, options) => client.stream(path, { ...options, params: params(options?.params) }),
   };

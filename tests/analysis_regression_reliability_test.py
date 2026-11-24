@@ -42,7 +42,7 @@ class RegressionReliabilityTests(TestCase):
         first.owner = Owner('u', 'a', 'session-two')
         self.assertNotEqual(one, first.document_draft('ana_1:1')['path'])
         self.assertNotIn(':', one)
-        self.assertTrue(one.endswith('/report.html'))
+        self.assertTrue(one.endswith('/report.md'))
         self.assertTrue((first.root / one).parent.is_dir())
     def test_effective_coordinates_do_not_become_cell_dimensions(self):
         capture, _, _, receipt = batch_fixture(False)

@@ -223,6 +223,25 @@ def batch_targets(service, capture, selections=None):
     return targets
 
 
+def _formula_choices(capture, eligible, dimensions):
+    dimensions = list(dimensions)
+    candidates = []
+    for item in eligible[:20]:
+        names = item.get('dimensionNames') or {}
+        codes = item.get('dimensions') or {}
+        candidate = {'factRef': item['factId'], 'subject': {key: names.get(key, codes.get(key)) for key in dimensions},
+                     'value': item.get('value')}
+        fields = ('columnName',) if item.get('columnName') else ('cellKey', 'headers')
+        for key in fields:
+            if item.get(key):
+                candidate[key] = item[key]
+        candidates.append(candidate)
+    return {'requiresSourceQuery': False, 'allowedDimensions': sorted(dimensions), 'candidates': candidates,
+            'candidateCount': len(eligible), 'candidatesComplete': len(candidates) == len(eligible),
+            'nextTool': 'AnalysisInspect', 'nextRead': {'section': 'inventory', 'captureRef': capture['captureRef'],
+                **({'memberDimension': dimensions[0]} if len(dimensions) == 1 else {})}}
+
+
 def formula_subjects(turn, subjects, selections=None):
     """AI 选择业务主体；所有维值必须唯一命中所选历史明细，且沿用真实指标。"""
     from .followup_scope import _inherited_tables, _selectors, _changes
@@ -282,19 +301,9 @@ def formula_subjects(turn, subjects, selections=None):
                         if item.get('batchId') == table['batchId'] and item.get('stepId') == selection['stepId']
                         and item.get('columnName') == metrics[0]['name']
                         and item.get('rowIndex') in selected_indices]
-            candidates = [{'factRef': item['factId'],
-                           'subject': {key: item.get('dimensionNames', {}).get(key, item.get('dimensions', {}).get(key))
-                                       for key in columns}, 'value': item.get('value')}
-                          for item in eligible[:20]]
             raise AnalysisError('PREPARATION_SUBJECT_NOT_UNIQUE',
                                 '主体须唯一命中已选来源行。字符串必须是实际 factId/memberRef；维值映射使用来源编码，不能填展示名称。请从候选选择，不必重新查数。',
-                                {'subject': subject, 'requiresSourceQuery': False,
-                                 'allowedDimensions': sorted(columns),
-                                 'candidates': candidates, 'candidateCount': len(eligible),
-                                 'candidatesComplete': len(candidates) == len(eligible),
-                                 'nextTool': 'AnalysisInspect',
-                                 'nextRead': {'section': 'inventory', 'captureRef': capture['captureRef'],
-                                              **({'memberDimension': next(iter(columns))} if len(columns) == 1 else {})}})
+                                {'subject': subject, **_formula_choices(capture, eligible, columns)})
         row_index, row = matched
         coordinates = {key: row[index] for key, index in columns.items()}
         target = metric_target(capture, receipt, _row_metric(table, row_index, metrics[0]), coordinates)
@@ -309,6 +318,45 @@ def formula_subjects(turn, subjects, selections=None):
             _bind_expected_value(target, receipt)
         targets.append(target)
     return targets
+
+
+def _scoped_formula_rows(rows, edits, dimensions):
+    """Apply exact member selections to a reused source before expanding its cells."""
+    from .dimension_scopes import concept
+    if not rows:
+        return []
+    selected = list(rows)
+    available = {key for row in rows for key in row.get('dimensions', {})}
+    for edit in edits:
+        selector = edit.get('selector') or {}
+        if selector.get('type') != 'VALUES':
+            continue
+        hint = concept(edit['dimensionHint'])
+        codes = {d['dimCode'] for d in dimensions if d.get('dimCode') and
+                 hint in {concept(label) for label in [d['dimCode'], d.get('label'), *d.get('names', [])] if label}
+                 and d['dimCode'] in available}
+        if len(codes) != 1:
+            raise AnalysisError('FORMULA_SCOPE_NEEDS_QUERY', '原来源不能唯一定位所选维度。先按本轮范围取值，再采用该结果分析构成。')
+        dim = codes.pop()
+        by_label = defaultdict(set)
+        all_codes = set()
+        for row in rows:
+            code = row.get('dimensions', {}).get(dim)
+            if code is not None:
+                all_codes.add(code)
+                label = row.get('dimensionNames', {}).get(dim)
+                if label:
+                    by_label[label].add(code)
+        matches = set()
+        for member in selector['members']:
+            members = by_label[member] | ({member} if member in all_codes else set())
+            if len(members) != 1:
+                raise AnalysisError('FORMULA_SCOPE_NEEDS_QUERY', '原来源不能唯一定位指定成员。先按本轮范围取值，再采用该结果分析构成。')
+            matches.update(members)
+        selected = [row for row in selected if row.get('dimensions', {}).get(dim) in matches]
+    if rows and not selected:
+        raise AnalysisError('FORMULA_SCOPE_NEEDS_QUERY', '原来源没有符合所选条件组合的行。请按本轮范围取值确认。')
+    return selected
 
 
 def _bind_expected_value(target, receipt):
@@ -331,6 +379,39 @@ def _row_metric(table, row_index, metric):
     if len(origins) != 1:
         raise AnalysisError('PREPARATION_TARGET_AMBIGUOUS', '精确单元格没有唯一的运行格来源。')
     return origins[0]
+
+
+def _form_objective_facts(service, capture, selection, objectives):
+    scoped = [o for o in objectives if o.get('factRefs')]
+    if not scoped:
+        return {}
+    catalog = [f for f in service.sources.catalog(capture)
+               if f.get('stepId') == selection.get('stepId') and f.get('observationId') == selection.get('observationId')
+               and (not selection.get('cellKeys') or f.get('cellKey') in selection['cellKeys'])]
+    aliases = {}
+    for fact in catalog:
+        for alias in (fact['factId'], fact.get('memberRef')):
+            if alias:
+                aliases.setdefault(alias, set()).add(fact['factId'])
+    if capture.get('originalToolName') == 'execute_budget_query':
+        data = receipt_from_capture(capture)['data']
+        keys = {f['cellKey']: f['factId'] for f in catalog}
+        origins = {o['originId']: keys[o['runtime']['cell']] for o in data.get('origins', [])
+                   if (o.get('runtime') or {}).get('observationId') == selection.get('observationId')
+                   and (o.get('runtime') or {}).get('cell') in keys}
+        for result in data.get('resultSets', []):
+            for row in result['rows']:
+                aliases.setdefault(row['factId'], set()).update(origins[i] for i in row.get('originRefs', []) if i in origins)
+    selected = {}
+    for item in scoped:
+        invalid = [ref for ref in item['factRefs'] if len(aliases.get(ref, ())) != 1]
+        if invalid:
+            raise AnalysisError('PREPARATION_SUBJECT_NOT_UNIQUE',
+                                '请从本来源已选单元格中选择，将返回的 factRef 填入该目标的 factRefs 后重试。',
+                                {'sourceRef': selection.get('sourceRef'), 'invalidRefs': invalid,
+                                 **_formula_choices(capture, catalog, selection.get('grain') or [])})
+        selected[item['objectiveRef']] = sorted(set().union(*(aliases[ref] for ref in item['factRefs'])))
+    return selected
 
 
 def _business_fact_reference(receipt, step_id, table, row_index, column):
@@ -591,31 +672,47 @@ class BudgetPreparation:
         """A frozen-facts filter is followed by preparation of exactly its result."""
         from .material_plan import needs_formulas, request_key
         request = capture.get('request', {})
-        role = material_role or turn.state.get('materialQueryRoles', {}).get(request_key(request), 'PRIMARY')
-        if (needs_formulas(turn.state, role) and request.get('purpose') == 'QUERY'
+        key = request_key(request)
+        role = material_role or turn.state.get('materialQueryRoles', {}).get(key, 'PRIMARY')
+        ref = turn.state.get('materialQueryObjectives', {}).get(key)
+        goal = next((item for item in turn.state.get('objectives', []) if item['objectiveRef'] == ref), None)
+        if goal and any(item.get('membersFromObjective') == ref for item in turn.state['objectives']):
+            from .objectives import resolve_dependencies, adopt_bound_sources
+            resolve_dependencies(turn)
+            adopt_bound_sources(turn, explicit=False, committed_objectives=[])
+            if any(item.get('resolvedMemberSource') and item['capability'] == 'DATA_COMPOSITION'
+                   for item in turn.state['objectives'] if item.get('membersFromObjective') == ref):
+                return await self.prepare_selected(turn)
+        wants_formula = goal['capability'] == 'DATA_COMPOSITION' if goal else needs_formulas(turn.state, role)
+        if (wants_formula and request.get('purpose') == 'QUERY'
                 and (request.get('basis') or {}).get('kind') == 'FACTS'
                 and (request.get('intentDraft') or {}).get('valueFilter')):
-            selections = [{**item, 'role': role} for item in self.service.sources.for_capture(capture).selectors(capture)]
+            selections = [{**item, 'role': role, **({'objectiveRef': ref} if goal else {})}
+                          for item in self.service.sources.for_capture(capture).selectors(capture)]
             return await self.prepare_selected(turn, selections)
         return None
 
-    async def prepare_selected(self, turn, selections=None):
-        """Resolve declared materials from real selected rows, never a latest-source guess."""
+    def selected_targets(self, turn, selections=None):
+        """Resolve and validate selected rows before installing a declaration or requesting formulas."""
         from .material_plan import needs_formulas
-        from .input_state import snapshot, require_unchanged
         if selections is None:
             selections = [{**item['selection'], 'role': item['role'], 'inputRef': item['inputRef'],
                            'sourceRef': item['sourceRef']} for item in turn.state.get('adoptedInputs', [])]
-        state = snapshot(self.service)
         targets, boundaries = [], []
+        form_facts = {}
         for selection in selections:
             role = selection.get('role', 'PRIMARY')
             if not needs_formulas(turn.state, role):
+                continue
+            from .objectives import for_selection
+            objectives = for_selection(turn.state, selection)
+            if turn.state.get('objectives') and not objectives:
                 continue
             capture = self.service.store.get_capture(self.service.owner, selection['captureRef'])
             if 'resultSetId' in selection:  # Verified empty source; no target to expand.
                 continue
             if 'batchId' not in selection:  # Form inputs already carry their actual formula boundary.
+                form_facts.update(_form_objective_facts(self.service, capture, selection, objectives))
                 continue
             receipt = receipt_from_capture(capture)
             matched = [(step, table) for step, table, _ in budget_batch.tables(receipt)
@@ -626,30 +723,69 @@ class BudgetPreparation:
             budget_batch.validate(capture, receipt, step, table)
             table = budget_exact.view(table)
             names, indices = budget_batch.selection_scope(selection, table)
+            catalog = self.service.sources.catalog(capture)
+            requested = {ref for o in objectives for ref in o.get('factRefs', [])}
+            seen = {}
             for metric in table['metrics']:
                 if metric['name'] not in names:
                     continue
                 selected = {**selection, 'columnNames': [metric['name']]}
                 refs = []
-                catalog = self.service.sources.catalog(capture)
-                for item in catalog:
-                    if (item.get('stepId') != step or item.get('batchId') != table['batchId']
-                            or item.get('columnName') != metric['name']
-                            or indices is not None and item.get('rowIndex') not in indices):
+                metric_rows = [item for item in catalog if item.get('stepId') == step
+                               and item.get('batchId') == table['batchId'] and item.get('columnName') == metric['name']
+                               and (indices is None or item.get('rowIndex') in indices)]
+                implicit_ids = None
+                if (any(not o.get('factRefs') for o in objectives) and role == 'PRIMARY' and turn.state.get('scopeEdits')
+                        and capture.get('originalToolName') == 'execute_budget_query'
+                        and capture.get('turnKey') and capture['turnKey'] != turn.state.get('turnKey')):
+                    implicit_ids = {row['factId'] for row in _scoped_formula_rows(
+                        metric_rows, turn.state['scopeEdits'], receipt.get('data', {}).get('dimensionCatalog', []))}
+                for item in metric_rows:
+                    aliases = {item['factId'], item.get('memberRef')}
+                    if requested and capture.get('originalToolName') == 'execute_budget_query':
+                        native = _business_fact_reference(receipt, step, table, item['rowIndex'], metric['name'])
+                        aliases.update(native['factIds'])
+                    for ref in aliases & requested:
+                        seen.setdefault(ref, set()).add(item['factId'])
+                    relevant = [o['objectiveRef'] for o in objectives if
+                                (aliases.intersection(o['factRefs']) if o.get('factRefs')
+                                 else implicit_ids is None or item['factId'] in implicit_ids)]
+                    if objectives and not relevant:
                         continue
                     row_metric = _row_metric(table, item['rowIndex'], metric)
                     if row_metric.get('scenarioFallback'):
-                        boundaries.append({'factRef': item['factId'], 'status': 'NO_TARGET_CELL', 'role': role})
+                        boundaries.append({'factRef': item['factId'], 'status': 'NO_TARGET_CELL', 'role': role,
+                                           'inputRef': selected.get('inputRef'), 'objectiveRefs': relevant})
                     else:
-                        refs.append(item['factId'])
+                        refs.append((item['factId'], relevant))
                 for offset in range(0, len(refs), 100):
-                    for target in formula_subjects(turn, refs[offset:offset + 100], [selected]):
+                    part = refs[offset:offset + 100]
+                    prepared = formula_subjects(turn, [ref for ref, _ in part], [selected])
+                    for target, (_, relevant) in zip(prepared, part, strict=True):
                         target.update(role=role)
+                        if relevant:
+                            target['objectiveRefs'] = relevant
                         target.update({key: selected[key] for key in ('inputRef', 'sourceRef') if key in selected})
                         targets.append(target)
+            invalid = [ref for ref in sorted(requested) if len(seen.get(ref, ())) != 1]
+            if invalid:
+                eligible = [item for item in catalog if item.get('stepId') == step and item.get('batchId') == table['batchId']
+                            and item.get('columnName') in names and (indices is None or item.get('rowIndex') in indices)]
+                dimensions = [name for name, column in table['columnRoles'].items() if column['kind'] == 'DIMENSION']
+                raise AnalysisError('PREPARATION_SUBJECT_NOT_UNIQUE',
+                                    '请从本来源候选选出要分析的行，将返回的 factRef 填入该目标的 factRefs 后重试。',
+                                    {'sourceRef': selection.get('sourceRef'), 'invalidRefs': invalid,
+                                     **_formula_choices(capture, eligible, dimensions)})
+        return targets, boundaries, form_facts
+
+    async def prepare_selected(self, turn, selections=None, *, resolved=None):
+        from .input_state import snapshot, require_unchanged
+        state = snapshot(self.service)
+        targets, boundaries, form_facts = resolved if resolved is not None else self.selected_targets(turn, selections)
         records = await self.ensure_grouped(turn, targets)
         require_unchanged(self.service, state)
         turn.state['budgetFormulaTargets'] = targets
+        turn.state['budgetFormObjectiveFacts'] = form_facts
         turn.state['budgetFormulaPreparation'] = records
         turn.state['materialBoundaries'] = boundaries
         errors = [{'subject': row.get('subject'), 'error': row['error']} for row in records if row.get('error')]
@@ -668,8 +804,11 @@ class BudgetPreparation:
         result = []
         for (input_ref, role, source_ref), group in groups.items():
             rows = await self.ensure(turn, group, role, captures)
+            objectives = {t['key']: t['objectiveRefs'] for t in group if t.get('objectiveRefs')}
             for row in rows:
                 row = deepcopy(row)
+                if row['targetKey'] in objectives:
+                    row['objectiveRefs'] = objectives[row['targetKey']]
                 if input_ref:
                     row.update(inputRef=input_ref, sourceRef=source_ref)
                     if row.get('selection'):

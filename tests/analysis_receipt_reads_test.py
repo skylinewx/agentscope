@@ -22,7 +22,7 @@ class ReceiptReadsTests(TestCase):
                       for index in range(64)]
         turn = SimpleNamespace(service=SimpleNamespace(owner='current-owner',
             store=SimpleNamespace(get_capture=lambda owner, ref: capture)),
-            state={'inheritedScope': {'selections': selections}})
+            state={'inheritedScope': {'selections': selections}, 'selectedContextRefs': ['selected']})
         with patch.object(budget_v2, '_budget_receipt', wraps=budget_v2._budget_receipt) as reads, \
              patch.object(budget_query, '_validate', wraps=budget_query._validate) as checks:
             result = review_context(turn)

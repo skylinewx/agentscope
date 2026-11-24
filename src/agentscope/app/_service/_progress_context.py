@@ -16,7 +16,7 @@ _MODELS = {
     'BUDGET_TASK': '预算任务', 'BUDGET_TASK_FORM_BINDING': '任务与表样',
     'MD_ORG': '机构', 'MD_ORG_BUD': '预算机构', 'MD_MGRVER': '预算版本',
     'MD_STAGE': '任务阶段', 'MD_CURRENCY': '币种', 'MD_SCENE': '情景',
-    'MD_BUDACCOUNT': '预算指标', 'DATATIME': '时期',
+    'DATATIME': '时期',
 }
 
 
@@ -45,6 +45,10 @@ def _quoted(values, limit=3):
 
 def _lookup(labels, model, key):
     return labels.get(f'{model}:{key}') or labels.get(str(key))
+
+
+def _model_label(labels, code):
+    return labels.get(f'model:{code}') or _MODELS.get(code)
 
 
 def _sum_inputs(request):
@@ -94,19 +98,19 @@ def operation(name, arguments, labels=None):
             if metric or task:
                 plan = f'接下来在{task or "可查询的预算任务"}中查找{period}{metric or "所需指标"}，比较候选表样与指标名称，确定读取金额前还需要哪些条件。'
     elif key == 'listcapabilities':
-        names = [_MODELS.get(code) for code in _items(request.get('modelCodes'))]
+        names = [_model_label(labels, code) for code in _items(request.get('modelCodes'))]
         names = '、'.join(dict.fromkeys(n for n in names if n))
         topic, title = 'schema', '确认可读取字段'
         plan = f'接下来检查{names or "当前对象"}支持的字段和关系，确定如何读取所需条件。'
     elif key == 'executesemanticplan':
         steps = _items(object_value(request.get('plan')).get('steps'))
-        names = [_MODELS.get(s.get('modelCode')) for s in steps if isinstance(s, dict)]
+        names = [_model_label(labels, s.get('modelCode')) for s in steps if isinstance(s, dict)]
         names = list(dict.fromkeys(n for n in names if n))
         batch = next((object_value(s.get('batchQuery')) for s in steps
                       if isinstance(s, dict) and s.get('operation') == 'BATCH_DATA_QUERY'), None)
         if batch is not None:
             topic, title = 'query', '读取业务金额'
-            periods, populations, groups, metrics = [], [], [], []
+            periods, populations, groups, metrics, members = [], [], [], [], []
             for dim in _items(batch.get('batchDimensions')):
                 if not isinstance(dim, dict):
                     continue
@@ -122,14 +126,17 @@ def operation(name, arguments, labels=None):
                         groups.append(label)
             for metric in _items(batch.get('metrics')):
                 selection = object_value(object_value(metric).get('selection'))
+                if title_text := _label(selection.get('headerText')):
+                    metrics.append(title_text)
                 for model, value in object_value(selection.get('targetDimensions')).items():
-                    label = _lookup(labels, model, value)
-                    if model == 'MD_BUDACCOUNT' and label:
-                        metrics.append(label)
+                    if label := labels.get(f'member:{model}:{value}'):
+                        members.append(label)
             subject = _quoted(metrics) or '所选指标'
             plan = f'接下来读取{"、".join(dict.fromkeys(periods))}的{subject}数据。' if periods else f'接下来读取{subject}的数据。'
             if populations:
                 plan += '机构范围为' + '、'.join(populations) + '。'
+            if names := _quoted(members):
+                plan += '取数条件包括' + names + '。'
             if groups:
                 plan += '本次按' + _quoted(groups) + '汇总，取得对应分组的返回金额。'
             else:
@@ -277,8 +284,6 @@ def public_observations(receipt, source_id, name='', request=None):
             matches = [m for m in _items(candidate.get('matches')) if isinstance(m, dict) and _label(m.get('label'))]
             for match in matches:
                 bind(match.get('resourceRef'), match['label'])
-                for model, value in object_value(match.get('targetDimensions')).items():
-                    bind(f'{model}:{value}', match['label'])
             bind(candidate.get('bindingRef'), f'{task}的{form}' if task and form else form)
             if i == 0 and task and form and matches:
                 names = _quoted([m['label'] for m in matches], 2)
@@ -295,8 +300,12 @@ def public_observations(receipt, source_id, name='', request=None):
         for candidate in candidates:
             if isinstance(candidate, dict):
                 bind(candidate.get('resourceRef'), candidate.get('label'))
-                bind(f'{candidate.get("modelCode")}:{candidate.get("key")}', candidate.get('label'))
+                if candidate.get('modelCode') and candidate.get('key'):
+                    bind(f'member:{candidate["modelCode"]}:{candidate["key"]}', candidate.get('label'))
     elif key == 'searchschema' and isinstance(data.get('definitions'), list):
+        for definition in data['definitions']:
+            if isinstance(definition, dict) and definition.get('kind') == 'MODEL' and definition.get('modelCode'):
+                bind('model:' + definition['modelCode'], definition.get('label'))
         count = len(data['definitions'])
         keyword = _quoted([request.get('keyword')]) or '所选名称'
         add(f'关于{keyword}，本次定义检索返回 {count} 条记录。' +
@@ -316,12 +325,13 @@ def public_observations(receipt, source_id, name='', request=None):
             continue
         rows = _items(step.get('rows'))
         model = next((r.get('modelCode') for r in rows if isinstance(r, dict)), '')
-        category = _MODELS.get(model)
+        category = _model_label(labels, model) or '当前对象'
         for row in rows:
             if isinstance(row, dict):
                 bind(row.get('resourceRef'), row.get('label'))
-                bind(f'{row.get("modelCode")}:{row.get("key")}', row.get('label'))
-        if category:
+                if row.get('modelCode') and row.get('key'):
+                    bind(f'member:{row["modelCode"]}:{row["key"]}', row.get('label'))
+        if rows:
             row_labels = [r.get('label') for r in rows if isinstance(r, dict)]
             preferred = [n for n in row_labels if n in ('人民币', '上报版', '编制版', '预算数')]
             names = _quoted(preferred or row_labels)

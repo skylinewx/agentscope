@@ -38,7 +38,7 @@ def waterfall_document(artifact=None, extra_script=''):
 body{margin:0;padding:24px;font:14px/1.6 sans-serif;color:#253750}
 h1{font-size:20px}.step{display:grid;grid-template-columns:minmax(100px,180px) minmax(0,1fr) minmax(80px,160px);gap:16px;align-items:center;margin:18px 0}
 .amount{text-align:right;font-variant-numeric:tabular-nums;overflow-wrap:anywhere;min-width:0}.track{height:28px;position:relative}
-.bar{height:20px;top:4px;background:#498b75}.negative{background:#c45e70}.total{background:#547ce7}
+.bar{height:20px;top:4px;background:#498b75;min-width:2px}.negative{background:#c45e70}.total{background:#547ce7}
 .zero{position:absolute;top:0;bottom:0;width:1px;background:#d9e0eb}
 @media(max-width:560px){.step{grid-template-columns:1fr auto;gap:4px 12px}.track{grid-row:2;grid-column:1/-1}.amount{grid-column:2;grid-row:1}}
 </style></head><body><h1>加减公式构成 · 元</h1>
@@ -69,6 +69,17 @@ analysisCharts.bindHorizontalWaterfall(rows,{setKey:'formula',nodeRef:'root'});
 
 
 class HorizontalWaterfallTests(TestCase):
+    def test_host_formula_component_retains_nonadditive_expression_and_every_additive_step(self):
+        for formula, steps in [('B1-C1+2', 4), ('B1*C1', 0)]:
+            artifact = waterfall_artifact(formula)
+            document = compile_document(artifact, {'title': '数据构成',
+                'html': '<html><head><title>数据构成</title></head><body><div data-analysis-waterfalls="formula"></div></body></html>',
+                'datasets': [{'key': 'formula', 'valueRef': 'derived_formula'}]})
+            self.assertIn('本层差额', document['html'])
+            node = formula_node(artifact)
+            self.assertIn('expressionTree', node)
+            self.assertEqual(len((node.get('waterfall') or {}).get('steps', [])), steps)
+
     def test_complete_formula_keeps_constant_and_does_not_balance_to_source(self):
         node = formula_node(waterfall_artifact())
         waterfall = node['waterfall']
@@ -84,6 +95,8 @@ class HorizontalWaterfallTests(TestCase):
         self.assertEqual(waterfall['steps'][1]['geometry'], {'left': 0.7, 'width': 0.3})
         self.assertEqual(waterfall['steps'][-1]['factRef'], node['factRef'])
         self.assertEqual(waterfall['steps'][-1]['headers'], node['headers'])
+        self.assertEqual(node['cellAddress'], 'A1')
+        self.assertEqual([s['label'] for s in waterfall['steps']], ['业务结果', '其他支出', '公式常数', '净结果'])
 
     def test_negative_input_subtracted_increases_result_and_crosses_zero(self):
         node = formula_node(waterfall_artifact('B1-C1', first='-10', second='-15'))
@@ -135,6 +148,15 @@ class HorizontalWaterfallTests(TestCase):
 
 @skipUnless(os.environ.get('RUN_ANALYSIS_BROWSER_TESTS') == '1', '显式启用本地无头浏览器回归')
 class HorizontalWaterfallBrowserTests(IsolatedAsyncioTestCase):
+    async def test_no_drawable_track_reports_its_width_instead_of_nonfinite_geometry(self):
+        document = waterfall_document(extra_script="for(const row of rows) row.track.style.width='0px';")
+        checker = LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None, widths=(420,))
+        observation, = await checker.check(document)
+        result = evaluate(document, {k: v for k, v in observation.items() if k != 'hostRenderedText'})
+        self.assertTrue(result['blocking'])
+        self.assertTrue(any('轨道实际宽 0.00px' in error for error in result['errors']), result['errors'])
+        self.assertFalse(any('NaN' in error for error in result['errors']))
+
     async def test_budget_null_contribution_renders_at_both_widths(self):
         from analysis_budget_formula_arithmetic_test import budget_facts, computed
         for first, source in [('10', '10'), (None, '0')]:
@@ -162,8 +184,28 @@ class HorizontalWaterfallBrowserTests(IsolatedAsyncioTestCase):
                 self.assertEqual(result['clippedText'], [])
                 self.assertEqual(result['numericChecks']['linearBars']['status'], 'PASS')
 
+    async def test_blank_formula_names_fail_even_with_bound_amounts_and_correct_lengths(self):
+        script = "document.querySelectorAll('.step > span:first-child').forEach(el=>el.textContent='');"
+        document = waterfall_document(extra_script=script)
+        observations = await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None,
+                                                widths=(420, 900)).check(document)
+        for observed in observations:
+            self.assertTrue(evaluate(document, observed)['blocking'])
+            self.assertTrue(any('缺少可见名称' in error for error in observed['errors']))
+
+    async def test_only_an_explicit_formula_caption_address_is_compared_to_the_source(self):
+        setup = """const figure=document.getElementById('chart');figure.dataset.analysisSet='formula';
+        figure.dataset.analysisRef='root';const heading=document.createElement('h3');
+        heading.textContent=CAPTION;figure.before(heading);"""
+        for caption, blocked in [('构成（表内公式 F14）', True), ('构成（来源单元格 $A$1）', False),
+                                 ('构成（表内公式 B1-C1+2）', False)]:
+            document = waterfall_document(extra_script=setup.replace('CAPTION', repr(caption)))
+            result, = await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None,
+                                               widths=(420,)).check(document)
+            self.assertEqual(any('来源单元格是' in error for error in result['errors']), blocked)
+
     async def test_wrong_cumulative_position_blocks_even_when_length_is_correct(self):
-        document = waterfall_document(extra_script="rows[1].element.style.left='0%';")
+        document = waterfall_document(extra_script="rows[1].element.style.transform='translateX(12px)';")
         for observation in await LocalRenderChecker(channel=os.environ.get('ANALYSIS_TEST_BROWSER_CHANNEL') or None, widths=(420, 1280)).check(document):
             result = evaluate(document, {key: value for key, value in observation.items() if key != 'hostRenderedText'})
             self.assertTrue(result['blocking'])

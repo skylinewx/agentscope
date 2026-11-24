@@ -4,6 +4,13 @@ from copy import deepcopy
 import json
 
 
+def report_source_tables(facts):
+    """List the reported task and form names once per distinct pair of source labels."""
+    pairs = dict.fromkeys((fact.get('taskName'), fact.get('formName')) for fact in facts
+                          if fact.get('taskName') or fact.get('formName'))
+    return [{'taskName': task, 'formName': form} for task, form in pairs]
+
+
 def business_memberships(items):
     """Keep distinct input groups and roles without per-cell host receipts."""
     return [{key: item[key] for key in ('inputRef', 'inputRole', 'grain') if key in item}
@@ -19,6 +26,21 @@ def row_ranges(numbers):
         else:
             groups.append([number])
     return '、'.join(str(group[0]) if len(group) == 1 else f'{group[0]}—{group[-1]}' for group in groups)
+
+
+def repeated_input_block(signatures, prior_inputs, read_fields):
+    """Locate one complete earlier input in this run, preserving order, types and multiplicity."""
+    for previous, fields, run_index in sorted(prior_inputs, key=lambda entry: -len(entry[0])):
+        if len(previous) > len(signatures) or not read_fields <= fields:
+            continue
+        try:
+            start = signatures.index(previous[0])
+        except ValueError:
+            continue
+        end = start + len(previous)
+        if signatures[start:end] == previous:
+            return run_index, start, end
+    return None
 
 
 def direct_input_fields(code):
@@ -73,7 +95,7 @@ def compact_business_scopes(scopes):
         if isinstance(scope.get('rangeSummary'), dict):
             # Retain actual exclusions, not batch alignment / matching counters.
             scope['rangeSummary'] = {key: child for key, child in scope['rangeSummary'].items()
-                if key not in ('targetCombinationCount', 'matchedTargetCount', 'alignedRowCount', 'dimensions')
+                if key not in ('matchedTargetCount', 'alignedRowCount', 'dimensions')
                 and not (key == 'filteredOutRowCount' and child == 0)}
         if scope.get('returnedRowCount') == scope.get('selectedRowCount'):
             scope.pop('returnedRowCount', None)

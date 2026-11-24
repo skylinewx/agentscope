@@ -66,6 +66,16 @@ from ._model import get_model
 from ._tts_model import get_tts_model
 from ._toolkit import get_toolkit
 from ._resources import ResourceService, resource_toolkit_scope
+from ._session import SessionStatus
+from ._session_activity import (
+    QUESTION_TITLE_KEY,
+    WAITING_FOR_RESULT_KEY,
+    SessionActivity,
+    completion_status,
+    latest_question_title,
+    parked_session_status,
+    question_title,
+)
 from ._session_projection import SessionProjection
 from ._sop import SOPService
 from ._projectors import SubagentHitlProjector
@@ -399,8 +409,8 @@ class ChatService:
         user: the same broken credential must not be reported twice.
 
         Either way the name is settled (``naming.auto`` is cleared) so
-        this runs at most once per session, and the session's event
-        stream is told to re-read the session list.
+        this runs at most once per session. Publish the change to the
+        user's session list even if they have opened another session.
 
         Args:
             user_id (`str`):
@@ -445,9 +455,12 @@ class ChatService:
             )
 
         try:
+            renamed = False
 
-            def apply_name(latest):
-                if latest.config.naming.auto:
+            def apply_name(latest: SessionRecord) -> None:
+                nonlocal renamed
+                renamed = latest.config.naming.auto
+                if renamed:
                     latest.config.name = name
                     latest.config.naming = SessionNaming(auto=False)
 
@@ -457,11 +470,20 @@ class ChatService:
                 session_record.id,
                 apply_name,
             )
-            await publish_session_event(
-                self._message_bus,
-                session_record.id,
-                CustomEvent(name="session_updated", value={}).model_dump(
-                    mode="json",
+            if not renamed:
+                return
+            await asyncio.gather(
+                self._message_bus.publish(
+                    MessageBusKeys.session_title_updates(user_id),
+                    {"type": "title_updated", "agent_id": agent_id},
+                ),
+                # Compatibility with clients listening to the chat stream.
+                publish_session_event(
+                    self._message_bus,
+                    session_record.id,
+                    CustomEvent(name="session_updated", value={}).model_dump(
+                        mode="json",
+                    ),
                 ),
             )
         except Exception as e:  # pylint: disable=broad-except
@@ -875,11 +897,15 @@ class ChatService:
                 user_id, agent_id, session_id, input_msg, consume_queue,
                 submission,
             ) as selected_input,
+            SessionActivity(
+                self._message_bus, user_id, agent_id, session_id,
+            ) as activity,
         ):
             if consume_queue or submission is not None:
                 if selected_input is None:
                     return
                 input_msg = selected_input
+            await activity.set_status(SessionStatus.RUNNING)
             from ._run_progress import RunProgress
             progress_input = input_msg[-1] if isinstance(input_msg, list) and input_msg else input_msg
             run_progress = RunProgress(self._message_bus, session_id, getattr(progress_input, 'id', None))
@@ -1337,6 +1363,9 @@ class ChatService:
             checkpoint_cursor: str | None = None
             events_since_checkpoint = 0
             released = False
+            current_question = agent.state.middle_context.get(QUESTION_TITLE_KEY)
+            if not isinstance(current_question, str):
+                current_question = latest_question_title(agent.state)
 
             async def checkpoint_reply(event: AgentEvent) -> None:
                 nonlocal events_since_checkpoint
@@ -1375,6 +1404,8 @@ class ChatService:
                     await task
                     raise
                 events_since_checkpoint = 0
+                if isinstance(event, ReplyEndEvent):
+                    await activity.reply_finished(reply_msg, current_question)
 
             # Text of the user turn that opened this run, captured
             # before the loop reassigns ``input_msg``; auto-naming
@@ -1392,6 +1423,7 @@ class ChatService:
                 while True:
                     reply_msg = None
                     try:
+                        await activity.set_status(SessionStatus.RUNNING)
                         if input_msg is None or isinstance(
                             input_msg,
                             (Msg, list),
@@ -1404,6 +1436,10 @@ class ChatService:
                                     if isinstance(input_msg, Msg)
                                     else input_msg
                                 )
+                                if any(msg.role == "user" for msg in input_msgs):
+                                    current_question = question_title(input_msgs)
+                                    agent.state.middle_context[QUESTION_TITLE_KEY] = current_question
+                                    agent.state.middle_context.pop(WAITING_FOR_RESULT_KEY, None)
                                 for msg in input_msgs:
                                     await self._storage.upsert_message(
                                         user_id,
@@ -1635,6 +1671,13 @@ class ChatService:
                     msg.finished_reason is ReplyFinishedReason.INTERRUPTED
                     for msg in reply_msgs
                 )
+                last_reply = reply_msgs[-1] if reply_msgs else None
+                if last_reply is not None and last_reply.finished_reason is not None:
+                    if (last_reply.finished_reason == ReplyFinishedReason.COMPLETED
+                            and completion_status(last_reply) == "WAITING"):
+                        agent.state.middle_context[WAITING_FOR_RESULT_KEY] = True
+                    else:
+                        agent.state.middle_context.pop(WAITING_FOR_RESULT_KEY, None)
 
                 # All persistence in a single coroutine, shielded from
                 # outer cancellation.  Must complete BEFORE the session
@@ -1714,6 +1757,7 @@ class ChatService:
                 # cannot race the next turn's snapshot of it. Skipped on
                 # the cancellation path above — a run being torn down
                 # has no business renaming anything.
+                await activity.set_status(parked_session_status(agent.state))
                 await self._auto_name_session(
                     user_id,
                     agent_id,

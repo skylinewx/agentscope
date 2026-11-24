@@ -11,7 +11,7 @@ import {
 	Settings2,
 	UsersRound,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 
 import type {
 	ChatModelConfig,
@@ -52,6 +52,7 @@ import {
 	ResizablePanelGroup,
 } from '@/components/ui/resizable.tsx';
 import { SidebarTrigger } from '@/components/ui/sidebar';
+import { useSessionActivity } from '@/context/session-activity';
 import { useAvailableModels } from '@/hooks/useAvailableModels';
 import { useAvailableRealtimeModels } from '@/hooks/useAvailableRealtimeModels';
 import { useKnowledgeBaseMiddlewareSchema } from '@/hooks/useKnowledgeBaseMiddlewareSchema';
@@ -79,9 +80,11 @@ interface ChatViewportProps {
 	 * workspace drive every control rendered here.
 	 */
 	sessionId: string | null;
+	focusReplyId?: string | null;
+	focusNavigationKey?: string;
 	/**
-	 * Optional hook invoked when a server-side change to this session
-	 * or its team arrives on the SSE stream. The outer page owns the
+	 * Optional hook invoked when a server-side change to this session's
+	 * team arrives on the SSE stream. The outer page owns the
 	 * session list that backs the sidebar, so it must be told to
 	 * refetch too; passing this callback wires that signal up.
 	 */
@@ -182,10 +185,17 @@ function closePanelInLayout(layout: PanelKey[][], key: PanelKey): PanelKey[][] {
 export function ChatViewport({
 	agentId,
 	sessionId,
+	focusReplyId,
+	focusNavigationKey,
 	onSessionsChanged,
 	hasAgentDefaults,
 }: ChatViewportProps) {
 	const { t } = useTranslation();
+	const activity = useSessionActivity();
+	const registerView = activity?.registerView;
+	useLayoutEffect(() => {
+		if (agentId && sessionId) return registerView?.({ agent_id: agentId, session_id: sessionId });
+	}, [agentId, sessionId, focusNavigationKey, registerView]);
 	const analysisQueries = useQueryClient();
 	const { sessions, refetch: refetchSessions } = useSessions(agentId);
 	const { groups } = useAvailableModels();
@@ -235,15 +245,6 @@ export function ChatViewport({
 		onSessionsChanged?.();
 	}, [refetchSessions, sessionId, onSessionsChanged]);
 
-	// Auto-naming replaced the session's placeholder name. The outer
-	// page shares this cached list whenever both are looking at the same
-	// agent; when they are not — drilled into a team member — it needs
-	// its own nudge.
-	const handleSessionUpdated = useCallback(async () => {
-		await refetchSessions();
-		onSessionsChanged?.();
-	}, [refetchSessions, onSessionsChanged]);
-
 	// Surface the plan panel the first time a session's tasks arrive over
 	// the stream, and only then — reopening it on every update would undo
 	// the user closing it. `state_updated` also fires for permission-only
@@ -285,7 +286,8 @@ export function ChatViewport({
 	} = useMessages(agentId, sessionId, {
 		onTeamUpdated: handleTeamUpdated,
 		onStateUpdated: handleStateUpdated,
-		onSessionUpdated: handleSessionUpdated,
+		onSessionUpdated: activity?.connected ? undefined : refetchSessions,
+		focusReplyId,
 		isRealtimeAudioActive: () => voiceBusy,
 		sendRealtimeUserConfirm: realtimeVoice.userConfirm,
 	});
@@ -735,7 +737,7 @@ export function ChatViewport({
 						minSize="24rem"
 					>
 						<div className="flex flex-col flex-1 min-h-0 min-w-0 overflow-x-hidden p-2">
-							<div className="flex flex-row gap-x-2 justify-between">
+							<div className="flex flex-col gap-1 md:flex-row md:justify-between md:gap-x-2">
 								<div className="flex min-w-0 flex-row items-center gap-x-1">
 									<SidebarTrigger className="md:hidden" />
 									{/* The open session, named opposite its own
@@ -760,9 +762,7 @@ export function ChatViewport({
 										</span>
 									)}
 								</div>
-								{/* Never squeezed by a long session name: the
-								    name truncates instead. */}
-								<div className="flex shrink-0 flex-row gap-x-1">
+								<div className="flex min-w-0 flex-wrap gap-1 md:shrink-0 md:flex-nowrap">
 									<RealtimeModelSelect
 										value={selectedRealtimeModel}
 										onChange={handleRealtimeModelChange}
@@ -934,6 +934,8 @@ export function ChatViewport({
 									className={'max-w-[var(--chat-content-w)] w-full'}
 									msgs={msgs}
 									loading={messagesLoading}
+									focusReplyId={focusReplyId}
+									focusNavigationKey={focusNavigationKey}
 									historyError={historyError}
 									connectionNotice={connectionNotice}
 									onReloadHistory={reloadHistory}

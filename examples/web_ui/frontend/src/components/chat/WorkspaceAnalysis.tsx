@@ -17,19 +17,25 @@ import { DEFAULT_VIEW, type ExportDelivery } from '@/lib/workspace-analysis';
 import { prepareReportPreview } from '@/lib/workspace-reports';
 
 function failure(error: unknown): { key: string; restore: boolean } {
-	if (error instanceof Error && ['UNSUPPORTED_VERSION', 'INVALID_VIEW'].includes(error.message))
+	if (error instanceof Error && error.message === 'UNSUPPORTED_VERSION')
 		return { key: 'analysis.unsupported', restore: false };
+	if (error instanceof Error && error.message === 'INVALID_VIEW')
+		return { key: 'analysis.invalidView', restore: false };
 	if (error instanceof ApiError) {
-		let code = '';
-		try {
-			code = (JSON.parse(error.detail) as { code?: string }).code ?? '';
-		} catch {
-			/* ordinary HTTP error */
+		let code = error.code ?? '';
+		if (!code && error.detail.startsWith('{')) {
+			try {
+				code = JSON.parse(error.detail)?.code ?? '';
+			} catch {
+				/* Plain HTTP detail. */
+			}
 		}
 		if (['PROJECTION_CHANGED', 'MISSING_PROJECTION'].includes(code))
 			return { key: 'analysis.changed', restore: true };
-		if (['UNSUPPORTED_VERSION', 'INVALID_ARTIFACT', 'INVALID_PRESENTATION'].includes(code))
+		if (code === 'UNSUPPORTED_VERSION')
 			return { key: 'analysis.unsupported', restore: false };
+		if (['INVALID_VIEW', 'INVALID_ARTIFACT', 'INVALID_PRESENTATION', 'DIGEST_MISMATCH'].includes(code))
+			return { key: 'analysis.invalidView', restore: false };
 		if (['ANALYSIS_DISABLED', 'SKILL_VERSION_MISMATCH'].includes(code))
 			return { key: 'analysis.activationRequired', restore: false };
 		if ([401, 403, 404].includes(error.status))

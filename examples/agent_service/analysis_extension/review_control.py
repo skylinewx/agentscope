@@ -238,14 +238,16 @@ def record_repair(turn, call_id, code):
                      'QUERY_TIMEOUT', 'SOURCE_UNAVAILABLE'}
         preparation = {'PREPARATION_NEEDS_SELECTION', 'PREPARATION_FILE_INPUT'}
         application = {'PREPARATION_INCOMPLETE', 'INPUT_DATA_INCOMPLETE', 'CAPTURE_INCOMPLETE'}
+        render = {'DOCUMENT_RENDER_ERRORS', 'DOCUMENT_FORMULA_COVERAGE_MISSING', 'DOCUMENT_TREND_COVERAGE_MISSING'}
         category = ('preparation' if code in preparation else 'application' if code in application else
-                    'semantic' if code in semantic else 'transient' if code in transient else 'parameter')
+                    'semantic' if code in semantic else 'transient' if code in transient else
+                    'render' if code in render else 'parameter')
         counts = state.setdefault('repairCounts', {})
         counts[category] = counts.get(category, 0) + 1
         category_limit = {'semantic': limits.max_review_attempts, 'transient': 2,
                           'preparation': limits.max_analysis_repairs + limits.max_review_attempts,
                           'application': limits.max_analysis_repairs + limits.max_review_attempts,
-                          'parameter': limits.max_analysis_repairs}[category]
+                          'render': limits.max_analysis_repairs, 'parameter': limits.max_analysis_repairs}[category]
         if counts[category] >= category_limit:
             state.setdefault('closeoutReason', 'REPAIR_LIMIT')
         if len(calls) >= limits.max_analysis_repairs + limits.max_review_attempts:
@@ -322,6 +324,7 @@ async def call_review_model(turn, execute, *, phase, input_chars, round_started,
         index += 1
         call_started = time.perf_counter()
         error_code = None
+        validation_message = None
         failure_kind, diagnostic, deadline = None, {}, None
         usage = {}
         usage_token = _MODEL_USAGE.set(usage)
@@ -353,6 +356,7 @@ async def call_review_model(turn, execute, *, phase, input_chars, round_started,
             feedback = correction_for(error, diagnostic, correction)
             if feedback is not None:
                 correction, next_retry = feedback, 'REVIEW_OUTPUT'
+                validation_message = feedback['message']
                 failure_kind = 'MODEL_OUTPUT_COVERAGE' if error_code == 'REVIEW_COVERAGE_INVALID' else 'MODEL_OUTPUT_SCHEMA'
             elif transient and not transport_retried:
                 transport_retried, next_retry = True, 'TRANSPORT'
@@ -365,13 +369,14 @@ async def call_review_model(turn, execute, *, phase, input_chars, round_started,
                                attempt=index, failureKind=failure_kind, retryReason=retry_reason)
             _MODEL_USAGE.reset(usage_token)
             estimate = usage.pop('reviewBudget', None)
+            sent_chars = (estimate or {}).get('materialChars', input_chars)
             adapter_attempts = usage.pop('adapterAttempts', [])
             elapsed = round((time.perf_counter() - call_started) * 1000, 2)
             last_duration = elapsed / 1000
             from .timing import timing_event, append_timing
             event = timing_event(turn, 'reviewModel', elapsed,
                                  includedIn='publication' if phase == 'DOCUMENT' else 'queryReview',
-                                 phase=phase, inputChars=input_chars, retry=index > 1, retryReason=retry_reason,
+                                 phase=phase, inputChars=sent_chars, retry=index > 1, retryReason=retry_reason,
                                  errorCode=error_code, failureKind=failure_kind,
                                  httpStatus=diagnostic.get('httpStatus'), upstreamRequestId=diagnostic.get('upstreamRequestId'),
                                  tokenUsage=usage or None, inputBudgetEstimate=estimate, firstResponseMs=None,
@@ -381,8 +386,9 @@ async def call_review_model(turn, execute, *, phase, input_chars, round_started,
             def record(state):
                 append_timing(state, event)
                 calls = state.setdefault('reviewModelCalls', [])
-                calls.append({'phase': phase, 'inputChars': input_chars, 'elapsedMs': elapsed,
+                calls.append({'phase': phase, 'inputChars': sent_chars, 'elapsedMs': elapsed,
                               'retry': index > 1, 'retryReason': retry_reason, 'errorCode': error_code, 'failureKind': failure_kind,
+                              **({'validationMessage': validation_message} if validation_message else {}),
                               'tokenUsage': usage or None, 'inputBudgetEstimate': estimate, 'firstResponseMs': None,
                               'adapterAttempts': adapter_attempts,
                               'firstResponseTiming': 'UNAVAILABLE_NON_STREAMING_API',
@@ -390,4 +396,4 @@ async def call_review_model(turn, execute, *, phase, input_chars, round_started,
                 del calls[:-64]
             progress(turn, record)
             logging.getLogger(__name__).info('审查模型请求 提问=%s 阶段=%s 重试=%s 材料字符=%d 耗时毫秒=%.2f 错误=%s',
-                turn_key(turn), phase, retry_reason, input_chars, elapsed, error_code)
+                turn_key(turn), phase, retry_reason, sent_chars, elapsed, error_code)

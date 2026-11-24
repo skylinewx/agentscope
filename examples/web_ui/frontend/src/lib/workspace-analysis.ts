@@ -88,7 +88,7 @@ export type Primitive =
 export interface RelationNode { key: string; label: string; display: string; note?: string; tone?: Tone; operator?: string; coefficient?: string; contribution?: string; weight?: number; emphasis?: boolean }
 export interface Relationship { layout?: 'compact' | 'flow'; equation: string; inputs: RelationNode[]; result: RelationNode; note: string; checks: { label: string; display: string }[] }
 export interface PresentationSection { groupId: string; title: string; description: string; width: 'full' | 'half'; claimsPosition: 'before' | 'after'; claimIndexes: number[]; blocks: { viewId: string; title: string; description: string; metricIndexes: number[]; sceneIndexes: number[]; tableIndexes: number[] }[] }
-export interface ChartScene { viewId: string; relationship?: Relationship; type: 'BAR_VALUES' | 'BAR_RANK' | 'BRIDGE' | 'FORMULA' | 'HIERARCHY' | 'WATERFALL' | 'RECONCILIATION'; title?: string; primary?: boolean; collapsed?: boolean; width: number; height: number; zeroBaseline: number; description: string; rowKeys: string[]; primitives: Primitive[] }
+export interface ChartScene { viewId: string; relationship?: Relationship; type: 'BAR_VALUES' | 'BAR_RANK' | 'BRIDGE' | 'FORMULA' | 'HIERARCHY' | 'WATERFALL' | 'RECONCILIATION' | 'PERIOD_TREND'; title?: string; primary?: boolean; collapsed?: boolean; width: number; height: number; zeroBaseline: number; description: string; rowKeys: string[]; primitives: Primitive[] }
 export interface AnalysisRow { rowKey: string; memberKey: string; valueRef: string; label: string; measure: string; exact: string | null; display: string; unit: string; state: string }
 export interface AnalysisColumn { key: string; label: string; unit: string }
 export interface AnalysisTable { viewId: string; collapsed: boolean; pageSize: number; tableKey: string; title: string; kind: 'values' | 'formula' | 'calculation'; note?: string; columns: AnalysisColumn[]; rows: { memberKey: string; label: string; note?: string; cells: Record<string, AnalysisRow> }[] }
@@ -142,7 +142,7 @@ export function parseDelivery(value: unknown, analysisRef: string): ExportDelive
 
 export function validateScene(value: unknown): asserts value is ChartScene {
 	const scene = record(value);
-	if (!['BAR_VALUES', 'BAR_RANK', 'BRIDGE', 'FORMULA', 'HIERARCHY', 'WATERFALL', 'RECONCILIATION'].includes(String(scene.type))) throw new Error('UNSUPPORTED_VERSION');
+	if (!['BAR_VALUES', 'BAR_RANK', 'BRIDGE', 'FORMULA', 'HIERARCHY', 'WATERFALL', 'RECONCILIATION', 'PERIOD_TREND'].includes(String(scene.type))) throw new Error('UNSUPPORTED_VERSION');
     str(scene.viewId);
     if (scene.relationship !== undefined) {
         if (!['FORMULA','HIERARCHY'].includes(String(scene.type))) throw new Error('INVALID_VIEW');
@@ -177,6 +177,11 @@ export function validateScene(value: unknown): asserts value is ChartScene {
 
 export function parseSnapshot(value: unknown): ViewSnapshot {
 	const v = record(value);
+	if (!Number.isSafeInteger(v.schemaVersion)) throw new Error('INVALID_VIEW');
+	if (v.schemaVersion !== 1) throw new Error('UNSUPPORTED_VERSION');
+	if (typeof v.rendererVersion !== 'string' || !v.rendererVersion.trim()
+		|| typeof v.engineVersion !== 'string' || !v.engineVersion.trim()) throw new Error('INVALID_VIEW');
+	if (v.rendererVersion !== '1.11.1' || !['1.5.0', '2.0.0'].includes(v.engineVersion)) throw new Error('UNSUPPORTED_VERSION');
     if (v.reportDelivery !== undefined) {
         const delivery = record(v.reportDelivery);
         for (const key of ['analysisRef', 'mode', 'semanticReview', 'programChecks', 'requirementsState']) str(delivery[key]);
@@ -207,7 +212,6 @@ export function parseSnapshot(value: unknown): ViewSnapshot {
         }
     }
     if (v.freeDocument !== undefined) parseFreeDocument(v.freeDocument);
-	if (v.schemaVersion !== 1 || v.rendererVersion !== '1.11.1' || !['1.5.0', '2.0.0'].includes(v.engineVersion as string)) throw new Error('UNSUPPORTED_VERSION');
 	if (typeof v.technicalDetails !== 'boolean' || typeof v.chartsRequested !== 'boolean') throw new Error('INVALID_VIEW');
 	for (const key of ['analysisRef', 'dataDigest', 'viewId', 'scopeId', 'scopeLabel', 'claimsScopeLabel', 'engineVersion']) str(v[key]);
 	if (!/^ana_[0-9a-f]{32}:[1-9][0-9]{0,8}$/.test(v.analysisRef as string) || typeof v.isFiltered !== 'boolean') throw new Error('INVALID_VIEW');

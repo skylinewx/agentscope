@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from copy import deepcopy
 import json
 import logging
@@ -21,6 +22,12 @@ from .execution_resources import PYTHON_DEFAULT_TIMEOUT_SECONDS, PYTHON_MAX_TIME
 def verification(facts, captures, verifier_refs=None, sources=None):
     from .adapters import default_sources
     return (sources or default_sources()).verify(facts, captures, verifier_refs)
+
+
+def _verification_build(base, capture_refs):
+    existing = set(base['captureRefs'])
+    return {'kind': 'CAPTURED_VERIFICATION', 'baseAnalysisRef': base['analysisRef'],
+            'verificationCaptureRefs': [ref for ref in capture_refs if ref not in existing]}
 
 
 def compact_derived(values, limit=100, analysis_ref=None):
@@ -108,6 +115,7 @@ class AnalysisService:
         self.preview_reviewer = None
         self.material_reviewer = None
         self.verification_runner = None
+        self.comparison_reader = None
         from .budget_preparation import BudgetPreparation
         self.budget_preparation = BudgetPreparation(self)
         self._evidence_cache = {}
@@ -135,6 +143,13 @@ class AnalysisService:
             return await prepare_input_set(self, **{key: value for key, value in kwargs.items() if key != 'action'})
         if self.turn is None:
             raise AnalysisError('NO_ACTIVE_USER_TURN', '当前没有可登记的真实用户轮。')
+        if kwargs.get('action') == 'tools':
+            if set(kwargs) - {'action', 'analysisRef', 'toolName'}:
+                raise AnalysisError('INVALID_TASK_ARGUMENT', '展开工具只需 action=tools，可附本会话已有的 analysisRef。')
+            if 'analysisRef' in kwargs:
+                # Checking ownership here never adopts an artifact or changes its frozen inputs.
+                self.store.get_analysis(self.owner, kwargs['analysisRef'])
+            return self.turn.task(action='tools', toolName=kwargs.get('toolName'))
         from . import source_views
         if kwargs.get('action') == 'sources':
             return source_views.directory(self.turn, kwargs.get('search'), kwargs.get('offset', 0),
@@ -145,6 +160,81 @@ class AnalysisService:
                 {'path': '/contextRefs', 'expectedPath': '/context/contextRefs'})
         if 'subjectFilter' in kwargs or any(key in (kwargs.get('context') or {}) for key in ('changedFields', 'changedDimensions')):
             raise AnalysisError('TASK_CONTRACT_CHANGED', '数值筛选放在查询 valueFilter；条件变更使用 intent 或 scopeEdits，不再申报旧变化标记。')
+        comparison = kwargs.pop('comparison', None)
+        previous_comparison = self.turn.state.get('comparisonPlan')
+        continuing = (previous_comparison and comparison is None and kwargs.get('action', 'declare') == 'declare'
+                      and kwargs.get('mode') == 'DIRECT' and not any(kwargs.get(k) for k in
+                      ('queryTargets', 'objectives', 'materials', 'analysisRef', 'references', 'subjectSources', 'investigations')))
+        if continuing:
+            comparison = {k: deepcopy(previous_comparison[k]) for k in ('items', 'groups', 'shared')}
+        if comparison is not None:
+            from .query_comparison import make_plan
+            # Accept an identical explicit FACTS selection in the general and per-item slots.
+            refs = kwargs.get('references') or []
+            if refs and all(r.get('use') == 'FACTS' and r.get('role', 'PRIMARY') == 'PRIMARY' and r.get('sourceRef')
+                            and r.get('mention') and r['mention'] in self.turn.state['request'] for r in refs):
+                selected = {i['sourceRef'] for i in comparison['items'] if i.get('sourceRef')}
+                if selected == {r['sourceRef'] for r in refs} and all(
+                        not r.get('contextRef') or any(i.get('sourceRef') == r['sourceRef'] and
+                        i.get('contextRef') == r['contextRef'] for i in comparison['items']) for r in refs):
+                    comparison = deepcopy(comparison)
+                    for i in comparison['items']:
+                        match = next((r for r in refs if r['sourceRef'] == i.get('sourceRef') and
+                                      (not r.get('contextRef') or r.get('contextRef') == i.get('contextRef'))), None)
+                        if match and (not i.get('mention') or i['mention'] not in self.turn.state['request']):
+                            i['mention'] = match['mention']
+                    kwargs.pop('references')
+            if (kwargs.get('action', 'declare') != 'declare' or kwargs.get('mode') != 'DIRECT'
+                    or kwargs.get('delivery', 'TEXT') != 'TEXT' or any(kwargs.get(k) for k in
+                    ('objectives', 'queryTargets', 'materials', 'analysisRef', 'references', 'subjectSources', 'investigations'))):
+                raise AnalysisError('INVALID_COMPARISON', '普通对比用 DIRECT 和 comparison。历史原值填在对应项。分析、联合筛选和额外计算按各自任务声明。')
+            if not continuing:
+                comparison = make_plan(self.turn, comparison)
+            context = kwargs.get('context') or {}
+            context_refs = context.get('contextRefs') or []
+            selected_contexts = {i['sourceRef']: i['contextRef'] for i in comparison['items']
+                                 if i.get('sourceRef') and i.get('contextRef')}
+            if context.get('mode') in ('CONTINUE', 'SYNTHESIZE') and context_refs and all(
+                    ref in selected_contexts for ref in context_refs):
+                # The source directory can return several results of the same turn.
+                # Only translate explicitly selected, ownership-checked sources.
+                contexts = list(dict.fromkeys(selected_contexts[ref] for ref in context_refs))
+                kwargs['context'] = {**context, 'mode': 'CONTINUE' if len(contexts) == 1 else 'SYNTHESIZE',
+                                     'contextRefs': contexts}
+            fresh = [i for i in comparison['items'] if not i.get('sourceRef')]
+            for field, key in (('scenario', 'scenario'), ('period', 'periodText')):
+                values = {i.get(key) for i in fresh}
+                if len(values) == 1 and None not in values:
+                    kwargs.setdefault('intent', {}).setdefault(field, values.pop())
+            kwargs['queryTargets'] = [item['id'] for item in comparison['items']]
+        references = kwargs.pop('references', None)
+        bound = None
+        if references is not None:
+            if kwargs.get('action', 'declare') != 'declare':
+                raise AnalysisError('INVALID_HISTORY_REFERENCE', '在 declare 中登记本轮需要沿用的资料。')
+            from .history_references import bind
+            bound = bind(self.turn, references)
+            if (kwargs.get('mode') == 'DIRECT' and all(item['use'] == 'QUERY_TRACE' for item in bound)
+                    and not any(kwargs.get(k) for k in ('intent', 'objectives', 'scopeEdits', 'executionPolicy'))):
+                kwargs['executionPolicy'] = {'sourceQueries': False, 'computations': False}
+            choices_from_refs = [{k: item[k] for k in ('sourceRef', 'role')} for item in bound if item['use'] == 'FACTS']
+            if choices_from_refs:
+                if 'subjectSources' in kwargs:
+                    raise AnalysisError('DUPLICATE_INPUT', '同一批来源只通过 references 或 subjectSources 选择一次。')
+                kwargs['subjectSources'] = choices_from_refs
+            reports = {item['analysisRef'] for item in bound if 'analysisRef' in item}
+            if reports:
+                if len(reports) != 1 or kwargs.get('analysisRef', next(iter(reports))) not in reports:
+                    raise AnalysisError('INVALID_REPORT_REUSE', '每次续审选择一份实际报告。')
+                kwargs['analysisRef'] = next(iter(reports))
+                report_contexts = list(dict.fromkeys(item['contextRef'] for item in bound if item['use'] == 'REPORT'))
+                if len(report_contexts) == 1 and 'context' not in kwargs:
+                    kwargs['context'] = {'mode': 'CONTINUE', 'contextRefs': report_contexts}
+            replay = list(dict.fromkeys(item['contextRef'] for item in bound if item['use'] == 'REQUERY'))
+            if replay:
+                if len(replay) != 1:
+                    raise AnalysisError('INVALID_HISTORY_REFERENCE', '重新查询时每个请求绑定一个原执行范围。')
+                kwargs['context'] = {'mode': 'CONTINUE', 'contextRefs': replay}
         choices = kwargs.pop('subjectSources', None)
         scope_edits = kwargs.pop('scopeEdits', None)
         report_ref = kwargs.pop('analysisRef', None)
@@ -168,10 +258,31 @@ class AnalysisService:
             raise AnalysisError('TASK_TURN_CHANGED', '真实用户轮已经切换，未将旧声明写入新问题。')
         from .turn_completion import TurnCompletion
         staged = TurnCompletion(self, deepcopy(turn.state))
+        if bound is not None:
+            old_fact_inputs = any(item['use'] in ('FACTS', 'REPORT') for item in staged.state.get('historyReferences', []))
+            if old_fact_inputs and choices is None and report_artifact is None:
+                for name in ('adoptedInputs', 'inputSetVersion', 'adoptedReportRef', 'selectedResultScope'):
+                    staged.state.pop(name, None)
+            staged.state['historyReferences'] = bound
+        elif choices is not None or report_artifact is not None or (kwargs.get('context') or {}).get('mode') == 'NEW':
+            staged.state.pop('historyReferences', None)
         result = staged.task(**kwargs)
         if kwargs.get('action', 'declare') == 'declare':
+            staged.state.pop('comparisonPlan', None)
             from .scope_changes import apply_scope_edits
+            if bound:
+                from .history_references import execution_view
+                traces = [execution_view(staged, item['contextRef']) for item in bound if item['use'] == 'QUERY_TRACE']
+                if traces:
+                    staged.state['executionTracesRead'] = [item['contextRef'] for item in traces]
+                    result['executionTraces'] = traces
+                result['historyReferences'] = bound
             apply_scope_edits(staged, scope_edits)
+            if staged.state.get('scopeEdits', []) != turn.state.get('scopeEdits', []) and staged.state.get('objectives'):
+                from .prepared_inputs import clear_formula_inputs
+                clear_formula_inputs(staged.state)
+                for key in ('analysisRef', 'report', 'currentReportReviewRef', 'hostCloseout', 'adoptedReportRef'):
+                    staged.state.pop(key, None)
             if report_artifact is not None:
                 result['reusedAnalysis'] = source_views.adopt_analysis(staged, report_artifact)
             elif choices is not None:
@@ -180,8 +291,17 @@ class AnalysisService:
                   and (turn.state.get('followupContext', {}).get('mode') != 'NEW'
                        or not turn.state.get('mode'))):
                 staged.state.pop('adoptedInputs', None)
+                staged.state.pop('adoptedReportRef', None)
                 staged.state.pop('inputSetVersion', None)
                 staged.state.pop('selectedResultScope', None)
+            from .objectives import adopt_bound_sources, resolve_dependencies
+            resolve_dependencies(staged)
+            adopt_bound_sources(staged, explicit=choices is not None or report_artifact is not None,
+                                committed_objectives=turn.state.get('objectives', []))
+            result['objectives'] = deepcopy(staged.state['objectives'])
+            if assessment and assessment.get('objectives') and assessment['objectives'] != result['objectives']:
+                assessment['objectives'] = deepcopy(result['objectives'])
+                assessment['assessmentKey'] = digest({key: value for key, value in assessment.items() if key != 'assessmentKey'})
             result['subjectSources'] = [{key: value for key, value in item.items() if key != 'selection'}
                                         for item in staged.state.get('adoptedInputs', [])]
             result['inputSetVersion'] = staged.state.get('inputSetVersion')
@@ -222,10 +342,23 @@ class AnalysisService:
                     adopted = staged.state['adoptedInputs'][0]
                     for target in targets:
                         target.update(inputRef=adopted['inputRef'], sourceRef=adopted['sourceRef'], role=adopted['role'])
+        selected_targets = None
+        if (report_artifact is None and subjects is None and kwargs.get('action', 'declare') == 'declare'
+                and needs_formulas(staged.state) and staged.state.get('adoptedInputs')):
+            selected_targets = self.budget_preparation.selected_targets(staged)
         if staged.state.get('adoptedInputs'):
             self.store.pin_source_views(self.owner, [item['sourceRef'] for item in staged.state['adoptedInputs']])
         turn.state.clear()
         turn.state.update(staged.state)
+        if comparison is not None:
+            from .query_comparison import execute
+            comparison['revision'] = digest([turn.state.get(k) for k in
+                    ('queryIntent', 'scopeEdits', 'followupContext', 'selectedContextRefs', 'executionPolicy')])
+            if previous_comparison and all(previous_comparison.get(k) == comparison.get(k)
+                                           for k in ('items', 'groups', 'shared', 'revision')):
+                comparison['runs'] = previous_comparison.get('runs', [])
+            turn.state['comparisonPlan'] = comparison
+            result['comparisonStatus'] = await execute(turn, comparison, self.comparison_reader)
         if assessment is not None:
             turn.state['analysisRequirement'] = assessment
             result['analysisRequirement'] = deepcopy(assessment)
@@ -251,8 +384,40 @@ class AnalysisService:
                 'next': ('构建时选择本题的总体数据或已准备目标回执，宿主自动附上各对象的公式材料；额外统计放在 operations。'
                          if all('selection' in item for item in records) else
                          '已登记各预期主体及缺口。仅补失败目标；提交后续实际回执构建时，宿主会重新核对并更新准备状态。')}
-        if report_artifact is None and subjects is None and kwargs.get('action', 'declare') == 'declare' and needs_formulas(turn.state) and turn.state.get('adoptedInputs'):
-            result['preparedFormulaInputs'] = await self.budget_preparation.prepare_selected(turn)
+        if selected_targets is not None:
+            result['preparedFormulaInputs'] = await self.budget_preparation.prepare_selected(turn, resolved=selected_targets)
+        from .objectives import pending_members
+        pending = pending_members(turn.state)
+        if pending:
+            result['pendingMembers'] = pending
+        prepared = result.get('preparedFormulaInputs') or {}
+        groups = turn.state.get('adoptedInputs', [])
+        expected = prepared.get('expected', 0)
+        ready = prepared.get('ready', sum('captureRef' in row for row in prepared.get('targets', [])))
+        if (expected and expected == ready and not pending and groups and report_artifact is None
+                and turn.state.get('deliveryMode') == 'DOCUMENT'
+                and turn.state.get('executionPolicy', {}).get('computations', True)
+                and all(any(g['role'] == obj['role'] and (not obj.get('sourceRef') or obj['sourceRef'] == g['sourceRef'])
+                            for g in groups) for obj in turn.state.get('objectives', []))):
+            from .prepared_inputs import task_basis
+            key = digest([task_basis(self), prepared.get('targets'), prepared.get('inputSetVersion')])
+            existing = turn.state.get('formulaBase') or {}
+            if existing.get('key') != key:
+                built = await self.build(operations=[], requestKey='formula-base-' + key)
+                artifact = self.store.get_analysis(self.owner, built['analysisRef'])
+                from .build_projection import project
+                projected = project(built, artifact)
+                existing = {**{k: built[k] for k in ('analysisRef', 'inputSetRef', 'documentDraft') if k in built},
+                            'key': key, 'markdownFigures': projected['markdownFigures'],
+                            'material': [entry['markdown'] + ('\n续读 ' + str(entry.get('nextRead') or entry.get('detailRead'))
+                                                             if not entry.get('readComplete') else '')
+                                         for entry in projected.get('formulaMaterials', [])]}
+                turn.state['formulaBase'] = {k: v for k, v in existing.items() if k != 'material'}
+                turn.state['analysisRef'] = built['analysisRef']
+                refs = turn.state.setdefault('buildRefs', [])
+                if built['analysisRef'] not in refs:
+                    refs.append(built['analysisRef'])
+            result['preparedAnalysis'] = existing
         if report_artifact is not None:
             # The full input set stays in state; avoid 100+ metric references in
             # the model reply when one explicit report reference selected them.
@@ -261,10 +426,7 @@ class AnalysisService:
 
     async def python(self, **kwargs):
         from .python_analysis import analyze
-        result = await analyze(self, **kwargs)
-        if result.get('analysisRef'):
-            self._record_completed_build(result['analysisRef'])
-        return result
+        return await analyze(self, **kwargs)
 
     def _record_completed_build(self, analysis_ref):
         """Successful computation registration survives background continuations.
@@ -282,9 +444,28 @@ class AnalysisService:
         self.store.turn_progress(self.owner, turn_key(self.turn), record)
 
     async def read_query_result(self, captureRef=None, pointer='', offset=0, limit=20, search=None, fields=None,
-                                requests=None, allPages=False, tableRef=None, columns=None, filters=None, cursor=None):
+                                requests=None, allPages=False, tableRef=None, columns=None, filters=None, cursor=None,
+                                view=None, contextRef=None):
         from .query_results import read_receipt
         await self.authorize()
+        if view is not None or contextRef is not None:
+            if (view != 'EXECUTION' or not contextRef or self.turn is None or captureRef or requests is not None
+                    or pointer or allPages or offset or limit != 20 or any(v is not None for v in (columns, filters, cursor, tableRef, fields, search))):
+                raise AnalysisError('INVALID_EXECUTION_READ', '读取原查询过程只填写 view=EXECUTION 和本会话的 contextRef。')
+            from .history_references import execution_view
+            data = execution_view(self.turn, contextRef)
+            refs = self.turn.state.setdefault('executionTracesRead', [])
+            if contextRef not in refs:
+                refs.append(contextRef)
+            return data
+        def capture_for_read(reference):
+            try:
+                return self.store.get_capture(self.owner, reference)
+            except AnalysisError as error:
+                if error.code != 'NOT_FOUND':
+                    raise
+                raise AnalysisError('NOT_FOUND', '当前会话没有这个查询回执。请从已保存查询的读取指引复制 captureRef；已选的 sourceRef 用于分析来源。') from error
+
         if requests is None and allPages:
             requests = [{'captureRef': captureRef, 'pointer': pointer, 'offset': offset, 'limit': limit,
                          **({'search': search} if search is not None else {}),
@@ -303,7 +484,7 @@ class AnalysisService:
             async def read_page(**request):
                 reference = request.get('captureRef')
                 if reference not in receipts:
-                    capture = self.store.get_capture(self.owner, reference)
+                    capture = capture_for_read(reference)
                     saved_captures[reference] = capture
                     adapter = self.sources.for_capture(capture)
                     receipt = adapter.raw_receipt(capture['response'])
@@ -322,7 +503,7 @@ class AnalysisService:
                                     **{key: value for key, value in request.items() if key != 'captureRef'})
             return await read_batch(requests, allPages, read_page,
                                     allowed_fields={'captureRef', 'pointer', 'offset', 'limit', 'search', 'fields', 'tableRef', 'columns', 'filters', 'cursor'})
-        capture = self.store.get_capture(self.owner, captureRef)
+        capture = capture_for_read(captureRef)
         adapter = self.sources.for_capture(capture)
         receipt = adapter.raw_receipt(capture['response'])
         if (not pointer and getattr(adapter, 'adapter_id', None) == 'budget-v2' and receipt.get('status') in ('SUCCEEDED', 'PARTIAL')
@@ -346,6 +527,11 @@ class AnalysisService:
                 raise AnalysisError('INPUT_SET_SELECTION', '纯文件集合用于 Python；原生预算运算需要已确认的业务事实。')
         from .input_state import snapshot, require_unchanged, validate_analysis
         input_state = snapshot(self)
+        from .objectives import pending_members
+        pending = pending_members(self.turn.state) if self.turn else []
+        if pending:
+            raise AnalysisError('OBJECTIVE_MEMBERS_PENDING', '这些目标仍在等待产生其成员的查询。已有的输入和公式材料已保留。',
+                                {'pendingMembers': pending, 'requiresBuild': False})
         adopted = self.turn.state.get('adoptedInputs', []) if self.turn else []
         if adopted and captureRefs is None and selections is None and baseAnalysisRef is None:
             selections = [deepcopy(item['selection']) for item in adopted]
@@ -378,6 +564,8 @@ class AnalysisService:
                    "ruleVersion": self.rules.version, "skillVersions": self.skill_versions}
         if adopted:
             request['inputSetVersion'] = self.turn.state['inputSetVersion']
+        if self.turn and self.turn.state.get('objectives'):
+            request['objectives'] = deepcopy(self.turn.state['objectives'])
         from .native_analysis import CAPABILITY_VERSION
         from .numeric_policy import NUMERIC_POLICY
         request['numericPolicyVersion'] = NUMERIC_POLICY
@@ -511,6 +699,10 @@ class AnalysisService:
                 effective_work.extend(defaults)
         # 结果引用由宿主确定；模型可使用本计划运算 id，无须手工维护第二套前缀。
         operation_refs = {value['derivedId'].removeprefix('derived_'): value['derivedId'] for value in derived}
+        from .work_bindings import bind_native
+        bind_native(effective_work, operations, derived,
+                    {task['taskId'] for task in request['workPlan']},
+                    {op['id'] for op in request['operations']})
         for task in effective_work:
             if task.get('kind') == 'COMPUTATION':
                 from .scalar_references import normalize_reference
@@ -569,6 +761,17 @@ class AnalysisService:
             artifact['computationIntent'] = {**context_for(self.turn),
                 'queryIntent': deepcopy(self.turn.state.get('queryIntent', {})),
                 'materials': deepcopy(self.turn.state.get('materials', []))}
+            if self.turn.state.get('objectives'):
+                from .objectives import coverage
+                artifact['objectiveCoverage'] = coverage(self.turn.state, artifact)
+                from .completion import formula_correction
+                for task in effective_work:
+                    if task.get('kind') == 'RELATION' and task.get('objectiveRef'):
+                        corrected = formula_correction(artifact, task, {'objectiveRef': task['objectiveRef'], 'operator': 'FORMULA_CHECK'})
+                        if corrected:
+                            task.update(corrected)
+                            artifact['planDigest'] = digest(artifact['plan'])
+                artifact['computationIntent']['objectives'] = deepcopy(self.turn.state['objectives'])
         artifact["findingRules"] = self.finding_rules
         from .completion_issues import context_for
         completion_context = context_for(self.turn, base if baseAnalysisRef else None)
@@ -657,7 +860,7 @@ class AnalysisService:
                 'relationCount': len(artifact['relations']),
                 'completion': completion_summary(artifact),
                 "next": ("剩余来源核验由宿主在发布前增量执行，成功凭据自动登记，无须重建或重算；" if verification_tasks else "") +
-                        "已返回的 derivedValues 可直接使用，缺具体字段才定向 Inspect。仅追加计算或工作项时传 baseAnalysisRef+operations+requestKey，省略 captureRefs/selections/scope，沿用已冻结输入；已有计算仅补完成引用可在发布时传 workRefs。换来源或范围时才同时提供三个完整输入字段。同轮省略 baseAnalysisRef 时补入新来源并延续已有输入。分析、构成查询首次用 DOCUMENT 交付图文；只改展示无需重建或重新查询。"}
+                        "已返回的 derivedValues 可直接使用，缺具体字段才定向 Inspect。仅追加计算或工作项时传 baseAnalysisRef+operations+requestKey，省略 captureRefs/selections/scope，沿用已冻结输入；仅在当前工作项已有 taskId 且需要补引用时传 workRefs。换来源或范围时才同时提供三个完整输入字段。同轮省略 baseAnalysisRef 时补入新来源并延续已有输入。分析、构成查询首次用 DOCUMENT 交付图文；只改展示无需重建或重新查询。"}
 
     def pending_verifications(self, artifact):
         """以来源、快照、查询会话、执行和证据标识计算差集，不整批重发。"""
@@ -1014,7 +1217,7 @@ class AnalysisService:
                     "planPolicy": "EXPLICIT_ONLY",
                     "viewOptions": ["title", "description", "showUnit", "includeDetails", "nodeRefs", "collapsed", "pageSize", "numberFormat", "labels", "comparisonRef", "descriptionParts", "maxInputsPerScene", "groupId", "orderRef", "nodeDescriptions", "relationLayout", "showChecks", "emphasisRefs", "orientation"],
                     "documentPresentation": {"version":"free-html-1", "publishField":"document", "source":["path","html"],
-                        "bindings":"key/valueRef/field/nodeRef/format", "textSlot":"{{key}}", "scriptData":"window.analysisData[key]",
+                        "bindings":"key/valueRef + field/nodeRef 或 rowRef/column，可选 format", "textSlot":"{{key}}", "scriptData":"window.analysisData[key]",
                         "datasets":"key/valueRef/nodeRefs/format", "scriptDatasets":"window.analysisSets[key]",
                         "datasetKinds":["ORDERED", "FORMULA", "RECONCILIATION", "TABULAR"],
                         "previewChecks":"previewPage 的运行页面检查；AnalysisInspect(section=preview,previewRef=repairRef) 读取同一文档摘要记录",
@@ -1148,6 +1351,12 @@ class AnalysisService:
             if self.delivery is None:
                 raise AnalysisError("DELIVERY_UNAVAILABLE", "当前宿主没有装配展示能力。")
             return self.delivery.ensure(analysisRef)
+        if section == "periodTrends":
+            from .period_trends import choices, trend_catalog
+            rows = choices(trend_catalog(artifact))
+            if search:
+                rows = [row for row in rows if any(search.casefold() in str(v).casefold() for v in row.values())]
+            return bounded_page(rows, offset, limit, self.store.limits.page_size)
         if section == "summary":
             document = None
             if artifact['publicationState'] == 'PUBLISHED':
@@ -1155,7 +1364,15 @@ class AnalysisService:
                 document = project(artifact, self.rules)
             from .aggregation_explanation import annotate
             scope = {**artifact['scope'], 'sourceScopes': annotate(artifact['scope'].get('sourceScopes', []))}
-            return {"analysisRef": analysisRef, **public_states(artifact), "scope": scope, "summary": summary(artifact, document)}
+            info = summary(artifact, document)
+            if detail != 'full':
+                from .build_projection import compact_scope
+                from .review_business_projection import compact_business_scopes
+                scope = compact_scope(scope, analysisRef)
+                scope['sourceScopes'] = compact_business_scopes(scope['sourceScopes'])
+                info.pop('scope', None)
+                scope['detailRead'] = {'section': 'summary', 'analysisRef': analysisRef, 'detail': 'full'}
+            return {"analysisRef": analysisRef, **public_states(artifact), "scope": scope, "summary": info}
         if section == "findings":
             self._check_draft_rules(artifact)
             if artifact["publicationState"] == "PUBLISHED" and (findingPlan is not None or thresholds is not None):
@@ -1183,7 +1400,14 @@ class AnalysisService:
             value = project(value)
             if 'rows' in value:
                 page = bounded_page(value['rows'], offset, limit, self.store.limits.page_size)
-                return {**{key: item for key, item in value.items() if key != 'rows'},
+                product = {key: item for key, item in value.items() if key != 'rows'}
+                if detail != 'full':
+                    for field in ('inputRefs', 'sourceFactIds'):
+                        if isinstance(product.get(field), list):
+                            product[field + 'Count'] = len(product.pop(field))
+                    product['detailRead'] = {'section': 'products', 'analysisRef': analysisRef,
+                                             'derivedId': derivedId, 'detail': 'full', 'offset': offset, 'limit': limit}
+                return {**product,
                         'rows': page['items'], 'rowPage': {key: item for key, item in page.items() if key != 'items'}}
             if 'text' in value:
                 text = value['text']
@@ -1378,8 +1602,7 @@ class AnalysisService:
         # 发布不允许就地修改输入。新增关联草稿仅登记凭据，不重跑查询、计算或 Python。
         draft = deepcopy(artifact)
         draft.update(updates, baseAnalysisRef=artifact['analysisRef'])
-        request = {'kind': 'CAPTURED_VERIFICATION', 'baseAnalysisRef': artifact['analysisRef'],
-                   'verificationCaptureRefs': [ref for ref in updates['captureRefs'] if ref not in artifact['captureRefs']]}
+        request = _verification_build(artifact, updates['captureRefs'])
         draft = self.store.build(self.owner, request, draft, 'verification-' + digest(request), artifact['analysisRef'])
         self._record_presentation_revision(draft)
         return draft
@@ -1400,24 +1623,41 @@ class AnalysisService:
                 revisions[artifact['analysisRef']] = base_ref
         progress(self.turn, record)
 
+    def _is_verification_of(self, stored_ref, submitted_ref):
+        # Confirm the host's exact receipt-verification build. Other children can carry new business results.
+        saved = self.store.get_analysis(self.owner, stored_ref)
+        if saved.get('baseAnalysisRef') != submitted_ref:
+            return False
+        base = self.store.get_analysis(self.owner, submitted_ref)
+        fingerprint = digest(_verification_build(base, saved['captureRefs']))
+        return self.store.find_request(self.owner, 'build', 'verification-' + fingerprint, fingerprint) == stored_ref
+
     async def publish(self, analysisRef=None, claims=None, viewPlan=None, requestKey=None,
                       thresholds=None, hypotheses=None, findingPlan=None, actionPlan=None, technicalDetails=None,
-                      presentation=None, workRefs=None, unresolvedItems=None, repairRef=None, repairs=None, previewOnly=False, document=None, renderCheckUnavailableReason=None, finalize=False, resumeReview=False):
+                      presentation=None, workRefs=None, unresolvedItems=None, repairRef=None, repairs=None, previewOnly=False, document=None, renderCheckUnavailableReason=None, finalize=None, resumeReview=False, reviewAction=None):
         from .publication import repair_request
         if repairRef is not None:
             saved_target = self.store.get_publication_proposal(self.owner, repairRef)
-            if analysisRef is not None and analysisRef != saved_target['analysisRef']:
-                raise AnalysisError('REPAIR_SCOPE', '修复引用与显式分析不一致；不能改绑另一个任务。')
+            if finalize is None and repairs and not previewOnly and 'markdown' in (saved_target.get('document') or {}):
+                # A changed draft has a new digest and needs its own render and review before registration.
+                finalize = True
+            if (analysisRef is not None and analysisRef != saved_target['analysisRef']
+                    and not self._is_verification_of(saved_target['analysisRef'], analysisRef)):
+                raise AnalysisError('REPAIR_SCOPE', '此次修复指定的分析与保存草稿不同。修这个草稿时保留 repairRef 和 repairs，省略 analysisRef。',
+                                    {'path': '/analysisRef', 'submitted': analysisRef, 'expected': saved_target['analysisRef'],
+                                     'requiresBuild': False})
             analysisRef = saved_target['analysisRef']
         if not analysisRef:
             raise AnalysisError('INVALID_PUBLICATION', '首次发布提供 analysisRef；修复使用返回的 repairRef。')
-        if resumeReview:
+        if resumeReview or reviewAction:
+            if reviewAction and (resumeReview or reviewAction not in ('VIEW', 'RESUME', 'RECHECK')):
+                raise AnalysisError('INVALID_PUBLICATION', '选择一项 reviewAction：VIEW 查看结论，RESUME 续审未完成段，RECHECK 重新审核正文。')
             if any(value is not None for value in (claims, viewPlan, thresholds, hypotheses, findingPlan, actionPlan,
                     technicalDetails, presentation, workRefs, unresolvedItems, repairRef, repairs, document,
                     renderCheckUnavailableReason)) or previewOnly or finalize:
-                raise AnalysisError('INVALID_PUBLICATION', '续审只使用 analysisRef、requestKey、resumeReview=true。')
+                raise AnalysisError('INVALID_PUBLICATION', '审核已有报告时只提交 analysisRef、requestKey 和 reviewAction。需要修改正文时按审核意见另行提交修订。')
             from .report_review import resume_review
-            return await resume_review(self, analysisRef)
+            return await resume_review(self, analysisRef, reviewAction or 'RESUME')
         if finalize:
             if previewOnly:
                 raise AnalysisError('INVALID_PUBLICATION', 'finalize 与 previewOnly 不能同时为 true。')
@@ -1448,7 +1688,7 @@ class AnalysisService:
                        findingPlan=findingPlan, actionPlan=actionPlan, technicalDetails=technicalDetails,
                        presentation=presentation, workRefs=workRefs, unresolvedItems=unresolvedItems, renderCheckUnavailableReason=renderCheckUnavailableReason)
         from .input_state import validate_analysis
-        validate_analysis(self, artifact)
+        validate_analysis(self, artifact, repairing=repairRef is not None)
         if repairRef is not None:
             repair_started = perf_counter()
             if any(v is not None for v in options.values()):
@@ -1463,8 +1703,9 @@ class AnalysisService:
                     if change.get('path') == '/document/path' and change.get('op') in ('add', 'replace'):
                         updated = {**saved['document'], 'path': change.get('value')}
                         updated.pop('html', None)
+                        updated.pop('markdown', None)
                         frozen = freeze_source(updated, self.delivery.root if self.delivery else None)
-                        change = {'op': 'replace', 'path': '/document/html', 'value': frozen['html']}
+                        change = {'op': 'replace', 'path': '/document', 'value': frozen}
                     normalized.append(change)
                 repairs = normalized
             request = repair_request(saved, analysisRef, repairs)
@@ -1611,8 +1852,11 @@ class AnalysisService:
                     repairAndFinalize={'repairRef': preview_ref,
                         'repairs': [], 'requestKey': 'repair-' + preview_ref, 'finalize': True},
                     repairHint='textRepairable=true 的文字问题优先把所有相关修改一次放入 repairs：{op:"replaceText",path:"/document/html",value:{oldText:textTargets原文片段,newText:修正文字,textRef:textTargets引用}}。使用 textTargets 的 oldText/textRef；原句跨标签时只修改必要片段并保留其中占位符；可补充引用页面已有绑定。正文、摘要和图注一起修正；依据 semanticReview.repairEvidence，不重查重算。textRepairable=false 不试猜跨标签或动态脚本文字，直接编辑当前文件，用 /document/path 刷新；已有 documentEditSource 时以该源为准。bindings/datasets 沿用。')
+                if 'markdown' in (request.get('document') or {}):
+                    result['repairHint'] = '按语义审查中的问题修订已冻结的 Markdown。文字可用 /document/markdown 和 textTargets 原句批量 replaceText；整稿可用 /document/path 指向修订后的 .md。沿用来源与计算。'
                 if self.delivery and repairs and any(change.get('op') == 'replaceText' for change in repairs):
-                    result['documentEditSource'] = self.delivery.save_edit_source(request['document']['html'])
+                    doc = request['document']
+                    result['documentEditSource'] = self.delivery.save_edit_source(doc.get('markdown', doc.get('html')), markdown='markdown' in doc)
                 if self.web_ui_url:
                     result['previewPage'] = self.web_ui_url.rstrip('/') + result['previewPage']
                 checks = result['diagnostics'].get('renderChecks')
@@ -1658,6 +1902,13 @@ class AnalysisService:
             from .publication import repair_fields, recovery_details
             details['repairFields'] = repair_fields(request)
             details = recovery_details(exc.code, details)
+            if exc.code == 'DOCUMENT_TREND_REQUIRED' and details.get('path') == '/document/markdown':
+                for choice in details.get('trendChoices', []):
+                    choice['repairAndFinalize'] = {'repairRef': proposal_ref, 'requestKey': 'trend-' + choice['trendRef'] + '-' + proposal_ref,
+                        'finalize': True, 'repairs': [{'op': 'appendMarkdown', 'path': '/document/markdown', 'value': choice['Markdown']}]}
+                details['repairHint'] = '按报告重点选一行 trendChoices，将该行的 repairAndFinalize 原样传给 AnalysisPublish。'
+                if len(details.get('issues', [])) == 1:
+                    details.pop('issues')
             if exc.code == 'VERSION_CONFLICT' and details['nextAction'] == 'RETRY_PREVIEW':
                 details['retryPreview'] = {'repairRef': proposal_ref, 'repairs': [], 'previewOnly': True,
                                           'requestKey': 'resume-preview-' + proposal_ref}
@@ -1729,13 +1980,21 @@ class AnalysisService:
                 proposed['freeDocument'] = compile_document(proposed, document)
             else:
                 proposed.update(validate_content(artifact, claims, viewPlan, presentation))
+                if (self.turn and self.turn.state.get('deliveryMode') == 'DOCUMENT' and not host_summary
+                        and not proposed.get('freeDocument') and not any(v.get('trendRef') for v in proposed['viewPlan'])):
+                    from .period_trends import choices, trend_catalog
+                    options = choices(trend_catalog(proposed))
+                    if options:
+                        raise AnalysisError('DOCUMENT_TREND_REQUIRED', '多时期分析需要时期折线图。',
+                                            {'path': '/viewPlan', 'trendChoices': options[:8], 'requiresBuild': False,
+                                             'hint': '把所选 trendRef 加入一个现有的可见 viewPlan 项，或在自由页面绑定 data-analysis-trend。'})
         except AnalysisError as exc: issues.extend((exc.details or {}).get('issues', [located(exc, '')]))
         try:
             completion = completion_summary(proposed)
             if completion['state'] == 'INCOMPLETE' and not proposed.get('partialReason'):
                 issues.append({'code': 'INCOMPLETE_WORK_PLAN', 'message': '已声明工作项尚未完成；补齐真实引用，或以 unresolvedItems 关联确实未完成的用户要求、taskId 和实际障碍。',
                                'path': '/workRefs', 'pendingTasks': [t for t in completion['items'] if t['state'] != 'READY'],
-                               'hint': '已有计算用 derivedId；枚举关系用 relationRef。用 workRefs 更新现有 taskId 的 refs，无需重新 Build；不得删除待办来宣布完成。'})
+                               'hint': '取值用所选原始事实，组织关系用 relationRef。误把数据构成登记为 RELATION 时，用 workRefs 指定该 taskId、operator=FORMULA_CHECK 和该目标的全部公式结果；可直接修正并发布。'})
         except AnalysisError as exc: issues.append(located(exc, '/workRefs'))
         raise_issues(issues)
         from .validation import validate_report_topics
@@ -1944,5 +2203,5 @@ class AnalysisService:
         await self.authorize()
         if self.delivery is None:
             raise AnalysisError("DELIVERY_UNAVAILABLE", "当前宿主没有装配展示能力。")
-        self.delivery.ensure(analysisRef)
-        return self.delivery.render_report(analysisRef, requestKey, viewParameters, layout)
+        await asyncio.to_thread(self.delivery.ensure, analysisRef)
+        return await asyncio.to_thread(self.delivery.render_report, analysisRef, requestKey, viewParameters, layout)

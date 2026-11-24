@@ -4,7 +4,7 @@ from copy import deepcopy
 from .models import AnalysisError
 
 
-WIRE_POLICY = 'BUSINESS_REVIEW_FOUR_SECTIONS_V6'
+WIRE_POLICY = 'BUSINESS_REVIEW_FOUR_SECTIONS_V8'
 
 
 def source_facts(source):

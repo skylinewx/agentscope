@@ -2,6 +2,7 @@
 """Session router — create, list, update, delete, stream, and get messages."""
 
 import asyncio
+from contextlib import asynccontextmanager, suppress
 import json
 from typing import AsyncGenerator
 
@@ -787,9 +788,97 @@ async def get_session_status(
 # Stream: live SSE connection for session events
 # ----------------------------------------------------------------------
 
+# SSE heartbeat comment frames keep idle streams open through proxies.
 _HEARTBEAT_INTERVAL_SECS = 30
 _SUBSCRIBE_TIMEOUT_SECS = 5.0
-# Interval between SSE heartbeat comment frames (``:\\n\\n``).
+_SSE_HEADERS = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+
+
+@asynccontextmanager
+async def _subscribe_live_events(
+    message_bus: MessageBus,
+    key: str,
+) -> AsyncGenerator[asyncio.Queue[dict | None], None]:
+    """Buffer live events while the stream sends its initial frames."""
+    ready = asyncio.Event()
+    queue: asyncio.Queue[dict | None] = asyncio.Queue()
+
+    async def feed() -> None:
+        try:
+            async for event in message_bus.subscribe(key, on_ready=ready.set):
+                queue.put_nowait(event)
+        finally:
+            queue.put_nowait(None)
+
+    feeder = asyncio.create_task(feed())
+    try:
+        await asyncio.wait_for(ready.wait(), timeout=_SUBSCRIBE_TIMEOUT_SECS)
+        yield queue
+    finally:
+        feeder.cancel()
+        with suppress(asyncio.CancelledError):
+            await feeder
+
+
+@session_router.get(
+    "/title-updates",
+    summary="Subscribe to session title updates (SSE)",
+)
+async def stream_session_title_updates(
+    user_id: str = Depends(get_current_user_id),
+    message_bus: MessageBus = Depends(get_message_bus),
+) -> StreamingResponse:
+    """Notify the owner's chat page when an agent's session list changes."""
+    return _session_updates_response(message_bus, user_id, include_activity=False)
+
+
+@session_router.get("/updates", summary="Subscribe to the owner's session updates (SSE)")
+async def stream_session_updates(
+    user_id: str = Depends(get_current_user_id),
+    message_bus: MessageBus = Depends(get_message_bus),
+) -> StreamingResponse:
+    """Recover recent completions, then stream live activity and titles."""
+    return _session_updates_response(message_bus, user_id, include_activity=True)
+
+
+def _session_updates_response(
+    message_bus: MessageBus, user_id: str, *, include_activity: bool,
+) -> StreamingResponse:
+    async def stream() -> AsyncGenerator[str, None]:
+        key = MessageBusKeys.session_updates(user_id)
+        async with _subscribe_live_events(message_bus, key) as queue:
+            replayed: set[str] = set()
+            if include_activity:
+                # Subscribe first so a completion cannot be lost between
+                # reading the journal and starting live delivery.
+                entries = await message_bus.log_read(
+                    key, max_count=MessageBusKeys.SESSION_COMPLETION_REPLAY_MAX_LEN * 2,
+                )
+                for entry_id, event in entries:
+                    replayed.add(entry_id)
+                    payload = {**event, "replayed": True}
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+            yield 'data: {"type":"ready"}\n\n'
+            while True:
+                try:
+                    event = await asyncio.wait_for(
+                        queue.get(), timeout=_HEARTBEAT_INTERVAL_SECS,
+                    )
+                except asyncio.TimeoutError:
+                    yield ":\n\n"
+                    continue
+                if event is None:
+                    break
+                if event.get("_entry_id") in replayed or (
+                    not include_activity and event.get("type") != "title_updated"
+                ):
+                    continue
+                payload = {key: value for key, value in event.items() if key != "_entry_id"}
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return StreamingResponse(
+        stream(), media_type="text/event-stream", headers=_SSE_HEADERS,
+    )
 
 
 async def _worker_still_asking(
@@ -903,38 +992,9 @@ async def stream_session_events(
 
     async def _sse_generator() -> AsyncGenerator[str, None]:
         events_key = MessageBusKeys.session_events(session_id)
-        ready = asyncio.Event()
-        queue: asyncio.Queue[dict | None] = asyncio.Queue()
-
-        async def _feeder() -> None:
-            """Read from the bus subscription and forward to the queue.
-
-            Pushes ``None`` as a sentinel when the subscription ends
-            (which in practice only happens if the bus shuts down).
-            """
-            try:
-                async for evt in message_bus.subscribe(
-                    events_key,
-                    on_ready=ready.set,
-                ):
-                    await queue.put(evt)
-            except asyncio.CancelledError:
-                pass
-            finally:
-                await queue.put(None)
-
-        feeder_task = asyncio.create_task(
-            _feeder(),
-            name=f"sse-feeder:{session_id}",
-        )
-
-        try:
-            # Subscribe first, then replay. Events arriving across that
-            # seam are present in both paths and deduplicated by entry id.
-            await asyncio.wait_for(
-                ready.wait(),
-                timeout=_SUBSCRIBE_TIMEOUT_SECS,
-            )
+        # Subscribe first, then replay. Events arriving across that seam
+        # are present in both paths and deduplicated by entry id.
+        async with _subscribe_live_events(message_bus, events_key) as queue:
             seen_entry_ids: set[str] = set()
             for entry_id, event in await message_bus.log_read(
                 events_key,
@@ -1000,18 +1060,9 @@ async def stream_session_events(
                     yield f"data: {data}\n\n"
                 except asyncio.TimeoutError:
                     yield ":\n\n"
-        finally:
-            feeder_task.cancel()
-            try:
-                await feeder_task
-            except asyncio.CancelledError:
-                pass
 
     return StreamingResponse(
         _sse_generator(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-        },
+        headers=_SSE_HEADERS,
     )

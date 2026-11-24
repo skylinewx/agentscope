@@ -26,6 +26,23 @@ def validate_coverage(verdict, material):
     from .readable_material import restore_material
     restored = restore_material(material) if material.get('materialFormat') else material
     collect(restored)
+    objectives = {o['number']: o for o in restored.get('objectiveCoverage', [])}
+    visible = {v['derivedId'] for v in restored.get('derived', []) if v.get('derivedId')}
+    applicable = {i: set(o.get('formulaRefs', [])) & visible for i, o in objectives.items()
+                  if o['capability'] == 'DATA_COMPOSITION' and not o.get('exploratory')}
+    checked = set()
+    for row in coverage:
+        number = row.get('objective')
+        if number is None:
+            continue
+        if number not in objectives:
+            raise AnalysisError('REVIEW_COVERAGE_INVALID', '核对对象编号必须来自本阶段材料。')
+        if row['status'] == 'COVERED' and applicable.get(number) and not (applicable[number] & set(row['evidenceRefs'])):
+            raise AnalysisError('REVIEW_COVERAGE_INVALID', f'目标 {number} 的构成结论请引用该对象的来源公式结果。若正文遗漏构成，请按实际情况纠正覆盖判断。')
+        checked.add(number)
+    missing = [n for n, refs in applicable.items() if refs and n not in checked]
+    if missing:
+        raise AnalysisError('REVIEW_COVERAGE_INVALID', '请为本阶段可核对的数据构成目标给出覆盖结论并填写目标编号 ' + '、'.join(map(str, missing)))
     unknown, invalid_positions = [], {}
     for index, item in enumerate(coverage):
         invalid = [pos for pos, ref in enumerate(item['evidenceRefs']) if ref not in known]

@@ -61,7 +61,7 @@ class Limits:
     max_review_attempts: int = 5
     max_review_output_repairs: int = 2
     review_budget_seconds: int = 1800
-    max_analysis_repairs: int = 4
+    max_analysis_repairs: int = 8
     repair_budget_seconds: int = 3600
     max_query_retries: int = 1
 

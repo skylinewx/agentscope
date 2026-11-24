@@ -23,6 +23,10 @@ def selected_tables(captures, selections):
             receipt = receipt_from_capture(capture)
             by_identity = {}
             for step, table, path in tables(receipt):
+                from .budget_dimensions import dimension_labels, source_models
+                models = source_models([*table.get('metrics', []), *table.get('data', {}).get('cellResults', [])])
+                if models:
+                    table = {**table, 'dimensionLabels': dimension_labels(receipt.get('data', {}).get('dimensionCatalog', []), models=models)}
                 by_identity.setdefault((step, table.get('batchId')), []).append((step, table, path))
             indexed[ref] = receipt, by_identity
         receipt, by_identity = indexed[ref]
@@ -62,7 +66,11 @@ def resolve_members(registry, captures, selections, scope, max_members):
     from .member_scopes import member_ref
     members = {}
     references = set(scope.get('referenceMembers', []))
-    for selection, table, _, _, rows in tables:
+    unmatched = []
+    for selection, table, _, selected_columns, rows in tables:
+        if selection.get('rowIndices') and rows == set() and 'exactRowMetrics' in table:
+            unmatched.append((selection, table, sorted(selected_columns)))
+            continue
         columns = table['data']['columns']
         index = next((i for i, column in enumerate(columns) if column['name'] == dimension
                       and table['columnRoles'][dimension]['kind'] in ('DIMENSION', 'PROPERTY')), None)
@@ -91,6 +99,22 @@ def resolve_members(registry, captures, selections, scope, max_members):
             if len(members) > max_members:
                 raise AnalysisError('FACT_LIMIT', '批量成员数量超过分析容量，原始查询结果仍可读取。')
     if not members:
+        if unmatched:
+            from .adapters.budget_batch import selectors
+            selection, table, names = unmatched[0]
+            capture = captures[selection['captureRef']]
+            details = {'path': '/selections/rowIndices', 'metricColumns': names,
+                       'submittedRowCount': len(selection['rowIndices']),
+                       'nativeRowsForColumns': sum(name in names for name in table['exactRowMetrics']),
+                       'selectionRead': {'section': 'selectors', 'captureRef': selection['captureRef']}}
+            returned = [entry for entry in selectors(capture) if entry['stepId'] == selection['stepId']
+                        and entry['batchId'] == selection['batchId'] and set(names) <= set(entry['columnNames'])]
+            if len(returned) == 1 and returned[0].get('rowIndicesOptional') and not references:
+                details['ifUsingAllReturnedRows'] = {key: selection[key] for key in (
+                    'captureRef', 'stepId', 'batchId', 'columnNames', 'role', 'grain') if key in selection}
+            raise AnalysisError('PREPARATION_NEEDS_SELECTION',
+                '所填原始行号没有命中所选指标。业务表合并展示的行号不能用作原始行号。'
+                '若目标是这些指标的全部返回行，可采用提供的完整选区；只取部分成员请沿用已筛选来源或核对原始选择器。无需重新取数。', details)
         raise AnalysisError('EMPTY_SELECTION', '所选批量结果没有主体成员。')
     scope['members'] = list(members)
     return scope
@@ -146,7 +170,7 @@ def selection_audit(captures, selections, scope):
                        'missingSelectedCellCount': missing_selected_cells,
                        'columnSelection': [{'columnName': name, 'selectedRowCount': len(selected)}
                                            for name, selected in sorted(record['columnRows'].items())],
-                       'columns': columns, 'columnRoles': table['columnRoles'],
+                       'columns': columns, 'columnRoles': table['columnRoles'], 'dimensionLabels': table.get('dimensionLabels', {}),
                        'request': {key: table['request'][key] for key in
                                    ('budTaskId', 'batchDimensions', 'resultWhere', 'aggregation', 'having', 'orderBy')
                                    if key in table['request']},

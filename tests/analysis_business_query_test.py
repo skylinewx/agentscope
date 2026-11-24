@@ -52,6 +52,43 @@ def business_fixture():
 
 
 class BusinessQueryTest(TestCase):
+    def test_unrelated_binding_failure_does_not_make_selected_cells_incomplete(self):
+        from analysis_extension.adapters.budget_batch import adapt
+        capture, receipt = business_fixture()
+        receipt.update(status='PARTIAL', completeness={'enumerationExhausted': False})
+        data = receipt['data']
+        data['complete'] = False
+        selection = {'captureRef': capture['captureRef'], 'stepId': 'batch', 'batchId': 'batch-A', 'columnNames': ['metric1']}
+        scope = {'memberDimension': 'MD_ORG', 'members': ['07', '05']}
+        for failed, expected in [('other-binding', True), ('binding-A', False), (None, False)]:
+            with self.subTest(failed=failed):
+                data['unresolvedGroups'] = [{'binding': failed, 'code': 'SOURCE_UNAVAILABLE'}]
+                update(capture, receipt)
+                result = adapt({capture['captureRef']: capture}, [selection], scope, 20)
+                self.assertEqual(result['scope']['selectedDataComplete'], expected)
+                self.assertFalse(result['scope']['sourcePagesComplete'])
+                self.assertFalse(result['scope']['populationComplete'])
+
+    def test_partial_empty_result_requires_a_completed_zero_row_batch_for_this_target(self):
+        from analysis_extension.empty_sources import is_empty_result
+        _, receipt = business_fixture()
+        data = receipt['data']
+        receipt['status'] = 'PARTIAL'
+        data.update(complete=False, unresolvedGroups=[{'binding': 'unrelated'}])
+        result = data['resultSets'][0]
+        result['rows'] = []
+        batch = data['stepResults'][0]['batchResults'][0]
+        batch['data'].update(rows=[], rowCount=0)
+        native = {'status': 'SUCCEEDED', 'rowCount': 0, 'batchId': batch['batchId'],
+                  'logicalTargetColumns': {result['targetId']: 'metric1'}}
+        data['valueFilter'] = {'executionStatus': 'EXECUTED', 'batches': [native]}
+        self.assertTrue(is_empty_result(receipt, result))
+        native['logicalTargetColumns'] = {'another-target': 'metric1'}
+        self.assertFalse(is_empty_result(receipt, result))
+        native['logicalTargetColumns'] = {result['targetId']: 'metric1'}
+        result['rowsComplete'] = False
+        self.assertFalse(is_empty_result(receipt, result))
+
     def test_independent_query_does_not_inherit_or_conflict_with_previous_value_filter(self):
         from types import SimpleNamespace
         from analysis_extension.followup_scope import prepare_request
@@ -168,6 +205,41 @@ class BusinessQueryTest(TestCase):
             ({**capture,'captureRef':'other'},{'executionId':'other','status':'IN_PROGRESS'})]),set())
         missing={**capture,'request':{'question':'净利润'}}
         self.assertEqual(superseded_status_reads([(missing,receipt),({**missing,'captureRef':'final'},terminal)]),set())
+
+    def test_complete_same_query_retry_resolves_only_covered_transient_failures(self):
+        from analysis_extension.query_waiting import superseded_query_reads
+
+        request = {'requestId': 'a', 'purpose': 'QUERY', 'querySessionId': 'session', 'contextId': 'ctx',
+                   'question': '比较两项', 'scope': {'periodCode': '2026N0001'}}
+        old = {'captureRef': 'old', 'originalToolName': 'execute_budget_query', 'request': request,
+               'connectionFingerprint': 'connection', 'turnKey': 'turn', 'capturedAt': '2026-06-01T00:00:00Z'}
+        new = {**old, 'captureRef': 'new', 'capturedAt': '2026-06-01T00:00:01Z',
+               'request': {**request, 'requestId': 'b', 'selection': 'CELLS'}}
+        result = {'targetId': 't', 'interpretationId': 'i1', 'context': {'target': {'formBindingKey': 'f'}}, 'rows': []}
+        pending = {'binding': 'g', 'diagnostics': {'retryable': True}}
+        data = {'purpose': 'QUERY', 'selection': 'CELLS', 'complete': False, 'unresolvedGroups': [pending],
+                'resultSets': [result]}
+        partial = {'status': 'PARTIAL', 'data': data, 'querySessionId': 'session', 'context': {'contextId': 'ctx'}}
+        finished = {**data, 'complete': True, 'unresolvedGroups': [], 'failureSummary': {'outcome': 'NO_DATA'},
+                    'resultSets': [result, {**result, 'interpretationId': 'i2', 'context': {'target': {'formBindingKey': 'g'}}}]}
+        success = {**partial, 'status': 'SUCCEEDED', 'data': finished}
+
+        self.assertEqual(superseded_query_reads([(old, partial), (new, success)]), {'old'})
+        for changed in ({'scope': {'periodCode': '2025N0001'}}, {'selection': 'FORMULAS'},
+                        {'basis': {'kind': 'MEMBERS'}}, {'valueFilter': {'threshold': '2'}}):
+            with self.subTest(changed=changed):
+                changed_capture = {**new, 'request': {**new['request'], **changed}}
+                self.assertFalse(superseded_query_reads([(old, partial), (changed_capture, success)]))
+        for changed in ({'turnKey': 'other'}, {'connectionFingerprint': 'other'},
+                        {'capturedAt': '2026-05-31T22:00:00Z'}):
+            with self.subTest(changed=changed):
+                self.assertFalse(superseded_query_reads([(old, partial), ({**new, **changed}, success)]))
+        for changed in ({'resultSets': [result]}, {'resultSets': finished['resultSets'][1:]}, {'complete': False},
+                        {'unresolvedGroups': [pending]}, {'resultSetCatalog': [{'rowsComplete': False}]}):
+            with self.subTest(changed=changed):
+                self.assertFalse(superseded_query_reads([(old, partial), (new, {**success, 'data': {**finished, **changed}})]))
+        terminal_error = {**data, 'unresolvedGroups': [{'binding': 'g', 'diagnostics': {'retryable': False}}]}
+        self.assertFalse(superseded_query_reads([(old, {**partial, 'data': terminal_error}), (new, success)]))
 
     def test_same_value_tasks_are_listed_without_duplicate_interpretations_or_cross_scope_merging(self):
         from analysis_extension.adapters.budget_query import present_value_groups

@@ -1,11 +1,34 @@
 """可选真实浏览器回归：冻结页面与聊天 iframe 使用同一检查协议。"""
 import os
-from unittest import skipUnless
+import subprocess
+import sys
+from unittest import IsolatedAsyncioTestCase, skipUnless
+from unittest.mock import patch
 
 from analysis_fixtures import OWNER, saved_fixture
 from analysis_presentation_fixtures import PresentationCase
 from analysis_extension.local_render import LocalRenderChecker
 from analysis_extension.models import AnalysisError
+
+
+class RenderDeadlineTests(IsolatedAsyncioTestCase):
+    async def test_stalled_driver_start_is_bounded_outside_the_worker(self):
+        popen = subprocess.Popen
+        workers = []
+        def stalled(command, **kwargs):
+            process = popen([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs)
+            workers.append(process)
+            return process
+        # The real termination helper uses subprocess to invoke the OS. Redirect just the test worker.
+        def launch(command, **kwargs):
+            return stalled(command, **kwargs) if command[0] == sys.executable else popen(command, **kwargs)
+        with patch('analysis_extension.local_render.subprocess.Popen', side_effect=launch), \
+                patch('analysis_extension.local_render.RENDER_SECONDS', 0.2):
+            with self.assertRaises(AnalysisError) as failure:
+                await LocalRenderChecker().check({'html': '<p>数据</p>', 'frameKey': 'test'})
+        self.assertEqual(failure.exception.code, 'RENDER_SERVICE_UNAVAILABLE')
+        self.assertFalse(failure.exception.details['requiresSourceQuery'])
+        self.assertIsNotNone(workers[0].poll())
 
 
 @skipUnless(os.environ.get('RUN_ANALYSIS_BROWSER_TESTS') == '1',
@@ -96,6 +119,16 @@ analysisCharts.bindLinearBars(['second','third'].map((key,index)=>
             await self.service.publish(**preview['confirmPublish'])
         self.assertEqual(caught.exception.code, 'DOCUMENT_RENDER_ERRORS')
 
+    async def test_caught_bar_binding_error_requires_local_repair(self):
+        request = await self.prepare("""<div id="track"><div id="bar" style="height:12px"></div></div><script>
+const element=document.getElementById('bar'), options={extent:document.getElementById('track')};
+try{analysisCharts.bindLinearBars([{element,valueKey:'absent'}],options)}catch(e){}
+</script>""")
+        preview = await self.service.publish(**request, previewOnly=True)
+        self.assertEqual(preview['nextAction'], 'REPAIR_DOCUMENT')
+        for sample in preview['diagnostics']['renderChecks']['viewports']:
+            self.assertTrue(any('线性条形' in message for message in sample['errors']))
+
     async def test_linear_bars_in_auto_layout_table_do_not_loop_in_resize_observer(self):
         request = await self.prepare('''<style>
 .comparison{width:100%;table-layout:auto}.track{height:12px;min-width:110px;background:#eee}
@@ -138,8 +171,25 @@ analysisCharts.bindLinearBars([
         published = await self.service.publish(**preview['confirmPublish'])
         self.assertTrue(published['delivery']['registered'])
 
+    async def test_linear_scale_accepts_one_css_pixel_and_rejects_a_larger_error(self):
+        request = await self.prepare('''<div data-analysis-scale="amounts" data-analysis-bar-value="amount"
+style="height:10px;width:64px;background:teal"></div>
+<div data-analysis-scale="amounts" data-analysis-bar-value="amount"
+style="height:10px;width:65px;background:teal"></div>''')
+        for width, expected in [('65px', 'PASS'), ('65.25px', 'FAIL')]:
+            with self.subTest(width=width):
+                request['document']['html'] = request['document']['html'].replace('width:65px', 'width:' + width)
+                request['requestKey'] = 'scale-check-' + width
+                preview = await self.service.publish(**request, previewOnly=True)
+                viewports = preview['diagnostics']['renderChecks']['viewports']
+                self.assertEqual(len(viewports), 2)
+                for view in viewports:
+                    checks = view['numericChecks']['linearBars']
+                    self.assertEqual(checks['measured'], 2)
+                    self.assertEqual(checks['status'], expected, view)
+
     async def test_bound_subpixel_amount_is_not_mistaken_for_a_missing_bar(self):
-        request = await self.prepare('''<div id="track" style="width:100%">
+        request = await self.prepare('''<style>#track > div{min-width:2px}</style><div id="track" style="width:100%">
 <div id="large" style="height:14px;background:teal"></div>
 <div id="small" style="height:14px;background:orange"></div></div><p>{{tiny}}</p>
 <script>analysisCharts.bindLinearBars([

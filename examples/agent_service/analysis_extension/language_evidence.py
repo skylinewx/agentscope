@@ -50,6 +50,9 @@ def bind(turn, request):
             if value:
                 anchor(value, f'{path}/selector/{key}')
         quote = (request.get('question') or '').strip()
+        member = scope.get('sourceText')
+        if isinstance(member, str) and member and member in quote and selector == {'type': 'VALUES', 'members': [member]}:
+            quote = member
         scope['sourceText'] = anchor(quote, path)
     for index, relation in enumerate(draft.get('relations', [])):
         relation['sourceText'] = anchor((request.get('question') or '').strip(), f'relations/{index}')

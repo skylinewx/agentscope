@@ -102,6 +102,23 @@ class PublicationRepairTests(PresentationCase):
         self.assertEqual(html.count('id="detail-title-'), 2)
         self.assertIn('查看其余 7 项（共 11 项）' if plans[0]['pageSize'] == 4 else '查看其余 8 项（共 11 项）', html)
 
+    async def test_invalid_value_work_reference_returns_an_editable_publication_path(self):
+        await self.build(work=[{'taskId': 'values', 'title': '列出来源值', 'kind': 'VALUES', 'refs': []}])
+        views = [self.view('TABLE', self.refs)]
+        with self.assertRaises(AnalysisError) as invalid_kind:
+            await self.service.publish(self.ref, [], views, 'bad-kind',
+                workRefs=[{'taskId': 'values', 'operator': 'SORT', 'refs': ['derived_sort']}])
+        self.assertEqual(invalid_kind.exception.details['path'], '/workRefs/0')
+        with self.assertRaises(AnalysisError) as invalid_ref:
+            await self.service.publish(self.ref, [], views, 'bad-ref',
+                workRefs=[{'taskId': 'values', 'refs': ['derived_sort']}])
+        detail = invalid_ref.exception.details
+        self.assertEqual(detail['path'], '/workRefs/0/refs')
+        self.assertFalse(detail['requiresSourceQuery'])
+        published = await self.service.publish(self.ref, requestKey='repaired-ref', repairRef=detail['repairRef'],
+            repairs=[{'op': 'replace', 'path': detail['path'], 'value': self.refs}])
+        self.assertEqual(published['summary']['completion']['state'], 'READY')
+
     async def test_work_refs_close_real_tasks_without_rebuilding_and_mismatch_is_not_pending(self):
         await self.build(work=[{'taskId': 'sort', 'title': '排序', 'kind': 'COMPUTATION', 'refs': []}])
         views = [self.view('TABLE', self.refs, orderRef='derived_sort')]

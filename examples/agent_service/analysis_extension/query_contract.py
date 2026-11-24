@@ -11,15 +11,19 @@ def model_schema(native):
     props.pop('conditionContext', None)
     props.pop('requestId', None)
     props.pop('purpose', None)
-    props['materialRole'] = {'enum': ['PRIMARY', 'REFERENCE', 'STRUCTURE'],
-        'description': '本次查询的资料用途，默认 PRIMARY；对照取数使用 REFERENCE。材料种类仅由 AnalysisTask.materials 声明，底层 purpose 由宿主生成。'}
-    schema['required'] = [key for key in schema.get('required', []) if key not in ('requestId', 'purpose')]
+    props.pop('question', None)
+    props['objectiveRef'] = {'type': 'string', 'minLength': 1, 'description': '存在多个适用目标时，选择 AnalysisTask 返回的目标引用。'}
+    schema['required'] = [key for key in schema.get('required', []) if key not in (
+        'requestId', 'purpose', 'question', 'contextId', 'querySessionId')]
+    for key in ('contextId', 'querySessionId'):
+        if key in props:
+            props[key]['description'] = '通常省略，由宿主绑定当前连接。目录有多个候选时，可成对指定已打开的上下文和会话。'
     scope = props.get('scope', {}).get('properties', {})
     scope['bindings'] = {'type': 'array', 'maxItems': 32, 'items': {
-        'type': 'object', 'additionalProperties': False, 'required': ['text', 'candidateRef'],
+        'type': 'object', 'additionalProperties': False, 'required': ['candidateRef'],
         'properties': {'text': {'type': 'string', 'minLength': 1},
                        'candidateRef': {'type': 'string', 'minLength': 1}}},
-        'description': '任务或表样简称先 search_entities，选择 scopeCandidates 的 candidateRef，text 保留用户原话；多候选结合上下文选择，不默认第一条。若发现本轮曾把同一检索词误填为未经确认的维度成员，用 AnalysisTask.scopeEdits 明确撤回该维度猜测后再绑定。'}
+        'description': '使用回执中已有的候选，或用 search_entities 检索任务或表样简称。candidateRef 填所选行的引用，通常只填 candidateRef。检索词与用户原词不同且元数据确认名称对应时可填 text 指明用户原词。多候选结合上下文选择。若同一词曾被误填为未经确认的维度成员，用 AnalysisTask.scopeEdits 撤回该猜测后再绑定。'}
     props['basis'] = {'type': 'object', 'additionalProperties': False, 'required': ['kind'],
                      'properties': {'kind': {'type': 'string', 'enum': ['INTENT', 'FACTS', 'MEMBERS']},
                                     'sourceRef': {'type': 'string', 'minLength': 1}},
@@ -44,11 +48,12 @@ def model_schema(native):
     if 'sharedConditions' in draft.get('properties', {}):
         draft['properties']['sharedConditions']['description'] = (
             '本次共享条件。省略、[] 或非空列表均保留仍适用的已确认条件；非空列表补充本次条件。'
+            '本轮明确重申的共同情景可按原词填 {"text":"原文情景词"}；收到未归属短语时保留其他目标、时期与范围，只补其实际用途。'
             '更换或解除情景、机构等条件使用 AnalysisTask.intent/scopeEdits，宿主同步释放旧条件及其校验上下文。')
     if 'targets' in draft.get('properties', {}):
         targets = draft['properties']['targets']
-        targets['description'] = targets.get('description', '') + ' 继续同一指标只改范围/排序/分组时可省略，宿主复用已确认目标；更换指标必须填写。'
-    scope['bindings']['description'] += ' 绑定后保持原 selection、指标、机构、时期和情景；仅因找到表样候选不改成 FULL_FORM。'
+        targets['description'] = targets.get('description', '') + ' 不同指标分别用用户原词；共用的业务条件放 sharedConditions。表名和指标不要拼成一个短语。继续同一指标只改范围/排序/分组时可省略；更换指标必须填写。'
+    scope['bindings']['description'] += ' 仅选候选时沿用实际执行条件和 selection。同一指标需纠正筛选、时期或共享条件时，可随绑定提交更正，再按新条件取数。换指标请重新提交目标。'
     dimension_scopes = draft.get('properties', {}).get('dimensionScopes')
     if dimension_scopes:
         dimension_scopes['description'] += (' 仅本次查询改变范围时填写；已在 AnalysisTask.scopeEdits 声明的相同选择器由宿主注入，无需重复。'
@@ -61,9 +66,15 @@ async def configure(toolkit, resource_ids):
     if not hasattr(toolkit, '_get_available_tools') or not hasattr(toolkit, 'tool_groups'):
         return
     available = await toolkit._get_available_tools([group.name for group in toolkit.tool_groups])
+    names = {}
     for registration in available.values():
         tool = registration.tool
         origin = leased_mcp_origin(tool, resource_ids)
+        if origin:
+            from .adapters.budget_v2 import declares_v2
+            if declares_v2(tool.input_schema):
+                names[tool.name] = origin['originalToolName']
         if origin and origin['originalToolName'] == 'execute_budget_query':
             # Each leased tool belongs to this agent session; never mutate the shared MCP tool.
             tool.model_input_schema = model_schema(tool.input_schema)
+    return names

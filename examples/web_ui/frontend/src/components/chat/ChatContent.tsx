@@ -1,4 +1,3 @@
-import { ExecutionProgress } from './ExecutionProgress';
 import { ReplyFinishedReason } from '@agentscope-ai/agentscope/event';
 import {
 	type ContentBlock,
@@ -7,10 +6,12 @@ import {
 	type ToolCallBlock,
 } from '@agentscope-ai/agentscope/message';
 import { GitBranch, TriangleAlert } from 'lucide-react';
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { AnalysisDraftContext } from './AnalysisDraftContext';
+import { ExecutionProgress } from './ExecutionProgress';
 import { MessageQueue } from './MessageQueue';
+import { FocusReply, ReplyResult } from './ReplyResult';
 import { Button } from '../ui/button';
 import { DiffStats } from './tool-renderers/_shared';
 import type { GitStatus } from '@/api';
@@ -31,12 +32,14 @@ import {
 	MessageScrollerViewport,
 } from '@/components/ui/message-scroller.tsx';
 import { Spinner } from '@/components/ui/spinner';
+import { useSessionActivity } from '@/context/session-activity';
 import type { MessageQueueController } from '@/hooks/useMessageQueue';
 import type { ConnectionNotice, ReplyPhase } from '@/hooks/useMessages';
 import { useTranslation } from '@/i18n/useI18n';
 import { draftScope } from '@/lib/analysis-draft';
 import type { RealtimeConnectionState } from '@/lib/browserWebRTCTransport';
 import { backgroundWaitStates, groupReplyMessages, pendingCalls } from '@/lib/reply-presentation';
+import { sessionKey } from '@/lib/session-activity';
 import { cn } from '@/lib/utils';
 
 /** How long a load may run before it is worth showing a spinner. */
@@ -68,6 +71,8 @@ function markerStamp(at: Date, previous: Date, language: string): string {
 
 interface ChatContentProps {
 	msgs: Msg[];
+	focusReplyId?: string | null;
+	focusNavigationKey?: string;
 	/**
 	 * Whether the history for the currently selected session is still on
 	 * the wire. Takes precedence over {@link msgs}, which still holds the
@@ -130,6 +135,8 @@ interface ChatContentProps {
 
 const ChatContentComponent: React.FC<ChatContentProps> = ({
 	msgs,
+	focusReplyId,
+	focusNavigationKey,
 	loading = false,
 	historyError = null,
 	connectionNotice = null,
@@ -158,6 +165,15 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 }) => {
 	const { t, i18n } = useTranslation();
 	const inputRef = useRef<TextInputRef>(null);
+	const viewportRef = useRef<HTMLDivElement>(null);
+	const activity = useSessionActivity();
+	const markRead = activity?.markRead;
+	const receipts = agentId && sessionId ? activity?.unread.get(sessionKey({ agent_id: agentId, session_id: sessionId })) : undefined;
+	const unreadIds = useMemo(() => new Set(receipts?.map(({ reply_id }) => reply_id)), [receipts]);
+	const markVisible = useCallback((replyId: string) => {
+		if (agentId && sessionId) markRead?.({ agent_id: agentId, session_id: sessionId, reply_id: replyId });
+	}, [agentId, sessionId, markRead]);
+
 	const inputScope = draftScope(getBaseUrl(), getUserId(), agentId, sessionId);
 	// Only a session that finished loading with nothing in it is empty.
 	// Treating "no messages yet" as empty would flash the greeting over
@@ -188,6 +204,7 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 	}, [msgs]);
 	const backgroundWaiting = useMemo(() => backgroundWaitStates(msgs), [msgs]);
 	const replyGroups = useMemo(() => groupReplyMessages(msgs), [msgs]);
+	const canFocus = focusReplyId && replyGroups.some(({ message }) => message.id === focusReplyId);
 
 	// On an empty session the prompt and the input centre together, so every box
 	// down to the message list shrinks to its content instead of filling.
@@ -257,7 +274,8 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 						defaultScrollPosition={'end'}
 					>
 						<MessageScroller>
-							<MessageScrollerViewport>
+							{canFocus && <FocusReply replyId={focusReplyId} navigationKey={focusNavigationKey} viewport={viewportRef} />}
+							<MessageScrollerViewport ref={viewportRef}>
 								<MessageScrollerContent>
 									{replyGroups.map(({ key, message }, index) => {
 										const previous = replyGroups[index - 1]?.message;
@@ -265,6 +283,11 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 										const previousAt = previous
 											? new Date(previous.finished_at ?? previous.created_at)
 											: at;
+										const waiting = backgroundWaiting.get(message.id) ?? false;
+										const unread = unreadIds.has(message.id);
+										const showResultAnchor = message.role === 'assistant' &&
+											message.finished_reason === ReplyFinishedReason.COMPLETED && !waiting &&
+											(unread || message.id === focusReplyId);
 										return (
 											<MessageScrollerItem
 												key={`${inputScope}:${key}`}
@@ -290,7 +313,8 @@ const ChatContentComponent: React.FC<ChatContentProps> = ({
 													sessionId={sessionId}
 													message={message}
 													connectionLost={connectionLost}
-													backgroundWaiting={backgroundWaiting.get(message.id) ?? false}
+													backgroundWaiting={waiting}
+													resultAnchor={showResultAnchor ? <ReplyResult replyId={message.id} onVisible={unread ? markVisible : undefined} /> : undefined}
 													onUserConfirm={onUserConfirm}
 												/>
 											</MessageScrollerItem>

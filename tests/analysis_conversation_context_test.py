@@ -113,6 +113,7 @@ class ConversationContextTest(unittest.TestCase):
         state = {**next_context_state(self.first), 'turnKey': 'top-three', 'mode': 'DIRECT',
                  'request': '回到第一组，只要前三名', 'queryIntent': {'population': '第一组前三名'},
                  'deliveredAnswer': '前三名的实际交付内容', 'followupContext': {'mode': 'CONTINUE'}}
+        state['selectedContextRefs'] = [state['businessContexts'][0]['contextRef']]
         remember_subject(SimpleNamespace(state=state, service=SimpleNamespace()), {'status': 'DIRECT'})
         snapshot = state['businessContexts'][-1]
         self.assertEqual(snapshot['captureRefs'], ['c1'])
@@ -141,6 +142,7 @@ class ConversationContextTest(unittest.TestCase):
         state['lastCheck'] = {'status': 'READY'}
         followup = {**next_context_state(state), 'turnKey': 'count', 'request': '其中有几家',
                     'queryIntent': self.first['queryIntent'], 'followupContext': {'mode': 'CONTINUE'}}
+        followup['selectedContextRefs'] = [saved['contextRef']]
         remember_subject(SimpleNamespace(state=followup, service=service), {'status': 'DIRECT'})
         self.assertEqual(set(followup['businessContexts'][-1]['captureRefs']), {'c1', 'grid-details'})
         self.assertEqual(followup['businessContexts'][-1]['analysisRef'], 'report:2')
@@ -150,6 +152,9 @@ class ConversationContextTest(unittest.TestCase):
         state['businessContexts'][0]['analysisRef'] = 'report:2'
         service = SimpleNamespace(store=Mock(), owner='owner')
         service.store.get_analysis.return_value = {'captureRefs': ['c1', 'grid-details']}
+        self.assertNotIn('queryCaptureRefs', evidence_turn(SimpleNamespace(state=state, service=service)).state)
+        service.store.get_analysis.assert_not_called()
+        state['selectedContextRefs'] = [state['businessContexts'][0]['contextRef']]
         original = deepcopy(state)
         evidence = evidence_turn(SimpleNamespace(state=state, service=service))
         self.assertEqual(evidence.state['queryCaptureRefs'], ['c1', 'grid-details'])

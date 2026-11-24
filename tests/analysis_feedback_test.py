@@ -12,6 +12,22 @@ from analysis_extension.tools import AnalysisPublish
 
 
 class ScopeFeedbackTests(TestCase):
+    def test_misplaced_document_bindings_give_the_repair_without_echoing_the_document(self):
+        request = {'requestKey': 'p', 'analysisRef': 'a:1', 'document': {'title': 'demo', 'html': 'private HTML'},
+                   'datasets': [{'key': 'items', 'valueRef': 'derived_items'}], 'bindings': []}
+        issues = schema_issues(request)
+        self.assertEqual(issues[0]['path'], '/document')
+        self.assertIn('移入 document', issues[0]['message'])
+        self.assertNotIn('private HTML', json.dumps(issues, ensure_ascii=False))
+        for field in ('datasets', 'bindings'):
+            request['document'][field] = request.pop(field)
+        self.assertEqual(schema_issues(request), [])
+        request['bindings'] = request['document'].pop('bindings')
+        misplaced = schema_issues(request)
+        self.assertEqual(len(misplaced), 1)
+        self.assertIn('并入 document', misplaced[0]['message'])
+        self.assertEqual(misplaced[0]['unknownFields'], ['bindings'])
+
     def test_all_missing_members_and_dimension_conflicts_are_returned_without_mutation(self):
         capture, selections, scope = fixture()
         scope['members'] = scope['members'][:1]
@@ -54,6 +70,10 @@ class ScopeFeedbackTests(TestCase):
         self.assertEqual(issues[0]['path'], '/claims')
         self.assertIn('repairs', issues[0]['message'])
         self.assertNotIn(str(request), issues[0]['message'])
+
+    def test_repair_tool_accepts_the_freeze_reference_already_checked_by_service(self):
+        self.assertEqual(schema_issues({'analysisRef': 'saved:2', 'repairRef': 'its-proposal', 'requestKey': 'fix',
+            'repairs': [{'op': 'appendMarkdown', 'path': '/document/markdown', 'value': '图表'}], 'finalize': True}), [])
 
     def test_document_publish_identifies_missing_analysis_reference_without_rewriting_report(self):
         request = {'document': {'title': '渠道分析', 'path': 'report.html',
@@ -112,6 +132,24 @@ class ScopeFeedbackTests(TestCase):
 
 
 class ServiceFeedbackTests(PresentationCase):
+    async def test_repair_can_reference_the_parent_only_of_a_verified_receipt_build(self):
+        from analysis_extension.models import digest
+        from analysis_extension.service import _verification_build
+        cap, selectors, scope = saved_fixture(self.store)
+        base_ref = (await self.service.build([cap], selectors, scope, [], 'base'))['analysisRef']
+        base = self.store.get_analysis(OWNER, base_ref)
+        proof = _verification_build(base, base['captureRefs'])
+        verified = self.store.build(OWNER, proof, base, 'verification-' + digest(proof), base_ref)
+        ordinary = self.store.build(OWNER, {'kind': 'other'}, base, 'new-business-draft', base_ref)
+        self.assertTrue(self.service._is_verification_of(verified['analysisRef'], base_ref))
+        self.assertFalse(self.service._is_verification_of(ordinary['analysisRef'], base_ref))
+        self.assertFalse(self.service._is_verification_of(verified['analysisRef'], ordinary['analysisRef']))
+        fields = {'analysisRef': ordinary['analysisRef'], 'claims': [], 'viewPlan': []}
+        repair = self.store.save_publication_proposal(OWNER, ordinary['analysisRef'], fields)
+        with self.assertRaises(AnalysisError) as caught:
+            await self.service.publish(base_ref, repairRef=repair, repairs=[], requestKey='conflicting-parent')
+        self.assertEqual((caught.exception.code, caught.exception.details['path']), ('REPAIR_SCOPE', '/analysisRef'))
+
     async def test_missing_analysis_reference_is_actionable_in_actual_tool_response(self):
         chunk = await AnalysisPublish(self.service).call(
             document={'title': '渠道分析', 'path': 'report.html',

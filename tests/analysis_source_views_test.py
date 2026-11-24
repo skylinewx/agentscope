@@ -11,6 +11,41 @@ from analysis_extension.followup_scope import remember_subject
 
 
 class SourceViewTests(PresentationCase):
+    async def test_searching_a_comparison_question_includes_its_reused_subject(self):
+        ref = self.prepare_sources()
+        raw = {'captureRef': ref, 'stepId': 'batch', 'batchId': 'batch-A', 'columnNames': ['metric1']}
+        selections = []
+        for role, selected in [('PRIMARY', {**raw, 'rowIndices': [0]}), ('REFERENCE', raw)]:
+            view = register(self.service.turn, selected)
+            selections.append({**selected, 'role': role, 'sourceRef': view['sourceRef']})
+        scope = {'scopeRef': 'selected-groups', 'selections': selections}
+        record = {'contextRef': 'compared', 'request': '以选定对象为主体和全体比较', 'subjectScope': scope}
+        turn = TurnCompletion(self.service, {'businessContexts': [record], 'inheritedScope': scope})
+        catalog = directory(turn, search='选定对象')
+        self.assertEqual(catalog['total'], 2)
+        self.assertIn('（主体） | 1 |', catalog['markdown'])
+        self.assertIn('（对照） | 2 |', catalog['markdown'])
+        self.assertEqual(directory(turn, search='另一业务')['total'], 0)
+        self.assertEqual(directory(turn, search='选定对象', context_refs=[])['total'], 0)
+        self.assertNotIn('adoptedInputs', turn.state)
+
+    async def test_comparison_context_accepts_only_sources_selected_from_its_directory(self):
+        ref = self.prepare_sources()
+        scope = {'selections': [], 'basis':'UNRESOLVED_QUERY_SUBJECT', 'candidateCount':2, 'captureRefs':[ref]}
+        record = {'turnKey':'previous', 'contextRef':'ctx-old', 'request':'查两项数值', 'goal':'查两项数值', 'kind':'DELIVERED',
+                  'status':'DIRECT', 'subjectScope':scope, 'captureRefs':[ref], 'intent':{}}
+        turn = self.service.turn = TurnCompletion(self.service, {'turnKey':'current', 'request':'比较刚才两项',
+            'businessContexts':[record], 'inheritedScope':scope, 'failures':{}, 'buildRefs':[]})
+        refs = [s['sourceRef'] for s in directory(turn, context_refs=['ctx-old'])['sources']]
+        self.assertEqual(len(refs), 2)
+        comparison = {'items':[{'sourceRef':ref} for ref in refs]}
+        with self.assertRaises(AnalysisError):
+            await self.service.task(mode='DIRECT', comparison=comparison,
+                                    context={'mode':'CONTINUE','contextRefs':['unknown']})
+        await self.service.task(mode='DIRECT', comparison=comparison, context={'mode':'CONTINUE','contextRefs':refs})
+        self.assertEqual(turn.state['followupContext']['contextRefs'], ['ctx-old'])
+        self.assertEqual({i['sourceRef'] for i in turn.state['comparisonPlan']['items']}, set(refs))
+
     async def test_exact_cell_subject_freezes_real_rows_and_retains_selected_table_proof(self):
         from analysis_exact_cells_test import exact_fixture
         from analysis_extension.query_subject import candidates, freeze_subject
@@ -28,7 +63,7 @@ class SourceViewTests(PresentationCase):
         self.assertFalse(turn.state['queryAnswerSubject']['invalidSelection'])
         selection = turn.state['queryAnswerSubject']['selections'][0]
         self.assertEqual([item['resultSetId'] for item in selected_result_sets(receipt, selection)], ['r0'])
-        turn.state.update(followupContext={'mode': 'CONTINUE'}, inheritedScope={'selections': [selection]})
+        turn.state.update(followupContext={'mode': 'CONTINUE'}, selectedContextRefs=['origin'], inheritedScope={'selections': [selection]})
         self.assertEqual(scope_terms(turn, capture, {'scope': {'formNames': ['利润表']}}), ['利润表'])
 
     async def test_complete_empty_result_is_adopted_and_built_without_inventing_members(self):
@@ -107,6 +142,84 @@ class SourceViewTests(PresentationCase):
         self.service.turn = TurnCompletion(self.service, state)
         return ref
 
+    async def test_followup_keeps_confirmed_subset_and_full_reference_on_the_same_source(self):
+        from unittest.mock import patch
+        from analysis_extension.followup_scope import _confirmed_primary_rows
+        from analysis_extension.source_views import install, select
+        ref = self.prepare_sources()
+        turn = self.service.turn
+        raw = {'captureRef': ref, 'stepId': 'batch', 'batchId': 'batch-A', 'columnNames': ['metric1']}
+        source = register(turn, raw)
+        inputs = select(turn, [{'sourceRef': source['sourceRef'], 'role': role} for role in ('PRIMARY', 'REFERENCE')])
+        install(turn, inputs)
+        turn.state['inheritedScope'] = {'selections': [{**raw, 'rowIndices': [1]}]}
+        objective = {'role': 'PRIMARY', 'capability': 'DATA_COMPOSITION', 'sourceRef': source['sourceRef'], 'factRefs': ['f1']}
+        facts = [{'factId': 'f' + str(i), 'rowIndex': i, 'stepId': 'batch', 'batchId': 'batch-A',
+                  'columnName': 'metric1', 'captureRefs': [ref],
+                  'inputMemberships': [{'inputRef': inputs[0]['inputRef'], 'inputRole': 'PRIMARY'}]} for i in (0, 1)]
+        artifact = {'captureRefs': [ref], 'computationIntent': {'objectives': [objective]}, 'facts': facts}
+        self.assertEqual(_confirmed_primary_rows(turn, artifact, inputs), (inputs[0]['inputRef'], [1]))
+        for goals in ([{**objective, 'factRefs': ['f0']}], [{**objective, 'factRefs': ['other']}],
+                      [objective, {**objective, 'capability': 'VALUES', 'factRefs': []}]):
+            self.assertIsNone(_confirmed_primary_rows(turn, {**artifact, 'computationIntent': {'objectives': goals}}, inputs))
+        with patch.object(self.store, 'get_analysis', return_value=artifact):
+            remember_subject(turn, {'status': 'READY', 'analysisRef': 'saved'})
+        scope = turn.state['resolvedSubjectScope']['selections']
+        self.assertEqual([(s['role'], s.get('rowIndices')) for s in scope], [('PRIMARY', [1]), ('REFERENCE', None)])
+        self.assertNotEqual(scope[0]['sourceRef'], scope[1]['sourceRef'])
+        turn.state.update(queryCaptureRefs=[], inheritedScope={'selections': scope})
+        catalog = directory(turn)
+        self.assertIn('（主体）', catalog['markdown'])
+        self.assertIn('（对照）', catalog['markdown'])
+
+    async def test_explicit_members_bind_the_population_without_adopting_its_old_amounts(self):
+        ref = self.prepare_sources()
+        source = directory(self.service.turn)['sources'][0]
+        selection = self.store.get_source_view(OWNER, source['sourceRef'])['selection']
+        record = {'turnKey': 'sources', 'contextRef': 'old', 'request': '筛出对象', 'kind': 'DELIVERED',
+                  'status': 'DIRECT', 'intent': {}, 'subjectScope': {'selections': [selection]}, 'captureRefs': [ref]}
+        turn = self.service.turn = TurnCompletion(self.service, {'turnKey': 'next', 'request': '查询这些对象的产出',
+            'businessContexts': [record, {**record, 'contextRef': 'other', 'captureRefs': [], 'subjectScope': {}}],
+            'failures': {}, 'buildRefs': []})
+        declared = await self.service.task(mode='DIRECT', references=[{'use': 'MEMBERS', 'mention': '这些对象',
+            'sourceRef': source['sourceRef']}])
+        self.assertEqual(declared['historyReferences'][0]['sourceRef'], source['sourceRef'])
+        self.assertFalse(turn.state.get('adoptedInputs'))
+        await self.service.task(mode='DIRECT', references=[{'use': 'FACTS', 'mention': '这些对象', 'sourceRef': source['sourceRef']}])
+        self.assertEqual([item['sourceRef'] for item in turn.state['adoptedInputs']], [source['sourceRef']])
+        await self.service.task(mode='DIRECT', references=[{'use': 'MEMBERS', 'mention': '这些对象', 'sourceRef': source['sourceRef']}])
+        self.assertFalse(turn.state.get('adoptedInputs'))
+
+    async def test_reusing_a_named_source_path_keeps_only_its_native_form_or_task(self):
+        from analysis_extension.followup_scope import prepare_request
+        from analysis_extension.history_references import apply_source_paths
+        ref = self.prepare_sources()
+        sources = directory(self.service.turn)['sources']
+        selections = [self.store.get_source_view(OWNER, s['sourceRef'])['selection'] for s in sources]
+        origin = self.store.get_capture(OWNER, ref)
+        ctx = {'contextRef': 'old', 'turnKey': 'sources', 'kind': 'DELIVERED', 'request': '已查询两项科目',
+               'status': 'DIRECT', 'captureRefs': [ref], 'subjectScope': {'selections': selections}}
+        for use, phrase, field, expected in [('FORM', '上次那张表', 'formCodes', 'LRB'),
+                                             ('TASK', '原来的任务', 'taskCodes', 'TASK')]:
+            turn = self.service.turn = TurnCompletion(self.service, {'turnKey': 'next', 'request': phrase + '查收入',
+                'businessContexts': [ctx], 'failures': {}, 'buildRefs': []})
+            declared = await self.service.task(mode='DIRECT', references=[{'use': use, 'mention': phrase}])
+            self.assertEqual([item['code'] for item in declared['historyReferences']], [expected])
+            self.assertFalse(turn.state.get('adoptedInputs'))
+            prepared = prepare_request(turn, origin, {'intentDraft': {'targets': [
+                {'id': 'income', 'businessPhrases': [{'text': '收入'}]}]}})
+            self.assertEqual(prepared['scope'], {field: [expected]})
+            self.assertFalse(prepared.get('basis'))
+            self.assertEqual(prepared['intentDraft']['targets'][0]['id'], 'income')
+            with self.assertRaises(AnalysisError) as conflict:
+                apply_source_paths(turn, origin, {'scope': {field: ['different']}}, 'PRIMARY')
+            self.assertEqual(conflict.exception.code, 'HISTORY_SCOPE_CONFLICT')
+            with self.assertRaises(AnalysisError) as foreign:
+                apply_source_paths(turn, {**origin, 'connectionFingerprint': 'another'}, {}, 'PRIMARY')
+            self.assertEqual(foreign.exception.code, 'SOURCE_CONNECTION_MISMATCH')
+            with self.assertRaises(AnalysisError):
+                await self.service.task(mode='DIRECT', references=[{'use': use, 'mention': phrase, 'sourceCode': 'unknown'}])
+
     async def test_directory_is_read_only_and_sources_are_owner_bound(self):
         self.prepare_sources()
         result = directory(self.service.turn)
@@ -134,7 +247,8 @@ class SourceViewTests(PresentationCase):
         self.assertTrue(all(value['calculationValidation'] == 'PASS' for value in artifact['derivedValues']))
         remember_subject(self.service.turn, {'status': 'READY', 'analysisRef': built['analysisRef']})
         restored = next_context_state(deepcopy(self.service.turn.state))
-        self.assertEqual(len(restored['adoptedInputs']), 2)
+        self.assertNotIn('adoptedInputs', restored)
+        self.assertEqual(len(restored['businessContexts'][-1]['adoptedInputs']), 2)
 
     async def test_direct_build_remains_reviewable_after_result_is_indexed_next_turn(self):
         from unittest.mock import patch, AsyncMock
@@ -159,9 +273,19 @@ class SourceViewTests(PresentationCase):
         restored = next_context_state(deepcopy(self.service.turn.state))
         restored.update(turnKey='review', request='继续审核，不取数、不计算', failures={}, buildRefs=[])
         self.service.turn = TurnCompletion(self.service, restored)
-        await self.service.task(mode='REPORT', goal='审核原报告', context={'mode': 'CONTINUE'},
+        self.assertNotIn('adoptedInputs', restored)
+        await self.service.task(mode='REPORT', goal='审核原报告', references=[{'use': 'REPORT', 'mention': '继续审核'}],
             executionPolicy={'sourceQueries': False, 'computations': False})
         self.assertEqual(len(self.service.turn.state['adoptedInputs']), 2)
+        from jsonschema import validate
+        from analysis_extension.tools import AnalysisTask
+        lookup = {'action': 'tools', 'analysisRef': calculated['analysisRef']}
+        validate(lookup, AnalysisTask(self.service).model_input_schema)
+        original = deepcopy(self.service.turn.state)
+        self.assertEqual((await self.service.task(**lookup))['status'], 'READY')
+        self.assertEqual(self.service.turn.state, {**original, 'expandedToolCatalog': True})
+        with self.assertRaises(AnalysisError):
+            await self.service.task(action='tools', analysisRef='ana_unknown:1')
         before = deepcopy(self.service.turn.state)
         validate_analysis(self.service, artifact)
         self.assertEqual(self.service.turn.state, before)
@@ -180,6 +304,7 @@ class SourceViewTests(PresentationCase):
             no_calculation.assert_not_called()
             no_query.assert_not_awaited()
         self.assertEqual(restored_report['reusedAnalysis']['sourceCount'], 2)
+        self.assertEqual(self.service.turn.state['adoptedReportRef'], artifact['analysisRef'])
         self.assertNotIn('subjectSources', restored_report)
         validate_analysis(self.service, artifact)
         derived = next(value for value in artifact['derivedValues'] if value['operator'] == 'PYTHON')
@@ -195,6 +320,21 @@ class SourceViewTests(PresentationCase):
             fetch.assert_not_awaited()
         self.assertTrue(preview['previewOnly'])
         self.assertEqual(self.store.get_analysis(OWNER, calculated['analysisRef']), artifact)
+        # A later direct query can use the same rows. An old report repair proposal
+        # still belongs to its original report, even if the input versions compare equal.
+        report_state = deepcopy(self.service.turn.state)
+        self.service.turn.state.update(mode='DIRECT', adoptedReportRef=None, buildRefs=[],
+                                      queryCaptureRefs=[ref], queryResultRefs=['current-result'])
+        with self.assertRaises(AnalysisError) as obsolete:
+            await self.service.publish(repairRef=preview['repairRef'], repairs=[], previewOnly=True)
+        self.assertEqual(obsolete.exception.code, 'STALE_INPUT_SET')
+        self.assertEqual(obsolete.exception.details, {'currentMode': 'DIRECT'})
+        self.service.turn.state['adoptedInputs'][0]['selection']['role'] = 'REFERENCE'
+        self.service.turn.state['inputSetVersion'] = 'new-inputs'
+        with self.assertRaises(AnalysisError) as mismatch:
+            validate_analysis(self.service, artifact)
+        self.assertEqual(mismatch.exception.details, {'currentMode': 'DIRECT'})
+        self.service.turn.state = report_state
         # A role, column, row or grain change is still a real input change.
         selected = deepcopy(self.service.turn.state['adoptedInputs'])
         for change in ({'role': 'REFERENCE'}, {'columnNames': ['metric2']},
@@ -297,6 +437,26 @@ class SourceViewTests(PresentationCase):
                                     subjectSources=[{'sourceRef': 'invented'}])
         self.assertEqual(before, self.service.turn.state)
 
+    async def test_partial_analysis_retains_both_roles_after_a_successful_reference_query(self):
+        ref = self.prepare_sources()
+        turn = self.service.turn
+        selection = {'captureRef': ref, 'stepId': 'batch', 'batchId': 'batch-A', 'columnNames': ['metric1']}
+        primary = register(turn, {**selection, 'rowIndices': [0]})
+        reference = register(turn, selection)
+        await self.service.task(mode='ANALYSIS', goal='对照已选成员和全体成员', subjectSources=[
+            {'sourceRef': primary['sourceRef'], 'role': 'PRIMARY'},
+            {'sourceRef': reference['sourceRef'], 'role': 'REFERENCE'}])
+        turn.state['queryAnswerSubject'] = {'selections': [selection], 'basis': 'REVIEWED_ANSWER'}
+        remember_subject(turn, {'status': 'PARTIAL', 'deliveryStatus': 'FACT_SUMMARY'})
+        restored = next_context_state(turn.state)
+        selections = restored['inheritedScope']['selections']
+        self.assertEqual([(s['role'], s['sourceRef']) for s in selections],
+                         [('PRIMARY', primary['sourceRef']), ('REFERENCE', reference['sourceRef'])])
+        following = TurnCompletion(self.service, {**restored, 'turnKey': 'next', 'request': '这些成员的其他指标'})
+        directory_view = directory(following)
+        self.assertIn('（主体） | 1 |', directory_view['markdown'])
+        self.assertIn('（对照） | 2 |', directory_view['markdown'])
+
     async def test_direct_query_freezes_reviewed_result_instead_of_its_adopted_old_base(self):
         ref = self.prepare_sources()
         selected = {'captureRef': ref, 'stepId': 'batch', 'batchId': 'batch-A', 'columnNames': ['metric1']}
@@ -323,7 +483,8 @@ class SourceViewTests(PresentationCase):
         self.assertEqual(inputs[0]['rowCount'], 2)
         self.assertEqual(inputs[0]['selection']['captureRef'], fresh)
         restored = next_context_state(self.service.turn.state)
-        self.assertEqual(restored['adoptedInputs'], inputs)
+        self.assertNotIn('adoptedInputs', restored)
+        self.assertEqual(restored['businessContexts'][-1]['adoptedInputs'], inputs)
         self.assertEqual(restored['inheritedScope']['selections'], [delivered])
 
     async def test_metadata_probe_does_not_replace_explicitly_adopted_facts(self):

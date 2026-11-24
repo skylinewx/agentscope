@@ -28,7 +28,14 @@ from ._config import ContextConfig, ReActConfig, ModelConfig, InjectionConfig
 from ._reply_presentation import ReplyPresentationTracker
 from ..state import AgentState
 from ..state._state import ReplyContext
-from ._utils import _ToolCallBatch, Acting, Exit, Reasoning, _resolve_timezone
+from ._utils import (
+    _ToolCallBatch,
+    Acting,
+    Exit,
+    Reasoning,
+    _resolve_timezone,
+    _tool_validation_message,
+)
 from .._io_log import CallIO
 from .._logging import logger
 from .._utils._common import (
@@ -237,6 +244,9 @@ class Agent:
         ]
         self._model_call_middlewares = [
             _ for _ in middlewares if _.is_implemented("on_model_call")
+        ]
+        self._model_input_middlewares = [
+            mw for mw in middlewares if mw.is_implemented("on_prepare_model_input")
         ]
         self._system_prompt_middlewares = [
             _ for _ in middlewares if _.is_implemented("on_system_prompt")
@@ -2577,7 +2587,7 @@ class Agent:
             except jsonschema.ValidationError as e:
                 raise AgentOrientedException(
                     f"Input validation failed for tool '{tool_call.name}': "
-                    f"{e.message} (at {e.json_path})",
+                    f"{_tool_validation_message(e)}",
                 ) from e
 
         # The exceptions that
@@ -3393,10 +3403,10 @@ class Agent:
             self.state.tool_context.activated_groups,
         )
 
-        return {
-            "messages": messages,
-            "tools": tools,
-        }
+        prepared = {"messages": messages, "tools": tools}
+        for mw in self._model_input_middlewares:
+            prepared = await mw.on_prepare_model_input(self, prepared)
+        return prepared
 
     async def _call_model(
         self,

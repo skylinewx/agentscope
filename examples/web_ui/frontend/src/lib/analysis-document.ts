@@ -5,13 +5,15 @@ export interface FreeAnalysisDocument {
 export function parseFreeDocument(value: unknown): FreeAnalysisDocument {
     if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('INVALID_VIEW');
     const d = value as Record<string, unknown>;
-    if (d.version !== 'free-html-1' || typeof d.title !== 'string' || !d.title || d.title.length > 300
-        || typeof d.html !== 'string' || !d.html || new TextEncoder().encode(d.html).byteLength > 768 * 1024
+    if (typeof d.version !== 'string' || !d.version.trim()) throw new Error('INVALID_VIEW');
+    if (d.version !== 'free-html-1') throw new Error('UNSUPPORTED_VERSION');
+    // The server verifies source evidence. A compiled Markdown report or trend can use zero dynamic bindings.
+    if (typeof d.title !== 'string' || !d.title.trim() || d.title.length > 300
+        || typeof d.html !== 'string' || !d.html.trim() || new TextEncoder().encode(d.html).byteLength > 768 * 1024
         || typeof d.contentDigest !== 'string' || !/^[0-9a-f]{64}$/.test(d.contentDigest)
         || typeof d.frameKey !== 'string' || !/^[0-9a-f]{64}$/.test(d.frameKey)
         || typeof d.bindingCount !== 'number' || !Number.isInteger(d.bindingCount) || d.bindingCount < 0 || d.bindingCount > 2000
-        || (d.datasetCount !== undefined && (typeof d.datasetCount !== 'number' || !Number.isInteger(d.datasetCount) || d.datasetCount < 0 || d.datasetCount > 50))
-        || (d.bindingCount === 0 && !d.datasetCount)) throw new Error('INVALID_VIEW');
+        || (d.datasetCount !== undefined && (typeof d.datasetCount !== 'number' || !Number.isInteger(d.datasetCount) || d.datasetCount < 0 || d.datasetCount > 50))) throw new Error('INVALID_VIEW');
     return d as unknown as FreeAnalysisDocument;
 }
 

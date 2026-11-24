@@ -87,9 +87,6 @@ def result_facts(receipt: dict, source_id: str) -> list[dict]:
                 if _number(value):
                     unit = column['unit']
                     metric = column.get('label') or column['name']
-                    fixed = data.get('fixedDimNameMap')
-                    if len(metrics) == 1 and isinstance(fixed, dict) and _label(fixed.get('MD_BUDACCOUNT')):
-                        metric = re.sub(r'^[一二三四五六七八九十]+[、.．]', '', fixed['MD_BUDACCOUNT'])
                     add(f'已返回的记录中，{scope}的“{metric}”为 {value} {unit}',
                         f'{pointer}/rows/{row_index}/{i if isinstance(row, list) else column["name"]}',
                         value, unit, scope)

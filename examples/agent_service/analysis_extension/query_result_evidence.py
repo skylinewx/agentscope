@@ -34,18 +34,26 @@ def select_results(turn, selections):
             'boundary': '已登记答复依据；执行成功不代表业务核对通过。原始文件及探索记录保留，必要依赖由宿主追溯。'}
 
 
-def bind_answer_outputs(service, run, names):
+def bind_answer_outputs(service, run, names, *, analysis_ref=None):
     """在同一次计算中选定最终产物，避免为登记引用再增加一次模型往返。"""
     if names is None:
         return {}
-    if (not isinstance(names, list) or not names or any(not isinstance(name, str) for name in names)
-            or len(names) != len(set(names))):
-        raise AnalysisError('QUERY_RESULT_REFS', 'answerOutputs 使用本次 result 中不重复的 name。')
     by_name = {value['derivedId'].removeprefix('derived_' + run['runRef'] + '_'): value['derivedId']
                for value in run['outputs']}
-    if not set(names) <= set(by_name):
-        raise AnalysisError('QUERY_RESULT_REFS', 'answerOutputs 包含本次执行不存在的产物名称。',
-                            {'pythonRunRef': run['runRef'], 'availableNames': list(by_name), 'requiresSourceQuery': False})
+    if (not isinstance(names, list) or not names or any(not isinstance(n, str) or n not in by_name for n in names)
+            or len(names) != len(set(names))):
+        preview = list(by_name)[:12]
+        detail = {'pythonRunRef': run['runRef'], 'executionStatus': run['status'], 'path': '/answerOutputs',
+                  'requiresSourceQuery': False, 'outputCount': len(by_name), 'availableNames': preview,
+                  'availableOutputRefs': [by_name[n] for n in preview],
+                  'nextRead': {'section': 'python', 'pythonRunRef': run['runRef'],
+                               'pythonPath': '/outputs', 'fields': ['derivedId']}}
+        message = ('Python 计算已成功，答复产物尚未选定。用 AnalysisTask(action=select_results) 提交 resultRefs，'
+                   '其中 pythonRunRef 沿用本次运行，outputRefs 只填需要的产物引用。可用 AnalysisInspect 查看其余输出。')
+        if analysis_ref:
+            detail['analysisRef'] = analysis_ref
+            message += ' 写报告可直接使用返回的 analysisRef，全部计算结果已保存。'
+        raise AnalysisError('QUERY_RESULT_REFS', message, detail)
     selections = [{'pythonRunRef': run['runRef'], 'outputRefs': [by_name[name] for name in names]}]
     if service.turn is not None:
         select_results(service.turn, selections)

@@ -65,6 +65,7 @@ async def calculate_references(kwargs, operation):
             raise AnalysisError('INVALID_VALUE_REFERENCE', 'valueRefs 是变量名到保存结果引用的映射。')
         inputs = []
         for name, ref in references.items():
+            extrema = {}
             if name in variables or not isinstance(ref, dict) or set(ref) - {'captureRef', 'analysisRef', 'tableRef', 'rowRef', 'columnRef', 'rowRefs', 'filters', 'aggregation'}:
                 raise AnalysisError('INVALID_VALUE_REFERENCE', '引用变量不能覆盖字面变量，且只能使用已声明的引用字段。')
             if ('captureRef' in ref) == ('analysisRef' in ref):
@@ -105,7 +106,7 @@ async def calculate_references(kwargs, operation):
                 table = next((t for t in table_cache[cache_key] if t.ref == ref.get('tableRef')), None)
                 if table is None:
                     raise AnalysisError('TABLE_NOT_FOUND', '结果中不存在指定业务表。')
-                candidates = table.select_rows(ref.get('filters'))
+                candidates = table.select_rows(ref.get('filters'), strict=True)
                 column = table.select_columns([ref['columnRef']])[0]['id']
                 if 'rowRefs' in ref:
                     ids = ref['rowRefs']
@@ -148,11 +149,17 @@ async def calculate_references(kwargs, operation):
                             reduced.append(calculate(f"{agg.lower()}({','.join(vals)})", vals)['value'])
                         numbers = reduced
                     value = numbers[0]
+                if agg in ('MIN', 'MAX'):
+                    from decimal import Decimal
+                    tied = [row for row, fact in zip(candidates, facts) if Decimal(fact['value']) == Decimal(value)]
+                    extrema = {'extrema': {'count': len(tied), 'members': [
+                        {table.labels.get(k, k): row.get('publicLabels', {}).get(k) or row['labels'].get(k)
+                         for k in table.dimensions} for row in tied[:20]], 'complete': len(tied) <= 20}}
             variables[name] = value
             capture_refs.update(f['captureRef'] for f in facts if isinstance(f.get('captureRef'), str))
             inputs.append({'variable': name, reference_field: source_ref, 'tableRef': ref.get('tableRef'),
                            'columnRef': ref.get('columnRef'), 'rowRefs': rows, 'aggregation': ref.get('aggregation'),
-                           'factRefs': [f['factId'] for f in facts], 'value': value,
+                           'factRefs': [f['factId'] for f in facts], 'value': value, **extrema,
                            'unit': None if ref.get('aggregation') == 'COUNT' else facts[0].get('unit')})
         prepared.append({**{k: v for k, v in request.items() if k != 'valueRefs'}, 'variables': variables})
         proofs.append({'expression': request.get('expression'), 'inputs': inputs})

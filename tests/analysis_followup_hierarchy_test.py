@@ -144,7 +144,7 @@ class HierarchyFollowupTest(TestCase):
         self.assertIn('久其集团', result['contextText'])
         self.assertEqual(result['scope']['periodCode'], '2026N0001')
 
-    def test_explicit_task_name_is_still_retained_when_metric_changes(self):
+    def test_previous_task_name_does_not_hard_filter_a_new_metric(self):
         turn, capture = self.confirmed_turn()
         capture['request']['question'] += '，年度二上任务'
         capture['request']['scope'] = {'taskNames': ['年度二上']}
@@ -152,7 +152,8 @@ class HierarchyFollowupTest(TestCase):
         turn.state['followupContext'] = {'mode': 'CONTINUE', 'changedFields': ['metric']}
         with patch('analysis_extension.followup_scope._same_source', return_value=True):
             result = prepare_request(turn, {'originalToolName': 'execute_budget_query'}, {'purpose': 'QUERY'})
-        self.assertIn('年度二上', result['contextText'])
+        self.assertNotIn('年度二上', result['contextText'])
+        self.assertNotIn('taskNames', result.get('scope', {}))
 
     def test_grouping_is_forwarded_without_reusing_legacy_filter_state(self):
         turn, _ = self.confirmed_turn()
